@@ -72,11 +72,16 @@ def passes(row, cfg: Config) -> bool:
     age_min = (fetched * 1000 - created) / 60_000 if created and fetched else None
     if age_min is not None and (age_min < cfg.min_age_minutes or age_min > cfg.max_age_hours * 60):
         return False
-    lp = (snap.get("safety") or {}).get("lp_locked_pct")
+    safety = snap.get("safety") or {}
+    lp = safety.get("lp_locked_pct")
     if lp is not None:
         established = (age_min is not None and age_min >= cfg.established_min_age_hours * 60
                        and (liq or 0) >= cfg.established_min_liquidity_usd)
-        if lp < (cfg.established_min_lp_locked_pct if established else cfg.min_lp_locked_pct):
+        floor = cfg.established_min_lp_locked_pct if established else cfg.min_lp_locked_pct
+        strong_exception = (not established and lp >= cfg.partial_lock_min_pct
+                            and (row["factor_score"] or 0) >= cfg.partial_lock_min_score
+                            and (safety.get("score") or 0) <= cfg.partial_lock_max_rugcheck_score)
+        if lp < floor and not strong_exception:
             return False
     return True
 

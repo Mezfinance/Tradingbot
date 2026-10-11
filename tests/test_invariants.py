@@ -46,6 +46,19 @@ def test_unsafe_established_tokens_are_always_rejected(cfg, good_pair, safety):
     assert not factors.evaluate(old_deep, safety, cfg).passed
 
 
+def test_fresh_tokens_never_pass_below_50_pct_lock(cfg, good_pair):
+    for pct in (0, 25, 49.9):
+        r = factors.evaluate(good_pair, SafetyReport(score=1, lp_locked_pct=pct, risks=[], danger=False), cfg)
+        assert not r.passed
+
+
+def test_partial_lock_exception_needs_strong_factors_and_never_grows_size(cfg, good_pair):
+    weak = replace(good_pair, buys={"h1": 500}, sells={"h1": 500}, price_change={"m5": 0, "h1": 2})
+    assert not factors.evaluate(weak, SafetyReport(score=1, lp_locked_pct=66, risks=[], danger=False), cfg).passed
+    assert Config().partial_lock_min_pct >= 50 and Config().partial_lock_min_score >= 0.75
+    assert 0 < Config().partial_lock_size_factor <= 1
+
+
 def test_established_lp_floor_never_below_30_pct():
     assert Config().established_min_lp_locked_pct >= 30
     from tradingbot.learning.params import TUNABLES

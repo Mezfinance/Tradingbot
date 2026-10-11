@@ -306,7 +306,7 @@ class Engine:
                          snap.symbol, verdict.action, verdict.conviction, verdict.thesis)
                 if (verdict.action == "buy" and verdict.conviction >= self.cfg.min_conviction
                         and verdict.social_score >= self.cfg.min_social_score):
-                    if self.buy(main, snap, verdict.conviction, decision_id):
+                    if self.buy(main, snap, verdict.conviction, decision_id, self._size_factor(result)):
                         slots -= 1
                         self._maybe_canary(snap, verdict.conviction, decision_id)
         self._track_unanalysed(survivors, analysed)
@@ -339,10 +339,14 @@ class Engine:
             return
         buy_rate = shadows.claude_buy_rate(self.journal, self.cfg)
         for book in baselines:
-            for snap, _result, _safety in shadows.picks(book.name, survivors, analysed, buy_rate, self._rng):
+            for snap, result, _safety in shadows.picks(book.name, survivors, analysed, buy_rate, self._rng):
                 if not self.entries_allowed(book):
                     break
-                self.buy(book, snap, self.cfg.shadow_conviction, None)
+                self.buy(book, snap, self.cfg.shadow_conviction, None, self._size_factor(result))
+
+    def _size_factor(self, result: FactorResult | None) -> float:
+        """Partial-LP-lock exceptions trade at reduced size (same rule for every book)."""
+        return self.cfg.partial_lock_size_factor if getattr(result, "partial_lock", False) else 1.0
 
     def preflight(self, snap: PairSnapshot, usd: float) -> tuple[PairSnapshot | None, str]:
         """Re-validate a token right before buying. Research can take minutes.
@@ -375,13 +379,15 @@ class Engine:
                 return None, f"price impact {impact:.2f}%"
         return now, ""
 
-    def buy(self, book: Book, snap: PairSnapshot, conviction: float, decision_id: int | None) -> bool:
+    def buy(self, book: Book, snap: PairSnapshot, conviction: float, decision_id: int | None,
+            size_factor: float = 1.0) -> bool:
         if any(p.token_address == snap.token_address for p in self.journal.open_positions(book.name)):
             return False
         if book.fixed_usd is not None:
             usd = min(book.fixed_usd, book.cash)
         else:
             usd = risk.position_size_usd(self.equity(book), book.cash, conviction, self.cfg)
+        usd *= max(0.0, min(1.0, size_factor))  # can only shrink a position, never grow it
         if usd < 1:
             log.info("[%s] position size too small for %s", book.name, snap.symbol)
             return False

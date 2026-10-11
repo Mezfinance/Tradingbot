@@ -79,7 +79,8 @@ def market_filters(p: PairSnapshot, cfg: Config) -> list[str]:
     return out
 
 
-def safety_filters(safety: SafetyReport | None, cfg: Config, established: bool = False) -> list[str]:
+def safety_filters(safety: SafetyReport | None, cfg: Config, established: bool = False,
+                   lp_floor: float | None = None) -> list[str]:
     out: list[str] = []
     if safety is None:
         out.append("safety check unavailable")
@@ -88,15 +89,28 @@ def safety_filters(safety: SafetyReport | None, cfg: Config, established: bool =
             out.append("rugcheck danger: " + "; ".join(r for r in safety.risks if r.startswith("danger")))
         if safety.score is not None and safety.score > cfg.max_rugcheck_score:
             out.append(f"rugcheck score {safety.score} > {cfg.max_rugcheck_score}")
-        need = cfg.established_min_lp_locked_pct if established else cfg.min_lp_locked_pct
+        need = lp_floor if lp_floor is not None else (
+            cfg.established_min_lp_locked_pct if established else cfg.min_lp_locked_pct)
         if safety.lp_locked_pct is not None and safety.lp_locked_pct < need:
             out.append(f"LP locked {safety.lp_locked_pct:.0f}% < {need:.0f}%")
     return out
 
 
 def hard_filters(p: PairSnapshot, safety: SafetyReport | None, cfg: Config) -> list[str]:
-    """Reasons to reject outright. Empty list means the token may be scored."""
+    """Reasons to reject outright, with the standard LP-lock rule for the token's profile."""
     return market_filters(p, cfg) + safety_filters(safety, cfg, is_established(p, cfg))
+
+
+def partial_lock_exception(kind: str, score: float, safety: SafetyReport | None, cfg: Config) -> bool:
+    """A fresh token whose LP lock is between `partial_lock_min_pct` and `min_lp_locked_pct` may
+    still pass, but only when everything else is exceptionally strong: a factor score of at least
+    `partial_lock_min_score` and a clean RugCheck (no danger, score <= `partial_lock_max_rugcheck_score`).
+    Such trades are bought at `partial_lock_size_factor` of the normal size."""
+    if kind != FRESH or safety is None or safety.danger or safety.lp_locked_pct is None:
+        return False
+    return (cfg.partial_lock_min_pct <= safety.lp_locked_pct < cfg.min_lp_locked_pct
+            and score >= cfg.partial_lock_min_score
+            and (safety.score or 0) <= cfg.partial_lock_max_rugcheck_score)
 
 
 def components(p: PairSnapshot) -> dict[str, float]:
@@ -163,11 +177,13 @@ def trend_components(p: PairSnapshot) -> dict[str, float]:
 
 
 def evaluate(p: PairSnapshot, safety: SafetyReport | None, cfg: Config) -> FactorResult:
-    rejections = hard_filters(p, safety, cfg)
     kind = profile(p, cfg)
     comps, weights = (trend_components(p), TREND_WEIGHTS) if kind == ESTABLISHED else (components(p), WEIGHTS)
     score = sum(weights[k] * v for k, v in comps.items())
+    exception = partial_lock_exception(kind, score, safety, cfg)
+    rejections = market_filters(p, cfg) + safety_filters(
+        safety, cfg, kind == ESTABLISHED, lp_floor=cfg.partial_lock_min_pct if exception else None)
     if not rejections and score < cfg.min_factor_score:
         rejections.append(f"factor score {score:.2f} < {cfg.min_factor_score:.2f}")
     return FactorResult(passed=not rejections, score=round(score, 4), components=comps, rejections=rejections,
-                        profile=kind)
+                        profile=kind, partial_lock=exception and not rejections)

@@ -39,6 +39,11 @@ class Config:
     established_min_age_hours: float = 72.0
     established_min_liquidity_usd: float = 100_000.0
     established_min_lp_locked_pct: float = 30.0
+    # Fresh tokens with a partial LP lock may pass only if everything else is exceptionally strong.
+    partial_lock_min_pct: float = 50.0
+    partial_lock_min_score: float = 0.75  # vs the normal min_factor_score
+    partial_lock_max_rugcheck_score: int = 1_000  # vs the normal max_rugcheck_score
+    partial_lock_size_factor: float = 0.5  # fraction of the normal position size
     min_factor_score: float = 0.55  # 0..1 composite needed to reach Claude
 
     # --- Claude analyst -------------------------------------------------

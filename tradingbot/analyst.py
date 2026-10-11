@@ -53,6 +53,11 @@ promotion adds nothing; heavy shilling should lower the score.
 - social_evidence: one or two sentences on what the score rests on.
 Count only what you verified; do not guess numbers.
 
+If partial_lp_lock_exception is true, the token passed the safety gate only because its other \
+numbers are exceptionally strong despite 20-50% of its liquidity being withdrawable. Treat that \
+as a live rug risk: look hard at who holds the unlocked LP and the deployer's history, and pass \
+unless the evidence of organic demand is clear.
+
 Base rates matter: the large majority of new memecoins go to zero, and most traders on these \
 markets lose money. Default to "pass". Only return "buy" when you found specific, verifiable \
 evidence of organic demand and no serious red flag. Conviction is your honest probability that \
@@ -111,6 +116,7 @@ def build_brief(p: PairSnapshot, safety: SafetyReport | None, factors: FactorRes
             "risks": safety.risks,
         },
         "token_profile": factors.profile,
+        "partial_lp_lock_exception": factors.partial_lock,
         "factor_score": factors.score,
         "factor_components": {k: round(v, 2) for k, v in factors.components.items()},
     }

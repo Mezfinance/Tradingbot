@@ -188,6 +188,7 @@ class Journal:
         snap = asdict(p)
         snap["safety"] = asdict(safety) if safety is not None else None
         snap["profile"] = factors.profile
+        snap["partial_lock"] = factors.partial_lock
         cur = self.db.execute(
             """INSERT INTO decisions(ts, token, symbol, stage, price, liquidity, fdv, factor_score,
                components, rejections, verdict, action, conviction, snapshot, playbook_arm, social_score)

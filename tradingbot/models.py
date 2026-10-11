@@ -54,6 +54,7 @@ class FactorResult:
     components: dict[str, float]
     rejections: list[str]
     profile: str = "fresh"  # "fresh" or "established" (see factors.py)
+    partial_lock: bool = False  # passed only via the strong-factors partial-LP-lock exception
 
 
 class Verdict(BaseModel):
