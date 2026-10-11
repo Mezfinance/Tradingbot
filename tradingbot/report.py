@@ -209,6 +209,24 @@ def learning(j: Journal) -> dict:
     }
 
 
+SOCIAL_SPLIT = 0.5
+
+
+def social(j: Journal) -> dict:
+    """Do tokens Claude rated socially strong actually do better? (All analysed tokens.)"""
+    rows = j.query(
+        """SELECT d.social_score AS s, t.start_price, t.p6h, t.max_price FROM decisions d
+           JOIN tracking t ON t.decision_id = d.id
+           WHERE d.stage='analysed' AND d.social_score IS NOT NULL AND t.start_price > 0""")
+    out = {}
+    for label, keep in (("high", lambda s: s >= SOCIAL_SPLIT), ("low", lambda s: s < SOCIAL_SPLIT)):
+        grp = [r for r in rows if keep(r["s"])]
+        p6 = [(r["p6h"] / r["start_price"] - 1) * 100 for r in grp if r["p6h"] is not None]
+        up = [(r["max_price"] / r["start_price"] - 1) * 100 for r in grp]
+        out[label] = {"n": len(grp), "median_6h_pct": _median(p6), "median_max_up_pct": _median(up)}
+    return out
+
+
 def downtime(j: Journal) -> dict:
     rows = j.query("SELECT start_ts, end_ts, open_positions FROM downtime")
     return {
@@ -230,6 +248,7 @@ def build(j: Journal, cfg: Config) -> dict:
         "strategies": [strategy_stats(j, n, cfg.starting_cash_usd) for n in names],
         "claude_selection": claude_selection(j),
         "downtime": downtime(j),
+        "social": social(j),
         "calibration": calibration(j),
         "learning": learning(j),
         "last_backup": json.loads(j.get_state("last_backup") or "null"),
@@ -316,6 +335,13 @@ def render(rep: dict) -> str:
         lines.append(f"\nLAST BACKUP: {bk['date']} -> {where}" + (f"  FAILED: {bk['error']}" if bk["error"] else ""))
     else:
         lines.append("\nLAST BACKUP: none yet")
+    soc = rep.get("social") or {}
+    if any(g["n"] for g in soc.values()):
+        lines.append(f"\nSOCIAL SCORE vs OUTCOME (analysed tokens, split at {SOCIAL_SPLIT})")
+        for label in ("high", "low"):
+            g = soc[label]
+            lines.append(f"  {label:<5} n={g['n']:<4} median 6h {_fmt(g['median_6h_pct'], '%', 1):>8}   "
+                         f"median best {_fmt(g['median_max_up_pct'], '%', 1):>8}")
     dt = rep["downtime"]
     if dt["outages"]:
         lines.append(f"\nDOWNTIME: {dt['outages']} outage(s), {dt['hours_offline']:.1f}h offline, "

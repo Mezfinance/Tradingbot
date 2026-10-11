@@ -65,6 +65,11 @@ class Verdict(BaseModel):
     red_flags: list[str] = Field(description="Concrete risks found during research")
     catalysts: list[str] = Field(description="Concrete, dated catalysts found, if any")
     social_signal: Literal["none", "organic", "paid_or_botted", "mixed"]
+    social_score: float = Field(default=0.0, description="0.0-1.0 strength of organic social demand")
+    mentions_found: int = Field(default=0, description="Distinct relevant posts/threads found")
+    notable_accounts: list[str] = Field(default_factory=list, description="Influential accounts involved")
+    buzz_recency: Literal["last_hour", "today", "older", "none"] = "none"
+    social_evidence: str = Field(default="", description="What the social score is based on")
     sources: list[str] = Field(description="URLs relied on")
 
 

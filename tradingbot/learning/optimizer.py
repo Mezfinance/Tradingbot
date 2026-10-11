@@ -55,6 +55,9 @@ def passes(row, cfg: Config) -> bool:
         return False
     if (row["factor_score"] or 0) < cfg.min_factor_score:
         return False
+    social = row["social_score"] if "social_score" in row.keys() else None
+    if social is not None and social < cfg.min_social_score:
+        return False
     snap = _snapshot(row)
     liq = snap.get("liquidity_usd", row["liquidity"])
     fdv = snap.get("fdv_usd", row["fdv"])
@@ -82,6 +85,7 @@ def history(j: Journal) -> list:
     """Every analysed token Claude wanted to buy, with its recorded price path start, oldest first."""
     return j.query(
         """SELECT d.id AS decision_id, d.action, d.conviction, d.factor_score, d.liquidity, d.fdv, d.snapshot,
+                  d.social_score,
                   t.token, t.start_ts, t.start_price
            FROM decisions d JOIN tracking t ON t.decision_id = d.id
            WHERE d.stage='analysed' AND d.action='buy' AND t.start_price > 0

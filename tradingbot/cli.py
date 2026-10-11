@@ -51,7 +51,8 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="tradingbot")
     parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup",
                                             "backup-now", "backup-list", "learn-now", "postmortems", "playbook", "optimize-now", "settings",
-                                            "settings-rollback", "code-versions", "code-diff", "code-rollback"])
+                                            "settings-rollback", "code-versions", "code-diff", "code-rollback",
+                                            "propose", "proposals"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -61,6 +62,9 @@ def main(argv: list[str] | None = None) -> None:
                         help="replay: override a setting, e.g. stop_loss_pct=20 (repeatable)")
     parser.add_argument("--split", help="replay: YYYY-MM-DD; tune before it, check after it")
     parser.add_argument("--size", type=float, default=50.0, help="replay: USD per trade")
+    parser.add_argument("--idea", help="propose: what to build")
+    parser.add_argument("--problem", default="", help="propose: what it should fix or improve")
+    parser.add_argument("--priority", type=int, default=1, help="propose: 1 (first) to 5 (last)")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -116,6 +120,30 @@ def main(argv: list[str] | None = None) -> None:
             for v in versions.history(j):
                 print(f"v{v['id']} [{v['status']}] {v['changes']} :: {v['reason'][:160]}"
                       + (f" :: {v['verdict']}" if v["verdict"] else ""))
+        return
+
+    if args.command in ("propose", "proposals"):
+        import time as _time
+
+        from tradingbot.journal import Journal
+        from tradingbot.learning import versions
+        j = Journal(cfg.db_path)
+        versions.ensure(j)
+        if args.command == "propose":
+            if not args.path or not args.idea:
+                parser.error('propose needs a title and --idea, e.g. propose "Mention velocity" --idea "..."')
+            pid = j.execute(
+                "INSERT INTO proposals(ts, source, title, problem, evidence, idea, priority) VALUES(?,?,?,?,?,?,?)",
+                (_time.time(), "user", args.path, args.problem or args.idea, "requested by the operator",
+                 args.idea, max(1, min(5, args.priority))))
+            print(f"queued proposal #{pid} for the engineer (it picks the highest priority first, "
+                  f"at most one attempt per {cfg.engineer_interval_h:g}h)")
+            return
+        for r in j.query("SELECT * FROM proposals ORDER BY status='open' DESC, priority, ts"):
+            print(f"#{r['id']} [{r['status']}] p{r['priority']} ({r['source']}) {r['title']}")
+            print(f"    idea: {r['idea'][:200]}")
+            if r["result"]:
+                print(f"    result: {r['result'][:200]}")
         return
 
     if args.command in ("code-versions", "code-diff", "code-rollback"):

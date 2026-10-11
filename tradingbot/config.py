@@ -49,6 +49,7 @@ class Config:
     api_account_pause_s: int = 600  # pause Claude calls after a billing/auth error
     api_transient_pause_s: int = 60  # pause after rate limits, overload or network errors
     min_conviction: float = 0.65  # Claude conviction needed to buy
+    min_social_score: float = 0.0  # Claude's organic social score needed to buy (0 = no gate; optimiser-tunable)
 
     # --- self-improvement (see tradingbot/learning) ----------------------
     learning: bool = True  # run the learning thread inside `run`

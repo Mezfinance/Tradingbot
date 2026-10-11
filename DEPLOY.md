@@ -113,6 +113,15 @@ Learning runs on its own thread, capped at $10/day of Claude spend (`TB_LEARNING
 
 Run them on Fly with `fly ssh console -C "python -m tradingbot <command>"`.
 
+**Give the bot ideas.** You can queue your own improvement for the engineer; it is built, tested and put on probation like any other change:
+
+```bash
+fly ssh console -C 'python -m tradingbot propose "Mention velocity factor" --idea "Count recent Reddit posts mentioning the token via the public search JSON and add it as a factor" --priority 1'
+fly ssh console -C "python -m tradingbot proposals"   # queue and results
+```
+
+**Social score.** Each analysis records Claude's 0–1 score for organic social demand, plus mentions found, notable accounts and how recent the buzz is. The report's `SOCIAL SCORE vs OUTCOME` section shows whether high-scoring tokens actually do better. `TB_MIN_SOCIAL_SCORE` (default 0, no gate) is a buy threshold the optimiser can raise if the data supports it.
+
 **Self-written code, step by step.** At most once a day, the engineer takes the highest-priority code proposal from the optimiser, edits a copy of the code with Claude, and ships it only if:
 - no protected file changed: risk rules, config limits, journal, execution and wallet code, health, backups, CLI, the learning system, and every existing test;
 - it compiles and imports, and doesn't touch keys or live-trading switches;

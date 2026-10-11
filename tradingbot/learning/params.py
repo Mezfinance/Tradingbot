@@ -34,6 +34,7 @@ TUNABLES: dict[str, Tunable] = {t.name: t for t in [
     Tunable("tp3_pct", 150, 1500, "exit", "third take-profit target (sells the rest)"),
     # selection: replayable on analysed candidates
     Tunable("min_conviction", 0.5, 0.95, "selection", "Claude conviction needed to buy"),
+    Tunable("min_social_score", 0.0, 0.9, "selection", "Claude's organic social score (0-1) needed to buy"),
     Tunable("min_factor_score", DEFAULTS.min_factor_score, 0.9, "filter", "composite score gate"),
     Tunable("min_liquidity_usd", DEFAULTS.min_liquidity_usd, 250_000, "filter", "liquidity floor"),
     Tunable("min_volume_h1_usd", DEFAULTS.min_volume_h1_usd, 500_000, "filter", "1h volume floor"),

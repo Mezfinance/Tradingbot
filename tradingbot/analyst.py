@@ -42,6 +42,17 @@ Research with web search before deciding. Look for:
 - Red flags: the deployer's history, bundled or sniped supply, insiders selling, copycat of a \
 token that already ran, impersonation of a real brand or person, "presale" or "guaranteed" language.
 
+Score the social side as numbers too, so the desk can learn which levels predict winners:
+- social_score (0.0-1.0): strength of ORGANIC demand. 0 = nobody is talking about it; 0.3 = a \
+few scattered or self-promotional posts; 0.6 = steady discussion from varied real accounts; 0.9+ = \
+broad, fast-growing organic attention, including credible accounts. Paid, botted or copy-paste \
+promotion adds nothing; heavy shilling should lower the score.
+- mentions_found: distinct relevant posts or threads about THIS contract you actually found.
+- notable_accounts: handles with real reach that are talking about it (empty if none).
+- buzz_recency: when most of the attention happened (last_hour, today, older, none).
+- social_evidence: one or two sentences on what the score rests on.
+Count only what you verified; do not guess numbers.
+
 Base rates matter: the large majority of new memecoins go to zero, and most traders on these \
 markets lose money. Default to "pass". Only return "buy" when you found specific, verifiable \
 evidence of organic demand and no serious red flag. Conviction is your honest probability that \
@@ -62,9 +73,15 @@ VERDICT_SCHEMA = {
         "red_flags": {"type": "array", "items": {"type": "string"}},
         "catalysts": {"type": "array", "items": {"type": "string"}},
         "social_signal": {"type": "string", "enum": ["none", "organic", "paid_or_botted", "mixed"]},
+        "social_score": {"type": "number"},
+        "mentions_found": {"type": "integer"},
+        "notable_accounts": {"type": "array", "items": {"type": "string"}},
+        "buzz_recency": {"type": "string", "enum": ["last_hour", "today", "older", "none"]},
+        "social_evidence": {"type": "string"},
         "sources": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["action", "conviction", "thesis", "red_flags", "catalysts", "social_signal", "sources"],
+    "required": ["action", "conviction", "thesis", "red_flags", "catalysts", "social_signal", "social_score",
+                 "mentions_found", "notable_accounts", "buzz_recency", "social_evidence", "sources"],
     "additionalProperties": False,
 }
 
@@ -230,4 +247,6 @@ def parse_verdict(content) -> Verdict | None:
         log.warning("verdict failed validation: %s", exc)
         return None
     v.conviction = max(0.0, min(1.0, v.conviction))
+    v.social_score = max(0.0, min(1.0, v.social_score))
+    v.mentions_found = max(0, v.mentions_found)
     return v

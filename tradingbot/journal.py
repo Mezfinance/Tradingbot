@@ -20,6 +20,7 @@ from tradingbot.models import FactorResult, PairSnapshot, Position, SafetyReport
 MIGRATIONS = [
     ("decisions", "snapshot", "TEXT"),  # full pair + safety snapshot at decision time (JSON)
     ("decisions", "playbook_arm", "TEXT"),  # "playbook:<ver>" | "control:<ver>" | "none" (A/B test)
+    ("decisions", "social_score", "REAL"),  # Claude's 0-1 organic social demand score
 ]
 
 SCHEMA = """
@@ -189,8 +190,8 @@ class Journal:
         snap["profile"] = factors.profile
         cur = self.db.execute(
             """INSERT INTO decisions(ts, token, symbol, stage, price, liquidity, fdv, factor_score,
-               components, rejections, verdict, action, conviction, snapshot, playbook_arm)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               components, rejections, verdict, action, conviction, snapshot, playbook_arm, social_score)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 time.time(), p.token_address, p.symbol,
                 stage or ("analysed" if analysed else "screened_out"),
@@ -201,6 +202,7 @@ class Journal:
                 verdict.conviction if verdict else None,
                 json.dumps(snap),
                 playbook_arm,
+                verdict.social_score if verdict else None,
             ),
         )
         self.db.commit()

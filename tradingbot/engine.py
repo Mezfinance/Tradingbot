@@ -304,7 +304,8 @@ class Engine:
                 analysed.append(((snap, result, safety), verdict.action))
                 log.info("%s -> %s (conviction %.2f): %s",
                          snap.symbol, verdict.action, verdict.conviction, verdict.thesis)
-                if verdict.action == "buy" and verdict.conviction >= self.cfg.min_conviction:
+                if (verdict.action == "buy" and verdict.conviction >= self.cfg.min_conviction
+                        and verdict.social_score >= self.cfg.min_social_score):
                     if self.buy(main, snap, verdict.conviction, decision_id):
                         slots -= 1
                         self._maybe_canary(snap, verdict.conviction, decision_id)
