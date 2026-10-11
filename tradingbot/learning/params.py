@@ -41,6 +41,12 @@ TUNABLES: dict[str, Tunable] = {t.name: t for t in [
     Tunable("max_age_hours", 6, DEFAULTS.max_age_hours, "filter", "skip pairs older than this"),
     Tunable("max_fdv_usd", 250_000, DEFAULTS.max_fdv_usd, "filter", "skip tokens valued above this"),
     Tunable("max_entry_drift_pct", 3, DEFAULTS.max_entry_drift_pct, "filter", "skip if price ran during research"),
+    Tunable("established_min_lp_locked_pct", DEFAULTS.established_min_lp_locked_pct, DEFAULTS.min_lp_locked_pct,
+            "filter", "LP lock required of established tokens (fresh tokens always need min_lp_locked_pct)"),
+    Tunable("established_min_liquidity_usd", DEFAULTS.established_min_liquidity_usd, 1_000_000, "filter",
+            "liquidity needed to count as established"),
+    Tunable("established_min_age_hours", DEFAULTS.established_min_age_hours, 720, "filter",
+            "age needed to count as established"),
     # sizing
     Tunable("risk_per_trade_pct", 0.5, 3.0, "sizing", "equity lost if the stop is hit"),
     Tunable("max_open_positions", 1, 8, "sizing", "concurrent positions"),

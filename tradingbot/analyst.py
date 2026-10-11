@@ -93,6 +93,7 @@ def build_brief(p: PairSnapshot, safety: SafetyReport | None, factors: FactorRes
             "lp_locked_pct": safety.lp_locked_pct,
             "risks": safety.risks,
         },
+        "token_profile": factors.profile,
         "factor_score": factors.score,
         "factor_components": {k: round(v, 2) for k, v in factors.components.items()},
     }

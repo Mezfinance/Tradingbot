@@ -53,6 +53,7 @@ class FactorResult:
     score: float  # 0..1 composite
     components: dict[str, float]
     rejections: list[str]
+    profile: str = "fresh"  # "fresh" or "established" (see factors.py)
 
 
 class Verdict(BaseModel):

@@ -2,12 +2,23 @@
 
 Nothing here calls an LLM. Claude only sees tokens that clear this gate, which
 keeps cost bounded and stops a persuasive narrative from overriding a bad contract.
+
+Two profiles:
+  fresh        young or thin pools: strict LP-lock rule, scored on short-term momentum.
+  established  at least `established_min_age_hours` old with at least
+               `established_min_liquidity_usd` liquidity: a lower LP-lock rule (shared pools
+               show partial locks from ordinary liquidity providers) and a trend score
+               (steady buying, sustained gains, real volume) instead of spike-chasing.
+Every other safety rule (RugCheck danger flags and score, missing safety data, the
+buy-then-sell honeypot check in the engine) applies to both.
 """
 
 from __future__ import annotations
 
 from tradingbot.config import Config
 from tradingbot.models import FactorResult, PairSnapshot, SafetyReport
+
+FRESH, ESTABLISHED = "fresh", "established"
 
 WEIGHTS = {
     "buy_pressure": 0.25,
@@ -17,6 +28,25 @@ WEIGHTS = {
     "breadth": 0.15,
     "socials": 0.05,
 }
+
+TREND_WEIGHTS = {
+    "buy_pressure": 0.25,
+    "trend": 0.25,
+    "holding": 0.15,
+    "turnover": 0.15,
+    "breadth": 0.15,
+    "socials": 0.05,
+}
+
+
+def is_established(p: PairSnapshot, cfg: Config) -> bool:
+    age = p.age_minutes
+    return (age is not None and age >= cfg.established_min_age_hours * 60
+            and (p.liquidity_usd or 0) >= cfg.established_min_liquidity_usd)
+
+
+def profile(p: PairSnapshot, cfg: Config) -> str:
+    return ESTABLISHED if is_established(p, cfg) else FRESH
 
 
 def ramp(x: float, lo: float, hi: float) -> float:
@@ -49,7 +79,7 @@ def market_filters(p: PairSnapshot, cfg: Config) -> list[str]:
     return out
 
 
-def safety_filters(safety: SafetyReport | None, cfg: Config) -> list[str]:
+def safety_filters(safety: SafetyReport | None, cfg: Config, established: bool = False) -> list[str]:
     out: list[str] = []
     if safety is None:
         out.append("safety check unavailable")
@@ -58,14 +88,15 @@ def safety_filters(safety: SafetyReport | None, cfg: Config) -> list[str]:
             out.append("rugcheck danger: " + "; ".join(r for r in safety.risks if r.startswith("danger")))
         if safety.score is not None and safety.score > cfg.max_rugcheck_score:
             out.append(f"rugcheck score {safety.score} > {cfg.max_rugcheck_score}")
-        if safety.lp_locked_pct is not None and safety.lp_locked_pct < cfg.min_lp_locked_pct:
-            out.append(f"LP locked {safety.lp_locked_pct:.0f}% < {cfg.min_lp_locked_pct:.0f}%")
+        need = cfg.established_min_lp_locked_pct if established else cfg.min_lp_locked_pct
+        if safety.lp_locked_pct is not None and safety.lp_locked_pct < need:
+            out.append(f"LP locked {safety.lp_locked_pct:.0f}% < {need:.0f}%")
     return out
 
 
 def hard_filters(p: PairSnapshot, safety: SafetyReport | None, cfg: Config) -> list[str]:
     """Reasons to reject outright. Empty list means the token may be scored."""
-    return market_filters(p, cfg) + safety_filters(safety, cfg)
+    return market_filters(p, cfg) + safety_filters(safety, cfg, is_established(p, cfg))
 
 
 def components(p: PairSnapshot) -> dict[str, float]:
@@ -101,10 +132,42 @@ def components(p: PairSnapshot) -> dict[str, float]:
     }
 
 
+def trend_components(p: PairSnapshot) -> dict[str, float]:
+    """Scoring for established tokens: a sustained, broad-based uptrend rather than a spike."""
+    buys, sells = p.buys.get("h6", 0), p.sells.get("h6", 0)
+    buy_ratio = buys / (buys + sells) if buys + sells else 0.0
+
+    # 24h trend: reward a healthy climb, fade a parabolic one (late entry into a blow-off).
+    h24 = p.price_change.get("h24", 0.0)
+    if h24 <= 0:
+        trend = 0.0
+    elif h24 <= 150:
+        trend = ramp(h24, 0, 40)
+    else:
+        trend = 1.0 - ramp(h24, 150, 600) * 0.8
+
+    liq = p.liquidity_usd or 0.0
+    vol_24 = p.volume.get("h24", 0.0)
+    turnover = vol_24 / liq if liq else 0.0
+    trades_24 = p.buys.get("h24", 0) + p.sells.get("h24", 0)
+    return {
+        "buy_pressure": ramp(buy_ratio, 0.48, 0.62),
+        "trend": trend,
+        # Holding its gains right now, not sliding: last hour roughly flat or up.
+        "holding": ramp(p.price_change.get("h1", 0.0), -10, 2),
+        # Very high daily turnover relative to liquidity is usually wash trading.
+        "turnover": ramp(turnover, 0.5, 4.0) * (0.5 if turnover > 30 else 1.0),
+        "breadth": ramp(trades_24, 1_000, 15_000),
+        "socials": 1.0 if p.socials else 0.3,
+    }
+
+
 def evaluate(p: PairSnapshot, safety: SafetyReport | None, cfg: Config) -> FactorResult:
     rejections = hard_filters(p, safety, cfg)
-    comps = components(p)
-    score = sum(WEIGHTS[k] * v for k, v in comps.items())
+    kind = profile(p, cfg)
+    comps, weights = (trend_components(p), TREND_WEIGHTS) if kind == ESTABLISHED else (components(p), WEIGHTS)
+    score = sum(weights[k] * v for k, v in comps.items())
     if not rejections and score < cfg.min_factor_score:
         rejections.append(f"factor score {score:.2f} < {cfg.min_factor_score:.2f}")
-    return FactorResult(passed=not rejections, score=round(score, 4), components=comps, rejections=rejections)
+    return FactorResult(passed=not rejections, score=round(score, 4), components=comps, rejections=rejections,
+                        profile=kind)

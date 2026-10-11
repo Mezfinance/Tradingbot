@@ -33,6 +33,25 @@ def test_unsafe_tokens_are_always_rejected(cfg, good_pair, safety):
     assert not factors.evaluate(good_pair, safety, cfg).passed
 
 
+@pytest.mark.parametrize("safety", [
+    None,
+    SafetyReport(score=1, lp_locked_pct=100, risks=["danger: Mint authority"], danger=True),
+    SafetyReport(score=1, lp_locked_pct=10, risks=[], danger=False),  # below even the established floor
+    SafetyReport(score=999_999, lp_locked_pct=100, risks=[], danger=False),
+])
+def test_unsafe_established_tokens_are_always_rejected(cfg, good_pair, safety):
+    old_deep = replace(good_pair, liquidity_usd=500_000,
+                       created_at_ms=int((good_pair.fetched_at - 10 * 86400) * 1000))
+    assert factors.is_established(old_deep, cfg)
+    assert not factors.evaluate(old_deep, safety, cfg).passed
+
+
+def test_established_lp_floor_never_below_30_pct():
+    assert Config().established_min_lp_locked_pct >= 30
+    from tradingbot.learning.params import TUNABLES
+    assert TUNABLES["established_min_lp_locked_pct"].lo >= 30
+
+
 def test_no_liquidity_is_always_rejected(cfg, good_pair, safe):
     assert not factors.evaluate(replace(good_pair, liquidity_usd=None), safe, cfg).passed
 

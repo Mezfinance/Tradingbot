@@ -35,6 +35,10 @@ class Config:
     max_fdv_usd: float = 25_000_000.0
     max_rugcheck_score: int = 2_000  # rugcheck raw score; lower is safer
     min_lp_locked_pct: float = 80.0
+    # Established tokens (old enough and deep enough) use a lower LP-lock rule; see factors.py.
+    established_min_age_hours: float = 72.0
+    established_min_liquidity_usd: float = 100_000.0
+    established_min_lp_locked_pct: float = 30.0
     min_factor_score: float = 0.55  # 0..1 composite needed to reach Claude
 
     # --- Claude analyst -------------------------------------------------
