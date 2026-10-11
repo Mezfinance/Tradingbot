@@ -15,6 +15,7 @@ import anthropic
 from pydantic import ValidationError
 
 from tradingbot.config import Config
+from tradingbot.costs import usage_cost_usd
 from tradingbot.models import FactorResult, PairSnapshot, SafetyReport, Verdict
 
 log = logging.getLogger(__name__)
@@ -98,6 +99,7 @@ class Analyst:
         self.cfg = cfg
         self.client = client or anthropic.Anthropic()
         self._calls: deque[float] = deque()
+        self.last_cost_usd = 0.0  # cost of the most recent analyse() call, including resumes
 
     def budget_ok(self) -> bool:
         now = time.time()
@@ -107,6 +109,7 @@ class Analyst:
 
     def analyse(self, p: PairSnapshot, safety: SafetyReport | None, factors: FactorResult) -> Verdict | None:
         """Returns None when no usable verdict was produced (budget, refusal, API error)."""
+        self.last_cost_usd = 0.0
         if not self.budget_ok():
             log.info("analysis budget exhausted for this hour; skipping %s", p.symbol)
             return None
@@ -133,6 +136,7 @@ class Analyst:
                     betas=["server-side-fallback-2026-07-01"],
                     fallbacks="default",
                 )
+                self.last_cost_usd += usage_cost_usd(getattr(resp, "model", self.cfg.model), resp.usage)
                 if resp.stop_reason != "pause_turn":
                     break
                 # Long server-tool turn: hand the partial turn back so Claude resumes it.
@@ -151,8 +155,8 @@ class Analyst:
             return None
 
         log.info(
-            "analysed %s: stop=%s in=%s out=%s",
-            p.symbol, resp.stop_reason, resp.usage.input_tokens, resp.usage.output_tokens,
+            "analysed %s: stop=%s in=%s out=%s cost=$%.3f",
+            p.symbol, resp.stop_reason, resp.usage.input_tokens, resp.usage.output_tokens, self.last_cost_usd,
         )
         if resp.stop_reason == "refusal":
             log.warning("analysis refused for %s", p.symbol)

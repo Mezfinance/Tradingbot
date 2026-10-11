@@ -34,6 +34,7 @@ REANALYSE_AFTER_S = 6 * 3600
 RECHECK_REJECTED_S = 30 * 60
 OUTCOME_HORIZON_S = 6 * 3600
 DUST_QTY = 1e-12
+EQUITY_SNAPSHOT_S = 60
 
 Survivor = tuple[PairSnapshot, FactorResult, SafetyReport | None]
 
@@ -55,6 +56,7 @@ class Engine:
         self.lock = threading.RLock()  # guards book cash and position state
         self._cooldown: dict[str, float] = {}  # token -> time it may be re-screened
         self._last_prices: dict[str, float] = {}
+        self._last_snapshot = 0.0
         self._stop = threading.Event()
 
     def _open_book(self, name: str, executor: Executor) -> Book:
@@ -118,8 +120,6 @@ class Engine:
     # --- positions ----------------------------------------------------------
     def manage_positions(self) -> dict[str, float]:
         positions = self.journal.open_positions(strategy=None)
-        if not positions:
-            return {}
         prices = self.current_prices({p.token_address for p in positions})
         now = time.time()
         for pos in positions:
@@ -136,7 +136,17 @@ class Engine:
                     pos.tp_hits, pos.stop_price = before
                     break
             self.journal.save_position(pos)
+        self.snapshot_equity(prices)
         return prices
+
+    def snapshot_equity(self, prices: dict[str, float], force: bool = False) -> None:
+        if not force and time.time() - self._last_snapshot < EQUITY_SNAPSHOT_S:
+            return
+        self._last_snapshot = time.time()
+        for book in self.books.values():
+            held = sum(p.qty * prices.get(p.token_address, p.entry_price)
+                       for p in self.journal.open_positions(book.name))
+            self.journal.snapshot_equity(book.name, book.cash, held)
 
     def equity(self, book: Book | None = None, prices: dict[str, float] | None = None) -> float:
         book = book or self.books[MAIN]
@@ -192,6 +202,9 @@ class Engine:
                 if slots <= 0 or not self.analyst.budget_ok():
                     break
                 verdict = self.analyst.analyse(snap, safety, result)
+                cost = getattr(self.analyst, "last_cost_usd", 0.0)
+                if cost:
+                    self.journal.log_cost("claude_api", cost, snap.token_address, MAIN)
                 if verdict is None:
                     self._cooldown[snap.token_address] = time.time() + RECHECK_REJECTED_S
                     continue

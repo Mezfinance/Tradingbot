@@ -98,10 +98,12 @@ def test_engine_buys_then_stops_out(cfg, good_pair, safe):
     dex.pair = replace(good_pair, price_usd=good_pair.price_usd * 0.5)
     eng.tick()  # same token was analysed recently, so no second Claude call
     assert journal.open_positions() == []
-    stats = journal.stats()
-    assert stats["closed_trades"] == 1 and stats["net_realised_usd"] < 0
+    from tradingbot import report
+    [stats] = report.build(journal, cfg)["strategies"]
+    loss = cfg.starting_cash_usd - eng.cash
+    assert stats["closed_trades"] == 1 and loss > 0
     # Loss is bounded near the risk budget (2% of equity, plus gap and costs)
-    assert -stats["net_realised_usd"] < cfg.starting_cash_usd * 0.06
+    assert loss < cfg.starting_cash_usd * 0.06
 
 
 def test_engine_respects_daily_loss_limit(cfg, good_pair, safe):

@@ -38,6 +38,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="tradingbot")
     parser.add_argument("command", choices=["scan", "once", "run", "report"])
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--json", action="store_true", help="report: print raw JSON")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -48,8 +49,10 @@ def main(argv: list[str] | None = None) -> None:
     logging.getLogger(__name__).info("mode=%s model=%s", cfg.mode, cfg.model)
 
     if args.command == "report":
+        from tradingbot import report
         from tradingbot.journal import Journal
-        print(json.dumps(Journal(cfg.db_path).stats(), indent=2))
+        rep = report.build(Journal(cfg.db_path), cfg)
+        print(json.dumps(rep, indent=2, default=str) if args.json else report.render(rep))
         return
 
     engine = build_engine(cfg, with_analyst=args.command != "scan")

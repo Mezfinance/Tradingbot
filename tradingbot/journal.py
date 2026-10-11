@@ -53,6 +53,14 @@ CREATE TABLE IF NOT EXISTS fills (
     trigger_price REAL                -- price that triggered the order, for slippage stats
 );
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS costs (
+    id INTEGER PRIMARY KEY,
+    ts REAL, kind TEXT, usd REAL, token TEXT, strategy TEXT DEFAULT 'claude'
+);
+CREATE TABLE IF NOT EXISTS equity (
+    ts REAL, strategy TEXT, cash REAL, positions_value REAL, equity REAL
+);
+CREATE INDEX IF NOT EXISTS equity_strategy ON equity(strategy, ts);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY,
     ts REAL, kind TEXT, token TEXT, detail TEXT, usd REAL DEFAULT 0,
@@ -205,6 +213,28 @@ class Journal:
         return float(row["pnl"])
 
     @locked
+    def log_cost(self, kind: str, usd: float, token: str | None = None, strategy: str = "claude") -> None:
+        """Costs paid outside the trading wallet (e.g. the Claude API bill)."""
+        self.db.execute(
+            "INSERT INTO costs(ts, kind, usd, token, strategy) VALUES(?,?,?,?,?)",
+            (time.time(), kind, usd, token, strategy),
+        )
+        self.db.commit()
+
+    @locked
+    def snapshot_equity(self, strategy: str, cash: float, positions_value: float) -> None:
+        self.db.execute(
+            "INSERT INTO equity(ts, strategy, cash, positions_value, equity) VALUES(?,?,?,?,?)",
+            (time.time(), strategy, cash, positions_value, cash + positions_value),
+        )
+        self.db.commit()
+
+    @locked
+    def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
+        """Read-only helper for reporting."""
+        return self.db.execute(sql, params).fetchall()
+
+    @locked
     def log_event(self, kind: str, token: str | None, detail: str, usd: float = 0.0,
                   strategy: str = "claude") -> None:
         self.db.execute(
@@ -214,40 +244,6 @@ class Journal:
         self.db.commit()
 
     # --- reporting --------------------------------------------------------
-    @locked
-    def stats(self) -> dict:
-        q = self.db.execute
-        closed = q(
-            "SELECT realized_usd - cost_usd AS pnl FROM positions WHERE closed_at IS NOT NULL AND strategy='claude'"
-        ).fetchall()
-        wins = [r["pnl"] for r in closed if r["pnl"] > 0]
-        losses = [r["pnl"] for r in closed if r["pnl"] <= 0]
-
-        def fwd(action: str) -> tuple[int, float | None]:
-            rows = q(
-                """SELECT price, outcome_price FROM decisions
-                   WHERE stage='analysed' AND action=? AND outcome_price IS NOT NULL AND price>0""",
-                (action,),
-            ).fetchall()
-            if not rows:
-                return 0, None
-            rets = [(r["outcome_price"] / r["price"] - 1) * 100 for r in rows]
-            return len(rets), sum(rets) / len(rets)
-
-        n_buy, ret_buy = fwd("buy")
-        n_pass, ret_pass = fwd("pass")
-        return {
-            "screened_out": q("SELECT COUNT(*) FROM decisions WHERE stage='screened_out'").fetchone()[0],
-            "analysed": q("SELECT COUNT(*) FROM decisions WHERE stage='analysed'").fetchone()[0],
-            "closed_trades": len(closed),
-            "open_trades": q("SELECT COUNT(*) FROM positions WHERE closed_at IS NULL AND strategy='claude'").fetchone()[0],
-            "win_rate": len(wins) / len(closed) if closed else None,
-            "net_realised_usd": sum(r["pnl"] for r in closed),
-            "avg_win_usd": sum(wins) / len(wins) if wins else None,
-            "avg_loss_usd": sum(losses) / len(losses) if losses else None,
-            "claude_buy_fwd_return_pct": ret_buy, "claude_buy_samples": n_buy,
-            "claude_pass_fwd_return_pct": ret_pass, "claude_pass_samples": n_pass,
-        }
 
 
 def _row_to_position(r: sqlite3.Row) -> Position:
