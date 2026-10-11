@@ -35,6 +35,8 @@ class Config:
     effort: str = "medium"
     max_web_searches: int = 5
     max_analyses_per_hour: int = 20  # cost cap
+    api_account_pause_s: int = 600  # pause Claude calls after a billing/auth error
+    api_transient_pause_s: int = 60  # pause after rate limits, overload or network errors
     min_conviction: float = 0.65  # Claude conviction needed to buy
 
     # --- baselines (simulated books traded alongside, see shadows.py) ---

@@ -22,6 +22,11 @@ log = logging.getLogger(__name__)
 
 MAX_PAUSE_RESUMES = 4
 
+# Outcomes of analyse(), read by the engine via `last_outcome`.
+OK = "ok"  # a verdict was produced
+FAILED = "failed"  # this token's analysis failed (refusal, truncation, bad output): set it aside
+UNAVAILABLE = "unavailable"  # the API itself is unusable right now: keep the token in the queue
+
 SYSTEM_PROMPT = """You are the research analyst for a small, risk-controlled Solana memecoin trading desk.
 
 A deterministic screener has already confirmed that each token you see has real liquidity, \
@@ -100,13 +105,27 @@ class Analyst:
         self.client = client or anthropic.Anthropic()
         self._calls: deque[float] = deque()
         self.last_cost_usd = 0.0  # cost of the most recent analyse() call, including resumes
+        self.last_outcome = OK
+        self.paused_until = 0.0
 
     def seed_history(self, call_times: list[float]) -> None:
         """Restore recent call times after a restart so the hourly cap still holds."""
         self._calls.extend(sorted(t for t in call_times if time.time() - t <= 3600))
 
+    def _pause(self, seconds: int, why: str) -> None:
+        """Stop calling Claude for a while. The call that failed doesn't count against the budget."""
+        if self._calls:
+            self._calls.pop()
+        self.paused_until = time.time() + seconds
+        self.last_outcome = UNAVAILABLE
+        log.error("Claude API unavailable (%s); pausing analysis for %d min, candidates stay queued",
+                  why, max(1, seconds // 60))
+
     def budget_ok(self) -> bool:
+        """False while paused or once this hour's call cap is reached."""
         now = time.time()
+        if now < self.paused_until:
+            return False
         while self._calls and now - self._calls[0] > 3600:
             self._calls.popleft()
         return len(self._calls) < self.cfg.max_analyses_per_hour
@@ -114,8 +133,10 @@ class Analyst:
     def analyse(self, p: PairSnapshot, safety: SafetyReport | None, factors: FactorResult) -> Verdict | None:
         """Returns None when no usable verdict was produced (budget, refusal, API error)."""
         self.last_cost_usd = 0.0
+        self.last_outcome = FAILED
         if not self.budget_ok():
-            log.info("analysis budget exhausted for this hour; skipping %s", p.symbol)
+            self.last_outcome = UNAVAILABLE
+            log.info("analysis paused or budget exhausted; skipping %s for now", p.symbol)
             return None
         self._calls.append(time.time())
 
@@ -148,14 +169,23 @@ class Analyst:
             else:
                 log.warning("analysis for %s still paused after %d resumes", p.symbol, MAX_PAUSE_RESUMES)
                 return None
-        except anthropic.RateLimitError as exc:
-            log.warning("rate limited analysing %s: %s", p.symbol, exc)
+        except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
+            self._pause(self.cfg.api_account_pause_s, f"auth {exc.status_code}: check ANTHROPIC_API_KEY")
+            return None
+        except anthropic.RateLimitError:
+            self._pause(self.cfg.api_transient_pause_s, "rate limited")
+            return None
+        except anthropic.InternalServerError as exc:
+            self._pause(self.cfg.api_transient_pause_s, f"server error {exc.status_code}")
             return None
         except anthropic.APIStatusError as exc:
-            log.error("API error %s analysing %s: %s", exc.status_code, p.symbol, exc.message)
+            if is_billing_error(exc):
+                self._pause(self.cfg.api_account_pause_s, "billing: credit balance too low")
+            else:
+                log.error("API error %s analysing %s: %s", exc.status_code, p.symbol, exc.message)
             return None
         except anthropic.APIConnectionError as exc:
-            log.warning("connection error analysing %s: %s", p.symbol, exc)
+            self._pause(self.cfg.api_transient_pause_s, f"connection error: {exc}")
             return None
 
         log.info(
@@ -168,7 +198,18 @@ class Analyst:
         if resp.stop_reason == "max_tokens":
             log.warning("analysis truncated for %s", p.symbol)
             return None
-        return parse_verdict(resp.content)
+        verdict = parse_verdict(resp.content)
+        if verdict is not None:
+            self.last_outcome = OK
+        return verdict
+
+
+def is_billing_error(exc: anthropic.APIStatusError) -> bool:
+    """Out of credit or a spend limit: account-level, so retrying sooner won't help."""
+    body = exc.body if isinstance(exc.body, dict) else {}
+    err = body.get("error") if isinstance(body.get("error"), dict) else {}
+    text = f"{err.get('message', '')} {exc.message}".lower()
+    return err.get("type") == "billing_error" or "credit balance" in text or "spend limit" in text
 
 
 def parse_verdict(content) -> Verdict | None:

@@ -252,6 +252,8 @@ class Engine:
                 if cost:
                     self.journal.log_cost("claude_api", cost, snap.token_address, MAIN)
                 if verdict is None:
+                    if getattr(self.analyst, "last_outcome", "failed") == "unavailable":
+                        break  # API down or paused: leave this and later candidates queued
                     self._cool(snap.token_address)
                     continue
                 decision_id = self.journal.log_decision(snap, result, verdict, analysed=True)

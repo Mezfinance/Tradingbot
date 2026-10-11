@@ -70,6 +70,10 @@ fly secrets set \
 
 At start-up the entrypoint writes the key to `/run/secrets` with owner-only permissions and removes it from the bot's environment. It is never written to the volume, so it never appears in snapshots or backups. The public Solana RPC is rate-limited; a free Helius or QuickNode endpoint is more reliable.
 
+## If Claude calls fail
+
+Billing or key problems (for example "credit balance is too low") pause Claude calls for 10 minutes and log `Claude API unavailable`. Rate limits and Anthropic outages pause them for 1 minute. In both cases candidates stay queued and are analysed once the API works again, with no restart needed. Fix billing at console.anthropic.com, or a bad key with `fly secrets set ANTHROPIC_API_KEY=...`.
+
 ## How it stays up
 
 - The **monitor** loop writes a heartbeat every 10s and the **scan** loop after every cycle.
