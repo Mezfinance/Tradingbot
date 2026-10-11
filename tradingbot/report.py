@@ -194,8 +194,13 @@ def learning(j: Journal) -> dict:
                     "WHERE kind IN ('postmortem','playbook','optimizer','engineer') GROUP BY kind")
     from tradingbot.learning import playbook
 
+    from tradingbot.learning import versions
+
     lessons = playbook.dump(j)
+    active = versions.active(j)
     return {
+        "settings_version": None if active is None else {"id": active["id"], "changes": active["changes"]},
+        "open_code_proposals": j.query("SELECT COUNT(*) AS n FROM proposals WHERE status='open'")[0]["n"],
         "lessons": {s: sum(l["status"] == s for l in lessons) for s in ("active", "candidate", "retired")},
         "active_lessons": [l["statement"] for l in lessons if l["status"] == "active"],
         "playbook_ab": playbook.arm_report(j) if lessons else None,
@@ -290,6 +295,9 @@ def render(rep: dict) -> str:
                        else "no significant difference yet")
             lines.append(f"  bought - passed at {col[1:]}, 90% interval: {ci[0]:+.1f}% to {ci[1]:+.1f}% -> {verdict}")
     lrn = rep.get("learning") or {}
+    if lrn.get("settings_version") and lrn["settings_version"]["changes"] != "{}":
+        sv = lrn["settings_version"]
+        lines.append(f"\nLEARNED SETTINGS: v{sv['id']} {sv['changes']}  (see `settings` for history)")
     if lrn.get("postmortems"):
         lines.append(f"\nLEARNING: post-mortems {lrn['postmortems']}; spend {lrn['spend_usd']}")
         lines.append(f"  lessons: {lrn['lessons']}")

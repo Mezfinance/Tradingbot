@@ -55,6 +55,13 @@ class Config:
     missed_reviews_per_day: int = 5
     lesson_min_support: int = 3  # trades supporting a lesson before the analyst sees it
     playbook_holdout: float = 0.25  # share of analyses run without the playbook (control arm)
+    optimizer_every_trades: int = 20  # closed Claude trades between optimiser rounds
+    optimizer_min_trades: int = 20  # candidates with price paths needed before any change
+    optimizer_min_holdout: int = 8
+    optimizer_holdout_frac: float = 0.3  # most recent share of candidates used only for validation
+    optimizer_min_gain_pct: float = 1.0  # required holdout gain, % of trade size per candidate
+    optimizer_budget_usd: float = 3.0  # Claude spend cap per optimiser round
+    rollback_min_trades: int = 10  # trades under a new version before it is re-checked
 
     # --- baselines (simulated books traded alongside, see shadows.py) ---
     shadows: str = "filters_only,random"  # "" disables

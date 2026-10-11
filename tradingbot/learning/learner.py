@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from tradingbot.config import Config
 from tradingbot.journal import Journal
 from tradingbot.learning import dossier, postmortem
+from tradingbot.learning.optimizer import Optimizer
 from tradingbot.learning.playbook import Playbook
 from tradingbot.llm import OK, UNAVAILABLE, LLMResult
 
@@ -33,6 +34,7 @@ class Learner:
         self._client = client
         self.paused_until = 0.0
         self.playbook = Playbook(journal, cfg)
+        self.optimizer = Optimizer(journal, cfg)
 
     @property
     def client(self):
@@ -99,6 +101,9 @@ class Learner:
             cost = self.playbook.consolidate_if_due(self.client)
             if cost:
                 self.journal.log_cost("playbook", cost)
+        self.optimizer.review_active()  # free: replay only
+        if self.can_spend() and self.optimizer.due():
+            self.record("optimizer", self.optimizer.run(self.client))
         return done
 
     def lessons(self) -> list[dict]:

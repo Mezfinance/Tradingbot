@@ -72,6 +72,9 @@ class Engine:
         self._last_prices: dict[str, float] = {}
         self._last_snapshot = 0.0
         self._stop = threading.Event()
+        if cfg.learning:
+            from tradingbot.learning import versions
+            versions.apply_active(journal, cfg)
         if cfg.learning and analyst is not None and hasattr(analyst, "playbook") and analyst.playbook is None:
             from tradingbot.learning.playbook import Playbook
             analyst.playbook = Playbook(journal, cfg)

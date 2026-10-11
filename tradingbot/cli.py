@@ -48,7 +48,8 @@ def build_engine(cfg: Config, with_analyst: bool = True):
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="tradingbot")
     parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup",
-                                            "backup-now", "backup-list", "learn-now", "postmortems", "playbook"])
+                                            "backup-now", "backup-list", "learn-now", "postmortems", "playbook", "optimize-now", "settings",
+                                            "settings-rollback"])
     parser.add_argument("path", nargs="?", help="backup: destination file")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
@@ -92,6 +93,26 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.journal import Journal
         from tradingbot.learning.learner import Learner
         print(f"completed {Learner(Journal(cfg.db_path), cfg).step()} review(s)")
+        return
+
+    if args.command in ("optimize-now", "settings", "settings-rollback"):
+        from tradingbot.journal import Journal
+        from tradingbot.learning import versions
+        from tradingbot.learning.learner import Learner
+        j = Journal(cfg.db_path)
+        versions.apply_active(j, cfg)
+        if args.command == "optimize-now":
+            learner = Learner(j, cfg)
+            res = learner.optimizer.run(learner.client)
+            learner.record("optimizer", res)
+            print(json.dumps({"outcome": res.outcome, "cost_usd": round(res.cost_usd, 3), "result": res.data,
+                              "error": res.error}, indent=2, default=str))
+        elif args.command == "settings-rollback":
+            print(versions.rollback(j, cfg, "manual rollback") or "nothing to roll back")
+        else:
+            for v in versions.history(j):
+                print(f"v{v['id']} [{v['status']}] {v['changes']} :: {v['reason'][:160]}"
+                      + (f" :: {v['verdict']}" if v["verdict"] else ""))
         return
 
     if args.command == "playbook":
