@@ -48,6 +48,17 @@ TB_CANARY_EVERY_N=3 TB_CANARY_USD=5 TB_LIVE_CONFIRM=I_ACCEPT_TOTAL_LOSS_RISK pyt
 
 **What it still can't capture:** your own trades moving the market at larger sizes, RPC congestion worse than a 3s delay, and anything the tracker misses between its once-a-minute samples.
 
+## Self-improvement
+
+The bot learns from its own trades, aiming at one objective (`tradingbot/learning/mission.py`): the most long-run net profit after all costs.
+
+1. **Post-mortems.** Claude reviews every closed trade, and every pump it passed on, factor by factor.
+2. **Playbook.** Lessons backed by repeated evidence are fed into new analyses, A/B tested against a control group.
+3. **Settings optimiser.** It changes stops, targets and filters within hard limits, only when the change wins on held-out data, and rolls back automatically.
+4. **Engineer.** It writes, tests and ships its own code changes. Protected files and safety tests can't be changed, every version is kept and can be restored, and bad versions roll back automatically.
+
+See [DEPLOY.md](DEPLOY.md) section 6 for the commands to inspect and undo each layer.
+
 ## Quick start
 
 ```bash

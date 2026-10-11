@@ -72,6 +72,7 @@ class Engine:
         self._last_prices: dict[str, float] = {}
         self._last_snapshot = 0.0
         self._stop = threading.Event()
+        self.restart_reason: str | None = None
         if cfg.learning:
             from tradingbot.learning import versions
             versions.apply_active(journal, cfg)
@@ -134,7 +135,7 @@ class Engine:
         health.start_watchdog(self.journal, self.cfg, self._stop)
         if self.cfg.learning and self.analyst is not None:
             from tradingbot.learning.learner import Learner
-            learner = Learner(self.journal, self.cfg)
+            learner = Learner(self.journal, self.cfg, restart=self.request_restart)
             threading.Thread(target=self._loop, name="learner", daemon=True,
                              args=(self.cfg.learning_interval_s, learner.step)).start()
         if self.cfg.health_port > 0:
@@ -155,9 +156,20 @@ class Engine:
             started = time.time()
             try:
                 fn()
-            except Exception:  # keep the loop alive; state is persisted
-                log.exception("%s failed", getattr(fn, "__name__", fn))
+            except Exception as exc:  # keep the loop alive; state is persisted
+                name = getattr(fn, "__name__", str(fn))
+                log.exception("%s failed", name)
+                try:  # counted during code probation (learning/engineer.py)
+                    self.journal.log_event("loop_error", None, f"{name}: {type(exc).__name__}: {exc}"[:500])
+                except Exception:  # noqa: BLE001 (never let error logging break the loop)
+                    pass
             self._stop.wait(max(0.0, interval - (time.time() - started)))
+
+    def request_restart(self, reason: str) -> None:
+        """Stop all loops so the process exits and the supervisor starts it again (new code)."""
+        log.warning("restart requested: %s", reason)
+        self.restart_reason = reason
+        self._stop.set()
 
     # --- prices ---------------------------------------------------------------
     def current_prices(self, tokens: set[str]) -> dict[str, float]:

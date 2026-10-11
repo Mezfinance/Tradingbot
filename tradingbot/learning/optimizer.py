@@ -32,6 +32,7 @@ from tradingbot import replay
 from tradingbot.config import Config
 from tradingbot.journal import Journal
 from tradingbot.learning import params, versions
+from tradingbot.learning.mission import MISSION
 from tradingbot.llm import OK, LLMResult, tool_loop
 
 log = logging.getLogger(__name__)
@@ -158,6 +159,7 @@ get stricter than the defaults. Sizing settings are not replay-testable and cann
 Also list code-level improvements that settings cannot achieve (missing data, a flawed rule, a \
 signal the post-mortems keep asking for), with the evidence. These go to an automated engineer, \
 so make each one specific, self-contained and testable."""
+SYSTEM = f"{MISSION}\n\n{SYSTEM}"
 
 FINAL_SCHEMA = {
     "type": "object",

@@ -22,6 +22,7 @@ import time
 
 from tradingbot.config import Config
 from tradingbot.journal import Journal
+from tradingbot.learning.mission import MISSION
 from tradingbot.llm import OK, structured_call
 
 log = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ written one at a time by trade reviews, so several may say the same thing under 
 Find groups that state the same lesson (not merely related ones) and merge each group into one \
 clear, testable statement. Keep a lesson separate when its condition or action differs. Return \
 an empty list if nothing should merge."""
+CONSOLIDATE_SYSTEM = f"{MISSION}\n\n{CONSOLIDATE_SYSTEM}"
 
 
 def clean_tag(tag: str) -> str:
@@ -73,7 +75,7 @@ class Playbook:
         self.journal = journal
         self.cfg = cfg
         self.rng = rng or random.Random()
-        journal.db.executescript(SCHEMA_SQL)
+        journal.ensure_schema(SCHEMA_SQL)
 
     # --- evidence -------------------------------------------------------------
     def record(self, analysis: dict) -> None:

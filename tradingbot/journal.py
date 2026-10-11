@@ -278,6 +278,11 @@ class Journal:
         self.db.commit()
 
     @locked
+    def ensure_schema(self, sql: str) -> None:
+        """Create extra tables (used by the learning modules) under the journal lock."""
+        self.db.executescript(sql)
+
+    @locked
     def backup(self, path: str) -> None:
         """Consistent copy of the live database (safe while the bot is running)."""
         dest = sqlite3.connect(path)

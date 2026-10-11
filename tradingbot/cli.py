@@ -49,8 +49,9 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="tradingbot")
     parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup",
                                             "backup-now", "backup-list", "learn-now", "postmortems", "playbook", "optimize-now", "settings",
-                                            "settings-rollback"])
-    parser.add_argument("path", nargs="?", help="backup: destination file")
+                                            "settings-rollback", "code-versions", "code-diff", "code-rollback"])
+    parser.add_argument("path", nargs="?",
+                        help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
     parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
@@ -115,6 +116,25 @@ def main(argv: list[str] | None = None) -> None:
                       + (f" :: {v['verdict']}" if v["verdict"] else ""))
         return
 
+    if args.command in ("code-versions", "code-diff", "code-rollback"):
+        from tradingbot.learning import codebase
+        if args.command == "code-versions":
+            running = codebase.current_version() or "image"
+            print(f"running now: {running}; active on next start: {codebase.active_version(cfg) or 'image'}")
+            for v in codebase.list_versions(cfg):
+                flags = ("ACTIVE " if v["active"] else "") + ("" if v["verified"] else "CHECKSUM-FAILED ")
+                print(f"{v['version']} <- {v['parent'] or 'image'} {flags}:: {v.get('title', '')}")
+                print(f"    {v.get('summary', '')[:200]}  files: {v.get('files_changed', [])}")
+            return
+        if not args.path:
+            parser.error(f"{args.command} needs a version, e.g. v3 (or 'image' for code-rollback)")
+        if args.command == "code-diff":
+            print((codebase.code_root(cfg) / "versions" / args.path / "DIFF.patch").read_text())
+            return
+        target = codebase.switch_to(cfg, args.path)
+        print(f"next start will run {target}. Restart to apply, e.g. `fly apps restart <app>`.")
+        return
+
     if args.command == "playbook":
         from tradingbot.journal import Journal
         from tradingbot.learning import playbook
@@ -165,6 +185,10 @@ def main(argv: list[str] | None = None) -> None:
         engine.tick()
     else:
         engine.run_forever()
+        if engine.restart_reason:
+            # Exit so the supervisor (Fly restart policy, systemd, Docker) starts the new code.
+            logging.getLogger(__name__).warning("exiting for restart: %s", engine.restart_reason)
+            raise SystemExit(75)
 
 
 if __name__ == "__main__":

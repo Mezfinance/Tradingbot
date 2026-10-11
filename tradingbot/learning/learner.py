@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from tradingbot.config import Config
 from tradingbot.journal import Journal
 from tradingbot.learning import dossier, postmortem
+from tradingbot.learning import codebase
+from tradingbot.learning.engineer import Engineer
 from tradingbot.learning.optimizer import Optimizer
 from tradingbot.learning.playbook import Playbook
 from tradingbot.llm import OK, UNAVAILABLE, LLMResult
@@ -28,13 +30,15 @@ UNAVAILABLE_PAUSE_S = 600
 
 
 class Learner:
-    def __init__(self, journal: Journal, cfg: Config, client=None):
+    def __init__(self, journal: Journal, cfg: Config, client=None, restart=None):
         self.journal = journal
         self.cfg = cfg
         self._client = client
         self.paused_until = 0.0
+        self.started = time.time()
         self.playbook = Playbook(journal, cfg)
         self.optimizer = Optimizer(journal, cfg)
+        self.engineer = Engineer(journal, cfg, restart=restart)
 
     @property
     def client(self):
@@ -104,6 +108,13 @@ class Learner:
         self.optimizer.review_active()  # free: replay only
         if self.can_spend() and self.optimizer.due():
             self.record("optimizer", self.optimizer.run(self.client))
+        if time.time() - self.started > codebase.HEALTHY_AFTER_S:
+            codebase.mark_healthy(self.cfg)  # running cleanly: reset the entrypoint's crash counter
+        self.engineer.review()  # free: probation checks on self-written code
+        if self.can_spend() and self.engineer.due():
+            res = self.engineer.attempt(self.client)
+            if res is not None:
+                self.record("engineer", res)
         return done
 
     def lessons(self) -> list[dict]:

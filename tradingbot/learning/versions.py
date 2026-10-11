@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS proposals (
 
 
 def ensure(journal: Journal) -> None:
-    journal.db.executescript(SCHEMA_SQL)
+    journal.ensure_schema(SCHEMA_SQL)
 
 
 def apply_to(cfg: Config, settings: dict) -> None:

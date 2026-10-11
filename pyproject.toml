@@ -12,6 +12,7 @@ dependencies = [
 [project.optional-dependencies]
 live = ["solders>=0.21"]
 backup = ["boto3>=1.34"]
+engineer = ["pytest>=8"]
 dev = ["pytest>=8", "moto[s3]>=5"]
 
 [project.scripts]

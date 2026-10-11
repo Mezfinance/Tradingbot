@@ -100,6 +100,50 @@ fly secrets set \
 
 At start-up the entrypoint writes the key to `/run/secrets` with owner-only permissions and removes it from the bot's environment. It is never written to the volume, so it never appears in snapshots or backups. The public Solana RPC is rate-limited; a free Helius or QuickNode endpoint is more reliable.
 
+## 6. The bot improves itself: what it changes and how to undo it
+
+Learning runs on its own thread, capped at $10/day of Claude spend (`TB_LEARNING_BUDGET_USD_PER_DAY`). Every part works towards one goal, written in the protected `tradingbot/learning/mission.py`: the most long-run net profit after all costs, without risking the account.
+
+| Layer | What changes | How to see it | How to undo it |
+|---|---|---|---|
+| Post-mortems | Nothing directly. Each closed trade, and each strong pump it passed on, is reviewed | `python -m tradingbot postmortems` | n/a |
+| Playbook | Lessons the analyst reads (25% of analyses run without them as a control) | `python -m tradingbot playbook` | Retired automatically when contradicted |
+| Settings | Stops, targets, filters, conviction threshold, within hard limits | `python -m tradingbot settings` | Automatic rollback, or `python -m tradingbot settings-rollback` |
+| **Code** | **The bot's own source code (except protected files)** | `python -m tradingbot code-versions`, `code-diff vN` | **Automatic rollback, or `code-rollback vN` / `code-rollback image`** |
+
+Run them on Fly with `fly ssh console -C "python -m tradingbot <command>"`.
+
+**Self-written code, step by step.** At most once a day, the engineer takes the highest-priority code proposal from the optimiser, edits a copy of the code with Claude, and ships it only if:
+- no protected file changed: risk rules, config limits, journal, execution and wallet code, health, backups, CLI, the learning system, and every existing test;
+- it compiles and imports, and doesn't touch keys or live-trading switches;
+- the **full test suite passes**, including `tests/test_invariants.py` (unsafe tokens always rejected, stops always fire, sizes capped, honeypots blocked, live trading locked).
+
+**Every version is kept, forever.** Each shipped version is stored as an immutable, read-only, checksummed copy in `/data/code/versions/vN`, with its parent, the proposal, a summary and the exact diff. It is also archived to your storage bucket as `code/vN.tar.gz`. Nothing is overwritten or deleted, so you can always go back:
+
+```bash
+fly ssh console -C "python -m tradingbot code-versions"        # list all versions, which is active
+fly ssh console -C "python -m tradingbot code-diff v3"         # see exactly what v3 changed
+fly ssh console -C "python -m tradingbot code-rollback v2"     # run v2 from the next start
+fly ssh console -C "python -m tradingbot code-rollback image"  # back to the deployed code
+fly apps restart supermeme                                     # apply
+```
+
+**Automatic rollback.** A new version is on probation:
+- **crash loop:** the start-up script falls back to its parent after 3 failed boots;
+- **failed checksums:** same fallback;
+- **20 loop errors, or it stops analysing tokens:** the bot rolls it back;
+- **worse trading:** after 10 trades, if Claude's edge over the `filters_only` baseline dropped by more than 5% per trade, it rolls back.
+
+**Keeping self-written code across deploys.** A new `fly deploy` always runs the new image; versions built on the old image are set aside, though still listed and archived. To carry them forward, let the bot push each version to a GitHub branch, then merge that branch before deploying:
+
+```bash
+fly secrets set GITHUB_TOKEN=<fine-grained token: contents read/write on this repo> \
+  GITHUB_REPO=Mezfinance/Tradingbot GITHUB_BASE_BRANCH=<your deploy branch> \
+  GITHUB_BRANCH=bot/self-improvements
+```
+
+The bot only ever pushes to `GITHUB_BRANCH`, never to your base branch. To switch self-writing off: `fly secrets set TB_ENGINEER_ENABLED=false`.
+
 ## If Claude calls fail
 
 Billing or key problems (for example "credit balance is too low") pause Claude calls for 10 minutes and log `Claude API unavailable`. Rate limits and Anthropic outages pause them for 1 minute. In both cases candidates stay queued and are analysed once the API works again, with no restart needed. Fix billing at console.anthropic.com, or a bad key with `fly secrets set ANTHROPIC_API_KEY=...`.

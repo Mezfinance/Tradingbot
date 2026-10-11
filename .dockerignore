@@ -6,5 +6,5 @@ __pycache__
 *.sqlite
 .env
 keypair.json
-tests
 .pytest_cache
+backups

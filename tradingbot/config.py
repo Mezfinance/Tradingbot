@@ -48,7 +48,7 @@ class Config:
     # --- self-improvement (see tradingbot/learning) ----------------------
     learning: bool = True  # run the learning thread inside `run`
     learning_interval_s: int = 300
-    learning_budget_usd_per_day: float = 5.0  # cap on Claude spend for reviews/optimiser/engineer
+    learning_budget_usd_per_day: float = 10.0  # cap on Claude spend for reviews/optimiser/engineer
     learning_max_per_cycle: int = 3
     postmortem_delay_h: float = 6.0  # wait so the review can see what happened after the exit
     missed_winner_multiple: float = 2.0  # review passes that later reached this multiple
@@ -62,6 +62,14 @@ class Config:
     optimizer_min_gain_pct: float = 1.0  # required holdout gain, % of trade size per candidate
     optimizer_budget_usd: float = 3.0  # Claude spend cap per optimiser round
     rollback_min_trades: int = 10  # trades under a new version before it is re-checked
+    engineer_enabled: bool = True  # let the bot write, test and ship its own code changes
+    engineer_interval_h: float = 24.0  # at most one code attempt per this many hours
+    engineer_budget_usd: float = 6.0  # Claude spend cap per code attempt
+    code_probation_trades: int = 10  # trades on new code before it is kept or rolled back
+    code_rollback_margin_pct: float = 5.0  # allowed drop in edge vs filters_only, % per trade
+    code_max_errors: int = 20  # loop errors on new code that force a rollback
+    code_dir: str = ""  # default: a "code" folder next to the database
+    tests_dir: str = ""  # tests for the image code (TB_TESTS_DIR=/app/tests in Docker)
 
     # --- baselines (simulated books traded alongside, see shadows.py) ---
     shadows: str = "filters_only,random"  # "" disables
