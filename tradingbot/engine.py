@@ -72,6 +72,9 @@ class Engine:
         self._last_prices: dict[str, float] = {}
         self._last_snapshot = 0.0
         self._stop = threading.Event()
+        if cfg.learning and analyst is not None and hasattr(analyst, "playbook") and analyst.playbook is None:
+            from tradingbot.learning.playbook import Playbook
+            analyst.playbook = Playbook(journal, cfg)
         if analyst is not None and hasattr(analyst, "seed_history"):
             analyst.seed_history([r["ts"] for r in journal.query(
                 "SELECT ts FROM costs WHERE kind='claude_api' AND ts > ?", (time.time() - 3600,))])
@@ -264,7 +267,8 @@ class Engine:
                         break  # API down or paused: leave this and later candidates queued
                     self._cool(snap.token_address)
                     continue
-                decision_id = self.journal.log_decision(snap, result, verdict, analysed=True, safety=safety)
+                decision_id = self.journal.log_decision(snap, result, verdict, analysed=True, safety=safety,
+                                                        playbook_arm=getattr(self.analyst, "last_arm", None))
                 self.tracker.track(decision_id, snap.token_address, snap.price_usd)
                 analysed.append(((snap, result, safety), verdict.action))
                 log.info("%s -> %s (conviction %.2f): %s",

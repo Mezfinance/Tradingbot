@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from tradingbot.config import Config
 from tradingbot.journal import Journal
 from tradingbot.learning import dossier, postmortem
+from tradingbot.learning.playbook import Playbook
 from tradingbot.llm import OK, UNAVAILABLE, LLMResult
 
 log = logging.getLogger(__name__)
@@ -31,6 +32,7 @@ class Learner:
         self.cfg = cfg
         self._client = client
         self.paused_until = 0.0
+        self.playbook = Playbook(journal, cfg)
 
     @property
     def client(self):
@@ -93,6 +95,10 @@ class Learner:
                     or self.missed_today() >= self.cfg.missed_reviews_per_day):
                 break
             done += self._review_missed(row)
+        if self.can_spend():
+            cost = self.playbook.consolidate_if_due(self.client)
+            if cost:
+                self.journal.log_cost("playbook", cost)
         return done
 
     def lessons(self) -> list[dict]:
@@ -139,7 +145,7 @@ class Learner:
         return 1
 
     def after_postmortem(self, analysis: dict) -> None:
-        """Hook for the playbook (part 2)."""
+        self.playbook.record(analysis)
 
 
 def _fmt(ret) -> str:

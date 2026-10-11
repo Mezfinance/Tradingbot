@@ -192,7 +192,13 @@ def learning(j: Journal) -> dict:
     cats = j.query("SELECT kind, category, COUNT(*) AS n FROM postmortems GROUP BY kind, category ORDER BY n DESC")
     spend = j.query("SELECT kind, COALESCE(SUM(usd), 0) AS s FROM costs "
                     "WHERE kind IN ('postmortem','playbook','optimizer','engineer') GROUP BY kind")
+    from tradingbot.learning import playbook
+
+    lessons = playbook.dump(j)
     return {
+        "lessons": {s: sum(l["status"] == s for l in lessons) for s in ("active", "candidate", "retired")},
+        "active_lessons": [l["statement"] for l in lessons if l["status"] == "active"],
+        "playbook_ab": playbook.arm_report(j) if lessons else None,
         "postmortems": {f"{r['kind']}:{r['category']}": r["n"] for r in cats},
         "spend_usd": {r["kind"]: round(r["s"], 2) for r in spend},
     }
@@ -286,6 +292,11 @@ def render(rep: dict) -> str:
     lrn = rep.get("learning") or {}
     if lrn.get("postmortems"):
         lines.append(f"\nLEARNING: post-mortems {lrn['postmortems']}; spend {lrn['spend_usd']}")
+        lines.append(f"  lessons: {lrn['lessons']}")
+        for s in lrn["active_lessons"]:
+            lines.append(f"  - {s}")
+        if lrn["playbook_ab"]:
+            lines.append(f"  playbook A/B (Claude trades): {lrn['playbook_ab']}")
     cal = rep["calibration"]
     if cal["matched_trades"]:
         lines.append(f"\nCALIBRATION: {cal['matched_trades']} real canary trades vs their simulated twins; "

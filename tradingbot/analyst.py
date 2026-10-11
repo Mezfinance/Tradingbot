@@ -107,6 +107,8 @@ class Analyst:
         self.last_cost_usd = 0.0  # cost of the most recent analyse() call, including resumes
         self.last_outcome = OK
         self.paused_until = 0.0
+        self.playbook = None  # set by the engine (learning.playbook.Playbook)
+        self.last_arm: str | None = None
 
     def seed_history(self, call_times: list[float]) -> None:
         """Restore recent call times after a restart so the hourly cap still holds."""
@@ -140,7 +142,9 @@ class Analyst:
             return None
         self._calls.append(time.time())
 
-        messages: list[dict] = [{"role": "user", "content": build_brief(p, safety, factors)}]
+        self.last_arm, lessons = self.playbook.choose_arm() if self.playbook is not None else ("none", "")
+        brief = build_brief(p, safety, factors)
+        messages: list[dict] = [{"role": "user", "content": f"{lessons}\n\n{brief}" if lessons else brief}]
         try:
             for _ in range(MAX_PAUSE_RESUMES + 1):
                 resp = self.client.beta.messages.create(

@@ -19,6 +19,7 @@ from tradingbot.models import FactorResult, PairSnapshot, Position, SafetyReport
 # Columns added after the first deployment; created on start-up if an older database lacks them.
 MIGRATIONS = [
     ("decisions", "snapshot", "TEXT"),  # full pair + safety snapshot at decision time (JSON)
+    ("decisions", "playbook_arm", "TEXT"),  # "playbook:<ver>" | "control:<ver>" | "none" (A/B test)
 ]
 
 SCHEMA = """
@@ -181,13 +182,14 @@ class Journal:
         analysed: bool = False,
         stage: str | None = None,
         safety: SafetyReport | None = None,
+        playbook_arm: str | None = None,
     ) -> int:
         snap = asdict(p)
         snap["safety"] = asdict(safety) if safety is not None else None
         cur = self.db.execute(
             """INSERT INTO decisions(ts, token, symbol, stage, price, liquidity, fdv, factor_score,
-               components, rejections, verdict, action, conviction, snapshot)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               components, rejections, verdict, action, conviction, snapshot, playbook_arm)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 time.time(), p.token_address, p.symbol,
                 stage or ("analysed" if analysed else "screened_out"),
@@ -197,6 +199,7 @@ class Journal:
                 verdict.action if verdict else None,
                 verdict.conviction if verdict else None,
                 json.dumps(snap),
+                playbook_arm,
             ),
         )
         self.db.commit()

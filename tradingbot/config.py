@@ -53,6 +53,8 @@ class Config:
     postmortem_delay_h: float = 6.0  # wait so the review can see what happened after the exit
     missed_winner_multiple: float = 2.0  # review passes that later reached this multiple
     missed_reviews_per_day: int = 5
+    lesson_min_support: int = 3  # trades supporting a lesson before the analyst sees it
+    playbook_holdout: float = 0.25  # share of analyses run without the playbook (control arm)
 
     # --- baselines (simulated books traded alongside, see shadows.py) ---
     shadows: str = "filters_only,random"  # "" disables

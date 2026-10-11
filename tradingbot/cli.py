@@ -48,7 +48,7 @@ def build_engine(cfg: Config, with_analyst: bool = True):
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="tradingbot")
     parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup",
-                                            "backup-now", "backup-list", "learn-now", "postmortems"])
+                                            "backup-now", "backup-list", "learn-now", "postmortems", "playbook"])
     parser.add_argument("path", nargs="?", help="backup: destination file")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
@@ -92,6 +92,14 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.journal import Journal
         from tradingbot.learning.learner import Learner
         print(f"completed {Learner(Journal(cfg.db_path), cfg).step()} review(s)")
+        return
+
+    if args.command == "playbook":
+        from tradingbot.journal import Journal
+        from tradingbot.learning import playbook
+        for l in playbook.dump(Journal(cfg.db_path)):
+            print(f"[{l['status']}] {l['tag']} ({l['support']} for / {l['contradict']} against)")
+            print(f"  {l['statement']}  (when: {l['applies_when'] or 'always'})")
         return
 
     if args.command == "postmortems":
