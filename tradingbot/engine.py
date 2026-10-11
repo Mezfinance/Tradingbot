@@ -10,6 +10,7 @@ from tradingbot import factors, risk
 from tradingbot.analyst import Analyst
 from tradingbot.config import Config
 from tradingbot.data.dexscreener import DexScreener
+from tradingbot.data.jupiter import Jupiter
 from tradingbot.data.rugcheck import RugCheck
 from tradingbot.execution.base import Executor
 from tradingbot.journal import Journal
@@ -25,8 +26,9 @@ DUST_QTY = 1e-12
 
 class Engine:
     def __init__(self, cfg: Config, dex: DexScreener, rug: RugCheck, analyst: Analyst | None,
-                 executor: Executor, journal: Journal):
+                 executor: Executor, journal: Journal, jupiter: Jupiter | None = None):
         self.cfg, self.dex, self.rug, self.analyst = cfg, dex, rug, analyst
+        self.jupiter = jupiter  # None disables the round-trip pre-flight (offline tests)
         self.executor, self.journal = executor, journal
         self.cash = journal.get_cash(cfg.starting_cash_usd)
         self._cooldown: dict[str, float] = {}  # token -> time it may be re-screened
@@ -125,14 +127,48 @@ class Engine:
                 if self._buy(snap, verdict.conviction, decision_id):
                     slots -= 1
 
+    def preflight(self, snap: PairSnapshot, usd: float) -> tuple[PairSnapshot | None, str]:
+        """Re-validate a token right before buying. Research can take minutes.
+
+        Returns (fresh snapshot, "") or (None, reason to skip).
+        """
+        fresh = self.dex.pairs([snap.token_address])
+        if not fresh:
+            return None, "pair disappeared"
+        now = fresh[0]
+        if rejections := factors.market_filters(now, self.cfg):
+            return None, "no longer passes: " + "; ".join(rejections)
+        drift = (now.price_usd / snap.price_usd - 1) * 100
+        if drift > self.cfg.max_entry_drift_pct:
+            return None, f"price ran {drift:+.1f}% during research"
+        if self.jupiter is not None:
+            rt = self.jupiter.round_trip(snap.token_address, usd)
+            if rt is None:
+                return None, "no swap route"
+            loss, impact = rt
+            if loss > self.cfg.max_round_trip_loss_pct:
+                return None, f"round-trip loss {loss:.1f}% (honeypot/tax/thin pool)"
+            if impact > self.cfg.max_price_impact_pct:
+                return None, f"price impact {impact:.2f}%"
+        return now, ""
+
     def _buy(self, snap: PairSnapshot, conviction: float, decision_id: int) -> bool:
         prices = {p.token_address: p.entry_price for p in self.journal.open_positions()}
         usd = risk.position_size_usd(self.equity(prices), self.cash, conviction, self.cfg)
         if usd < 1:
             log.info("position size too small for %s", snap.symbol)
             return False
-        fill = self.executor.buy(snap.token_address, usd, snap.price_usd)
+        fresh, reason = self.preflight(snap, usd)
+        if fresh is None:
+            log.info("skip buy %s: %s", snap.symbol, reason)
+            self.journal.log_event("entry_skipped", snap.token_address, reason)
+            return False
+        fill = self.executor.buy(snap.token_address, usd, fresh.price_usd)
         if fill is None:
+            self.journal.log_event("entry_skipped", snap.token_address, "executor declined")
+            return False
+        if not fill.ok:
+            self._charge_failed(snap.token_address, fill)
             return False
         self.cash -= fill.usd
         self.journal.set_cash(self.cash)
@@ -148,7 +184,9 @@ class Engine:
 
     def _sell(self, pos: Position, qty: float, price: float, reason: str) -> bool:
         fill = self.executor.sell(pos.token_address, min(qty, pos.qty), price)
-        if fill is None:
+        if fill is None or not fill.ok:
+            if fill is not None:
+                self._charge_failed(pos.token_address, fill)
             log.error("sell failed for %s (%s); will retry next tick", pos.symbol, reason)
             return False
         pos.qty -= fill.qty
@@ -162,6 +200,13 @@ class Engine:
             pos.exit_reason = reason
         log.info("SELL %s %s qty=%.6g @ %.10g -> $%.2f", pos.symbol, reason, fill.qty, fill.price, fill.usd)
         return True
+
+    def _charge_failed(self, token: str, fill) -> None:
+        """A reverted transaction still costs its network fee."""
+        self.cash -= fill.usd
+        self.journal.set_cash(self.cash)
+        self.journal.log_event("tx_failed", token, fill.note, fill.usd)
+        log.warning("transaction failed for %s: %s (fee $%.4f)", token, fill.note, fill.usd)
 
     # --- measurement ----------------------------------------------------------
     def update_outcomes(self) -> None:

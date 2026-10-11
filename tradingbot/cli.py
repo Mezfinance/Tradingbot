@@ -18,18 +18,20 @@ from tradingbot.config import Config
 def build_engine(cfg: Config, with_analyst: bool = True):
     from tradingbot.analyst import Analyst
     from tradingbot.data.dexscreener import DexScreener
+    from tradingbot.data.jupiter import Jupiter
     from tradingbot.data.rugcheck import RugCheck
     from tradingbot.engine import Engine
     from tradingbot.journal import Journal
 
+    jupiter = Jupiter(cfg.slippage_bps)
     if cfg.mode == "live":
         from tradingbot.execution.jupiter import JupiterExecutor
-        executor = JupiterExecutor(cfg)
+        executor = JupiterExecutor(cfg, jupiter)
     else:
-        from tradingbot.execution.paper import PaperExecutor
-        executor = PaperExecutor(cfg)
+        from tradingbot.execution.sim import SimExecutor
+        executor = SimExecutor(cfg, jupiter)
     analyst = Analyst(cfg) if with_analyst else None
-    return Engine(cfg, DexScreener(), RugCheck(), analyst, executor, Journal(cfg.db_path))
+    return Engine(cfg, DexScreener(), RugCheck(), analyst, executor, Journal(cfg.db_path), jupiter)
 
 
 def main(argv: list[str] | None = None) -> None:

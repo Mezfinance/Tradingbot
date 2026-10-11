@@ -49,6 +49,10 @@ CREATE TABLE IF NOT EXISTS fills (
     usd REAL, fee_usd REAL, reason TEXT, tx TEXT
 );
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY,
+    ts REAL, kind TEXT, token TEXT, detail TEXT, usd REAL DEFAULT 0
+);
 """
 
 
@@ -158,6 +162,13 @@ class Journal:
             (since_ts,),
         ).fetchone()
         return float(row["pnl"])
+
+    def log_event(self, kind: str, token: str | None, detail: str, usd: float = 0.0) -> None:
+        self.db.execute(
+            "INSERT INTO events(ts, kind, token, detail, usd) VALUES(?,?,?,?,?)",
+            (time.time(), kind, token, detail, usd),
+        )
+        self.db.commit()
 
     # --- reporting --------------------------------------------------------
     def stats(self) -> dict:

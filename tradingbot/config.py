@@ -43,8 +43,17 @@ class Config:
     trailing_stop_pct: float = 30.0  # armed after first take-profit
     max_hold_hours: float = 24.0
     daily_loss_limit_pct: float = 10.0  # halts new entries for the UTC day
-    slippage_bps: int = 300
-    fee_bps: int = 100  # swap fee + priority fee estimate
+    slippage_bps: int = 300  # swap reverts if output falls further than this
+    fee_bps: int = 100  # used only by the offline PaperExecutor
+
+    # --- execution realism (simulated and live) -------------------------
+    max_price_impact_pct: float = 3.0
+    max_round_trip_loss_pct: float = 10.0  # buy-then-sell quote; catches honeypots/taxes
+    max_entry_drift_pct: float = 15.0  # skip if price ran this much during research
+    priority_fee_sol: float = 0.001  # base + priority fee per transaction
+    ata_rent_sol: float = 0.00203928  # new token account; live executor does not reclaim it
+    sim_latency_s: float = 3.0  # decision -> landed transaction
+    sim_fill_mode: str = "midpoint"  # expected | midpoint | pessimistic (see SimExecutor)
 
     # --- live -----------------------------------------------------------
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
@@ -81,6 +90,8 @@ class Config:
                 f"Live mode requires TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}. "
                 "Run in paper mode until the journal shows a real edge."
             )
+        if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):
+            raise ValueError("sim_fill_mode must be expected, midpoint or pessimistic")
         if len(self.take_profit_pcts) != len(self.take_profit_fractions):
             raise ValueError("take_profit_pcts and take_profit_fractions must align")
         if abs(sum(self.take_profit_fractions) - 1.0) > 1e-6:
