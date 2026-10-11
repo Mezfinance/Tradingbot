@@ -34,6 +34,11 @@ class Config:
     max_analyses_per_hour: int = 20  # cost cap
     min_conviction: float = 0.65  # Claude conviction needed to buy
 
+    # --- baselines (simulated books traded alongside, see shadows.py) ---
+    shadows: str = "filters_only,random"  # "" disables
+    shadow_conviction: float = 0.825  # fixed sizing input for baseline buys
+    shadow_seed: int = 7
+
     # --- risk -----------------------------------------------------------
     risk_per_trade_pct: float = 2.0  # % of equity lost if stop is hit
     max_position_pct: float = 10.0  # % of equity in any single token

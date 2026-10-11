@@ -169,7 +169,8 @@ def test_monitor_thread_exits_while_research_is_blocked(cfg, good_pair, safe):
 
     eng.analyst = SimpleNamespace(analyse=stuck_research, budget_ok=lambda: True)
     eng.journal.recently_seen = lambda *a: False  # make the scan loop pick the token up again
-    eng.screen = lambda: [(good_pair, SimpleNamespace(score=1), safe)]
+    other = replace(good_pair, token_address="MINT2")
+    eng.screen = lambda: [(other, SimpleNamespace(score=1), safe)]
     runner = threading.Thread(target=eng.run_forever, daemon=True)
     runner.start()
     assert blocked.wait(2)

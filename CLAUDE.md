@@ -24,6 +24,7 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 | `tradingbot/execution/paper.py` | Flat-cost offline executor, used only by tests |
 | `tradingbot/execution/jupiter.py` | Live USDC<->token swaps; fills measured from wallet balance deltas, fee read from the confirmed tx. **Experimental, never run against mainnet** |
 | `tradingbot/execution/base.py` | `Fill` (`usd` = net cash movement; `ok=False` = reverted tx that still cost its fee) |
+| `tradingbot/shadows.py` | Baseline books: `filters_only` (buy every survivor, no Claude) and `random` (random picks among Claude-analysed tokens at Claude's smoothed buy rate). Config `shadows` (comma list, "" disables), `shadow_conviction`, `shadow_seed`. Always simulated, even in live mode |
 | `tradingbot/costs.py` | `usage_cost_usd(model, usage)`: list prices per model + web search $10/1k |
 | `tradingbot/report.py` | `build()` -> per-strategy stats (equity, return, max drawdown, win rate, median/mean trade, profit factor, fees, failed txs, Claude API $, net after API, median entry/exit slippage vs trigger, skip reasons) + Claude buy-vs-pass with bootstrap 90% CI; `render()` text table. Warns below 30 closed trades |
 | `tradingbot/cli.py` | `python -m tradingbot scan|once|run|report [--json]` |
@@ -48,12 +49,14 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 
 - **2026-10-11 (realism part 3):** `costs.py`, `report.py`, equity snapshots, `report --json`; removed `Journal.stats()`. 38 tests.
 
+- **2026-10-11 (realism part 4):** shadow books; `screen()` no longer drops tokens Claude holds (Claude's loop skips them instead) so baselines see the same candidates; monitor handles the claude book first. 44 tests.
+
 ## Realism roadmap (in progress)
 
 1. Done: quote-based fills, round-trip check, fresh price at buy.
 2. Done: separate fast position-monitor thread (Jupiter price API) + trigger price on every fill.
 3. Done: Claude/tx cost accounting + richer report (equity curve, drawdown, medians, CI).
-4. Shadow portfolios (all-survivors, random) for a Claude-vs-baseline comparison.
+4. Done: shadow portfolios (`filters_only`, `random`); report prints Claude's edge over each after API cost.
 5. Persistent state, downtime log, 1h/6h/24h outcomes with max-up/max-down.
 6. Canary live trades for calibration + replay tool from recorded price paths.
 

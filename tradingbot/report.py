@@ -183,6 +183,11 @@ def render(rep: dict) -> str:
         ]
         for label, key, suffix in rows:
             lines.append(f"{label:<26}" + "".join(f"{_fmt(s[key], suffix):>16}" for s in strategies))
+        main = strategies[0]
+        for s in strategies[1:]:
+            edge = main["net_after_api_usd"] - s["net_after_api_usd"]
+            lines.append(f"{main['strategy']} vs {s['strategy']}: {edge:+,.2f} USD after Claude API costs "
+                         f"({'Claude adds value' if edge > 0 else 'Claude does not pay for itself'} so far)")
         for s in strategies:
             lines.append("")
             lines.append(f"[{s['strategy']}] exits: {s['exit_reasons'] or '-'}")

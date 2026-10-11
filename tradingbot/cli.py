@@ -30,8 +30,14 @@ def build_engine(cfg: Config, with_analyst: bool = True):
     else:
         from tradingbot.execution.sim import SimExecutor
         executor = SimExecutor(cfg, jupiter)
+    from tradingbot.execution.sim import SimExecutor
+    from tradingbot.shadows import parse_shadows
+
+    # Baselines are always simulated, even when the main book trades live.
+    shadow_executors = {name: SimExecutor(cfg, jupiter) for name in parse_shadows(cfg.shadows)}
     analyst = Analyst(cfg) if with_analyst else None
-    return Engine(cfg, DexScreener(), RugCheck(), analyst, executor, Journal(cfg.db_path), jupiter)
+    return Engine(cfg, DexScreener(), RugCheck(), analyst, executor, Journal(cfg.db_path), jupiter,
+                  shadow_executors=shadow_executors)
 
 
 def main(argv: list[str] | None = None) -> None:

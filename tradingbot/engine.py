@@ -12,12 +12,13 @@ The "claude" book is the real strategy; other books are baselines (see shadows.p
 from __future__ import annotations
 
 import logging
+import random
 import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
-from tradingbot import factors, risk
+from tradingbot import factors, risk, shadows
 from tradingbot.analyst import Analyst
 from tradingbot.config import Config
 from tradingbot.data.dexscreener import DexScreener
@@ -48,11 +49,15 @@ class Book:
 
 class Engine:
     def __init__(self, cfg: Config, dex: DexScreener, rug: RugCheck, analyst: Analyst | None,
-                 executor: Executor, journal: Journal, jupiter: Jupiter | None = None):
+                 executor: Executor, journal: Journal, jupiter: Jupiter | None = None,
+                 shadow_executors: dict[str, Executor] | None = None):
         self.cfg, self.dex, self.rug, self.analyst = cfg, dex, rug, analyst
         self.journal = journal
         self.jupiter = jupiter  # None: no round-trip preflight, prices from DexScreener (tests)
         self.books: dict[str, Book] = {MAIN: self._open_book(MAIN, executor)}
+        for name, ex in (shadow_executors or {}).items():
+            self.books[name] = self._open_book(name, ex)
+        self._rng = random.Random(cfg.shadow_seed)
         self.lock = threading.RLock()  # guards book cash and position state
         self._cooldown: dict[str, float] = {}  # token -> time it may be re-screened
         self._last_prices: dict[str, float] = {}
@@ -119,7 +124,8 @@ class Engine:
 
     # --- positions ----------------------------------------------------------
     def manage_positions(self) -> dict[str, float]:
-        positions = self.journal.open_positions(strategy=None)
+        # The real book is handled first so simulated latency on baselines never delays it.
+        positions = sorted(self.journal.open_positions(strategy=None), key=lambda p: p.strategy != MAIN)
         prices = self.current_prices({p.token_address for p in positions})
         now = time.time()
         for pos in positions:
@@ -170,12 +176,11 @@ class Engine:
     def screen(self) -> list[Survivor]:
         """Discover tokens and return those that clear every deterministic gate, best first."""
         addrs, boosted = self.dex.discover()
-        held = {p.token_address for p in self.journal.open_positions(MAIN)}
         survivors: list[Survivor] = []
         now = time.time()
         for snap in self.dex.pairs(addrs, boosted):
             token = snap.token_address
-            if token in held or self._cooldown.get(token, 0) > now:
+            if self._cooldown.get(token, 0) > now:
                 continue
             if self.journal.recently_seen(token, REANALYSE_AFTER_S):
                 continue
@@ -197,10 +202,13 @@ class Engine:
         analysed: list[tuple[Survivor, str]] = []  # (survivor, claude action)
         main = self.books[MAIN]
         if self.analyst is not None and self.entries_allowed(main):
-            slots = self.cfg.max_open_positions - len(self.journal.open_positions(MAIN))
+            held = {p.token_address for p in self.journal.open_positions(MAIN)}
+            slots = self.cfg.max_open_positions - len(held)
             for snap, result, safety in survivors:
                 if slots <= 0 or not self.analyst.budget_ok():
                     break
+                if snap.token_address in held:
+                    continue
                 verdict = self.analyst.analyse(snap, safety, result)
                 cost = getattr(self.analyst, "last_cost_usd", 0.0)
                 if cost:
@@ -218,7 +226,16 @@ class Engine:
         self.after_screen(survivors, analysed)
 
     def after_screen(self, survivors: list[Survivor], analysed: list[tuple[Survivor, str]]) -> None:
-        """Hook for baseline books (see shadows.py). The main engine does nothing here."""
+        """Let each baseline book pick from the same candidates Claude saw."""
+        baselines = [b for b in self.books.values() if b.name != MAIN]
+        if not baselines:
+            return
+        buy_rate = shadows.claude_buy_rate(self.journal, self.cfg)
+        for book in baselines:
+            for snap, _result, _safety in shadows.picks(book.name, survivors, analysed, buy_rate, self._rng):
+                if not self.entries_allowed(book):
+                    break
+                self.buy(book, snap, self.cfg.shadow_conviction, None)
 
     def preflight(self, snap: PairSnapshot, usd: float) -> tuple[PairSnapshot | None, str]:
         """Re-validate a token right before buying. Research can take minutes.
