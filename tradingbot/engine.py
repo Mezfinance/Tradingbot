@@ -32,6 +32,8 @@ from tradingbot.tracker import Tracker
 log = logging.getLogger(__name__)
 
 MAIN = "claude"
+CANARY = "canary"
+BOOK_PRIORITY = {MAIN: 0, CANARY: 1}  # real-money books are exited before simulated baselines
 REANALYSE_AFTER_S = 6 * 3600
 RECHECK_REJECTED_S = 30 * 60
 DUST_QTY = 1e-12
@@ -45,18 +47,22 @@ class Book:
     name: str
     executor: Executor
     cash: float
+    fixed_usd: float | None = None  # fixed trade size instead of risk-based sizing (canary)
 
 
 class Engine:
     def __init__(self, cfg: Config, dex: DexScreener, rug: RugCheck, analyst: Analyst | None,
                  executor: Executor, journal: Journal, jupiter: Jupiter | None = None,
-                 shadow_executors: dict[str, Executor] | None = None):
+                 shadow_executors: dict[str, Executor] | None = None,
+                 canary_executor: Executor | None = None):
         self.cfg, self.dex, self.rug, self.analyst = cfg, dex, rug, analyst
         self.journal = journal
         self.jupiter = jupiter  # None: no round-trip preflight, prices from DexScreener (tests)
         self.books: dict[str, Book] = {MAIN: self._open_book(MAIN, executor)}
         for name, ex in (shadow_executors or {}).items():
             self.books[name] = self._open_book(name, ex)
+        if canary_executor is not None and cfg.canary_every_n > 0:
+            self.books[CANARY] = self._open_book(CANARY, canary_executor, cfg.canary_budget_usd, cfg.canary_usd)
         self._rng = random.Random(cfg.shadow_seed)
         self.lock = threading.RLock()  # guards book cash and position state
         self.tracker = Tracker(journal, dex, jupiter)
@@ -86,8 +92,10 @@ class Engine:
         self._cooldown[token] = until
         self.journal.set_cooldown(token, until)
 
-    def _open_book(self, name: str, executor: Executor) -> Book:
-        return Book(name, executor, self.journal.get_cash(self.cfg.starting_cash_usd, name))
+    def _open_book(self, name: str, executor: Executor, start_cash: float | None = None,
+                   fixed_usd: float | None = None) -> Book:
+        start = self.cfg.starting_cash_usd if start_cash is None else start_cash
+        return Book(name, executor, self.journal.get_cash(start, name), fixed_usd)
 
     # Convenience accessors for the main book.
     @property
@@ -147,7 +155,8 @@ class Engine:
     # --- positions ----------------------------------------------------------
     def manage_positions(self) -> dict[str, float]:
         # The real book is handled first so simulated latency on baselines never delays it.
-        positions = sorted(self.journal.open_positions(strategy=None), key=lambda p: p.strategy != MAIN)
+        positions = sorted(self.journal.open_positions(strategy=None),
+                           key=lambda p: BOOK_PRIORITY.get(p.strategy, 2))
         prices = self.current_prices({p.token_address for p in positions})
         now = time.time()
         self.journal.set_state("heartbeat", repr(now))
@@ -247,8 +256,19 @@ class Engine:
                 if verdict.action == "buy" and verdict.conviction >= self.cfg.min_conviction:
                     if self.buy(main, snap, verdict.conviction, decision_id):
                         slots -= 1
+                        self._maybe_canary(snap, verdict.conviction, decision_id)
         self._track_unanalysed(survivors, analysed)
         self.after_screen(survivors, analysed)
+
+    def _maybe_canary(self, snap: PairSnapshot, conviction: float, decision_id: int) -> None:
+        """Mirror every Nth Claude buy with a small real trade (same decision, same exit rules)."""
+        book = self.books.get(CANARY)
+        if book is None:
+            return
+        count = int(self.journal.get_state("canary_count") or 0) + 1
+        self.journal.set_state("canary_count", str(count))
+        if count % self.cfg.canary_every_n == 0:
+            self.buy(book, snap, conviction, decision_id)
 
     def _track_unanalysed(self, survivors: list[Survivor], analysed: list[tuple[Survivor, str]]) -> None:
         """Candidates Claude didn't get to (budget, slots) still get a price path, once per 6h."""
@@ -262,7 +282,7 @@ class Engine:
 
     def after_screen(self, survivors: list[Survivor], analysed: list[tuple[Survivor, str]]) -> None:
         """Let each baseline book pick from the same candidates Claude saw."""
-        baselines = [b for b in self.books.values() if b.name != MAIN]
+        baselines = [b for b in self.books.values() if b.name not in BOOK_PRIORITY]
         if not baselines:
             return
         buy_rate = shadows.claude_buy_rate(self.journal, self.cfg)
@@ -300,7 +320,10 @@ class Engine:
     def buy(self, book: Book, snap: PairSnapshot, conviction: float, decision_id: int | None) -> bool:
         if any(p.token_address == snap.token_address for p in self.journal.open_positions(book.name)):
             return False
-        usd = risk.position_size_usd(self.equity(book), book.cash, conviction, self.cfg)
+        if book.fixed_usd is not None:
+            usd = min(book.fixed_usd, book.cash)
+        else:
+            usd = risk.position_size_usd(self.equity(book), book.cash, conviction, self.cfg)
         if usd < 1:
             log.info("[%s] position size too small for %s", book.name, snap.symbol)
             return False

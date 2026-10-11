@@ -26,6 +26,7 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 | `tradingbot/execution/base.py` | `Fill` (`usd` = net cash movement; `ok=False` = reverted tx that still cost its fee) |
 | `tradingbot/shadows.py` | Baseline books: `filters_only` (buy every survivor, no Claude) and `random` (random picks among Claude-analysed tokens at Claude's smoothed buy rate). Config `shadows` (comma list, "" disables), `shadow_conviction`, `shadow_seed`. Always simulated, even in live mode |
 | `tradingbot/tracker.py` | `Tracker.track(decision_id, token, price)` + `poll()` each scan cycle: samples Jupiter/DexScreener prices for 24h into `prices`, fills `tracking.p1h/p6h/p24h`, `max_price`, `min_price`. Token missing from both feeds while others quote = 0 (rug); no prices at all = sample skipped |
+| Canary (in `engine.py`) | `canary_every_n>0` (paper mode + confirm phrase) adds a `canary` book with the live `JupiterExecutor`, `fixed_usd=canary_usd`, cash `canary_budget_usd`; mirrors every Nth successful Claude buy (`state.canary_count`) on the same `decision_id`. Exit order: claude, canary, then baselines (`BOOK_PRIORITY`). `report.calibration()` compares fee-free swap returns of canary vs its sim twin |
 | `tradingbot/costs.py` | `usage_cost_usd(model, usage)`: list prices per model + web search $10/1k |
 | `tradingbot/report.py` | `build()` -> per-strategy stats (equity, return, max drawdown, win rate, median/mean trade, profit factor, fees, failed txs, Claude API $, net after API, median entry/exit slippage vs trigger, skip reasons) + Claude buy-vs-pass with bootstrap 90% CI; `render()` text table. Warns below 30 closed trades |
 | `tradingbot/cli.py` | `python -m tradingbot scan|once|run|report [--json]` |
@@ -53,6 +54,8 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 - **2026-10-11 (realism part 4):** shadow books; `screen()` no longer drops tokens Claude holds (Claude's loop skips them instead) so baselines see the same candidates; monitor handles the claude book first. 44 tests.
 
 - **2026-10-11 (realism part 5):** tracker, persistence, downtime; `Journal.execute/executemany`; removed `pending_outcomes/set_outcome`. 48 tests.
+
+- **2026-10-11 (realism part 6a):** canary book + calibration report. 50 tests.
 
 ## Realism roadmap (in progress)
 

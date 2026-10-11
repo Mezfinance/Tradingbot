@@ -35,9 +35,13 @@ def build_engine(cfg: Config, with_analyst: bool = True):
 
     # Baselines are always simulated, even when the main book trades live.
     shadow_executors = {name: SimExecutor(cfg, jupiter) for name in parse_shadows(cfg.shadows)}
+    canary = None
+    if cfg.canary_every_n > 0:
+        from tradingbot.execution.jupiter import JupiterExecutor
+        canary = JupiterExecutor(cfg, jupiter)
     analyst = Analyst(cfg) if with_analyst else None
     return Engine(cfg, DexScreener(), RugCheck(), analyst, executor, Journal(cfg.db_path), jupiter,
-                  shadow_executors=shadow_executors)
+                  shadow_executors=shadow_executors, canary_executor=canary)
 
 
 def main(argv: list[str] | None = None) -> None:

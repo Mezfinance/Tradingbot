@@ -39,6 +39,11 @@ class Config:
     shadow_conviction: float = 0.825  # fixed sizing input for baseline buys
     shadow_seed: int = 7
 
+    # --- canary: small real trades mirroring 1 in N Claude buys (calibrates the sim) ---
+    canary_every_n: int = 0  # 0 disables; needs the live keypair and confirmation phrase
+    canary_usd: float = 5.0  # fixed size per canary trade
+    canary_budget_usd: float = 100.0  # canary book's starting cash (keep the wallet at about this)
+
     # --- risk -----------------------------------------------------------
     risk_per_trade_pct: float = 2.0  # % of equity lost if stop is hit
     max_position_pct: float = 10.0  # % of equity in any single token
@@ -96,6 +101,10 @@ class Config:
                 f"Live mode requires TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}. "
                 "Run in paper mode until the journal shows a real edge."
             )
+        if self.canary_every_n > 0 and self.live_confirm != LIVE_CONFIRM_PHRASE:
+            raise ValueError(f"Canary trades spend real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+        if self.canary_every_n > 0 and self.mode == "live":
+            raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):
             raise ValueError("sim_fill_mode must be expected, midpoint or pessimistic")
         if len(self.take_profit_pcts) != len(self.take_profit_fractions):

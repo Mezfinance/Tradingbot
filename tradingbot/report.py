@@ -156,6 +156,37 @@ def claude_selection(j: Journal) -> dict:
     return out
 
 
+def _swap_return_pct(j: Journal, position_id: int) -> float | None:
+    """Return from fill prices only (fees excluded), so a $5 canary compares fairly with a $50 sim trade."""
+    rows = j.query("SELECT side, qty, price FROM fills WHERE position_id=?", (position_id,))
+    bought = sum(r["qty"] * r["price"] for r in rows if r["side"] == "buy")
+    sold = sum(r["qty"] * r["price"] for r in rows if r["side"] == "sell")
+    return (sold / bought - 1) * 100 if bought else None
+
+
+def calibration(j: Journal) -> dict:
+    """Real canary trades vs the simulated Claude trade on the same decision."""
+    pairs = j.query(
+        """SELECT c.id AS canary_id, s.id AS sim_id FROM positions c
+           JOIN positions s ON s.decision_id = c.decision_id AND s.strategy='claude'
+           WHERE c.strategy='canary' AND c.closed_at IS NOT NULL AND s.closed_at IS NOT NULL""")
+    gaps = []
+    for p in pairs:
+        real, sim = _swap_return_pct(j, p["canary_id"]), _swap_return_pct(j, p["sim_id"])
+        if real is not None and sim is not None:
+            gaps.append(real - sim)
+    gap = _median(gaps)
+    advice = None
+    if gap is not None and len(gaps) >= 5:
+        if gap < -1:
+            advice = "simulation is optimistic; try TB_SIM_FILL_MODE=pessimistic or raise TB_SIM_LATENCY_S"
+        elif gap > 1:
+            advice = "simulation is pessimistic; try TB_SIM_FILL_MODE=expected"
+        else:
+            advice = "simulation is within 1 point of real fills"
+    return {"matched_trades": len(gaps), "median_real_minus_sim_pct": gap, "advice": advice}
+
+
 def downtime(j: Journal) -> dict:
     rows = j.query("SELECT start_ts, end_ts, open_positions FROM downtime")
     return {
@@ -177,6 +208,7 @@ def build(j: Journal, cfg: Config) -> dict:
         "strategies": [strategy_stats(j, n, cfg.starting_cash_usd) for n in names],
         "claude_selection": claude_selection(j),
         "downtime": downtime(j),
+        "calibration": calibration(j),
         "funnel": {r["stage"]: r["n"] for r in funnel},
     }
 
@@ -238,6 +270,11 @@ def render(rep: dict) -> str:
             verdict = ("buys beat passes" if ci[0] > 0 else "passes beat buys" if ci[1] < 0
                        else "no significant difference yet")
             lines.append(f"  bought - passed at {col[1:]}, 90% interval: {ci[0]:+.1f}% to {ci[1]:+.1f}% -> {verdict}")
+    cal = rep["calibration"]
+    if cal["matched_trades"]:
+        lines.append(f"\nCALIBRATION: {cal['matched_trades']} real canary trades vs their simulated twins; "
+                     f"median real - sim = {_fmt(cal['median_real_minus_sim_pct'], ' pts')}"
+                     + (f" -> {cal['advice']}" if cal["advice"] else " (need 5+ for advice)"))
     dt = rep["downtime"]
     if dt["outages"]:
         lines.append(f"\nDOWNTIME: {dt['outages']} outage(s), {dt['hours_offline']:.1f}h offline, "
