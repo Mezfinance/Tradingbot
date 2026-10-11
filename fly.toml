@@ -1,7 +1,7 @@
 # Fly.io config for the trading bot: one always-on machine, SQLite on a volume.
 # Change `app` to a unique name, and `primary_region` if you prefer (iad = US East,
 # fra = Frankfurt; both are close to Jupiter and the main Solana RPCs).
-app = "claude-tradingbot"
+app = "supermeme"
 primary_region = "iad"
 
 [build]

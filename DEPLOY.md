@@ -7,8 +7,8 @@ You need `flyctl`, logged in (`fly auth login`).
 ## 1. First deploy
 
 ```bash
-# Pick a unique app name and put it in fly.toml (`app = "..."`), then:
-fly apps create <your-app-name>
+# The app name is set in fly.toml (`app = "supermeme"`).
+fly apps create supermeme
 
 # The journal volume. Use the same region as primary_region in fly.toml.
 fly volumes create tradingbot_data --region iad --size 1

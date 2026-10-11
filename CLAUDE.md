@@ -62,6 +62,7 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 
 - **2026-10-11 (realism part 6b):** replay tool, `Config.with_overrides`, README realism table. Live no-Claude end-to-end run verified real quote fills, fees, tracking and a modelled slippage revert. 55 tests.
 
+- **2026-10-11:** Fly app created by the user as `supermeme` (region `iad`); `fly.toml` updated.
 - **2026-10-11 (deploy):** Fly.io deployment, watchdog + `/health`, `health`/`backup` commands. Image built and run in Docker here: health OK, report/backup via exec, key kept off the volume. Not yet deployed to Fly by anyone. 60 tests.
 
 ## Realism roadmap
