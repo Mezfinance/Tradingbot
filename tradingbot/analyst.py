@@ -101,6 +101,10 @@ class Analyst:
         self._calls: deque[float] = deque()
         self.last_cost_usd = 0.0  # cost of the most recent analyse() call, including resumes
 
+    def seed_history(self, call_times: list[float]) -> None:
+        """Restore recent call times after a restart so the hourly cap still holds."""
+        self._calls.extend(sorted(t for t in call_times if time.time() - t <= 3600))
+
     def budget_ok(self) -> bool:
         now = time.time()
         while self._calls and now - self._calls[0] > 3600:

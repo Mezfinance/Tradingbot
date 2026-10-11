@@ -27,13 +27,13 @@ from tradingbot.data.rugcheck import RugCheck
 from tradingbot.execution.base import Executor, Fill
 from tradingbot.journal import Journal
 from tradingbot.models import FactorResult, PairSnapshot, Position, SafetyReport
+from tradingbot.tracker import Tracker
 
 log = logging.getLogger(__name__)
 
 MAIN = "claude"
 REANALYSE_AFTER_S = 6 * 3600
 RECHECK_REJECTED_S = 30 * 60
-OUTCOME_HORIZON_S = 6 * 3600
 DUST_QTY = 1e-12
 EQUITY_SNAPSHOT_S = 60
 
@@ -59,10 +59,32 @@ class Engine:
             self.books[name] = self._open_book(name, ex)
         self._rng = random.Random(cfg.shadow_seed)
         self.lock = threading.RLock()  # guards book cash and position state
-        self._cooldown: dict[str, float] = {}  # token -> time it may be re-screened
+        self.tracker = Tracker(journal, dex, jupiter)
+        self._cooldown: dict[str, float] = journal.load_cooldowns()  # token -> time it may be re-screened
         self._last_prices: dict[str, float] = {}
         self._last_snapshot = 0.0
         self._stop = threading.Event()
+        if analyst is not None and hasattr(analyst, "seed_history"):
+            analyst.seed_history([r["ts"] for r in journal.query(
+                "SELECT ts FROM costs WHERE kind='claude_api' AND ts > ?", (time.time() - 3600,))])
+        self._record_downtime()
+
+    def _record_downtime(self) -> None:
+        """If the bot was off, record for how long and how many positions went unmanaged."""
+        last = self.journal.get_state("heartbeat")
+        if last is None:
+            return
+        gap = time.time() - float(last)
+        if gap > max(60.0, 3 * self.cfg.monitor_interval_s):
+            n_open = len(self.journal.open_positions(strategy=None))
+            self.journal.execute("INSERT INTO downtime(start_ts, end_ts, open_positions) VALUES(?,?,?)",
+                                 (float(last), time.time(), n_open))
+            log.warning("bot was offline for %.0f min with %d open positions unmanaged", gap / 60, n_open)
+
+    def _cool(self, token: str) -> None:
+        until = time.time() + RECHECK_REJECTED_S
+        self._cooldown[token] = until
+        self.journal.set_cooldown(token, until)
 
     def _open_book(self, name: str, executor: Executor) -> Book:
         return Book(name, executor, self.journal.get_cash(self.cfg.starting_cash_usd, name))
@@ -128,6 +150,7 @@ class Engine:
         positions = sorted(self.journal.open_positions(strategy=None), key=lambda p: p.strategy != MAIN)
         prices = self.current_prices({p.token_address for p in positions})
         now = time.time()
+        self.journal.set_state("heartbeat", repr(now))
         for pos in positions:
             price = prices.get(pos.token_address)
             book = self.books.get(pos.strategy)
@@ -189,7 +212,7 @@ class Engine:
             safety = self.rug.report(token)
             result = factors.evaluate(snap, safety, self.cfg)
             if not result.passed:
-                self._cooldown[token] = now + RECHECK_REJECTED_S
+                self._cool(token)
                 self.journal.log_decision(snap, result)
                 log.info("screened out %s: %s", snap.symbol, "; ".join(result.rejections))
                 continue
@@ -214,16 +237,28 @@ class Engine:
                 if cost:
                     self.journal.log_cost("claude_api", cost, snap.token_address, MAIN)
                 if verdict is None:
-                    self._cooldown[snap.token_address] = time.time() + RECHECK_REJECTED_S
+                    self._cool(snap.token_address)
                     continue
                 decision_id = self.journal.log_decision(snap, result, verdict, analysed=True)
+                self.tracker.track(decision_id, snap.token_address, snap.price_usd)
                 analysed.append(((snap, result, safety), verdict.action))
                 log.info("%s -> %s (conviction %.2f): %s",
                          snap.symbol, verdict.action, verdict.conviction, verdict.thesis)
                 if verdict.action == "buy" and verdict.conviction >= self.cfg.min_conviction:
                     if self.buy(main, snap, verdict.conviction, decision_id):
                         slots -= 1
+        self._track_unanalysed(survivors, analysed)
         self.after_screen(survivors, analysed)
+
+    def _track_unanalysed(self, survivors: list[Survivor], analysed: list[tuple[Survivor, str]]) -> None:
+        """Candidates Claude didn't get to (budget, slots) still get a price path, once per 6h."""
+        done = {s[0].token_address for s, _ in analysed}
+        for snap, result, _safety in survivors:
+            if snap.token_address in done or self.journal.recently_seen(snap.token_address, REANALYSE_AFTER_S,
+                                                                         stage="survivor"):
+                continue
+            decision_id = self.journal.log_decision(snap, result, stage="survivor")
+            self.tracker.track(decision_id, snap.token_address, snap.price_usd)
 
     def after_screen(self, survivors: list[Survivor], analysed: list[tuple[Survivor, str]]) -> None:
         """Let each baseline book pick from the same candidates Claude saw."""
@@ -327,10 +362,4 @@ class Engine:
 
     # --- measurement ----------------------------------------------------------
     def update_outcomes(self) -> None:
-        pending = self.journal.pending_outcomes(OUTCOME_HORIZON_S)
-        if not pending:
-            return
-        prices = {s.token_address: s.price_usd for s in self.dex.pairs({r["token"] for r in pending})}
-        for row in pending:
-            # A token that vanished from DexScreener is treated as a total loss.
-            self.journal.set_outcome(row["id"], prices.get(row["token"]))
+        self.tracker.poll()

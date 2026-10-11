@@ -124,20 +124,44 @@ def strategy_stats(j: Journal, name: str, start_cash: float) -> dict:
     }
 
 
-def claude_selection(j: Journal) -> dict:
-    """Forward returns of tokens Claude bought vs passed (6h after analysis)."""
-    def fwd(action: str) -> list[float]:
-        rows = j.query(
-            """SELECT price, outcome_price FROM decisions WHERE stage='analysed' AND action=?
-               AND outcome_price IS NOT NULL AND price > 0""", (action,))
-        return [(r["outcome_price"] / r["price"] - 1) * 100 for r in rows]
+GROUPS = (
+    ("bought", "d.stage='analysed' AND d.action='buy'"),
+    ("passed", "d.stage='analysed' AND d.action='pass'"),
+    ("not analysed", "d.stage='survivor'"),
+)
 
-    buys, passes = fwd("buy"), fwd("pass")
+
+def claude_selection(j: Journal) -> dict:
+    """Forward returns of candidates after 1h/6h/24h, plus the best and worst point reached.
+
+    Uses the price paths from tracker.py, so every candidate counts, bought or not.
+    """
+    out: dict = {}
+    for label, where in GROUPS:
+        rows = j.query(f"""SELECT t.* FROM tracking t JOIN decisions d ON d.id = t.decision_id
+                           WHERE {where} AND t.start_price > 0""")
+        g: dict = {"n": len(rows)}
+        for col in ("p1h", "p6h", "p24h"):
+            rets = [(r[col] / r["start_price"] - 1) * 100 for r in rows if r[col] is not None]
+            g[col] = {"n": len(rets), "mean": _mean(rets), "median": _median(rets), "values": rets}
+        g["median_max_up_pct"] = _median([(r["max_price"] / r["start_price"] - 1) * 100 for r in rows])
+        g["median_max_down_pct"] = _median([(r["min_price"] / r["start_price"] - 1) * 100 for r in rows])
+        out[label] = g
+    for col in ("p6h", "p24h"):
+        out[f"buy_minus_pass_{col}_ci90"] = bootstrap_diff_ci(
+            out["bought"][col]["values"], out["passed"][col]["values"])
+    for g in (out[label] for label, _ in GROUPS):
+        for col in ("p1h", "p6h", "p24h"):
+            g[col].pop("values")
+    return out
+
+
+def downtime(j: Journal) -> dict:
+    rows = j.query("SELECT start_ts, end_ts, open_positions FROM downtime")
     return {
-        "buy_samples": len(buys), "pass_samples": len(passes),
-        "buy_mean_pct": _mean(buys), "pass_mean_pct": _mean(passes),
-        "buy_median_pct": _median(buys), "pass_median_pct": _median(passes),
-        "buy_minus_pass_mean_ci90": bootstrap_diff_ci(buys, passes),
+        "outages": len(rows),
+        "hours_offline": sum(r["end_ts"] - r["start_ts"] for r in rows) / 3600,
+        "outages_with_open_positions": sum(r["open_positions"] > 0 for r in rows),
     }
 
 
@@ -152,6 +176,7 @@ def build(j: Journal, cfg: Config) -> dict:
     return {
         "strategies": [strategy_stats(j, n, cfg.starting_cash_usd) for n in names],
         "claude_selection": claude_selection(j),
+        "downtime": downtime(j),
         "funnel": {r["stage"]: r["n"] for r in funnel},
     }
 
@@ -199,15 +224,23 @@ def render(rep: dict) -> str:
                              f"need {MIN_TRADES_FOR_CONCLUSION}+ before drawing conclusions")
 
     sel = rep["claude_selection"]
-    lines += ["", "CLAUDE SELECTION (price change 6h after analysis)",
-              f"  bought: n={sel['buy_samples']} mean={_fmt(sel['buy_mean_pct'], '%')} "
-              f"median={_fmt(sel['buy_median_pct'], '%')}",
-              f"  passed: n={sel['pass_samples']} mean={_fmt(sel['pass_mean_pct'], '%')} "
-              f"median={_fmt(sel['pass_median_pct'], '%')}"]
-    ci = sel["buy_minus_pass_mean_ci90"]
-    if ci:
-        verdict = ("buys beat passes" if ci[0] > 0 else "passes beat buys" if ci[1] < 0
-                   else "no significant difference yet")
-        lines.append(f"  buy - pass, 90% interval: {ci[0]:+.1f}% to {ci[1]:+.1f}%  -> {verdict}")
+    lines += ["", "CANDIDATE OUTCOMES (price change after analysis; median, with mean in brackets)",
+              f"{'group':<14}{'n':>5}{'1h':>18}{'6h':>18}{'24h':>18}{'max up':>10}{'max down':>10}"]
+    for label, _ in GROUPS:
+        g = sel[label]
+        cells = "".join(f"{_fmt(g[c]['median'], '%', 1) + ' (' + _fmt(g[c]['mean'], '%', 1) + ')':>18}"
+                        for c in ("p1h", "p6h", "p24h"))
+        lines.append(f"{label:<14}{g['n']:>5}{cells}"
+                     f"{_fmt(g['median_max_up_pct'], '%', 1):>10}{_fmt(g['median_max_down_pct'], '%', 1):>10}")
+    for col in ("p6h", "p24h"):
+        ci = sel[f"buy_minus_pass_{col}_ci90"]
+        if ci:
+            verdict = ("buys beat passes" if ci[0] > 0 else "passes beat buys" if ci[1] < 0
+                       else "no significant difference yet")
+            lines.append(f"  bought - passed at {col[1:]}, 90% interval: {ci[0]:+.1f}% to {ci[1]:+.1f}% -> {verdict}")
+    dt = rep["downtime"]
+    if dt["outages"]:
+        lines.append(f"\nDOWNTIME: {dt['outages']} outage(s), {dt['hours_offline']:.1f}h offline, "
+                     f"{dt['outages_with_open_positions']} with positions unmanaged")
     lines += ["", f"FUNNEL: {rep['funnel']}"]
     return "\n".join(lines)

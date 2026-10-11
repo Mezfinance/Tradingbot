@@ -53,6 +53,20 @@ CREATE TABLE IF NOT EXISTS fills (
     trigger_price REAL                -- price that triggered the order, for slippage stats
 );
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS tracking (
+    decision_id INTEGER PRIMARY KEY,  -- one price path per candidate decision
+    token TEXT NOT NULL,
+    start_ts REAL NOT NULL,
+    start_price REAL NOT NULL,
+    p1h REAL, p6h REAL, p24h REAL,    -- first price seen at/after each horizon (0 = token gone)
+    max_price REAL, min_price REAL,   -- best and worst seen over 24h
+    done INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS tracking_active ON tracking(done, start_ts);
+CREATE TABLE IF NOT EXISTS prices (token TEXT, ts REAL, price REAL);
+CREATE INDEX IF NOT EXISTS prices_token ON prices(token, ts);
+CREATE TABLE IF NOT EXISTS cooldowns (token TEXT PRIMARY KEY, until REAL);
+CREATE TABLE IF NOT EXISTS downtime (start_ts REAL, end_ts REAL, open_positions INTEGER);
 CREATE TABLE IF NOT EXISTS costs (
     id INTEGER PRIMARY KEY,
     ts REAL, kind TEXT, usd REAL, token TEXT, strategy TEXT DEFAULT 'claude'
@@ -108,12 +122,31 @@ class Journal:
     def set_cash(self, cash: float, strategy: str = "claude") -> None:
         self.set_state(f"cash:{strategy}", repr(cash))
 
+    @locked
+    def execute(self, sql: str, params: tuple = ()) -> int:
+        cur = self.db.execute(sql, params)
+        self.db.commit()
+        return cur.lastrowid
+
+    @locked
+    def executemany(self, sql: str, rows: list[tuple]) -> None:
+        self.db.executemany(sql, rows)
+        self.db.commit()
+
+    # --- cooldowns (persisted so a restart doesn't re-spend on known rejects) ---
+    def set_cooldown(self, token: str, until: float) -> None:
+        self.execute("INSERT OR REPLACE INTO cooldowns(token, until) VALUES(?, ?)", (token, until))
+
+    def load_cooldowns(self) -> dict[str, float]:
+        rows = self.query("SELECT token, until FROM cooldowns WHERE until > ?", (time.time(),))
+        return {r["token"]: r["until"] for r in rows}
+
     # --- decisions --------------------------------------------------------
     @locked
-    def recently_seen(self, token: str, within_s: float) -> bool:
+    def recently_seen(self, token: str, within_s: float, stage: str = "analysed") -> bool:
         row = self.db.execute(
-            "SELECT 1 FROM decisions WHERE token=? AND ts>? AND stage='analysed' LIMIT 1",
-            (token, time.time() - within_s),
+            "SELECT 1 FROM decisions WHERE token=? AND ts>? AND stage=? LIMIT 1",
+            (token, time.time() - within_s, stage),
         ).fetchone()
         return row is not None
 
@@ -124,6 +157,7 @@ class Journal:
         factors: FactorResult,
         verdict: Verdict | None = None,
         analysed: bool = False,
+        stage: str | None = None,
     ) -> int:
         cur = self.db.execute(
             """INSERT INTO decisions(ts, token, symbol, stage, price, liquidity, fdv, factor_score,
@@ -131,7 +165,7 @@ class Journal:
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 time.time(), p.token_address, p.symbol,
-                "analysed" if analysed else "screened_out",
+                stage or ("analysed" if analysed else "screened_out"),
                 p.price_usd, p.liquidity_usd, p.fdv_usd, factors.score,
                 json.dumps(factors.components), json.dumps(factors.rejections),
                 verdict.model_dump_json() if verdict else None,
@@ -141,21 +175,6 @@ class Journal:
         )
         self.db.commit()
         return cur.lastrowid
-
-    @locked
-    def pending_outcomes(self, older_than_s: float) -> list[sqlite3.Row]:
-        return self.db.execute(
-            "SELECT id, token, price FROM decisions WHERE stage='analysed' AND outcome_price IS NULL AND ts<?",
-            (time.time() - older_than_s,),
-        ).fetchall()
-
-    @locked
-    def set_outcome(self, decision_id: int, price: float | None) -> None:
-        self.db.execute(
-            "UPDATE decisions SET outcome_price=?, outcome_ts=? WHERE id=?",
-            (price if price is not None else 0.0, time.time(), decision_id),
-        )
-        self.db.commit()
 
     # --- positions --------------------------------------------------------
     @locked
