@@ -1,4 +1,6 @@
 import json
+
+import pytest
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -110,7 +112,7 @@ def test_engine_respects_daily_loss_limit(cfg, good_pair, safe):
     eng.tick()
     eng.dex.pair = replace(good_pair, price_usd=good_pair.price_usd * 0.5)
     eng.tick()
-    assert not eng.entries_allowed({})
+    assert not eng.entries_allowed()
 
 
 def test_failed_take_profit_sell_is_retried(cfg, good_pair, safe):
@@ -140,3 +142,45 @@ def test_refused_analysis_is_not_retried_every_tick(cfg, good_pair, safe):
     eng.tick()
     eng.tick()
     assert len(client.calls) == 1
+
+
+def test_monitor_thread_exits_while_research_is_blocked(cfg, good_pair, safe):
+    import threading
+    import time as _time
+
+    cfg.monitor_interval_s = 0.02
+    cfg.scan_interval_s = 0.02
+    journal = Journal(":memory:")
+    dex = FakeDex(good_pair)
+    eng = Engine(cfg, dex, SimpleNamespace(report=lambda m: safe),
+                 Analyst(cfg, FakeClient([resp("end_turn", BUY_JSON)])), PaperExecutor(cfg), journal)
+    eng.tick()  # open a position
+    [pos] = journal.open_positions()
+
+    release = threading.Event()
+    blocked = threading.Event()
+
+    def stuck_research(*a, **k):
+        blocked.set()
+        release.wait(5)
+        return None
+
+    eng.analyst = SimpleNamespace(analyse=stuck_research, budget_ok=lambda: True)
+    eng.journal.recently_seen = lambda *a: False  # make the scan loop pick the token up again
+    eng.screen = lambda: [(good_pair, SimpleNamespace(score=1), safe)]
+    runner = threading.Thread(target=eng.run_forever, daemon=True)
+    runner.start()
+    assert blocked.wait(2)
+
+    dex.pair = replace(good_pair, price_usd=pos.entry_price * 0.5)  # crash through the stop
+    deadline = _time.time() + 2
+    while journal.open_positions() and _time.time() < deadline:
+        _time.sleep(0.02)
+    assert journal.open_positions() == []  # exited while research was still blocked
+    assert not release.is_set()
+    release.set()
+    eng._stop.set()
+    runner.join(2)
+
+    row = journal.db.execute("SELECT trigger_price, price FROM fills WHERE side='sell'").fetchone()
+    assert row["trigger_price"] == pytest.approx(pos.entry_price * 0.5)

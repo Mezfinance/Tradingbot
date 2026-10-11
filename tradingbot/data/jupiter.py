@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 
@@ -16,6 +17,8 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_DECIMALS = 6
 PRICE_BATCH = 50
 SOL_PRICE_TTL_S = 300
+MIN_REQUEST_INTERVAL_S = 0.5  # keeps the shared free tier comfortably under its rate limit
+RETRIES_ON_429 = 3
 
 
 @dataclass
@@ -43,12 +46,28 @@ class Jupiter:
         self.slippage_bps = slippage_bps
         self._decimals: dict[str, int] = {USDC_MINT: USDC_DECIMALS, SOL_MINT: 9}
         self._sol_price: tuple[float, float] | None = None  # (price, fetched_at)
+        self._pace = threading.Lock()
+        self._last_request = 0.0
+
+    def _get(self, path: str, params: dict) -> httpx.Response:
+        """GET with global pacing (both bot threads share this client) and 429 back-off."""
+        for attempt in range(RETRIES_ON_429 + 1):
+            with self._pace:
+                wait = self._last_request + MIN_REQUEST_INTERVAL_S - time.monotonic()
+                if wait > 0:
+                    time.sleep(wait)
+                self._last_request = time.monotonic()
+            resp = self.http.get(path, params=params)
+            if resp.status_code != 429 or attempt == RETRIES_ON_429:
+                return resp
+            time.sleep(2 ** attempt)
+        return resp
 
     def quote(self, in_mint: str, out_mint: str, in_raw: int) -> Quote | None:
         if in_raw <= 0:
             return None
         try:
-            resp = self.http.get("/swap/v1/quote", params={
+            resp = self._get("/swap/v1/quote", {
                 "inputMint": in_mint, "outputMint": out_mint,
                 "amount": in_raw, "slippageBps": self.slippage_bps,
             })
@@ -74,7 +93,7 @@ class Jupiter:
         for i in range(0, len(mints), PRICE_BATCH):
             chunk = mints[i : i + PRICE_BATCH]
             try:
-                resp = self.http.get("/price/v3", params={"ids": ",".join(chunk)})
+                resp = self._get("/price/v3", {"ids": ",".join(chunk)})
                 resp.raise_for_status()
                 data = resp.json()
             except (httpx.HTTPError, ValueError) as exc:

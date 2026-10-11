@@ -15,6 +15,7 @@ class Config:
     starting_cash_usd: float = 1000.0
     db_path: str = "tradingbot.db"
     scan_interval_s: int = 60
+    monitor_interval_s: int = 10  # open positions are priced and exited on this cadence
 
     # --- hard filters (deterministic, applied before Claude is called) --
     min_liquidity_usd: float = 15_000.0

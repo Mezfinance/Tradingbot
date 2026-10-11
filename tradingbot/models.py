@@ -82,3 +82,4 @@ class Position:
     realized_usd: float = 0.0
     closed_at: float | None = None
     exit_reason: str | None = None
+    strategy: str = "claude"  # which book owns it (claude, or a shadow baseline)
