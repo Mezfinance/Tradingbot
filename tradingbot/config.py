@@ -73,25 +73,33 @@ class Config:
 
     @classmethod
     def from_env(cls) -> "Config":
-        cfg = cls()
+        overrides = {}
         for f in fields(cls):
             raw = os.environ.get(f"TB_{f.name.upper()}")
-            if raw is None or raw == "":
-                continue
-            current = getattr(cfg, f.name)
+            if raw is not None and raw != "":
+                overrides[f.name] = raw
+        return cls().with_overrides(overrides)
+
+    def with_overrides(self, raw: dict[str, str]) -> "Config":
+        """Apply string overrides (from env vars or --set key=value), coerced to each field's type."""
+        names = {f.name for f in fields(self)}
+        for name, text in raw.items():
+            if name not in names:
+                raise ValueError(f"unknown setting {name!r}")
+            current = getattr(self, name)
             if isinstance(current, bool):
-                value = raw.lower() in ("1", "true", "yes")
+                value = text.lower() in ("1", "true", "yes")
             elif isinstance(current, int):
-                value = int(raw)
+                value = int(text)
             elif isinstance(current, float):
-                value = float(raw)
+                value = float(text)
             elif isinstance(current, list):
-                value = [float(x) for x in raw.split(",")]
+                value = [float(x) for x in text.split(",")]
             else:
-                value = raw
-            setattr(cfg, f.name, value)
-        cfg.validate()
-        return cfg
+                value = text
+            setattr(self, name, value)
+        self.validate()
+        return self
 
     def validate(self) -> None:
         if self.mode not in ("paper", "live"):

@@ -15,7 +15,7 @@ import logging
 import random
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 
 from tradingbot import factors, risk, shadows
@@ -301,6 +301,12 @@ class Engine:
         if not fresh:
             return None, "pair disappeared"
         now = fresh[0]
+        if self.jupiter is not None:
+            # DexScreener can lag a fast mover by a minute; Jupiter's price is what a swap
+            # would see now, and is the same source the monitor uses for exits.
+            live = self.jupiter.prices([snap.token_address]).get(snap.token_address)
+            if live is not None:
+                now = replace(now, price_usd=live.usd)
         if rejections := factors.market_filters(now, self.cfg):
             return None, "no longer passes: " + "; ".join(rejections)
         drift = (now.price_usd / snap.price_usd - 1) * 100

@@ -10,14 +10,14 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 
 | Path | Role |
 |---|---|
-| `tradingbot/config.py` | `Config` dataclass; every field is overridable with a `TB_<FIELD>` env var. Live mode needs `TB_LIVE_CONFIRM=I_ACCEPT_TOTAL_LOSS_RISK` |
+| `tradingbot/config.py` | `Config` dataclass; every field is overridable with a `TB_<FIELD>` env var or `with_overrides({"field": "text"})`. Live mode needs `TB_LIVE_CONFIRM=I_ACCEPT_TOTAL_LOSS_RISK` |
 | `tradingbot/models.py` | `PairSnapshot`, `SafetyReport`, `FactorResult`, `Verdict` (pydantic), `Position` |
 | `tradingbot/data/dexscreener.py` | Discovery feeds (profiles, boosts) + `/tokens/v1/solana/{csv}` pair data. Pump.fun bonding-curve pairs have **no liquidity field** |
 | `tradingbot/data/rugcheck.py` | `api.rugcheck.xyz/v1/tokens/{mint}/report/summary`. `None` result = unsafe |
 | `tradingbot/factors.py` | `market_filters` -> `safety_filters` -> weighted 0..1 composite (`WEIGHTS`). No LLM here |
 | `tradingbot/analyst.py` | Claude call: `claude-opus-5-5`, adaptive thinking, effort `medium`, `web_search_20260209`, JSON-schema `output_config`, server-side refusal fallback (`fallbacks="default"`, beta `server-side-fallback-2026-07-01`), `pause_turn` resume loop, hourly call cap |
 | `tradingbot/risk.py` | Pure sizing + `plan_exits` (stop, time stop, trailing stop, TP ladder; moves stop to breakeven after TP1) |
-| `tradingbot/engine.py` | Two threads: **monitor** (`monitor_interval_s`=10s, Jupiter `/price/v3` with DexScreener fallback, runs exits) and **scan** (`scan_interval_s`=60s: screen -> Claude -> `preflight` (fresh pair, market filters, entry drift, round trip) -> buy; then outcomes). `Book` = per-strategy cash + positions (`MAIN="claude"`); `after_screen()` hook for baselines. `self.lock` guards cash/position mutation; executors are called outside it. `tick()` = synchronous pass for `once`/tests |
+| `tradingbot/engine.py` | Two threads: **monitor** (`monitor_interval_s`=10s, Jupiter `/price/v3` with DexScreener fallback, runs exits) and **scan** (`scan_interval_s`=60s: screen -> Claude -> `preflight` (fresh pair, market filters, entry drift, round trip) -> buy; then outcomes). `Book` = per-strategy cash + positions (`MAIN="claude"`); `after_screen()` hook for baselines. `preflight` takes the entry trigger price from Jupiter `/price/v3` (DexScreener lags fast movers by up to a minute). `self.lock` guards cash/position mutation; executors are called outside it. `tick()` = synchronous pass for `once`/tests |
 | `tradingbot/journal.py` | Thread-safe (`@locked`, one RLock, `check_same_thread=False`). SQLite: `decisions`, `positions` (+`strategy`), `fills` (+`trigger_price` for slippage), `events` (skips, failed txs), `costs` (Claude API, per call), `equity` (snapshot per book every 60s from the monitor thread), `tracking` + `prices` (candidate price paths), `cooldowns`, `downtime`, `state` (`cash:<strategy>`, `heartbeat`). Decision stages: `screened_out`, `survivor` (passed gates, not analysed; tracked once per 6h), `analysed`. Use `query()` for read-only report SQL. `stats()` compares forward returns of Claude buys vs passes |
 | `tradingbot/data/jupiter.py` | `Jupiter` client: `/swap/v1/quote` (impact is returned as a **fraction**, stored as percent), `/price/v3` (USD price, liquidity, decimals; 50 ids/call), `round_trip()` buy-then-sell quote |
 | `tradingbot/execution/sim.py` | **Default paper executor.** Quote -> `sim_latency_s` wait -> re-quote; reverts (fee only) if below the first quote's slippage floor; fills per `sim_fill_mode`; charges priority fee + token-account rent. Exits ignore the impact cap; no route on exit = stuck position |
@@ -27,9 +27,10 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 | `tradingbot/shadows.py` | Baseline books: `filters_only` (buy every survivor, no Claude) and `random` (random picks among Claude-analysed tokens at Claude's smoothed buy rate). Config `shadows` (comma list, "" disables), `shadow_conviction`, `shadow_seed`. Always simulated, even in live mode |
 | `tradingbot/tracker.py` | `Tracker.track(decision_id, token, price)` + `poll()` each scan cycle: samples Jupiter/DexScreener prices for 24h into `prices`, fills `tracking.p1h/p6h/p24h`, `max_price`, `min_price`. Token missing from both feeds while others quote = 0 (rug); no prices at all = sample skipped |
 | Canary (in `engine.py`) | `canary_every_n>0` (paper mode + confirm phrase) adds a `canary` book with the live `JupiterExecutor`, `fixed_usd=canary_usd`, cash `canary_budget_usd`; mirrors every Nth successful Claude buy (`state.canary_count`) on the same `decision_id`. Exit order: claude, canary, then baselines (`BOOK_PRIORITY`). `report.calibration()` compares fee-free swap returns of canary vs its sim twin |
+| `tradingbot/replay.py` | `python -m tradingbot replay --group bought|passed|survivors|filters|all --set k=v --split DATE --size USD`: runs `risk.plan_exits` over `prices` paths from `tracking`; cost model from canary fills (5+), else claude-book fills, else defaults; per-trade view (no slots / daily limit), ~60s exit cadence |
 | `tradingbot/costs.py` | `usage_cost_usd(model, usage)`: list prices per model + web search $10/1k |
 | `tradingbot/report.py` | `build()` -> per-strategy stats (equity, return, max drawdown, win rate, median/mean trade, profit factor, fees, failed txs, Claude API $, net after API, median entry/exit slippage vs trigger, skip reasons) + Claude buy-vs-pass with bootstrap 90% CI; `render()` text table. Warns below 30 closed trades |
-| `tradingbot/cli.py` | `python -m tradingbot scan|once|run|report [--json]` |
+| `tradingbot/cli.py` | `python -m tradingbot scan|once|run|report [--json]|replay` |
 | `tests/` | Offline pytest suite with fake DexScreener, RugCheck and Anthropic clients |
 
 ## Conventions and invariants
@@ -57,18 +58,21 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 
 - **2026-10-11 (realism part 6a):** canary book + calibration report. 50 tests.
 
-## Realism roadmap (in progress)
+- **2026-10-11 (realism part 6b):** replay tool, `Config.with_overrides`, README realism table. Live no-Claude end-to-end run verified real quote fills, fees, tracking and a modelled slippage revert. 55 tests.
+
+## Realism roadmap
 
 1. Done: quote-based fills, round-trip check, fresh price at buy.
 2. Done: separate fast position-monitor thread (Jupiter price API) + trigger price on every fill.
 3. Done: Claude/tx cost accounting + richer report (equity curve, drawdown, medians, CI).
 4. Done: shadow portfolios (`filters_only`, `random`); report prints Claude's edge over each after API cost.
 5. Done: persisted cooldowns + analyst hourly budget (seeded from `costs`), heartbeat-based downtime log, tracker-driven 1h/6h/24h outcomes with max up/down for bought, passed and not-analysed candidates.
-6. Canary live trades for calibration + replay tool from recorded price paths.
+6. Done: canary live trades for calibration + replay tool from recorded price paths.
+
+All six parts are complete. Next real-world step: run in paper mode on an always-on machine with an API key for 2+ weeks, then read `report`.
 
 ## Ideas not yet built
 
 - Holder-concentration and deployer-history factors (Helius/Birdeye; need API keys).
 - X API integration for mention velocity as a numeric factor, alongside Claude's web search.
-- Historical backtester driven by recorded `decisions` snapshots.
 - Telegram alerts / manual-approve mode before live buys.

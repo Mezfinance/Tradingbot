@@ -4,6 +4,7 @@
   python -m tradingbot once     # one full tick (manage, research, enter)
   python -m tradingbot run      # loop forever
   python -m tradingbot report   # journal statistics
+  python -m tradingbot replay --group bought --set stop_loss_pct=20 --split 2026-10-18
 """
 
 from __future__ import annotations
@@ -46,9 +47,14 @@ def build_engine(cfg: Config, with_analyst: bool = True):
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="tradingbot")
-    parser.add_argument("command", choices=["scan", "once", "run", "report"])
+    parser.add_argument("command", choices=["scan", "once", "run", "report", "replay"])
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
+    parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
+    parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
+                        help="replay: override a setting, e.g. stop_loss_pct=20 (repeatable)")
+    parser.add_argument("--split", help="replay: YYYY-MM-DD; tune before it, check after it")
+    parser.add_argument("--size", type=float, default=50.0, help="replay: USD per trade")
     args = parser.parse_args(argv)
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
@@ -63,6 +69,15 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.journal import Journal
         rep = report.build(Journal(cfg.db_path), cfg)
         print(json.dumps(rep, indent=2, default=str) if args.json else report.render(rep))
+        return
+
+    if args.command == "replay":
+        from tradingbot import replay
+        from tradingbot.journal import Journal
+        if args.group not in replay.GROUPS:
+            parser.error(f"--group must be one of {replay.GROUPS}")
+        overrides = dict(kv.split("=", 1) for kv in args.set)
+        print(replay.report(Journal(cfg.db_path), cfg, overrides, args.group, args.size, args.split))
         return
 
     engine = build_engine(cfg, with_analyst=args.command != "scan")
