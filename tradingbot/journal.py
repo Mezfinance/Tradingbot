@@ -249,6 +249,15 @@ class Journal:
         self.db.commit()
 
     @locked
+    def backup(self, path: str) -> None:
+        """Consistent copy of the live database (safe while the bot is running)."""
+        dest = sqlite3.connect(path)
+        try:
+            self.db.backup(dest)
+        finally:
+            dest.close()
+
+    @locked
     def query(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         """Read-only helper for reporting."""
         return self.db.execute(sql, params).fetchall()

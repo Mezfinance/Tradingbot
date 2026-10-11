@@ -16,6 +16,9 @@ class Config:
     db_path: str = "tradingbot.db"
     scan_interval_s: int = 60
     monitor_interval_s: int = 10  # open positions are priced and exited on this cadence
+    watchdog_s: int = 300  # exit (for a supervisor restart) if the monitor loop stalls this long
+    scan_watchdog_s: int = 1800  # same for the scan loop; Claude research makes cycles long
+    health_port: int = 0  # serve GET /health on this port when > 0
 
     # --- hard filters (deterministic, applied before Claude is called) --
     min_liquidity_usd: float = 15_000.0

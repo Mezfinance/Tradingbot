@@ -30,7 +30,9 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 | `tradingbot/replay.py` | `python -m tradingbot replay --group bought|passed|survivors|filters|all --set k=v --split DATE --size USD`: runs `risk.plan_exits` over `prices` paths from `tracking`; cost model from canary fills (5+), else claude-book fills, else defaults; per-trade view (no slots / daily limit), ~60s exit cadence |
 | `tradingbot/costs.py` | `usage_cost_usd(model, usage)`: list prices per model + web search $10/1k |
 | `tradingbot/report.py` | `build()` -> per-strategy stats (equity, return, max drawdown, win rate, median/mean trade, profit factor, fees, failed txs, Claude API $, net after API, median entry/exit slippage vs trigger, skip reasons) + Claude buy-vs-pass with bootstrap 90% CI; `render()` text table. Warns below 30 closed trades |
-| `tradingbot/cli.py` | `python -m tradingbot scan|once|run|report [--json]|replay` |
+| `tradingbot/health.py` | `status()` from `heartbeat` (monitor, `watchdog_s`=300) and `scan_heartbeat` (scan cycle, `scan_watchdog_s`=1800) with start-up grace; `start_watchdog()` calls `os._exit(1)` on a stall so the supervisor restarts; `start_health_server()` serves `GET /health` when `health_port>0` |
+| `tradingbot/cli.py` | `python -m tradingbot scan|once|run|report [--json]|replay|health|backup PATH` |
+| `Dockerfile`, `deploy/entrypoint.sh`, `fly.toml`, `DEPLOY.md` | Fly.io deployment: one machine (`fly scale count 1`; SQLite has one writer), volume `tradingbot_data` at `/data` (14-day snapshots, auto-extend), `restart policy="always"`, private HTTP check on 8080. Entrypoint writes `TB_KEYPAIR_JSON` to `/run/secrets/keypair.json` (0600) and unsets it; the key never touches the volume. `BASE_IMAGE` build arg exists so sandboxes can pull from a mirror |
 | `tests/` | Offline pytest suite with fake DexScreener, RugCheck and Anthropic clients |
 
 ## Conventions and invariants
@@ -59,6 +61,8 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 - **2026-10-11 (realism part 6a):** canary book + calibration report. 50 tests.
 
 - **2026-10-11 (realism part 6b):** replay tool, `Config.with_overrides`, README realism table. Live no-Claude end-to-end run verified real quote fills, fees, tracking and a modelled slippage revert. 55 tests.
+
+- **2026-10-11 (deploy):** Fly.io deployment, watchdog + `/health`, `health`/`backup` commands. Image built and run in Docker here: health OK, report/backup via exec, key kept off the volume. Not yet deployed to Fly by anyone. 60 tests.
 
 ## Realism roadmap
 

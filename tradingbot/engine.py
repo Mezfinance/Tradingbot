@@ -118,9 +118,14 @@ class Engine:
         self.update_outcomes()
 
     def run_forever(self) -> None:
+        from tradingbot import health
+
         monitor = threading.Thread(target=self._loop, name="monitor", daemon=True,
                                    args=(self.cfg.monitor_interval_s, self.manage_positions))
         monitor.start()
+        health.start_watchdog(self.journal, self.cfg, self._stop)
+        if self.cfg.health_port > 0:
+            health.start_health_server(self.journal, self.cfg)
         try:
             self._loop(self.cfg.scan_interval_s, self._scan_cycle)
         finally:
@@ -129,6 +134,7 @@ class Engine:
     def _scan_cycle(self) -> None:
         self.scan_and_enter()
         self.update_outcomes()
+        self.journal.set_state("scan_heartbeat", repr(time.time()))
 
     def _loop(self, interval: float, fn) -> None:
         while not self._stop.is_set():

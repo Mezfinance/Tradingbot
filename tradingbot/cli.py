@@ -47,7 +47,8 @@ def build_engine(cfg: Config, with_analyst: bool = True):
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="tradingbot")
-    parser.add_argument("command", choices=["scan", "once", "run", "report", "replay"])
+    parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup"])
+    parser.add_argument("path", nargs="?", help="backup: destination file")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
     parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
@@ -69,6 +70,21 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.journal import Journal
         rep = report.build(Journal(cfg.db_path), cfg)
         print(json.dumps(rep, indent=2, default=str) if args.json else report.render(rep))
+        return
+
+    if args.command == "health":
+        from tradingbot import health
+        from tradingbot.journal import Journal
+        ok, detail = health.status(Journal(cfg.db_path), cfg)
+        print(json.dumps({"ok": ok, **detail}, indent=2))
+        raise SystemExit(0 if ok else 1)
+
+    if args.command == "backup":
+        from tradingbot.journal import Journal
+        if not args.path:
+            parser.error("backup needs a destination path")
+        Journal(cfg.db_path).backup(args.path)
+        print(f"backed up {cfg.db_path} -> {args.path}")
         return
 
     if args.command == "replay":

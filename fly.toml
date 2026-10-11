@@ -1,0 +1,39 @@
+# Fly.io config for the trading bot: one always-on machine, SQLite on a volume.
+# Change `app` to a unique name, and `primary_region` if you prefer (iad = US East,
+# fra = Frankfurt; both are close to Jupiter and the main Solana RPCs).
+app = "claude-tradingbot"
+primary_region = "iad"
+
+[build]
+
+[env]
+  TB_MODE = "paper"
+  TB_DB_PATH = "/data/tradingbot.db"
+  TB_HEALTH_PORT = "8080"
+
+# The journal. Daily snapshots are kept for 14 days; the volume grows itself if it fills.
+[mounts]
+  source = "tradingbot_data"
+  destination = "/data"
+  snapshot_retention = 14
+  auto_extend_size_threshold = 80
+  auto_extend_size_increment = "1GB"
+  auto_extend_size_limit = "5GB"
+
+# The bot's watchdog exits the process if a loop stalls; this brings it straight back.
+[[restart]]
+  policy = "always"
+
+# Private health check (no public service is exposed). See `fly checks list`.
+[checks]
+  [checks.alive]
+    type = "http"
+    port = 8080
+    path = "/health"
+    interval = "30s"
+    timeout = "5s"
+    grace_period = "2m"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

@@ -64,7 +64,7 @@ pytest                        # offline test suite
 
 `replay` re-runs risk settings over recorded price paths. Tune on data before `--split`, then check on data after it; a setting that only wins before the split is overfitted.
 
-**Run it on a machine that stays on** (a home server or a small VPS), under something that restarts it after a crash, for example `systemd` or `tmux` plus a restart loop. A cloud coding session is shut down after a period of inactivity.
+**Run it on a machine that stays on.** [DEPLOY.md](DEPLOY.md) covers Fly.io: one always-on machine, the journal on a volume, a watchdog that restarts stalled loops, and backups. The `Dockerfile` also works on any VPS or container host.
 
 All settings live in `tradingbot/config.py` and can be overridden with `TB_<NAME>` env vars (e.g. `TB_MIN_LIQUIDITY_USD=30000`). See `.env.example`.
 
