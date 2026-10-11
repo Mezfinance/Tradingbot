@@ -14,7 +14,12 @@ import threading
 import time
 from dataclasses import asdict
 
-from tradingbot.models import FactorResult, PairSnapshot, Position, Verdict
+from tradingbot.models import FactorResult, PairSnapshot, Position, SafetyReport, Verdict
+
+# Columns added after the first deployment; created on start-up if an older database lacks them.
+MIGRATIONS = [
+    ("decisions", "snapshot", "TEXT"),  # full pair + safety snapshot at decision time (JSON)
+]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS decisions (
@@ -53,6 +58,15 @@ CREATE TABLE IF NOT EXISTS fills (
     trigger_price REAL                -- price that triggered the order, for slippage stats
 );
 CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS postmortems (
+    id INTEGER PRIMARY KEY,
+    ts REAL, kind TEXT,               -- trade | missed
+    position_id INTEGER, decision_id INTEGER, token TEXT, symbol TEXT,
+    return_pct REAL, category TEXT,
+    analysis TEXT,                    -- full structured JSON from Claude
+    cost_usd REAL,
+    UNIQUE(kind, position_id, decision_id)
+);
 CREATE TABLE IF NOT EXISTS tracking (
     decision_id INTEGER PRIMARY KEY,  -- one price path per candidate decision
     token TEXT NOT NULL,
@@ -100,6 +114,14 @@ class Journal:
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        for table, column, kind in MIGRATIONS:
+            cols = {r["name"] for r in self.db.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                self.db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+        self.db.commit()
 
     # --- state ------------------------------------------------------------
     @locked
@@ -158,11 +180,14 @@ class Journal:
         verdict: Verdict | None = None,
         analysed: bool = False,
         stage: str | None = None,
+        safety: SafetyReport | None = None,
     ) -> int:
+        snap = asdict(p)
+        snap["safety"] = asdict(safety) if safety is not None else None
         cur = self.db.execute(
             """INSERT INTO decisions(ts, token, symbol, stage, price, liquidity, fdv, factor_score,
-               components, rejections, verdict, action, conviction)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               components, rejections, verdict, action, conviction, snapshot)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 time.time(), p.token_address, p.symbol,
                 stage or ("analysed" if analysed else "screened_out"),
@@ -171,6 +196,7 @@ class Journal:
                 verdict.model_dump_json() if verdict else None,
                 verdict.action if verdict else None,
                 verdict.conviction if verdict else None,
+                json.dumps(snap),
             ),
         )
         self.db.commit()

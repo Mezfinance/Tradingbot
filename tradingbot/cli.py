@@ -48,7 +48,7 @@ def build_engine(cfg: Config, with_analyst: bool = True):
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="tradingbot")
     parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup",
-                                            "backup-now", "backup-list"])
+                                            "backup-now", "backup-list", "learn-now", "postmortems"])
     parser.add_argument("path", nargs="?", help="backup: destination file")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
@@ -86,6 +86,24 @@ def main(argv: list[str] | None = None) -> None:
             parser.error("backup needs a destination path")
         Journal(cfg.db_path).backup(args.path)
         print(f"backed up {cfg.db_path} -> {args.path}")
+        return
+
+    if args.command == "learn-now":
+        from tradingbot.journal import Journal
+        from tradingbot.learning.learner import Learner
+        print(f"completed {Learner(Journal(cfg.db_path), cfg).step()} review(s)")
+        return
+
+    if args.command == "postmortems":
+        from tradingbot.journal import Journal
+        rows = Journal(cfg.db_path).query("SELECT * FROM postmortems ORDER BY ts DESC LIMIT 20")
+        for r in rows:
+            a = json.loads(r["analysis"])
+            ret = "n/a" if r["return_pct"] is None else f"{r['return_pct']:+.1f}%"
+            print(f"[{r['kind']}] {r['symbol']} {ret} {a['category']} ({a['decision_quality']} decision)")
+            print(f"  {a['what_happened']}")
+            if a["lesson"]["statement"]:
+                print(f"  lesson [{a['lesson']['tag']}]: {a['lesson']['statement']}")
         return
 
     if args.command in ("backup-now", "backup-list"):

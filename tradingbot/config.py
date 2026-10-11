@@ -45,6 +45,15 @@ class Config:
     api_transient_pause_s: int = 60  # pause after rate limits, overload or network errors
     min_conviction: float = 0.65  # Claude conviction needed to buy
 
+    # --- self-improvement (see tradingbot/learning) ----------------------
+    learning: bool = True  # run the learning thread inside `run`
+    learning_interval_s: int = 300
+    learning_budget_usd_per_day: float = 5.0  # cap on Claude spend for reviews/optimiser/engineer
+    learning_max_per_cycle: int = 3
+    postmortem_delay_h: float = 6.0  # wait so the review can see what happened after the exit
+    missed_winner_multiple: float = 2.0  # review passes that later reached this multiple
+    missed_reviews_per_day: int = 5
+
     # --- baselines (simulated books traded alongside, see shadows.py) ---
     shadows: str = "filters_only,random"  # "" disables
     shadow_conviction: float = 0.825  # fixed sizing input for baseline buys

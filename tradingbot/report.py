@@ -188,6 +188,16 @@ def calibration(j: Journal) -> dict:
     return {"matched_trades": len(gaps), "median_real_minus_sim_pct": gap, "advice": advice}
 
 
+def learning(j: Journal) -> dict:
+    cats = j.query("SELECT kind, category, COUNT(*) AS n FROM postmortems GROUP BY kind, category ORDER BY n DESC")
+    spend = j.query("SELECT kind, COALESCE(SUM(usd), 0) AS s FROM costs "
+                    "WHERE kind IN ('postmortem','playbook','optimizer','engineer') GROUP BY kind")
+    return {
+        "postmortems": {f"{r['kind']}:{r['category']}": r["n"] for r in cats},
+        "spend_usd": {r["kind"]: round(r["s"], 2) for r in spend},
+    }
+
+
 def downtime(j: Journal) -> dict:
     rows = j.query("SELECT start_ts, end_ts, open_positions FROM downtime")
     return {
@@ -210,6 +220,7 @@ def build(j: Journal, cfg: Config) -> dict:
         "claude_selection": claude_selection(j),
         "downtime": downtime(j),
         "calibration": calibration(j),
+        "learning": learning(j),
         "last_backup": json.loads(j.get_state("last_backup") or "null"),
         "funnel": {r["stage"]: r["n"] for r in funnel},
     }
@@ -272,6 +283,9 @@ def render(rep: dict) -> str:
             verdict = ("buys beat passes" if ci[0] > 0 else "passes beat buys" if ci[1] < 0
                        else "no significant difference yet")
             lines.append(f"  bought - passed at {col[1:]}, 90% interval: {ci[0]:+.1f}% to {ci[1]:+.1f}% -> {verdict}")
+    lrn = rep.get("learning") or {}
+    if lrn.get("postmortems"):
+        lines.append(f"\nLEARNING: post-mortems {lrn['postmortems']}; spend {lrn['spend_usd']}")
     cal = rep["calibration"]
     if cal["matched_trades"]:
         lines.append(f"\nCALIBRATION: {cal['matched_trades']} real canary trades vs their simulated twins; "

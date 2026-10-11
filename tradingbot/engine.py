@@ -126,6 +126,11 @@ class Engine:
                                    args=(self.cfg.monitor_interval_s, self.manage_positions))
         monitor.start()
         health.start_watchdog(self.journal, self.cfg, self._stop)
+        if self.cfg.learning and self.analyst is not None:
+            from tradingbot.learning.learner import Learner
+            learner = Learner(self.journal, self.cfg)
+            threading.Thread(target=self._loop, name="learner", daemon=True,
+                             args=(self.cfg.learning_interval_s, learner.step)).start()
         if self.cfg.health_port > 0:
             health.start_health_server(self.journal, self.cfg)
         try:
@@ -231,7 +236,7 @@ class Engine:
             result = factors.evaluate(snap, safety, self.cfg)
             if not result.passed:
                 self._cool(token)
-                self.journal.log_decision(snap, result)
+                self.journal.log_decision(snap, result, safety=safety)
                 log.info("screened out %s: %s", snap.symbol, "; ".join(result.rejections))
                 continue
             survivors.append((snap, result, safety))
@@ -259,7 +264,7 @@ class Engine:
                         break  # API down or paused: leave this and later candidates queued
                     self._cool(snap.token_address)
                     continue
-                decision_id = self.journal.log_decision(snap, result, verdict, analysed=True)
+                decision_id = self.journal.log_decision(snap, result, verdict, analysed=True, safety=safety)
                 self.tracker.track(decision_id, snap.token_address, snap.price_usd)
                 analysed.append(((snap, result, safety), verdict.action))
                 log.info("%s -> %s (conviction %.2f): %s",
@@ -284,11 +289,11 @@ class Engine:
     def _track_unanalysed(self, survivors: list[Survivor], analysed: list[tuple[Survivor, str]]) -> None:
         """Candidates Claude didn't get to (budget, slots) still get a price path, once per 6h."""
         done = {s[0].token_address for s, _ in analysed}
-        for snap, result, _safety in survivors:
+        for snap, result, safety in survivors:
             if snap.token_address in done or self.journal.recently_seen(snap.token_address, REANALYSE_AFTER_S,
                                                                          stage="survivor"):
                 continue
-            decision_id = self.journal.log_decision(snap, result, stage="survivor")
+            decision_id = self.journal.log_decision(snap, result, stage="survivor", safety=safety)
             self.tracker.track(decision_id, snap.token_address, snap.price_usd)
 
     def after_screen(self, survivors: list[Survivor], analysed: list[tuple[Survivor, str]]) -> None:
