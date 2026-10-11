@@ -15,6 +15,7 @@ class Config:
     starting_cash_usd: float = 1000.0
     db_path: str = "tradingbot.db"
     scan_interval_s: int = 60
+    discovery: str = "dexscreener,geckoterminal"  # token discovery feeds (comma list)
     monitor_interval_s: int = 10  # open positions are priced and exited on this cadence
     watchdog_s: int = 300  # exit (for a supervisor restart) if the monitor loop stalls this long
     scan_watchdog_s: int = 1800  # same for the scan loop; Claude research makes cycles long
@@ -30,7 +31,7 @@ class Config:
     min_liquidity_usd: float = 15_000.0
     min_volume_h1_usd: float = 25_000.0
     min_age_minutes: float = 10.0
-    max_age_hours: float = 72.0
+    max_age_hours: float = 720.0  # 30 days: trending established tokens are often better than fresh launches
     max_fdv_usd: float = 25_000_000.0
     max_rugcheck_score: int = 2_000  # rugcheck raw score; lower is safer
     min_lp_locked_pct: float = 80.0
@@ -39,7 +40,7 @@ class Config:
     # --- Claude analyst -------------------------------------------------
     model: str = "claude-opus-5-5"
     effort: str = "medium"
-    max_web_searches: int = 5
+    max_web_searches: int = 8  # 5 was too few to also check the contract and deployer
     max_analyses_per_hour: int = 20  # cost cap
     api_account_pause_s: int = 600  # pause Claude calls after a billing/auth error
     api_transient_pause_s: int = 60  # pause after rate limits, overload or network errors

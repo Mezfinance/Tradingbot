@@ -86,6 +86,7 @@ def build_brief(p: PairSnapshot, safety: SafetyReport | None, factors: FactorRes
         "buys": p.buys,
         "sells": p.sells,
         "paid_dexscreener_boost": p.boosted,
+        "discovered_via": p.sources,
         "listed_socials": p.socials,
         "rugcheck": None if safety is None else {
             "score": safety.score,

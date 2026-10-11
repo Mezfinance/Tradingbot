@@ -55,8 +55,9 @@ class Engine:
     def __init__(self, cfg: Config, dex: DexScreener, rug: RugCheck, analyst: Analyst | None,
                  executor: Executor, journal: Journal, jupiter: Jupiter | None = None,
                  shadow_executors: dict[str, Executor] | None = None,
-                 canary_executor: Executor | None = None):
+                 canary_executor: Executor | None = None, gecko=None):
         self.cfg, self.dex, self.rug, self.analyst = cfg, dex, rug, analyst
+        self.gecko = gecko  # optional GeckoTerminal discovery (trending by trading activity)
         self.journal = journal
         self.jupiter = jupiter  # None: no round-trip preflight, prices from DexScreener (tests)
         self.books: dict[str, Book] = {MAIN: self._open_book(MAIN, executor)}
@@ -237,13 +238,28 @@ class Engine:
         return True
 
     # --- entries ------------------------------------------------------------
+    def discover(self) -> tuple[dict[str, list[str]], set[str]]:
+        """Token addresses from every enabled feed -> which feeds found them; plus paid-boosted set."""
+        feeds = {f.strip() for f in self.cfg.discovery.split(",") if f.strip()}
+        found: dict[str, list[str]] = {}
+        boosted: set[str] = set()
+        if "dexscreener" in feeds:
+            dex_addrs, boosted = self.dex.discover()
+            for a in dex_addrs:
+                found.setdefault(a, []).append("dexscreener_listings")
+        if "geckoterminal" in feeds and self.gecko is not None:
+            for a in self.gecko.discover():
+                found.setdefault(a, []).append("geckoterminal_trending")
+        return found, boosted
+
     def screen(self) -> list[Survivor]:
         """Discover tokens and return those that clear every deterministic gate, best first."""
-        addrs, boosted = self.dex.discover()
+        addrs, boosted = self.discover()
         survivors: list[Survivor] = []
         now = time.time()
-        for snap in self.dex.pairs(addrs, boosted):
+        for snap in self.dex.pairs(list(addrs), boosted):
             token = snap.token_address
+            snap.sources = addrs.get(token, [])
             if self._cooldown.get(token, 0) > now:
                 continue
             if self.journal.recently_seen(token, REANALYSE_AFTER_S):

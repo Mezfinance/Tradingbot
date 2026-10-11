@@ -30,6 +30,7 @@ class PairSnapshot:
     socials: list[str] = field(default_factory=list)
     boosted: bool = False
     fetched_at: float = field(default_factory=time.time)
+    sources: list[str] = field(default_factory=list)  # discovery feeds that surfaced it
 
     @property
     def age_minutes(self) -> float | None:

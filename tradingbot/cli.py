@@ -41,8 +41,10 @@ def build_engine(cfg: Config, with_analyst: bool = True):
         from tradingbot.execution.jupiter import JupiterExecutor
         canary = JupiterExecutor(cfg, jupiter)
     analyst = Analyst(cfg) if with_analyst else None
+    from tradingbot.data.geckoterminal import GeckoTerminal
+
     return Engine(cfg, DexScreener(), RugCheck(), analyst, executor, Journal(cfg.db_path), jupiter,
-                  shadow_executors=shadow_executors, canary_executor=canary)
+                  shadow_executors=shadow_executors, canary_executor=canary, gecko=GeckoTerminal())
 
 
 def main(argv: list[str] | None = None) -> None:
