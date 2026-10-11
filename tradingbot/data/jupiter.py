@@ -50,7 +50,7 @@ class Jupiter:
         self._last_request = 0.0
 
     def _get(self, path: str, params: dict) -> httpx.Response:
-        """GET with global pacing (both bot threads share this client) and 429 back-off."""
+        """GET with global pacing (both bot threads share this client) and back-off on 429 and 5xx."""
         for attempt in range(RETRIES_ON_429 + 1):
             with self._pace:
                 wait = self._last_request + MIN_REQUEST_INTERVAL_S - time.monotonic()
@@ -58,7 +58,7 @@ class Jupiter:
                     time.sleep(wait)
                 self._last_request = time.monotonic()
             resp = self.http.get(path, params=params)
-            if resp.status_code != 429 or attempt == RETRIES_ON_429:
+            if not (resp.status_code == 429 or resp.status_code >= 500) or attempt == RETRIES_ON_429:
                 return resp
             time.sleep(2 ** attempt)
         return resp

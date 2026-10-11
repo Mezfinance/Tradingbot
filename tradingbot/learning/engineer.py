@@ -186,6 +186,8 @@ class Engineer:
         self.cfg = cfg
         self.restart = restart or (lambda reason: log.warning("restart requested: %s", reason))
         journal.ensure_schema(SCHEMA_SQL)
+        # A proposal left 'building' means the process died mid-attempt; queue it again.
+        journal.execute("UPDATE proposals SET status='open' WHERE status='building'")
 
     # --- scheduling -----------------------------------------------------------
     def in_probation(self) -> dict | None:
@@ -208,6 +210,15 @@ class Engineer:
         prop = dict(rows[0])
         self.journal.set_state("engineer_last_attempt", repr(time.time()))
         self.journal.execute("UPDATE proposals SET status='building' WHERE id=?", (prop["id"],))
+        try:
+            return self._build(client, prop)
+        except Exception as exc:  # infrastructure error, not the proposal's fault: retry next interval
+            log.exception("engineer: attempt on %r crashed", prop["title"])
+            self.journal.execute("UPDATE proposals SET status='open' WHERE id=? AND status='building'", (prop["id"],))
+            self.journal.log_event("engineer_crashed", None, f"{prop['title']}: {type(exc).__name__}: {exc}"[:500])
+            return None
+
+    def _build(self, client, prop: dict) -> LLMResult | None:
         name = f"p{prop['id']}_{int(time.time())}"
         ws = codebase.make_workspace(self.cfg, name)
         baseline = tree_digests(ws)

@@ -26,6 +26,7 @@ log = logging.getLogger(__name__)
 
 OK, FAILED, UNAVAILABLE = "ok", "failed", "unavailable"
 MAX_PAUSE_RESUMES = 4
+STREAM_ABOVE_TOKENS = 16000
 
 
 @dataclass
@@ -49,6 +50,11 @@ def _request(client, cfg: Config, *, system: str, messages: list, tools: list, s
     )
     if tools:
         kwargs["tools"] = tools
+    # The SDK refuses non-streaming requests whose max_tokens could run past 10 minutes.
+    stream = getattr(client.beta.messages, "stream", None)
+    if max_tokens > STREAM_ABOVE_TOKENS and stream is not None:
+        with stream(**kwargs) as s:
+            return s.get_final_message()
     return client.beta.messages.create(**kwargs)
 
 
