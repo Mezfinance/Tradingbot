@@ -28,6 +28,7 @@ from tradingbot.execution.base import Executor, Fill
 from tradingbot.journal import Journal
 from tradingbot.models import FactorResult, PairSnapshot, Position, SafetyReport
 from tradingbot.tracker import Tracker
+from tradingbot.backups import DailyBackup
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ class Engine:
         self._rng = random.Random(cfg.shadow_seed)
         self.lock = threading.RLock()  # guards book cash and position state
         self.tracker = Tracker(journal, dex, jupiter)
+        self.backups = DailyBackup(journal, cfg)
         self._cooldown: dict[str, float] = journal.load_cooldowns()  # token -> time it may be re-screened
         self._last_prices: dict[str, float] = {}
         self._last_snapshot = 0.0
@@ -134,6 +136,7 @@ class Engine:
     def _scan_cycle(self) -> None:
         self.scan_and_enter()
         self.update_outcomes()
+        self.backups.run_if_due()
         self.journal.set_state("scan_heartbeat", repr(time.time()))
 
     def _loop(self, interval: float, fn) -> None:

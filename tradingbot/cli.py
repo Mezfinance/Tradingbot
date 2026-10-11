@@ -47,7 +47,8 @@ def build_engine(cfg: Config, with_analyst: bool = True):
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="tradingbot")
-    parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup"])
+    parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup",
+                                            "backup-now", "backup-list"])
     parser.add_argument("path", nargs="?", help="backup: destination file")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
@@ -86,6 +87,16 @@ def main(argv: list[str] | None = None) -> None:
         Journal(cfg.db_path).backup(args.path)
         print(f"backed up {cfg.db_path} -> {args.path}")
         return
+
+    if args.command in ("backup-now", "backup-list"):
+        from tradingbot import backups
+        from tradingbot.journal import Journal
+        if args.command == "backup-now":
+            out = backups.DailyBackup(Journal(cfg.db_path), cfg).run()
+        else:
+            out = backups.list_backups(cfg)
+        print(json.dumps(out, indent=2))
+        raise SystemExit(1 if isinstance(out, dict) and out.get("error") else 0)
 
     if args.command == "replay":
         from tradingbot import replay

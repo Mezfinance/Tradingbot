@@ -20,6 +20,12 @@ class Config:
     scan_watchdog_s: int = 1800  # same for the scan loop; Claude research makes cycles long
     health_port: int = 0  # serve GET /health on this port when > 0
 
+    # --- daily journal backups (see backups.py) --------------------------
+    backup_hour_utc: int = 0  # back up on the first scan cycle after this UTC hour each day
+    backup_keep_local: int = 7  # compressed copies kept on the volume
+    backup_dir: str = ""  # default: a "backups" folder next to the database
+    backup_prefix: str = "journal/"  # key prefix in the bucket
+
     # --- hard filters (deterministic, applied before Claude is called) --
     min_liquidity_usd: float = 15_000.0
     min_volume_h1_usd: float = 25_000.0

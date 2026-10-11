@@ -35,17 +35,47 @@ Watch the first hour of logs after setting the API key. That's the first real Cl
 
 ## 3. Back up the journal
 
-Fly snapshots the volume daily and keeps 14 days (`snapshot_retention` in fly.toml). To take a copy yourself:
+The bot backs itself up once a day, on the first scan after midnight UTC (`TB_BACKUP_HOUR_UTC`). It also makes one straight away on first start-up.
+
+| Copy | Where | Kept for |
+|---|---|---|
+| Compressed journal (`tradingbot-YYYY-MM-DD.db.gz`) | `/data/backups` on the volume | Newest 7 (`TB_BACKUP_KEEP_LOCAL`) |
+| The same file, uploaded | Your Tigris bucket under `journal/` | Forever (each is small) |
+| Whole-volume snapshot | Fly, automatic | 14 days |
+
+**Turn on the bucket upload (once):**
 
 ```bash
-fly ssh console -C "python -m tradingbot backup /data/backup.db"
-fly ssh sftp get /data/backup.db ./tradingbot-$(date +%F).db
+fly storage create        # creates a Tigris bucket and adds its credentials to the app
+git pull && fly deploy
 ```
 
-`backup` uses SQLite's online backup, so it's safe while the bot is running. Run `report` or `replay` locally against the copy:
+`fly storage create` prints the bucket credentials once, so save them in your password manager.
+
+**Check backups:**
 
 ```bash
-TB_DB_PATH=./tradingbot-2026-10-25.db python -m tradingbot report
+fly ssh console -C "python -m tradingbot backup-list"   # local and bucket copies
+fly ssh console -C "python -m tradingbot backup-now"    # make one immediately
+```
+
+The `report` also ends with a `LAST BACKUP` line, and a failed backup is logged as `daily backup failed` without stopping trading.
+
+**Get a copy onto your laptop**, either from the volume:
+
+```bash
+fly ssh sftp get /data/backups/tradingbot-2026-10-12.db.gz ./
+gunzip tradingbot-2026-10-12.db.gz
+TB_DB_PATH=./tradingbot-2026-10-12.db python -m tradingbot report
+```
+
+or from the bucket, using any S3 tool with the credentials `fly storage create` printed (endpoint `https://t3.storage.dev`, region `auto`).
+
+**Snapshot retention:** if you created the volume by hand before the first deploy, set retention explicitly:
+
+```bash
+fly volumes list                                      # find the volume ID
+fly volumes update <volume-id> --snapshot-retention 14
 ```
 
 ## 4. Change settings

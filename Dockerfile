@@ -8,8 +8,8 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY tradingbot ./tradingbot
-# [live] adds solders, needed only for canary/live trades but small enough to always include.
-RUN pip install ".[live]"
+# [live] adds solders (canary/live trades); [backup] adds boto3 (daily uploads to object storage).
+RUN pip install ".[live,backup]"
 
 COPY deploy/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

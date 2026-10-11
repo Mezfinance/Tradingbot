@@ -31,7 +31,8 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 | `tradingbot/costs.py` | `usage_cost_usd(model, usage)`: list prices per model + web search $10/1k |
 | `tradingbot/report.py` | `build()` -> per-strategy stats (equity, return, max drawdown, win rate, median/mean trade, profit factor, fees, failed txs, Claude API $, net after API, median entry/exit slippage vs trigger, skip reasons) + Claude buy-vs-pass with bootstrap 90% CI; `render()` text table. Warns below 30 closed trades |
 | `tradingbot/health.py` | `status()` from `heartbeat` (monitor, `watchdog_s`=300) and `scan_heartbeat` (scan cycle, `scan_watchdog_s`=1800) with start-up grace; `start_watchdog()` calls `os._exit(1)` on a stall so the supervisor restarts; `start_health_server()` serves `GET /health` when `health_port>0` |
-| `tradingbot/cli.py` | `python -m tradingbot scan|once|run|report [--json]|replay|health|backup PATH` |
+| `tradingbot/backups.py` | `DailyBackup.run_if_due()` from the scan cycle: once per UTC day after `backup_hour_utc` (and on first start), online SQLite copy -> gzip to `<db dir>/backups/tradingbot-YYYY-MM-DD.db.gz`, keep `backup_keep_local`=7, upload to `$BUCKET_NAME` under `backup_prefix`=`journal/` via boto3 (`AWS_ENDPOINT_URL_S3`, region `auto`) when `fly storage create` secrets exist. Never raises; failures -> `events.backup_failed`; result in `state.last_backup` (shown in report). Skipped for `:memory:` DBs |
+| `tradingbot/cli.py` | `python -m tradingbot scan|once|run|report [--json]|replay|health|backup PATH|backup-now|backup-list` |
 | `Dockerfile`, `deploy/entrypoint.sh`, `fly.toml`, `DEPLOY.md` | Fly.io deployment: one machine (`fly scale count 1`; SQLite has one writer), volume `tradingbot_data` at `/data` (14-day snapshots, auto-extend), `restart policy="always"`, private HTTP check on 8080. Entrypoint writes `TB_KEYPAIR_JSON` to `/run/secrets/keypair.json` (0600) and unsets it; the key never touches the volume. `BASE_IMAGE` build arg exists so sandboxes can pull from a mirror |
 | `tests/` | Offline pytest suite with fake DexScreener, RugCheck and Anthropic clients |
 
@@ -63,6 +64,7 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 - **2026-10-11 (realism part 6b):** replay tool, `Config.with_overrides`, README realism table. Live no-Claude end-to-end run verified real quote fills, fees, tracking and a modelled slippage revert. 55 tests.
 
 - **2026-10-11:** Fly app created by the user as `supermeme` (region `iad`); `fly.toml` updated. First deploy ran; the first real Claude call reached the API and was rejected only for low credit (user then added funds).
+- **2026-10-11 (backups):** daily compressed journal backups to the volume + Tigris bucket (`[backup]` extra = boto3; Dockerfile installs `.[live,backup]`). Upload verified against moto S3; container verified locally. User still needs `fly storage create` + `fly deploy`. 72 tests.
 - **2026-10-11 (api errors):** billing/auth/transient Claude errors pause analysis instead of setting candidates aside. 65 tests. Needs `fly deploy` to reach the running bot.
 - **2026-10-11 (deploy):** Fly.io deployment, watchdog + `/health`, `health`/`backup` commands. Image built and run in Docker here: health OK, report/backup via exec, key kept off the volume. Not yet deployed to Fly by anyone. 60 tests.
 

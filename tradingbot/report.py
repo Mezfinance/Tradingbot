@@ -8,6 +8,7 @@ strategy's average look good.
 
 from __future__ import annotations
 
+import json
 import random
 import re
 import statistics
@@ -209,6 +210,7 @@ def build(j: Journal, cfg: Config) -> dict:
         "claude_selection": claude_selection(j),
         "downtime": downtime(j),
         "calibration": calibration(j),
+        "last_backup": json.loads(j.get_state("last_backup") or "null"),
         "funnel": {r["stage"]: r["n"] for r in funnel},
     }
 
@@ -275,6 +277,12 @@ def render(rep: dict) -> str:
         lines.append(f"\nCALIBRATION: {cal['matched_trades']} real canary trades vs their simulated twins; "
                      f"median real - sim = {_fmt(cal['median_real_minus_sim_pct'], ' pts')}"
                      + (f" -> {cal['advice']}" if cal["advice"] else " (need 5+ for advice)"))
+    bk = rep.get("last_backup")
+    if bk:
+        where = bk["uploaded"] or "volume only"
+        lines.append(f"\nLAST BACKUP: {bk['date']} -> {where}" + (f"  FAILED: {bk['error']}" if bk["error"] else ""))
+    else:
+        lines.append("\nLAST BACKUP: none yet")
     dt = rep["downtime"]
     if dt["outages"]:
         lines.append(f"\nDOWNTIME: {dt['outages']} outage(s), {dt['hours_offline']:.1f}h offline, "
