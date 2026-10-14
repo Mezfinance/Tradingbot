@@ -129,6 +129,7 @@ GROUPS = (
     ("bought", "d.stage='analysed' AND d.action='buy'"),
     ("passed", "d.stage='analysed' AND d.action='pass'"),
     ("not analysed", "d.stage='survivor'"),
+    ("triaged out", "d.stage='triaged_out'"),
 )
 
 
@@ -227,6 +228,30 @@ def social(j: Journal) -> dict:
     return out
 
 
+def triage(j: Journal, cfg: Config) -> dict:
+    """What the cheap first pass sent on, what it skipped, and what Opus made of the audited skips."""
+    rows = j.query("SELECT stage, action, conviction, triage FROM decisions WHERE triage IS NOT NULL")
+    if not rows:
+        return {}
+    tri = [(r, json.loads(r["triage"])) for r in rows]
+    audits = [r for r, t in tri if t.get("audit") and r["stage"] == "analysed"]
+    spend = {r["kind"]: r["s"] for r in j.query(
+        "SELECT kind, COALESCE(SUM(usd), 0) AS s, COUNT(*) AS n FROM costs "
+        "WHERE kind IN ('triage', 'claude_api') GROUP BY kind")}
+    n_full = j.query("SELECT COUNT(*) AS n FROM costs WHERE kind='claude_api'")[0]["n"]
+    skipped = sum(r["stage"] == "triaged_out" for r, _ in tri)
+    return {
+        "checked": len(tri),
+        "sent_on": sum(t["decision"] == "analyse" for _, t in tri),
+        "skipped": skipped,
+        "audited_skips": len(audits),
+        "audited_skips_opus_would_buy": sum(r["action"] == "buy" and (r["conviction"] or 0) >= cfg.min_conviction
+                                            for r in audits),
+        "triage_spend_usd": spend.get("triage", 0.0),
+        "full_analyses_avoided_usd": skipped * (spend.get("claude_api", 0.0) / n_full if n_full else 0.0),
+    }
+
+
 def downtime(j: Journal) -> dict:
     rows = j.query("SELECT start_ts, end_ts, open_positions FROM downtime")
     return {
@@ -249,6 +274,7 @@ def build(j: Journal, cfg: Config) -> dict:
         "claude_selection": claude_selection(j),
         "downtime": downtime(j),
         "social": social(j),
+        "triage": triage(j, cfg),
         "calibration": calibration(j),
         "learning": learning(j),
         "last_backup": json.loads(j.get_state("last_backup") or "null"),
@@ -342,6 +368,13 @@ def render(rep: dict) -> str:
             g = soc[label]
             lines.append(f"  {label:<5} n={g['n']:<4} median 6h {_fmt(g['median_6h_pct'], '%', 1):>8}   "
                          f"median best {_fmt(g['median_max_up_pct'], '%', 1):>8}")
+    tri = rep.get("triage") or {}
+    if tri:
+        lines.append(f"\nTRIAGE: {tri['checked']} checked, {tri['sent_on']} sent to full analysis, "
+                     f"{tri['skipped']} skipped; triage cost ${tri['triage_spend_usd']:.2f}, "
+                     f"~${tri['full_analyses_avoided_usd']:.2f} of full analyses avoided")
+        lines.append(f"  audited skips (sent on anyway): {tri['audited_skips']}, "
+                     f"of which the full analysis would buy {tri['audited_skips_opus_would_buy']}")
     dt = rep["downtime"]
     if dt["outages"]:
         lines.append(f"\nDOWNTIME: {dt['outages']} outage(s), {dt['hours_offline']:.1f}h offline, "

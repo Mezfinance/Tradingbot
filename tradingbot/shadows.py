@@ -5,7 +5,7 @@ fill model and costs as the Claude book. Only the selection rule differs:
 
   filters_only  buy every token that clears the deterministic gates (no Claude).
                 If Claude cannot beat this, the API spend is wasted.
-  random        among the tokens Claude analysed, buy at random with Claude's
+  random        among the tokens Claude looked at (triage included), buy at random with Claude's
                 own historical buy rate. If Claude cannot beat this, its picks
                 carry no information beyond the filters.
 """
@@ -31,11 +31,11 @@ def parse_shadows(spec: str) -> list[str]:
 
 
 def claude_buy_rate(journal: Journal, cfg: Config) -> float:
-    """Share of analysed tokens Claude chose to buy, shrunk towards a prior while samples are few."""
+    """Share of candidates Claude chose to buy (triage skips count as passes), shrunk towards a prior."""
     row = journal.query(
         """SELECT COUNT(*) AS n,
                   COALESCE(SUM(action='buy' AND conviction>=?), 0) AS buys
-           FROM decisions WHERE stage='analysed'""",
+           FROM decisions WHERE stage IN ('analysed', 'triaged_out')""",
         (cfg.min_conviction,),
     )[0]
     return (row["buys"] + PRIOR_BUY_RATE * PRIOR_WEIGHT) / (row["n"] + PRIOR_WEIGHT)

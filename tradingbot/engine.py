@@ -55,8 +55,9 @@ class Engine:
     def __init__(self, cfg: Config, dex: DexScreener, rug: RugCheck, analyst: Analyst | None,
                  executor: Executor, journal: Journal, jupiter: Jupiter | None = None,
                  shadow_executors: dict[str, Executor] | None = None,
-                 canary_executor: Executor | None = None, gecko=None):
+                 canary_executor: Executor | None = None, gecko=None, triage=None):
         self.cfg, self.dex, self.rug, self.analyst = cfg, dex, rug, analyst
+        self.triage = triage  # optional cheap first pass before the analyst (tradingbot/triage.py)
         self.gecko = gecko  # optional GeckoTerminal discovery (trending by trading activity)
         self.journal = journal
         self.jupiter = jupiter  # None: no round-trip preflight, prices from DexScreener (tests)
@@ -264,7 +265,8 @@ class Engine:
             snap.sources = addrs.get(token, [])
             if self._cooldown.get(token, 0) > now:
                 continue
-            if self.journal.recently_seen(token, REANALYSE_AFTER_S):
+            if (self.journal.recently_seen(token, REANALYSE_AFTER_S)
+                    or self.journal.recently_seen(token, REANALYSE_AFTER_S, stage="triaged_out")):
                 continue
             if factors.market_filters(snap, self.cfg):
                 continue
@@ -291,6 +293,19 @@ class Engine:
                     break
                 if snap.token_address in held:
                     continue
+                tri = None
+                if self.triage is not None:
+                    tri = self.triage.check(snap, safety, result)
+                    if self.triage.last_cost_usd:
+                        self.journal.log_cost("triage", self.triage.last_cost_usd, snap.token_address, MAIN)
+                    if self.triage.last_outcome == "unavailable":
+                        break  # API down: leave this and later candidates queued
+                    if not self.triage.goes_on(tri):
+                        decision_id = self.journal.log_decision(snap, result, stage="triaged_out", safety=safety,
+                                                                triage=tri)
+                        self.tracker.track(decision_id, snap.token_address, snap.price_usd)
+                        analysed.append(((snap, result, safety), "pass"))  # same pool for the random baseline
+                        continue
                 verdict = self.analyst.analyse(snap, safety, result)
                 cost = getattr(self.analyst, "last_cost_usd", 0.0)
                 if cost:
@@ -301,7 +316,8 @@ class Engine:
                     self._cool(snap.token_address)
                     continue
                 decision_id = self.journal.log_decision(snap, result, verdict, analysed=True, safety=safety,
-                                                        playbook_arm=getattr(self.analyst, "last_arm", None))
+                                                        playbook_arm=getattr(self.analyst, "last_arm", None),
+                                                        triage=tri)
                 self.tracker.track(decision_id, snap.token_address, snap.price_usd)
                 analysed.append(((snap, result, safety), verdict.action))
                 log.info("%s -> %s (conviction %.2f): %s",

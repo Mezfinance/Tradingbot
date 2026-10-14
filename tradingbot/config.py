@@ -52,6 +52,11 @@ class Config:
     effort: str = "medium"
     max_web_searches: int = 8  # 5 was too few to also check the contract and deployer
     max_analyses_per_hour: int = 20  # cost cap
+    # cheap first pass: a small model drops obvious junk before the full analysis (tradingbot/triage.py)
+    triage: bool = True
+    triage_model: str = "claude-haiku-5-5"
+    triage_effort: str = "low"
+    triage_audit_pct: float = 10.0  # share of triage skips sent to the full analysis anyway, to measure triage
     api_account_pause_s: int = 600  # pause Claude calls after a billing/auth error
     api_transient_pause_s: int = 60  # pause after rate limits, overload or network errors
     min_conviction: float = 0.65  # Claude conviction needed to buy

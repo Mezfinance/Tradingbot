@@ -39,15 +39,17 @@ class LLMResult:
 
 
 def _request(client, cfg: Config, *, system: str, messages: list, tools: list, schema: dict | None,
-             effort: str, max_tokens: int):
+             effort: str, max_tokens: int, model: str | None = None):
+    model = model or cfg.model
     output_config: dict = {"effort": effort}
     if schema is not None:
         output_config["format"] = {"type": "json_schema", "schema": schema}
     kwargs = dict(
-        model=cfg.model, max_tokens=max_tokens, system=system, messages=messages,
+        model=model, max_tokens=max_tokens, system=system, messages=messages,
         thinking={"type": "adaptive"}, output_config=output_config,
-        betas=["server-side-fallback-2026-07-01"], fallbacks="default",
     )
+    if not model.startswith("claude-haiku"):  # Haiku has no server-side refusal fallback
+        kwargs.update(betas=["server-side-fallback-2026-07-01"], fallbacks="default")
     if tools:
         kwargs["tools"] = tools
     # The SDK refuses non-streaming requests whose max_tokens could run past 10 minutes.
@@ -80,7 +82,7 @@ def _final_json(content) -> dict | None:
 
 
 def structured_call(client, cfg: Config, *, system: str, user: str, schema: dict, web_searches: int = 0,
-                    effort: str = "medium", max_tokens: int = 16000) -> LLMResult:
+                    effort: str = "medium", max_tokens: int = 16000, model: str | None = None) -> LLMResult:
     tools = ([{"type": "web_search_20260209", "name": "web_search", "max_uses": web_searches}]
              if web_searches > 0 else [])
     messages: list = [{"role": "user", "content": user}]
@@ -88,8 +90,8 @@ def structured_call(client, cfg: Config, *, system: str, user: str, schema: dict
     try:
         for _ in range(MAX_PAUSE_RESUMES + 1):
             resp = _request(client, cfg, system=system, messages=messages, tools=tools, schema=schema,
-                            effort=effort, max_tokens=max_tokens)
-            result.cost_usd += usage_cost_usd(getattr(resp, "model", cfg.model), resp.usage)
+                            effort=effort, max_tokens=max_tokens, model=model)
+            result.cost_usd += usage_cost_usd(getattr(resp, "model", None) or model or cfg.model, resp.usage)
             if resp.stop_reason != "pause_turn":
                 break
             messages = [messages[0], {"role": "assistant", "content": resp.content}]

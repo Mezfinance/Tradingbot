@@ -21,6 +21,7 @@ MIGRATIONS = [
     ("decisions", "snapshot", "TEXT"),  # full pair + safety snapshot at decision time (JSON)
     ("decisions", "playbook_arm", "TEXT"),  # "playbook:<ver>" | "control:<ver>" | "none" (A/B test)
     ("decisions", "social_score", "REAL"),  # Claude's 0-1 organic social demand score
+    ("decisions", "triage", "TEXT"),  # first-pass verdict JSON {decision, reason, red_flags, audit}
 ]
 
 SCHEMA = """
@@ -184,6 +185,7 @@ class Journal:
         stage: str | None = None,
         safety: SafetyReport | None = None,
         playbook_arm: str | None = None,
+        triage: dict | None = None,
     ) -> int:
         snap = asdict(p)
         snap["safety"] = asdict(safety) if safety is not None else None
@@ -191,8 +193,8 @@ class Journal:
         snap["partial_lock"] = factors.partial_lock
         cur = self.db.execute(
             """INSERT INTO decisions(ts, token, symbol, stage, price, liquidity, fdv, factor_score,
-               components, rejections, verdict, action, conviction, snapshot, playbook_arm, social_score)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               components, rejections, verdict, action, conviction, snapshot, playbook_arm, social_score, triage)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 time.time(), p.token_address, p.symbol,
                 stage or ("analysed" if analysed else "screened_out"),
@@ -204,6 +206,7 @@ class Journal:
                 json.dumps(snap),
                 playbook_arm,
                 verdict.social_score if verdict else None,
+                json.dumps(triage) if triage is not None else None,
             ),
         )
         self.db.commit()
