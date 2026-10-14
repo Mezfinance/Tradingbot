@@ -57,7 +57,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup",
                                             "backup-now", "backup-list", "learn-now", "postmortems", "playbook", "optimize-now", "settings",
                                             "settings-rollback", "code-versions", "code-diff", "code-rollback",
-                                            "propose", "proposals", "watch-status"])
+                                            "propose", "proposals", "watch-status", "watch-report",
+                                            "watch-export"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -67,6 +68,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="replay: override a setting, e.g. stop_loss_pct=20 (repeatable)")
     parser.add_argument("--split", help="replay: YYYY-MM-DD; tune before it, check after it")
     parser.add_argument("--size", type=float, default=50.0, help="replay: USD per trade")
+    parser.add_argument("--age", type=int, default=15, help="watch-report/watch-export: feature age in minutes")
+    parser.add_argument("--label", default="pump2x", help="watch-report: pump2x | pump5x | clean2x")
     parser.add_argument("--idea", help="propose: what to build")
     parser.add_argument("--problem", default="", help="propose: what it should fix or improve")
     parser.add_argument("--priority", type=int, default=1, help="propose: 1 (first) to 5 (last)")
@@ -175,6 +178,23 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "watch-status":
         from tradingbot.watcher import Watcher
         print(json.dumps(Watcher.from_config(cfg).status(), indent=2))
+        return
+
+    if args.command in ("watch-report", "watch-export"):
+        from tradingbot import watch_analysis
+        from tradingbot.watcher import WatchStore, watch_db_path
+        store = WatchStore(watch_db_path(cfg))
+        if args.command == "watch-export":
+            if not args.path:
+                parser.error("watch-export needs a destination file, e.g. /data/watch-rows.csv")
+            print(f"wrote {watch_analysis.export_csv(store, args.path, args.age)} rows to {args.path}")
+            return
+        if args.label not in ("pump2x", "pump5x", "clean2x"):
+            parser.error("--label must be pump2x, pump5x or clean2x")
+        detail = watch_analysis.analyse(store, args.age, args.label)
+        summ = watch_analysis.summary(store, args.label)
+        print(json.dumps({"summary": summ, "detail": detail}, indent=2, default=str) if args.json
+              else watch_analysis.render(detail, summ))
         return
 
     if args.command == "playbook":
