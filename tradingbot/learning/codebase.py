@@ -190,6 +190,21 @@ def active_version(cfg: Config) -> str | None:
     return f.read_text().strip() or None if f.exists() else None
 
 
+def record_running(cfg: Config) -> None:
+    """Note which code the bot process runs; other processes (ssh, CLI) don't inherit its env."""
+    root = code_root(cfg)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "running").write_text(current_version() or "image")
+
+
+def running_version(cfg: Config) -> str:
+    """Code the bot process is running: this process's own if it is the bot, else what it recorded."""
+    if current_version():
+        return current_version()
+    f = code_root(cfg) / "running"
+    return f.read_text().strip() if f.exists() else "image"
+
+
 def mark_healthy(cfg: Config) -> None:
     """Called once the process has run cleanly for a while: the crash counter starts over."""
     f = code_root(cfg) / "boots"

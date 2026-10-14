@@ -96,3 +96,12 @@ def test_jupiter_retries_server_errors(monkeypatch):
     jup = Jupiter(http=httpx.Client(transport=httpx.MockTransport(handler), base_url="https://x"))
     assert jup.quote(jupiter_mod.USDC_MINT, "TOK", 1_000_000) is not None
     assert len(calls) == 3
+
+
+def test_running_version_is_visible_to_other_processes(tmp_path, monkeypatch):
+    from tradingbot.learning import codebase
+    cfg = Config(db_path=str(tmp_path / "bot.db"), code_dir=str(tmp_path / "code"))
+    monkeypatch.setenv("TB_CODE_VERSION", "v1")
+    codebase.record_running(cfg)
+    monkeypatch.delenv("TB_CODE_VERSION")  # an ssh session doesn't inherit the bot's env
+    assert codebase.running_version(cfg) == "v1"

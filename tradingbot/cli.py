@@ -149,8 +149,10 @@ def main(argv: list[str] | None = None) -> None:
     if args.command in ("code-versions", "code-diff", "code-rollback"):
         from tradingbot.learning import codebase
         if args.command == "code-versions":
-            running = codebase.current_version() or "image"
+            running = codebase.running_version(cfg)
             print(f"running now: {running}; active on next start: {codebase.active_version(cfg) or 'image'}")
+            if codebase.crashed_versions(cfg):
+                print(f"fell back from (crash loop or bad checksum): {codebase.crashed_versions(cfg)}")
             for v in codebase.list_versions(cfg):
                 flags = ("ACTIVE " if v["active"] else "") + ("" if v["verified"] else "CHECKSUM-FAILED ")
                 print(f"{v['version']} <- {v['parent'] or 'image'} {flags}:: {v.get('title', '')}")
@@ -214,6 +216,9 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "once":
         engine.tick()
     else:
+        if cfg.db_path != ":memory:":
+            from tradingbot.learning import codebase
+            codebase.record_running(cfg)
         engine.run_forever()
         if engine.restart_reason:
             # Exit so the supervisor (Fly restart policy, systemd, Docker) starts the new code.
