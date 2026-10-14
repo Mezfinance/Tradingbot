@@ -105,3 +105,23 @@ def test_running_version_is_visible_to_other_processes(tmp_path, monkeypatch):
     codebase.record_running(cfg)
     monkeypatch.delenv("TB_CODE_VERSION")  # an ssh session doesn't inherit the bot's env
     assert codebase.running_version(cfg) == "v1"
+
+
+def test_tracker_samples_on_its_own_thread_not_after_claude(cfg, good_pair, safe, monkeypatch):
+    """Polling after each scan cycle left ~18-minute gaps in price paths while Claude was busy."""
+    from tradingbot import health
+    from tradingbot.engine import Engine
+    from tradingbot.execution.paper import PaperExecutor
+    from tests.test_analyst_engine import FakeDex
+    monkeypatch.setattr(health, "start_watchdog", lambda *a, **k: None)
+    eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: safe), None,
+                 PaperExecutor(cfg), Journal(":memory:"))
+    loops = []
+    monkeypatch.setattr(eng, "_loop", lambda interval, fn: loops.append((interval, fn.__name__)))
+    eng.run_forever()
+    assert (cfg.track_interval_s, "update_outcomes") in loops
+    polled = []
+    monkeypatch.setattr(eng.tracker, "poll", lambda: polled.append(1))
+    monkeypatch.setattr(eng, "scan_and_enter", lambda: None)
+    eng._scan_cycle()
+    assert polled == []

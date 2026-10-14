@@ -139,6 +139,9 @@ class Engine:
             learner = Learner(self.journal, self.cfg, restart=self.request_restart)
             threading.Thread(target=self._loop, name="learner", daemon=True,
                              args=(self.cfg.learning_interval_s, learner.step)).start()
+        # Own thread: sampling after each scan cycle left ~18-minute gaps while Claude was busy.
+        threading.Thread(target=self._loop, name="tracker", daemon=True,
+                         args=(self.cfg.track_interval_s, self.update_outcomes)).start()
         if self.cfg.health_port > 0:
             health.start_health_server(self.journal, self.cfg)
         try:
@@ -148,7 +151,6 @@ class Engine:
 
     def _scan_cycle(self) -> None:
         self.scan_and_enter()
-        self.update_outcomes()
         self.backups.run_if_due()
         self.journal.set_state("scan_heartbeat", repr(time.time()))
 

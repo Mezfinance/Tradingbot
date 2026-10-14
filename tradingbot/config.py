@@ -17,6 +17,7 @@ class Config:
     scan_interval_s: int = 60
     discovery: str = "dexscreener,geckoterminal"  # token discovery feeds (comma list)
     monitor_interval_s: int = 10  # open positions are priced and exited on this cadence
+    track_interval_s: int = 60  # candidate price paths (tracker) are sampled on this cadence
     watchdog_s: int = 300  # exit (for a supervisor restart) if the monitor loop stalls this long
     scan_watchdog_s: int = 1800  # same for the scan loop; Claude research makes cycles long
     health_port: int = 0  # serve GET /health on this port when > 0
