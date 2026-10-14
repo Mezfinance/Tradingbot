@@ -140,6 +140,11 @@ class Engine:
             learner = Learner(self.journal, self.cfg, restart=self.request_restart)
             threading.Thread(target=self._loop, name="learner", daemon=True,
                              args=(self.cfg.learning_interval_s, learner.step)).start()
+        if self.cfg.watch and self.cfg.db_path != ":memory:":
+            from tradingbot.watcher import Watcher  # research only: records new pools, never trades
+            watcher = Watcher.from_config(self.cfg)
+            threading.Thread(target=self._loop, name="watcher", daemon=True,
+                             args=(self.cfg.watch_poll_s, watcher.step)).start()
         # Own thread: sampling after each scan cycle left ~18-minute gaps while Claude was busy.
         threading.Thread(target=self._loop, name="tracker", daemon=True,
                          args=(self.cfg.track_interval_s, self.update_outcomes)).start()

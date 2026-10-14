@@ -27,6 +27,15 @@ class Config:
     backup_keep_local: int = 7  # compressed copies kept on the volume
     backup_dir: str = ""  # default: a "backups" folder next to the database
     backup_prefix: str = "journal/"  # key prefix in the bucket
+    # --- pump watcher (tradingbot/watcher.py): records new pools and their early numbers for research
+    watch: bool = True
+    watch_db_path: str = ""  # default: watch.db next to the journal
+    watch_poll_s: int = 30
+    watch_launch_sample_pct: float = 20.0  # share of bonding-curve launches kept (graduations: all)
+    watch_ages_min: str = "5,15,30,60,180,360,1440"  # snapshot each pool at these ages
+    watch_info_age_min: float = 15.0  # token info (socials, developer, holders) taken at this age
+    watch_ohlcv_min_volume_usd: float = 5000.0  # fetch 5-min candles at 24h only above this 24h volume
+    watch_backup_keep_local: int = 2
 
     # --- hard filters (deterministic, applied before Claude is called) --
     min_liquidity_usd: float = 15_000.0

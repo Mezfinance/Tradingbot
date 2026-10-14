@@ -29,7 +29,8 @@ def gecko_with(responses):
         r = responses[window]
         return r if isinstance(r, httpx.Response) else httpx.Response(200, json={"data": [pool(m) for m in r]})
 
-    return GeckoTerminal(httpx.Client(transport=httpx.MockTransport(handler), base_url="https://x")), calls
+    return GeckoTerminal(httpx.Client(transport=httpx.MockTransport(handler), base_url="https://x"),
+                         min_interval_s=0), calls
 
 
 def test_base_token_parsing():

@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup",
                                             "backup-now", "backup-list", "learn-now", "postmortems", "playbook", "optimize-now", "settings",
                                             "settings-rollback", "code-versions", "code-diff", "code-rollback",
-                                            "propose", "proposals"])
+                                            "propose", "proposals", "watch-status"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -170,6 +170,11 @@ def main(argv: list[str] | None = None) -> None:
             return
         target = codebase.switch_to(cfg, args.path)
         print(f"next start will run {target}. Restart to apply, e.g. `fly apps restart <app>`.")
+        return
+
+    if args.command == "watch-status":
+        from tradingbot.watcher import Watcher
+        print(json.dumps(Watcher.from_config(cfg).status(), indent=2))
         return
 
     if args.command == "playbook":
