@@ -80,6 +80,14 @@ class GeckoTerminal:
         except (TypeError, KeyError, ValueError):
             return None
 
+    def token_prices(self, mints: list[str]) -> dict[str, float]:
+        data = self._get(f"/simple/networks/{self.network}/token_price/{','.join(mints)}")
+        try:
+            raw = data["data"]["attributes"]["token_prices"]
+        except (TypeError, KeyError):
+            return {}
+        return {m: float(v) for m, v in raw.items() if v is not None}
+
     def new_pools(self, page: int = 1) -> list[dict]:
         """Newest pools first (bonding-curve launches and graduations), with base_token and dex ids."""
         data = self._get(f"/networks/{self.network}/new_pools", {"page": page})

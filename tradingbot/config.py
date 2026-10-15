@@ -50,6 +50,13 @@ class Config:
     x_cost_per_post: float = 0.005  # X pay-per-use estimate; adjust to your bill
     x_cost_per_count_call: float = 0.005
     narrative_daily_usd: float = 2.0  # Haiku narrative tags for every recorded pool (~$0.0003 each)
+    enrich_macro_every_s: int = 600  # BTC/ETH, fear & greed, SOL funding, stablecoins, network load, meme index
+    enrich_biz_every_s: int = 600  # 4chan /biz/ threads with contract addresses
+    x_watch_accounts: str = "elonmusk"  # mega-accounts whose latest posts are matched against token themes
+    x_watch_every_s: int = 3600
+    x_paid_callers: str = ""  # known paid promoter X handles (comma list), flagged when they post a token
+    kol_wallets: str = ""  # known influencer / copy-traded wallets (comma list), flagged when they buy early
+    cex_wallets: str = ""  # known exchange hot wallets (comma list), flagged when they fund early buyers
 
     # --- hard filters (deterministic, applied before Claude is called) --
     min_liquidity_usd: float = 15_000.0

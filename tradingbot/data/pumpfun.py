@@ -46,6 +46,9 @@ class PumpFun:
     def coin(self, mint: str) -> dict | None:
         return self._get(f"/coins-v2/{mint}")
 
+    def user(self, address: str) -> dict | None:
+        return self._get(f"/users/{address}")
+
     def creator_coins(self, creator: str, limit: int = 50) -> dict | None:
         """{"count": total launches by this wallet, "coins": [...newest first...]}."""
         return self._get(f"/coins-v2/user-created-coins/{creator}", {"offset": 0, "limit": limit})
@@ -93,3 +96,18 @@ def compact_creator(d: dict | None, before_ms: float) -> dict:
                                         if prior else None),
         "creator_prior_names": [(c.get("symbol") or "")[:20] for c in prior[:20]],
     }
+
+
+def compact_user(u: dict | None) -> dict:
+    """The developer's pump.fun profile: a following, a linked X account, a bio."""
+    if not u:
+        return {}
+    def num(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+    return {"username": bool(u.get("username")), "profile_image": bool(u.get("profile_image")),
+            "followers": num(u.get("followers")), "following": num(u.get("following")),
+            "x_username": u.get("x_username") or "", "bio": bool(u.get("bio")),
+            "badges": len(u.get("group_badges") or []), "banned": bool(u.get("is_banned"))}

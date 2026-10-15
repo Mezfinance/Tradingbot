@@ -20,6 +20,13 @@ import httpx
 log = logging.getLogger(__name__)
 
 RPC_URL = "https://mainnet.helius-rpc.com/"
+# Jito's public tip accounts: SOL sent here buys a place at the front of the block.
+JITO_TIP_ACCOUNTS = {
+    "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5", "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
+    "Cw8CFyM9FkoMi7K7Crf6HNQqf4uEMzpKw6QNghXLvLkY", "ADaUMid9yfUytqMBgopwjb2DTLSokTSzL1zt6iGPaS49",
+    "DfXygSm4jCyNCybVYYK6DwvWqjKee8pbDmJGcLWNDXjh", "ADuUkR4vqLUMWXxW9gh6D6L8pMSawimctcNZ5pGwDcEt",
+    "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL", "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
+}
 HISTORY_CREDITS_PER_100 = 10
 RPC_CREDITS = 1
 
@@ -82,6 +89,17 @@ class Helius:
                 continue
         return out
 
+    def balances(self, wallets: list[str]) -> dict[str, float]:
+        """SOL balance of each wallet (100 per call)."""
+        out: dict[str, float] = {}
+        for i in range(0, len(wallets), 100):
+            chunk = wallets[i:i + 100]
+            res = self._rpc("getMultipleAccounts", [chunk, {"encoding": "base64", "dataSlice": {"offset": 0, "length": 0}}],
+                            RPC_CREDITS)
+            for w, info in zip(chunk, (res or {}).get("value") or []):
+                out[w] = (info or {}).get("lamports", 0) / 1e9
+        return out
+
     def wallet_origin(self, wallet: str) -> dict | None:
         """{"first_ts", "funder"} from the wallet's first transaction; None if unknown."""
         txs = self.history(wallet, limit=1)
@@ -108,7 +126,8 @@ def funder_of(tx: dict, wallet: str) -> str | None:
 
 
 def trades(txs: list[dict], mint: str) -> list[list]:
-    """Compact per-owner token balance changes: [blockTime, slot, owner, delta_tokens, fee_payer]."""
+    """Compact per-owner token balance changes:
+    [blockTime, slot, owner, delta_tokens, fee_payer, fee_lamports, jito_tip_lamports]."""
     out = []
     for tx in txs:
         meta = tx.get("meta") or {}
@@ -123,7 +142,10 @@ def trades(txs: list[dict], mint: str) -> list[list]:
                 change[b["owner"]] = change.get(b["owner"], 0.0) + sign * amt
         keys = _keys(tx)
         payer = keys[0] if keys else None
+        pre, post = meta.get("preBalances") or [], meta.get("postBalances") or []
+        tip = sum(post[i] - pre[i] for i, k in enumerate(keys)
+                  if k in JITO_TIP_ACCOUNTS and i < len(pre) and i < len(post))
         for owner, delta in change.items():
             if abs(delta) > 0:
-                out.append([tx.get("blockTime"), tx.get("slot"), owner, delta, payer])
+                out.append([tx.get("blockTime"), tx.get("slot"), owner, delta, payer, meta.get("fee") or 0, max(tip, 0)])
     return out

@@ -87,6 +87,11 @@ CREATE TABLE IF NOT EXISTS watch_mentions (
 CREATE INDEX IF NOT EXISTS watch_mentions_mint ON watch_mentions(mint);
 -- market conditions: SOL price and how many new pools appeared (before sampling)
 CREATE TABLE IF NOT EXISTS watch_market (ts REAL NOT NULL, sol_usd REAL, new_pools INTEGER, new_launchpad INTEGER);
+-- market-wide numbers over time (long format: key, value)
+CREATE TABLE IF NOT EXISTS watch_macro (ts REAL NOT NULL, key TEXT NOT NULL, value REAL);
+CREATE INDEX IF NOT EXISTS watch_macro_key ON watch_macro(key, ts);
+-- latest posts of watched mega-accounts (X), for theme matching
+CREATE TABLE IF NOT EXISTS watch_xfeed (ts REAL NOT NULL, account TEXT, post_ts REAL, text TEXT);
 -- wallet origins (Helius), cached across tokens
 CREATE TABLE IF NOT EXISTS watch_wallets (wallet TEXT PRIMARY KEY, first_ts REAL, funder TEXT, checked_ts REAL);
 """
