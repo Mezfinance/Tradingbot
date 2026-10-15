@@ -426,6 +426,9 @@ class Watcher:
                     detail = wa.analyse(self.store, 15, label, subset=subset, rows=rows_by_age[15])
                     full[f"{label}:{subset or 'all'}"] = {"summary": summ, "detail_15m": detail}
                     text += [f"===== {label}, {subset or 'all'} tokens =====", wa.render(detail, summ), ""]
+            pv = wa.paid_value(rows_by_age[15], "pump2x")  # is Helius / X worth paying for (15-min features)
+            full["paid_value_15m"] = pv
+            text = [wa.render_paid_value(pv), ""] + text
             (out / "report.json").write_text(json.dumps(full, indent=2, default=str))
             (out / "report.txt").write_text("\n".join(text))
             for age in wa.FEATURE_AGES:

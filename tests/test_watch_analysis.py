@@ -133,3 +133,25 @@ def test_a_single_wick_is_not_a_pump():
     add_pool(store, "P", "M", T0, snaps={15: snap(1.0)}, candles=wick)
     [row] = wa.build_dataset(store, 15, now=NOW)
     assert row["best_mult"] == 3.0 and row["best_close_mult"] == 1.1 and not row["pump2x"]
+
+
+def test_paid_value_compares_models_with_and_without_the_paid_features():
+    import random
+    from tradingbot.watch_analysis import paid_value, render_paid_value
+    rng = random.Random(3)
+    rows = []
+    for i in range(700):
+        sel = "control" if i % 7 else "below_rank"
+        signal = rng.random()
+        pumped = int(signal > 0.7) if sel == "control" else int(rng.random() < 0.3)
+        row = {"pool": f"p{i}", "created_ts": i, "free_noise": rng.random(), "pump2x": pumped,
+               "hel_selection": sel, "x_selection": "none"}
+        if sel == "control":
+            row["hel_signal"] = signal + rng.gauss(0, 0.05)
+        rows.append(row)
+    pv = paid_value(rows, "pump2x")
+    h = pv["helius"]
+    assert h["paid_features"] == 1 and h["fair_rows"] == 600
+    assert h["auc_with"] > 0.9 and h["auc_gain"] > 0.3
+    assert "need" in pv["x"]["note"]
+    assert "held-out AUC with its 1 features" in render_paid_value(pv)

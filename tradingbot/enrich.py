@@ -24,10 +24,12 @@ import hashlib
 import io
 import json
 import logging
+import math
 import time
 from datetime import datetime, timezone
 
 import httpx
+import numpy as np
 
 from tradingbot.config import Config
 from tradingbot.data.dexscreener import DexScreener
@@ -50,6 +52,11 @@ WINDOWS = {  # kind -> (earliest age, latest age) in minutes; outside the window
     "candles15": (15, 25),
 }
 PAID_OR_HEAVY = ("helius", "x", "jupquote", "rugcheck", "links", "crosschain", "dev", "sentiment", "candles15")
+# Paid lookups that describe the token rather than the pool: a graduation pool reuses its launch pool's row.
+MINT_KINDS = ("helius", "x", "dev", "narrative", "sentiment")
+# Lookups rationed by a free-data score, with a random control slice (see `select`).
+RANKED = {"helius": ("helius_budget", "helius_daily_credits", 30.0), "x": ("x_budget", "x_daily_budget_usd", 0.015)}
+LAUNCH_MINT_SUFFIXES = ("pump", "bonk")  # pump.fun and letsbonk mints keep their suffix after graduating
 NARRATIVE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -168,6 +175,7 @@ class Enricher:
         self.helius_budget = Budget(store, "helius_credits", cfg.helius_daily_credits)
         self.x_budget = Budget(store, "x_usd", cfg.x_daily_budget_usd)
         self.narrative_budget = Budget(store, "narrative_usd", cfg.narrative_daily_usd)
+        self._rank_cache: dict = {}
         self._last = {"lists": 0.0, "market": 0.0, "tg": 0.0, "macro": 0.0, "biz": 0.0, "xfeed": 0.0}
 
     @classmethod
@@ -296,6 +304,80 @@ class Enricher:
         self.store.execute("INSERT OR REPLACE INTO watch_enrich(pool, kind, ts, data) VALUES(?,?,?,?)",
                            (pool, kind, now, json.dumps(data or {})))
 
+    def copy_from_sibling(self, pool: dict, kind: str) -> bool:
+        """Reuse a usable row of the same token from another pool (e.g. the launch pool of a graduation).
+        The copy keeps the source's timestamp, so features still only see it from when it was fetched."""
+        rows = self.store.query(
+            """SELECT e.pool, e.ts, e.data FROM watch_enrich e JOIN watch_pools p ON p.pool=e.pool
+               WHERE p.mint=? AND e.pool != ? AND e.kind=? ORDER BY e.ts""", (pool["mint"], pool["pool"], kind))
+        for r in rows:
+            data = json.loads(r["data"]) if r["data"] else {}
+            if not data or "skipped" in data:
+                continue
+            data["copied_from"] = data.get("copied_from") or r["pool"]
+            if kind == "helius":
+                data["pool_accounts"] = sorted(set(data.get("pool_accounts") or []) | {pool["pool"]})
+            self._save(pool["pool"], kind, data, r["ts"])
+            return True
+        return False
+
+    @staticmethod
+    def free_score(pool: dict) -> float:
+        """How promising a token looks at 5 min from free data alone: buyers, buy pressure, turnover."""
+        snap = json.loads(pool["snap5"]) if pool.get("snap5") else {}
+        buyers, sellers = snap.get("buyers_m5") or 0, snap.get("sellers_m5") or 0
+        vol, liq = snap.get("vol_m5") or 0, snap.get("liq") or 0
+        score = math.log1p(buyers) + (buyers / (buyers + sellers) if buyers + sellers else 0)
+        return round(score + (min(vol / liq, 2.0) / 2 if liq > 0 else 0), 4)
+
+    def select(self, pool: dict, kind: str, now: float) -> dict:
+        """Decide whether an eligible token gets a paid lookup.
+
+        f = what the budget can cover / eligible tokens per hour (both from the last few hours). A stable
+        random `enrich_control_share` * f of tokens is looked up whatever their score (selection "control",
+        an unbiased sample for judging whether the paid data adds anything); the rest of the budget goes to
+        tokens whose free score is in the top (1 - control share) * f of recent eligible tokens ("ranked").
+        Before there is enough history, or when the budget covers everyone, all are looked up ("all").
+        """
+        c = self.cfg
+        budget_attr, daily_field, default_cost = RANKED[kind]
+        score = self.free_score(pool)
+        scores, oldest = self._rank_history(kind, now)
+        if len(scores) < c.enrich_rank_min_history:
+            return {"pay": True, "selection": "all", "score": score}
+        hours = max(1.0, min(c.enrich_rank_window_h, (now - oldest) / 3600))
+        avg_cost = float(self.store.get_state(f"avgcost:{kind}") or default_cost) or default_cost
+        affordable = getattr(c, daily_field) / 24 / avg_cost
+        f = affordable / (len(scores) / hours)
+        if f >= 1:
+            return {"pay": True, "selection": "all", "score": score}
+        u = int(hashlib.sha1(f"{pool['pool']}:{kind}".encode()).hexdigest()[:8], 16) / 0xFFFFFFFF
+        if u < c.enrich_control_share * f:
+            return {"pay": True, "selection": "control", "score": score}
+        threshold = float(np.quantile(scores, 1 - (1 - c.enrich_control_share) * f))
+        if score >= threshold:
+            return {"pay": True, "selection": "ranked", "score": score}
+        return {"pay": False, "score": score, "threshold": round(threshold, 4), "coverage": round(f, 3)}
+
+    def _rank_history(self, kind: str, now: float) -> tuple[list[float], float]:
+        """Free scores of recent eligible tokens (not copies), read once per pass."""
+        key = (kind, now)
+        if key not in self._rank_cache:
+            rows = self.store.query(
+                "SELECT ts, json_extract(data, '$.score') AS score FROM watch_enrich "
+                "WHERE kind=? AND ts>=? AND json_extract(data, '$.score') IS NOT NULL "
+                "AND json_extract(data, '$.copied_from') IS NULL", (kind, now - self.cfg.enrich_rank_window_h * 3600))
+            self._rank_cache = {key: ([float(r["score"]) for r in rows], min((r["ts"] for r in rows), default=now))}
+        return self._rank_cache[key]
+
+    def _note_cost(self, kind: str, cost: float) -> None:
+        """Running average cost of one lookup, used to estimate how many tokens the budget covers."""
+        if cost <= 0:
+            return
+        old = self.store.get_state(f"avgcost:{kind}")
+        new = cost if old is None else 0.9 * float(old) + 0.1 * cost
+        self.store.set_state(f"avgcost:{kind}", repr(new))
+
     def _has(self, pool: str, kind: str) -> bool:
         return bool(self.store.query("SELECT 1 FROM watch_enrich WHERE pool=? AND kind=?", (pool, kind)))
 
@@ -317,9 +399,19 @@ class Enricher:
                 if kind in ("pumpfun5", "pumpfun15") and not is_pump_mint(pool):
                     self._save(pool["pool"], kind, {}, now)
                     continue
+                if kind in MINT_KINDS and self.copy_from_sibling(pool, kind):
+                    continue  # already paid for under another pool of the same token
                 if kind in PAID_OR_HEAVY and not self.eligible(pool):
                     self._save(pool["pool"], kind, {"skipped": "not active enough"}, now)
                     continue
+                choice = None
+                if kind in RANKED and self._client_enabled(kind):
+                    choice = self.select(pool, kind, now)
+                    if not choice.pop("pay"):
+                        self._save(pool["pool"], kind, {"skipped": "below rank threshold", **choice}, now)
+                        continue
+                spend = getattr(self, RANKED[kind][0]) if kind in RANKED else None
+                before = spend.spent() if spend else 0.0
                 try:
                     data = fn(pool, kind, now)
                 except Exception as exc:  # noqa: BLE001 (one bad token never stops the others)
@@ -327,13 +419,29 @@ class Enricher:
                     data = {}
                 if data is None:  # out of budget for now: leave it for a later pass
                     continue
+                if choice and data and "skipped" not in data:
+                    data.update(choice)
+                    self._note_cost(kind, spend.spent() - before)
                 self._save(pool["pool"], kind, data, now)
                 budget -= 1
         return TASK_LIMIT_PER_STEP - budget
 
+    def _client_enabled(self, kind: str) -> bool:
+        return bool(getattr(self.helius if kind == "helius" else self.x, "enabled", False))
+
+    def is_graduation(self, pool: dict) -> bool:
+        """A pool a launchpad token moved to on completing its curve (other new pools are mostly not memecoins)."""
+        if pool["dex"] in LAUNCHPAD_DEXES:
+            return False
+        if pool["dex"] == "pumpswap" or (pool["mint"] or "").endswith(LAUNCH_MINT_SUFFIXES):
+            return True
+        marks = ",".join("?" * len(LAUNCHPAD_DEXES))
+        return bool(self.store.query(f"SELECT 1 FROM watch_pools WHERE mint=? AND pool != ? AND dex IN ({marks})",
+                                     (pool["mint"], pool["pool"], *LAUNCHPAD_DEXES)))
+
     def eligible(self, pool: dict) -> bool:
-        """Paid lookups go to graduations and to launches that already drew real buyers by 5 min."""
-        if pool["dex"] not in LAUNCHPAD_DEXES:
+        """Paid lookups go to graduations, and to other pools that already drew real buyers by 5 min."""
+        if self.is_graduation(pool):
             return True
         snap = json.loads(pool["snap5"]) if pool.get("snap5") else {}
         return (snap.get("buyers_m5") or 0) >= self.cfg.enrich_min_buyers_m5
@@ -596,6 +704,11 @@ class Enricher:
             "enriched": {r["kind"]: r["n"] for r in q(
                 "SELECT kind, COUNT(*) AS n FROM watch_enrich WHERE data NOT IN ('{}') "
                 "AND data NOT LIKE '%skipped%' GROUP BY kind")},
+            "paid_selection": {kind: {r["sel"]: r["n"] for r in q(
+                "SELECT CASE WHEN json_extract(data, '$.copied_from') IS NOT NULL THEN 'copied' "
+                "WHEN json_extract(data, '$.skipped') IS NOT NULL THEN json_extract(data, '$.skipped') "
+                "ELSE COALESCE(json_extract(data, '$.selection'), 'before rationing') END AS sel, COUNT(*) AS n "
+                "FROM watch_enrich WHERE kind=? AND data != '{}' GROUP BY sel", (kind,))} for kind in RANKED},
             "list_rows": q("SELECT COUNT(*) AS n FROM watch_lists")[0]["n"],
             "telegram_mentions": q("SELECT COUNT(*) AS n FROM watch_mentions")[0]["n"],
             "market_rows": q("SELECT COUNT(*) AS n FROM watch_market")[0]["n"],

@@ -113,6 +113,8 @@ class Context:
             if img:
                 self.image_seen[img].append((created, mint))
             hel = kinds.get("helius", (0, {}))[1]
+            if hel.get("copied_from"):
+                continue  # the same token's launch pool already counted these wallets
             accounts = set(hel.get("pool_accounts") or [])
             for w in {t[2] for t in hel.get("trades") or [] if t[3] > 0 and t[2] not in accounts}:
                 self.early_wallets[w].append((created, mint))
@@ -127,6 +129,19 @@ class Context:
         if not got or got[0] > ts or not got[1] or "skipped" in got[1]:
             return None
         return got[1]
+
+    def selection(self, pool: str, kind: str, ts: float) -> str:
+        """How a paid lookup was chosen, for judging the paid data on an unbiased slice:
+        all / ranked / control / legacy (before rationing) / below_rank / skipped / later / none."""
+        got = self.enrich.get(pool, {}).get(kind)
+        if not got:
+            return "none"
+        if got[0] > ts:
+            return "later"
+        data = got[1]
+        if "skipped" in data:
+            return "below_rank" if data["skipped"] == "below rank threshold" else "skipped"
+        return data.get("selection") or ("legacy" if data else "none")
 
     def pumps_between(self, word: str, lo: float, hi: float, exclude_mint: str) -> int:
         """Tokens sharing `word` that first hit 2x in (lo, hi], not counting `exclude_mint`."""

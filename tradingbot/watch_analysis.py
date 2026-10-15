@@ -222,13 +222,14 @@ def build_dataset(store: WatchStore, age: int, now: float | None = None) -> list
                 row["dev_prior_pump_rate"] = (sum(outcome_at_age[q]["pump2x"] for q in done) / len(done)
                                               if done else None)
         row.update(ctx.features(pool, p, ts, info_ok=bool(p["info"] and p["info_ts"] and p["info_ts"] <= ts), snap=d))
+        row["hel_selection"], row["x_selection"] = ctx.selection(pool, "helius", ts), ctx.selection(pool, "x", ts)
         row.update(out)
         rows.append(row)
     return rows
 
 
 LABEL_KEYS = ("best_mult", "best_close_mult", "worst_mult", "pump2x", "pump5x", "clean2x", "trade_ret")
-ID_KEYS = ("pool", "mint", "dex", "created_ts", "age")
+ID_KEYS = ("pool", "mint", "dex", "created_ts", "age", "hel_selection", "x_selection")
 
 
 def feature_names(rows: list[dict]) -> list[str]:
@@ -283,7 +284,11 @@ SUBSETS = {
     None: lambda r: True,
     # Tokens with the paid wallet-level data (Helius): graduations and launches with real buyers at 5 min.
     "enriched": lambda r: r.get("hel_early_buyers") is not None or r.get("hel_top10_share") is not None,
+    # Helius rows chosen without looking at the free score (random control slice, or everyone while the
+    # budget covered all): the fair sample for asking whether the paid data adds anything.
+    "control": lambda r: r.get("hel_selection") in UNBIASED,
 }
+UNBIASED = ("control", "all")
 
 
 def analyse(store: WatchStore, age: int = 15, label: str = "pump2x", now: float | None = None,
@@ -346,6 +351,74 @@ def analyse(store: WatchStore, age: int = 15, label: str = "pump2x", now: float 
                 f"else exit at 24h; {ROUND_TRIP_COST * 100:.0f}% round-trip cost",
     }
     return out
+
+
+PAID_SOURCES = {"helius": "hel_selection", "x": "x_selection"}
+HAS_DATA = ("all", "ranked", "control", "legacy")
+
+
+def _heldout(rows: list[dict], names: list[str], label: str) -> dict:
+    """Held-out AUC and top-decile lift of the logistic model on `names` (earliest 70% trains)."""
+    y = np.array([float(r[label]) for r in rows])
+    cut = int(len(rows) * TRAIN_SHARE)
+    if not names or y[:cut].sum() == 0 or y[cut:].sum() == 0:
+        return {"test_auc": None, "test_lift": None}
+    x_raw, _ = _matrix(rows, names)
+    mu, sd = x_raw[:cut].mean(axis=0), x_raw[:cut].std(axis=0) + 1e-9
+    x = (x_raw - mu) / sd
+    w, b = logistic(x[:cut], y[:cut])
+    p = 1 / (1 + np.exp(-(x[cut:] @ w + b)))
+    top = p >= np.quantile(p, 0.9)
+    base = y[cut:].mean()
+    return {"test_auc": auc(p, y[cut:]), "test_lift": float(y[cut:][top].mean() / base) if base else None}
+
+
+def paid_value(rows: list[dict], label: str = "pump2x") -> dict:
+    """Is each paid source worth its cost? On tokens it was fetched for without looking at their free score
+    (control slice), compare the model with and without the features only that source provides. Also: did
+    ranking by free score pick tokens that pumped more often than the random control slice?"""
+    out = {}
+    for source, key in PAID_SOURCES.items():
+        with_data = [r for r in rows if r.get(key) in HAS_DATA]
+        without = [r for r in rows if r.get(key) not in HAS_DATA]
+        present = lambda rs, n: any(r.get(n) is not None for r in rs)  # noqa: E731
+        res: dict = {"rows_with_data": len(with_data)}
+        for sel in ("ranked", "control"):
+            got = [r[label] for r in rows if r.get(key) == sel]
+            res[f"{sel}_n"], res[f"{sel}_pump_rate"] = len(got), (sum(got) / len(got) if got else None)
+        fair = [r for r in rows if r.get(key) in UNBIASED]
+        res["fair_rows"] = len(fair)
+        if len(fair) < MIN_ROWS:
+            res["note"] = f"need {MIN_ROWS} control/all rows with this source; have {len(fair)}"
+            out[source] = res
+            continue
+        names = feature_names(fair)
+        paid = [n for n in names if present(with_data, n) and not present(without, n)]
+        res["paid_features"] = len(paid)
+        full = _heldout(fair, names, label)
+        free = _heldout(fair, [n for n in names if n not in paid], label)
+        res.update({"auc_with": full["test_auc"], "auc_without": free["test_auc"],
+                    "lift_with": full["test_lift"], "lift_without": free["test_lift"]})
+        if full["test_auc"] is not None and free["test_auc"] is not None:
+            res["auc_gain"] = full["test_auc"] - free["test_auc"]
+        out[source] = res
+    return out
+
+
+def render_paid_value(pv: dict) -> str:
+    f = lambda v, d=3: "n/a" if v is None else f"{v:.{d}f}"  # noqa: E731
+    pct = lambda v: "n/a" if v is None else f"{v * 100:.1f}%"  # noqa: E731
+    lines = ["PAID DATA VALUE (control slice: tokens looked up without regard to their free score)"]
+    for source, r in pv.items():
+        lines.append(f"  {source}: {r['rows_with_data']} rows with data; pump rate ranked {pct(r['ranked_pump_rate'])} "
+                     f"(n={r['ranked_n']}) vs control {pct(r['control_pump_rate'])} (n={r['control_n']})")
+        if r.get("note"):
+            lines.append(f"    {r['note']}")
+            continue
+        lines.append(f"    held-out AUC with its {r['paid_features']} features {f(r['auc_with'])} vs without "
+                     f"{f(r['auc_without'])} (gain {f(r.get('auc_gain'))}); lift {f(r['lift_with'], 2)} vs "
+                     f"{f(r['lift_without'], 2)} on {r['fair_rows']} rows")
+    return "\n".join(lines)
 
 
 def summary(store: WatchStore, label: str = "pump2x", now: float | None = None,

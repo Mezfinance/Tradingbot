@@ -43,7 +43,10 @@ class Config:
     enrich_market_every_s: int = 300  # SOL price + new-pool counts
     tg_channels: str = ""  # public Telegram calling channels to scan (comma list of t.me names)
     tg_every_s: int = 180
-    enrich_min_buyers_m5: int = 20  # launches need this many buyers at 5 min for Helius/X (graduations always)
+    enrich_min_buyers_m5: int = 20  # launches/other pools need this many buyers at 5 min for Helius/X (graduations always)
+    enrich_control_share: float = 0.2  # share of the Helius/X budget spent on random eligible tokens (control)
+    enrich_rank_window_h: float = 6.0  # recent eligible tokens the rank threshold is set from
+    enrich_rank_min_history: int = 30  # below this many scored tokens, every eligible token is looked up
     helius_daily_credits: int = 30_000  # ~0.9M/month: fits Helius free (1M); raise on a paid plan
     enrich_wallets_per_token: int = 8  # early buyers whose wallet age/funder is looked up
     x_daily_budget_usd: float = 3.0

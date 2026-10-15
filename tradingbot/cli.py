@@ -71,6 +71,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--age", type=int, default=15, help="watch-report/watch-export: feature age in minutes")
     parser.add_argument("--label", default="pump2x", help="watch-report: pump2x | pump5x | clean2x")
     parser.add_argument("--enriched", action="store_true", help="watch-report: only tokens with Helius/X data")
+    parser.add_argument("--control", action="store_true",
+                        help="watch-report: only tokens whose Helius lookup ignored the free score (control slice)")
+    parser.add_argument("--paid-value", action="store_true",
+                        help="watch-report: is Helius / X data worth paying for (control slice, 15-min features)")
     parser.add_argument("--idea", help="propose: what to build")
     parser.add_argument("--problem", default="", help="propose: what it should fix or improve")
     parser.add_argument("--priority", type=int, default=1, help="propose: 1 (first) to 5 (last)")
@@ -213,7 +217,11 @@ def main(argv: list[str] | None = None) -> None:
             return
         if args.label not in ("pump2x", "pump5x", "clean2x"):
             parser.error("--label must be pump2x, pump5x or clean2x")
-        subset = "enriched" if args.enriched else None
+        if args.paid_value:
+            pv = watch_analysis.paid_value(watch_analysis.build_dataset(store, 15), args.label)
+            print(json.dumps(pv, indent=2) if args.json else watch_analysis.render_paid_value(pv))
+            return
+        subset = "control" if args.control else "enriched" if args.enriched else None
         detail = watch_analysis.analyse(store, args.age, args.label, subset=subset)
         summ = watch_analysis.summary(store, args.label, subset=subset)
         print(json.dumps({"summary": summ, "detail": detail}, indent=2, default=str) if args.json

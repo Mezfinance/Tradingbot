@@ -272,3 +272,87 @@ def test_market_wide_sources_are_recorded():
     assert json.loads(st.get_state("perp_symbols")) == ["SOL", "WIF"]
     assert e.poll_biz(T0) == 1
     assert st.query("SELECT source FROM watch_mentions")[0]["source"] == "4chan"
+
+
+def test_graduation_reuses_the_launch_pools_paid_rows():
+    st = store_with([("LAUNCH", MINT, "pump-fun", 40), ("GRADP", MINT, "pumpswap", 40)])
+    e = make_enricher(st)
+    e.helius_budget.allows = lambda cost, now=None: True
+    calls = []
+    real = e.helius.history
+    e.helius.history = lambda a, limit=100: calls.append(a) or real(a, limit)
+    for _ in range(4):
+        e.run_tasks(T0 + 20 * 60)
+    rows = {r["pool"]: (r["ts"], json.loads(r["data"])) for r in st.query("SELECT * FROM watch_enrich WHERE kind='helius'")}
+    assert len(calls) == 1  # paid once for the token
+    [copy] = [p for p, (_, d) in rows.items() if "copied_from" in d]
+    src = rows[copy][1]["copied_from"]
+    assert rows[copy][0] == rows[src][0]  # keeps the fetch time: no peeking
+    assert copy in rows[copy][1]["pool_accounts"] and rows[copy][1]["trades"] == rows[src][1]["trades"]
+
+
+def test_only_genuine_graduations_skip_the_activity_check():
+    st = store_with([("ORCA", "O" * 10, "orca", 3), ("BUSYORCA", "B" * 10, "orca", 40),
+                     ("CURVE1", "C" * 10, "meteora-dbc", 3), ("DAMM", "C" * 10, "meteora-damm-v2", 0),
+                     ("PUMPGRAD", "Zpump", "meteora-damm-v2", 0)])
+    e = make_enricher(st)
+    pools = {r["pool"]: dict(r) for r in e.store.query(
+        "SELECT p.*, s.data AS snap5 FROM watch_pools p JOIN watch_snaps s ON s.pool=p.pool")}
+    assert not e.eligible(pools["ORCA"]) and e.eligible(pools["BUSYORCA"])
+    assert e.eligible(pools["DAMM"]) and e.eligible(pools["PUMPGRAD"])  # launchpad sibling / pump mint
+    assert not e.eligible(pools["CURVE1"])
+
+
+def seed_scores(st, kind, now, scores):
+    for i, s in enumerate(scores):
+        st.execute("INSERT INTO watch_enrich(pool, kind, ts, data) VALUES(?,?,?,?)",
+                   (f"old{i}", kind, now - 5 * 3600, json.dumps({"score": s})))
+
+
+def pool_row(name, buyers):
+    return {"pool": name, "mint": name, "dex": "pumpswap", "snap5": json.dumps({"buyers_m5": buyers})}
+
+
+def test_rationing_spends_on_the_best_scores_plus_a_random_control_slice():
+    now = T0 + 6 * 3600
+    st = WatchStore(":memory:")
+    e = make_enricher(st, helius_daily_credits=3600)  # 5 lookups/hour at 30 credits
+    assert e.select(pool_row("early", 0), "helius", now)["selection"] == "all"  # no history yet: everyone
+    seed_scores(st, "helius", now, [i / 10 for i in range(100)])  # 20 eligible/hour -> coverage 0.25
+    now += 1  # next pass (history is read once per pass)
+    hot = e.select(pool_row("hot", 10_000), "helius", now)
+    assert hot["pay"] and hot["selection"] in ("ranked", "control")
+    picks = [e.select(pool_row(f"cold{i}", 0), "helius", now) for i in range(400)]
+    control = [p for p in picks if p["pay"]]
+    assert all(p["selection"] == "control" for p in control)
+    assert 0.02 < len(control) / 400 < 0.09  # 20% of 0.25 coverage
+    skipped = [p for p in picks if not p["pay"]][0]
+    assert skipped["coverage"] == 0.25 and skipped["threshold"] > 7
+    e2 = make_enricher(st, helius_daily_credits=1_000_000)
+    assert e2.select(pool_row("any", 0), "helius", now)["selection"] == "all"  # budget covers everyone
+
+
+def test_rationed_lookups_record_their_selection_and_cost():
+    st = store_with([("BUSY", MINT, "pump-fun", 40), ("MEH", "M" * 10, "pumpswap", 0)])
+    now = T0 + 20 * 60
+    seed_scores(st, "helius", now, [4.0] * 40)
+    e = make_enricher(st, helius_daily_credits=24 * 30 * 4)  # covers half of the 8 eligible per hour
+    e.helius_budget.allows = lambda cost, now=None: True
+    for _ in range(3):
+        e.run_tasks(now)
+    got = {r["pool"]: json.loads(r["data"]) for r in st.query("SELECT * FROM watch_enrich WHERE kind='helius' "
+                                                               "AND pool IN ('BUSY','MEH')")}
+    assert got["BUSY"]["selection"] in ("ranked", "control") and got["BUSY"]["score"] > 4
+    meh = got["MEH"]
+    assert meh.get("selection") == "control" or meh["skipped"] == "below rank threshold"
+    assert float(st.get_state("avgcost:helius")) > 0
+
+
+def test_status_shows_how_paid_lookups_were_chosen():
+    st = store_with([("LAUNCH", MINT, "pump-fun", 40), ("GRADP", MINT, "pumpswap", 40), ("QUIET", "Q" * 10, "orca", 1)])
+    e = make_enricher(st)
+    e.helius_budget.allows = lambda cost, now=None: True
+    for _ in range(3):
+        e.run_tasks(T0 + 20 * 60)
+    sel = e.status()["paid_selection"]["helius"]
+    assert sel == {"all": 1, "copied": 1, "not active enough": 1}
