@@ -47,8 +47,9 @@ WINDOWS = {  # kind -> (earliest age, latest age) in minutes; outside the window
     "pumpfun5": (5, 25), "pumpfun15": (15, 45), "orders": (15, 120), "narrative": (15, 360),
     "image": (15, 360), "helius": (7, 60), "x": (15, 90), "jupiter": (15, 120), "rugcheck": (15, 120),
     "jupquote": (15, 120), "links": (15, 240), "crosschain": (15, 240), "dev": (7, 120), "sentiment": (20, 180),
+    "candles15": (15, 25),
 }
-PAID_OR_HEAVY = ("helius", "x", "jupquote", "rugcheck", "links", "crosschain", "dev", "sentiment")
+PAID_OR_HEAVY = ("helius", "x", "jupquote", "rugcheck", "links", "crosschain", "dev", "sentiment", "candles15")
 NARRATIVE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -309,7 +310,7 @@ class Enricher:
                          ("jupiter", self.task_jupiter), ("rugcheck", self.task_rugcheck),
                          ("jupquote", self.task_jupquote), ("x", self.task_x), ("narrative", self.task_narrative),
                          ("image", self.task_image), ("links", self.task_links), ("crosschain", self.task_crosschain),
-                         ("sentiment", self.task_sentiment)):
+                         ("sentiment", self.task_sentiment), ("candles15", self.task_candles)):
             if budget <= 0:
                 break
             for pool in self.due(kind, now, min(budget, PER_KIND_PER_STEP)):
@@ -449,7 +450,7 @@ class Enricher:
                 "numSells", "numTraders", "numNetBuyers", "numOrganicBuyers", "priceChange", "liquidityChange")
         audit = t.get("audit") or {}
         return {
-            "holders": t.get("holderCount"), "organic_score": t.get("organicScore"),
+            "holders": t.get("holderCount"), "organic_score": t.get("organicScore"), "usd_price": t.get("usdPrice"),
             "organic_label": t.get("organicScoreLabel"), "tags": t.get("tags") or [],
             "verified": bool(set(t.get("tags") or []) & {"verified", "strict"}),
             "top_holders_pct": audit.get("topHoldersPercentage"), "dev_mints": audit.get("devMints"),
@@ -459,6 +460,12 @@ class Enricher:
             "stats5m": {k: (t.get("stats5m") or {}).get(k) for k in keep},
             "stats1h": {k: (t.get("stats1h") or {}).get(k) for k in keep},
         }
+
+    def task_candles(self, pool: dict, kind: str, now: float) -> dict:
+        """1-minute candles of the first ~25 minutes, fetched at ~15 minutes (only those before each snapshot count)."""
+        if not hasattr(self.gecko, "ohlcv"):
+            return {}
+        return {"candles": self.gecko.ohlcv(pool["pool"], minutes=1, limit=30) or []}
 
     def task_rugcheck(self, pool: dict, kind: str, now: float) -> dict:
         r = self.extras.rugcheck(pool["mint"])

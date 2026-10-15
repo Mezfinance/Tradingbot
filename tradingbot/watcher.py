@@ -163,6 +163,7 @@ def compact_info(info: dict | None) -> dict:
         "graduation_pct": _num(launch.get("graduation_percentage")),
         "graduated": launch.get("completed"),
         "categories": info.get("categories") or [],
+        "coingecko_id": info.get("coingecko_coin_id") or "",
     }
 
 
@@ -403,17 +404,18 @@ class Watcher:
             (out / "status.json").write_text(json.dumps(self.status(), indent=2))
             full: dict = {}
             text = []
+            rows_by_age = {age: wa.build_dataset(self.store, age) for age in wa.FEATURE_AGES}  # built once
             for label in ("pump2x", "clean2x", "pump5x"):
                 for subset in (None, "enriched"):
-                    summ = wa.summary(self.store, label, subset=subset)
-                    detail = wa.analyse(self.store, 15, label, subset=subset)
+                    summ = wa.summary(self.store, label, subset=subset, rows_by_age=rows_by_age)
+                    detail = wa.analyse(self.store, 15, label, subset=subset, rows=rows_by_age[15])
                     full[f"{label}:{subset or 'all'}"] = {"summary": summ, "detail_15m": detail}
                     text += [f"===== {label}, {subset or 'all'} tokens =====", wa.render(detail, summ), ""]
             (out / "report.json").write_text(json.dumps(full, indent=2, default=str))
             (out / "report.txt").write_text("\n".join(text))
             for age in wa.FEATURE_AGES:
                 raw = out / f"rows-{age}m.csv"
-                if wa.export_csv(self.store, str(raw), age):
+                if wa.export_csv(self.store, str(raw), age, rows=rows_by_age[age]):
                     with open(raw, "rb") as src, gzip.open(f"{raw}.gz", "wb", compresslevel=6) as dst:
                         shutil.copyfileobj(src, dst, length=1 << 20)
                 raw.unlink(missing_ok=True)

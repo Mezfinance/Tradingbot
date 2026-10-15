@@ -183,6 +183,15 @@ Budgets (spread evenly over each UTC day):
 | `TB_NARRATIVE_DAILY_USD` | 2.0 | Haiku narrative tags, ~$0.0003 per token |
 | `TB_ENRICH_MIN_BUYERS_M5` | 20 | launches need this many buyers at 5 minutes for Helius/X lookups |
 
+Optional lists switch on five more factors (FACTORS.md #86, #108, #109, #115, #197):
+
+```
+fly secrets set TB_KOL_WALLETS="wallet1,wallet2" -a supermeme        # influencer / copy-traded wallets
+fly secrets set TB_CEX_WALLETS="wallet1,wallet2" -a supermeme        # exchange hot wallets
+fly secrets set TB_X_PAID_CALLERS="handle1,handle2" -a supermeme     # paid promoter X accounts
+fly secrets set TB_X_WATCH_ACCOUNTS="elonmusk,cz_binance" -a supermeme  # mega-accounts to match themes against
+```
+
 `watch-status` shows how many tokens each source has enriched and today's spend per budget.
 
 ## If Claude calls fail

@@ -40,7 +40,8 @@ class Paced:
 class Extras:
     def __init__(self, client: httpx.Client | None = None, pace_s: float = 0.4):
         self.http = client or httpx.Client(timeout=15, headers=UA, follow_redirects=True)
-        self.pace = {h: Paced(pace_s) for h in ("jup", "rug", "dex", "misc")}
+        self.pace = {h: Paced(pace_s) for h in ("jup", "dex", "misc")}
+        self.pace["rug"] = Paced(2.0)  # RugCheck rate-limits hard; fresh tokens may also not be indexed yet
 
     def _get(self, host: str, url: str, **kw):
         self.pace[host].wait()

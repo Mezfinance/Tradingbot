@@ -138,6 +138,8 @@ def _static_features(pool: dict) -> dict:
         "dex_pumpfun": float(pool["dex"] == "pump-fun"), "dex_pumpswap": float(pool["dex"] == "pumpswap"),
         "dex_meteora": float((pool["dex"] or "").startswith("meteora")),
         "dex_raydium": float((pool["dex"] or "").startswith("raydium")),
+        "dex_launchlab": float(pool["dex"] == "raydium-launchlab"), "dex_bags": float(pool["dex"] == "bags-fm"),
+        "dex_meteora_dbc": float(pool["dex"] == "meteora-dbc"),
         "hour_sin": math.sin(2 * math.pi * hour / 24), "hour_cos": math.cos(2 * math.pi * hour / 24),
         "weekend": float(created.tm_wday >= 5),
         "name_len": float(len(name)), "name_has_digit": float(any(c.isdigit() for c in name)),
@@ -156,6 +158,8 @@ def _info_features(info: dict) -> dict:
         "graduation_pct": _f(info.get("graduation_pct")),
         "mint_authority": float(info.get("mint_authority") == "yes"),
         "freeze_authority": float(info.get("freeze_authority") == "yes"),
+        "honeypot_flag": float(info.get("is_honeypot") == "yes"),
+        "info_graduated": float(bool(info.get("graduated"))),
     }
 
 
@@ -169,7 +173,12 @@ def build_dataset(store: WatchStore, age: int, now: float | None = None) -> list
     for r in store.query("SELECT pool, age_min, ts, data FROM watch_snaps WHERE data IS NOT NULL AND data != '{}'"):
         snaps[r["pool"]][r["age_min"]] = (r["ts"], json.loads(r["data"]))
     paths = _future_paths(store)
-    ctx = Context(store)
+    try:
+        from tradingbot.config import Config
+        cfg = Config.from_env()  # the operator's wallet / caller lists reach the factors
+    except Exception:  # noqa: BLE001 (analysis must run even with odd env settings)
+        cfg = None
+    ctx = Context(store, cfg)
 
     # Developer track record: launches and pumps among the developer's EARLIER tokens.
     by_dev: dict[str, list[tuple[float, str]]] = defaultdict(list)
@@ -212,7 +221,7 @@ def build_dataset(store: WatchStore, age: int, now: float | None = None) -> list
                 row["dev_prior_launches"] = _log1p(len(prior))
                 row["dev_prior_pump_rate"] = (sum(outcome_at_age[q]["pump2x"] for q in done) / len(done)
                                               if done else None)
-        row.update(ctx.features(pool, p, ts, info_ok=bool(p["info"] and p["info_ts"] and p["info_ts"] <= ts)))
+        row.update(ctx.features(pool, p, ts, info_ok=bool(p["info"] and p["info_ts"] and p["info_ts"] <= ts), snap=d))
         row.update(out)
         rows.append(row)
     return rows
@@ -340,11 +349,11 @@ def analyse(store: WatchStore, age: int = 15, label: str = "pump2x", now: float 
 
 
 def summary(store: WatchStore, label: str = "pump2x", now: float | None = None,
-            subset: str | None = None) -> list[dict]:
+            subset: str | None = None, rows_by_age: dict | None = None) -> list[dict]:
     """Held-out quality per feature age, to pick when to decide."""
     res = []
     for age in FEATURE_AGES:
-        a = analyse(store, age, label, now, subset)
+        a = analyse(store, age, label, now, subset, rows=(rows_by_age or {}).get(age))
         res.append({k: a.get(k) for k in ("age_min", "rows", "base_rate", "test_auc", "test_lift",
                                           "trade_all_test_mean", "note")}
                    | {"top_decile_mean_ret": (a.get("trade_top_decile") or {}).get("mean_ret")})
@@ -391,8 +400,9 @@ def render(a: dict, summ: list[dict] | None = None) -> str:
     return "\n".join(lines)
 
 
-def export_csv(store: WatchStore, path: str, age: int = 15, now: float | None = None) -> int:
-    rows = build_dataset(store, age, now)
+def export_csv(store: WatchStore, path: str, age: int = 15, now: float | None = None,
+               rows: list[dict] | None = None) -> int:
+    rows = rows if rows is not None else build_dataset(store, age, now)
     if not rows:
         return 0
     cols = list(ID_KEYS) + feature_names(rows) + list(LABEL_KEYS)

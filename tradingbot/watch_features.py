@@ -49,7 +49,7 @@ def _gini(values: list[float]) -> float | None:
 
 
 class Context:
-    def __init__(self, store: WatchStore):
+    def __init__(self, store: WatchStore, cfg=None):
         pools = [dict(r) for r in store.query("SELECT pool, mint, name, created_ts, first FROM watch_pools")]
         self.created = {p["pool"]: p["created_ts"] for p in pools}
         self.enrich: dict[str, dict[str, tuple[float, dict]]] = defaultdict(dict)
@@ -76,6 +76,9 @@ class Context:
         self.created_sorted = sorted(self.created.values())
 
         # Theme heat: launches and pumps among tokens sharing a name word.
+        self._words_of_mint: dict[str, set[str]] = defaultdict(set)
+        for p in pools:
+            self._words_of_mint[p["mint"]] |= words(p["name"])
         self.word_created: dict[str, list[float]] = defaultdict(list)
         self.word_pumps: dict[str, list[tuple[float, str]]] = defaultdict(list)
         for p in pools:
@@ -87,6 +90,8 @@ class Context:
             v.sort()
         for v in self.word_pumps.values():
             v.sort()
+        self.word_pump_ts = {w: [t for t, _ in v] for w, v in self.word_pumps.items()}
+        self.t2x_by_time = sorted((t, m) for m, t in self.t2x.items())
 
         # Attention lists and Telegram mentions per token, in time order.
         self.lists: dict[str, list[tuple[float, str, int, float]]] = defaultdict(list)
@@ -113,6 +118,8 @@ class Context:
                 self.early_wallets[w].append((created, mint))
         for v in self.early_wallets.values():
             v.sort()
+        from tradingbot.watch_features_more import More  # the long tail of factors (FACTORS.md)
+        self.more = More(self, store, cfg)
 
     # --- helpers -------------------------------------------------------------------
     def _known(self, pool: str, kind: str, ts: float) -> dict | None:
@@ -121,11 +128,17 @@ class Context:
             return None
         return got[1]
 
+    def pumps_between(self, word: str, lo: float, hi: float, exclude_mint: str) -> int:
+        """Tokens sharing `word` that first hit 2x in (lo, hi], not counting `exclude_mint`."""
+        n = self._count_between(self.word_pump_ts.get(word, []), lo, hi)
+        own = self.t2x.get(exclude_mint)
+        return n - (own is not None and lo < own <= hi and word in self._words_of_mint.get(exclude_mint, ()))
+
     def _count_between(self, sorted_vals: list[float], lo: float, hi: float) -> int:
         return bisect.bisect_right(sorted_vals, hi) - bisect.bisect_right(sorted_vals, lo)
 
     # --- all features for one pool at time ts ----------------------------------------------
-    def features(self, pool: str, p: dict, ts: float, info_ok: bool) -> dict:
+    def features(self, pool: str, p: dict, ts: float, info_ok: bool, snap: dict | None = None) -> dict:
         out: dict = {}
         created, mint = p["created_ts"], p["mint"]
         out.update(self._pumpfun(pool, p, ts, info_ok))
@@ -138,6 +151,8 @@ class Context:
         out.update(self._telegram(mint, created, ts))
         out.update(self._market(ts))
         out.update(self._themes(p["name"], mint, created, ts))
+        info = json.loads(p["info"]) if info_ok and p.get("info") else {}
+        out.update(self.more.features(pool, p, ts, snap or {}, info))
         return out
 
     def _pumpfun(self, pool, p, ts, info_ok) -> dict:
@@ -154,6 +169,7 @@ class Context:
         mcap, ath = pf.get("usd_market_cap"), pf.get("ath_market_cap_usd")
         out.update({
             "pf_live": float(pf.get("is_live", False)), "pf_boosted": float((pf.get("boost_mode") or "NONE") != "NONE"),
+            "pf_complete": float(pf.get("complete", False)),
             "pf_verified": float(pf.get("verified", False)), "pf_nsfw": float(pf.get("nsfw", False)),
             "pf_transfer_fee": float((pf.get("transfer_fee_bps") or 0) > 0),
             "pf_transfer_hook": float(pf.get("transfer_hook", False)),
@@ -296,7 +312,7 @@ class Context:
         return out
 
     def _telegram(self, mint, created, ts) -> dict:
-        m = [e for e in self.mentions.get(mint, []) if e[0] <= ts]
+        m = [e for e in self.mentions.get(mint, []) if e[0] <= ts and e[1] != "biz"]  # biz = 4chan, counted apart
         if not self.mentions and not m:
             return {}
         return {"tg_mentions": _log1p(len(m)), "tg_channels": float(len({c for _, c in m})),
@@ -331,5 +347,5 @@ class Context:
             return {"theme_launches_1h": 0.0, "theme_pumped_6h": 0.0}
         launches = max(self._count_between(self.word_created[w], ts - HOUR, ts) for w in ws)
         launches -= created > ts - HOUR  # not counting this token itself
-        pumped = max(sum(1 for t, m in self.word_pumps[w] if ts - 6 * HOUR < t <= ts and m != mint) for w in ws)
+        pumped = max(self.pumps_between(w, ts - 6 * HOUR, ts, mint) for w in ws)
         return {"theme_launches_1h": _log1p(max(launches, 0)), "theme_pumped_6h": _log1p(pumped)}
