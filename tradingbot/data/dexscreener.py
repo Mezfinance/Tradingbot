@@ -48,6 +48,40 @@ class DexScreener:
                     boosted.add(addr)
         return list(seen), boosted
 
+    def lists(self) -> dict[str, list[tuple[int, str, float]]]:
+        """Paid-attention lists right now: feed -> [(rank, token, boost amount)] for this chain."""
+        out: dict[str, list[tuple[int, str, float]]] = {}
+        for path in DISCOVERY_FEEDS:
+            try:
+                resp = self.http.get(path)
+                resp.raise_for_status()
+                items = resp.json()
+            except (httpx.HTTPError, ValueError) as exc:
+                log.debug("list %s failed: %s", path, exc)
+                continue
+            name = path.strip("/").split("/")[0] + ":" + path.strip("/").split("/")[1]
+            ranked = [i for i in (items if isinstance(items, list) else []) if i.get("chainId") == self.chain]
+            out[name] = [(rank, i["tokenAddress"], float(i.get("totalAmount") or i.get("amount") or 0))
+                         for rank, i in enumerate(ranked, 1) if i.get("tokenAddress")]
+        return out
+
+    def orders(self, token: str) -> list[dict] | None:
+        """Paid DexScreener products for a token: profile, ads, community takeover, boosts."""
+        try:
+            resp = self.http.get(f"/orders/v1/{self.chain}/{token}")
+            resp.raise_for_status()
+            data = resp.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.debug("orders %s failed: %s", token, exc)
+            return None
+        items = data.get("orders", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        boosts = data.get("boosts", []) if isinstance(data, dict) else []
+        out = [{"type": o.get("type"), "status": o.get("status"), "paid_ts": (o.get("paymentTimestamp") or 0) / 1000}
+               for o in items]
+        out += [{"type": "boost", "status": "approved", "paid_ts": (b.get("paymentTimestamp") or 0) / 1000,
+                 "amount": b.get("amount")} for b in boosts]
+        return out
+
     def pairs(self, addresses: Iterable[str], boosted: set[str] = frozenset()) -> list[PairSnapshot]:
         """Best (deepest) pair for each token address."""
         addrs = list(addresses)

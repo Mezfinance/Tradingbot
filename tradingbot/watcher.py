@@ -71,6 +71,24 @@ CREATE TABLE IF NOT EXISTS watch_snaps (
     PRIMARY KEY (pool, age_min)
 );
 CREATE TABLE IF NOT EXISTS watch_state (key TEXT PRIMARY KEY, value TEXT);
+-- enrichment (enrich.py): one row per pool and source, data JSON ('{}' = tried, nothing usable)
+CREATE TABLE IF NOT EXISTS watch_enrich (
+    pool TEXT NOT NULL, kind TEXT NOT NULL, ts REAL NOT NULL, data TEXT,
+    PRIMARY KEY (pool, kind)
+);
+-- attention lists over time (DexScreener boosts/profiles, GeckoTerminal trending)
+CREATE TABLE IF NOT EXISTS watch_lists (ts REAL NOT NULL, list TEXT NOT NULL, rank INTEGER, mint TEXT, amount REAL);
+CREATE INDEX IF NOT EXISTS watch_lists_mint ON watch_lists(mint, ts);
+-- contract addresses posted in public Telegram channels
+CREATE TABLE IF NOT EXISTS watch_mentions (
+    source TEXT NOT NULL, channel TEXT, post TEXT NOT NULL, mint TEXT NOT NULL, post_ts REAL, seen_ts REAL,
+    PRIMARY KEY (source, post, mint)
+);
+CREATE INDEX IF NOT EXISTS watch_mentions_mint ON watch_mentions(mint);
+-- market conditions: SOL price and how many new pools appeared (before sampling)
+CREATE TABLE IF NOT EXISTS watch_market (ts REAL NOT NULL, sol_usd REAL, new_pools INTEGER, new_launchpad INTEGER);
+-- wallet origins (Helius), cached across tokens
+CREATE TABLE IF NOT EXISTS watch_wallets (wallet TEXT PRIMARY KEY, first_ts REAL, funder TEXT, checked_ts REAL);
 """
 
 
@@ -117,8 +135,14 @@ def compact_info(info: dict | None) -> dict:
         return {}
     holders = info.get("holders") or {}
     launch = info.get("launchpad_details") or {}
+    image = info.get("image") or {}
     return {
         "websites": len(info.get("websites") or []),
+        "website_domains": [_domain(w) for w in (info.get("websites") or [])][:3],
+        "twitter_handle": (info.get("twitter_handle") or "")[:120],
+        "telegram_handle": (info.get("telegram_handle") or "")[:80],
+        "description": (info.get("description") or "")[:400],
+        "image_url": image.get("thumb") or info.get("image_url") or "",
         "twitter": bool(info.get("twitter_handle")),
         "telegram": bool(info.get("telegram_handle")),
         "discord": bool(info.get("discord_url")),
@@ -135,6 +159,11 @@ def compact_info(info: dict | None) -> dict:
         "graduated": launch.get("completed"),
         "categories": info.get("categories") or [],
     }
+
+
+def _domain(url: str) -> str:
+    url = (url or "").lower().split("://", 1)[-1]
+    return url.split("/", 1)[0].removeprefix("www.")[:80]
 
 
 def _ts(iso: str | None) -> float | None:
@@ -197,6 +226,8 @@ class Watcher:
         self.cfg, self.gecko, self.store = cfg, gecko, store
         self.ages = sorted(int(a) for a in cfg.watch_ages_min.split(",") if a.strip())
         self.s3_factory = s3_factory
+        self._seen: dict[str, bool] = {}  # every new pool seen recently -> is a launchpad pool (before sampling)
+        self.seen_counts = [0, 0]  # new pools, of which launchpad, since the market row was last written
 
     @classmethod
     def from_config(cls, cfg: Config) -> "Watcher":
@@ -225,6 +256,13 @@ class Watcher:
                 addr, mint, dex = attrs.get("address"), base_token(p), dex_id(p)
                 if not addr or not mint or mint in NOT_MEMECOINS:
                     continue
+                if addr not in self._seen:
+                    self._seen[addr] = dex in LAUNCHPAD_DEXES
+                    self.seen_counts[0] += 1
+                    self.seen_counts[1] += dex in LAUNCHPAD_DEXES
+                    if len(self._seen) > 20_000:
+                        for old in list(self._seen)[:10_000]:
+                            del self._seen[old]
                 if self.store.query("SELECT 1 FROM watch_pools WHERE pool=?", (addr,)):
                     known += 1
                     continue

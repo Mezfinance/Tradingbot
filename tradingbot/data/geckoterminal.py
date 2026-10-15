@@ -66,6 +66,20 @@ class GeckoTerminal:
                 return None
         return None
 
+    def trending_ranked(self, duration: str = "1h") -> list[str]:
+        """Base-token mints of trending pools in rank order (no dedupe across pools of one token)."""
+        data = self._get(f"/networks/{self.network}/trending_pools", {"duration": duration})
+        return [m for m in (base_token(p, self.network) for p in (data or {}).get("data") or [])
+                if m and m not in NOT_MEMECOINS]
+
+    def sol_price(self) -> float | None:
+        sol = "So11111111111111111111111111111111111111112"
+        data = self._get(f"/simple/networks/{self.network}/token_price/{sol}")
+        try:
+            return float(data["data"]["attributes"]["token_prices"][sol])
+        except (TypeError, KeyError, ValueError):
+            return None
+
     def new_pools(self, page: int = 1) -> list[dict]:
         """Newest pools first (bonding-curve launches and graduations), with base_token and dex ids."""
         data = self._get(f"/networks/{self.network}/new_pools", {"page": page})

@@ -36,6 +36,20 @@ class Config:
     watch_info_age_min: float = 15.0  # token info (socials, developer, holders) taken at this age
     watch_ohlcv_min_volume_usd: float = 5000.0  # fetch 5-min candles at 24h only above this 24h volume
     watch_backup_keep_local: int = 2
+    # --- watcher enrichment (tradingbot/enrich.py): extra pump factors, each budgeted
+    enrich: bool = True
+    enrich_poll_s: int = 20
+    enrich_lists_every_s: int = 120  # DexScreener boosts/profiles + GeckoTerminal trending
+    enrich_market_every_s: int = 300  # SOL price + new-pool counts
+    tg_channels: str = ""  # public Telegram calling channels to scan (comma list of t.me names)
+    tg_every_s: int = 180
+    enrich_min_buyers_m5: int = 20  # launches need this many buyers at 5 min for Helius/X (graduations always)
+    helius_daily_credits: int = 30_000  # ~0.9M/month: fits Helius free (1M); raise on a paid plan
+    enrich_wallets_per_token: int = 8  # early buyers whose wallet age/funder is looked up
+    x_daily_budget_usd: float = 3.0
+    x_cost_per_post: float = 0.005  # X pay-per-use estimate; adjust to your bill
+    x_cost_per_count_call: float = 0.005
+    narrative_daily_usd: float = 2.0  # Haiku narrative tags for every recorded pool (~$0.0003 each)
 
     # --- hard filters (deterministic, applied before Claude is called) --
     min_liquidity_usd: float = 15_000.0

@@ -145,6 +145,11 @@ class Engine:
             watcher = Watcher.from_config(self.cfg)
             threading.Thread(target=self._loop, name="watcher", daemon=True,
                              args=(self.cfg.watch_poll_s, watcher.step)).start()
+            if self.cfg.enrich:
+                from tradingbot.enrich import Enricher
+                enricher = Enricher.from_config(self.cfg, watcher.store, watcher)
+                threading.Thread(target=self._loop, name="enricher", daemon=True,
+                                 args=(self.cfg.enrich_poll_s, enricher.step)).start()
         # Own thread: sampling after each scan cycle left ~18-minute gaps while Claude was busy.
         threading.Thread(target=self._loop, name="tracker", daemon=True,
                          args=(self.cfg.track_interval_s, self.update_outcomes)).start()

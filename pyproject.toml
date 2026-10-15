@@ -8,6 +8,7 @@ dependencies = [
     "httpx>=0.27",
     "pydantic>=2.7",
     "numpy>=1.26",  # watch_analysis regression
+    "pillow>=10",  # enrich: image fingerprints
 ]
 
 [project.optional-dependencies]

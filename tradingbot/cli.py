@@ -176,8 +176,10 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "watch-status":
+        from tradingbot.enrich import Enricher
         from tradingbot.watcher import Watcher
-        print(json.dumps(Watcher.from_config(cfg).status(), indent=2))
+        w = Watcher.from_config(cfg)
+        print(json.dumps({**w.status(), "enrichment": Enricher.from_config(cfg, w.store, w).status()}, indent=2))
         return
 
     if args.command == "watch-links":
