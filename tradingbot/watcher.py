@@ -45,6 +45,8 @@ WINDOWS = ("m5", "m15", "m30", "h1", "h6", "h24")
 MAX_PAGES = 3  # new_pools pages per poll; ~20 pools a page
 SNAP_CALLS_PER_STEP = 4  # 30 pools per call
 INFO_CALLS_PER_STEP = 3
+INFO_MAX_TRIES = 3
+INFO_RETRY_S = 600
 OHLCV_CALLS_PER_STEP = 1
 DAY_S = 86400
 
@@ -309,18 +311,31 @@ class Watcher:
         return taken
 
     def fetch_info(self, now: float) -> int:
+        """Token info once per pool. A failed fetch (usually GeckoTerminal's rate limit) is retried up to
+        INFO_MAX_TRIES times, INFO_RETRY_S apart; only a pool still failing 2 hours late is given up on."""
         due = self.store.query(
             """SELECT pool, mint, created_ts FROM watch_pools WHERE info_ts IS NULL AND created_ts <= ?
-               ORDER BY created_ts LIMIT ?""", (now - self.cfg.watch_info_age_min * 60, INFO_CALLS_PER_STEP * 4))
+               ORDER BY created_ts LIMIT ?""", (now - self.cfg.watch_info_age_min * 60, INFO_CALLS_PER_STEP * 20))
+        tries = getattr(self, "_info_tries", None)
+        if tries is None:
+            tries = self._info_tries = {}
         calls = 0
         for r in due:
-            if now - r["created_ts"] > self.cfg.watch_info_age_min * 60 + 7200:  # too late to mean "at 15 min"
+            n, next_ts = tries.get(r["pool"], (0, 0.0))
+            if now - r["created_ts"] > self.cfg.watch_info_age_min * 60 + 7200 or n >= INFO_MAX_TRIES:
                 self.store.execute("UPDATE watch_pools SET info='{}', info_ts=? WHERE pool=?", (now, r["pool"]))
+                tries.pop(r["pool"], None)
+                continue
+            if now < next_ts:
                 continue
             if calls >= INFO_CALLS_PER_STEP:
                 break
             info = self.gecko.token_info(r["mint"])
             calls += 1
+            if info is None:  # request failed: try again later instead of recording "no info"
+                tries[r["pool"]] = (n + 1, now + INFO_RETRY_S)
+                continue
+            tries.pop(r["pool"], None)
             self.store.execute("UPDATE watch_pools SET info=?, info_ts=? WHERE pool=?",
                                (json.dumps(compact_info(info)), now, r["pool"]))
         return calls

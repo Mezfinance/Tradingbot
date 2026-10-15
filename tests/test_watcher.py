@@ -163,3 +163,28 @@ def test_daily_report_is_written_uploaded_once_and_linkable(tmp_path, monkeypatc
 def test_new_launchpads_are_sampled():
     from tradingbot.watcher import LAUNCHPAD_DEXES
     assert {"stonkfun", "moonit"} <= LAUNCHPAD_DEXES
+
+
+def test_failed_token_info_is_retried_not_recorded_as_empty():
+    calls = []
+    info = {"twitter_handle": "abc"}
+    g = FakeGecko({1: [pool("A", "MA")]})
+    g.token_info = lambda mint: calls.append(mint) or (None if len(calls) < 2 else info)
+    w, _ = make(g)
+    w.discover(T0)
+    w.fetch_info(T0 + 16 * 60)                       # fails (rate limit)
+    assert w.store.query("SELECT info_ts FROM watch_pools")[0]["info_ts"] is None
+    w.fetch_info(T0 + 17 * 60)                       # too soon to retry
+    assert len(calls) == 1
+    w.fetch_info(T0 + 27 * 60)                       # retried after 10 minutes, succeeds
+    assert json.loads(w.store.query("SELECT info FROM watch_pools")[0]["info"])["twitter"] is True
+
+
+def test_token_info_gives_up_after_three_failures():
+    g = FakeGecko({1: [pool("A", "MA")]})
+    g.token_info = lambda mint: None
+    w, _ = make(g)
+    w.discover(T0)
+    for minute in (16, 27, 38, 49):
+        w.fetch_info(T0 + minute * 60)
+    assert w.store.query("SELECT info FROM watch_pools")[0]["info"] == "{}"
