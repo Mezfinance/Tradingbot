@@ -153,6 +153,38 @@ fly secrets set GITHUB_TOKEN=<fine-grained token: contents read/write on this re
 
 The bot only ever pushes to `GITHUB_BRANCH`, never to your base branch. To switch self-writing off: `fly secrets set TB_ENGINEER_ENABLED=false`.
 
+## 7. Pump watcher: research data, and the keys it can use
+
+The watcher records every new Solana pool (pump.fun launches sampled at 20%, every graduation)
+and the factors around it, to find what predicts a pump. It never trades. Data lives in
+`/data/watch.db`; a backup and a full analysis are uploaded to the bucket daily (`watch/`).
+
+```
+fly machine exec <machine-id> "python -m tradingbot watch-status" -a supermeme     # is it collecting?
+fly machine exec <machine-id> "python -m tradingbot watch-links" -a supermeme      # 7-day download links
+fly machine exec <machine-id> "python -m tradingbot watch-report-now" -a supermeme # write a report now
+fly machine exec <machine-id> "python -m tradingbot watch-report" -a supermeme     # print the analysis
+```
+
+Optional keys switch on more factors. Without them those factors are skipped, nothing breaks:
+
+```
+fly secrets set HELIUS_API_KEY=... -a supermeme      # bundles, snipers, holders, wallet age/funder
+fly secrets set X_BEARER_TOKEN=... -a supermeme      # posts with the contract address, author reach
+fly secrets set TB_TG_CHANNELS="chan1,chan2" -a supermeme   # public Telegram calling channels (t.me names)
+```
+
+Budgets (spread evenly over each UTC day):
+
+| Setting | Default | Notes |
+|---|---|---|
+| `TB_HELIUS_DAILY_CREDITS` | 30000 | ~0.9M credits/month, fits Helius free (1M). Developer plan (10M): try 300000 |
+| `TB_X_DAILY_BUDGET_USD` | 3.0 | X pay-per-use, ~$0.005 per post read; ~$90/month at the default |
+| `TB_NARRATIVE_DAILY_USD` | 2.0 | Haiku narrative tags, ~$0.0003 per token |
+| `TB_ENRICH_MIN_BUYERS_M5` | 20 | launches need this many buyers at 5 minutes for Helius/X lookups |
+
+`watch-status` shows how many tokens each source has enriched and today's spend per budget.
+
 ## If Claude calls fail
 
 Billing or key problems (for example "credit balance is too low") pause Claude calls for 10 minutes and log `Claude API unavailable`. Rate limits and Anthropic outages pause them for 1 minute. In both cases candidates stay queued and are analysed once the API works again, with no restart needed. Fix billing at console.anthropic.com, or a bad key with `fly secrets set ANTHROPIC_API_KEY=...`.

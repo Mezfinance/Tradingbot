@@ -81,7 +81,8 @@ def test_stop_before_target_is_not_a_clean_pump():
     add_pool(store, "P", "M", T0, snaps={15: snap(1.0)}, candles=candle_path(T0, 15, [0.6, 0.45, 2.5]))
     [row] = wa.build_dataset(store, 15, now=NOW)
     assert row["pump2x"] and not row["clean2x"]
-    assert abs(row["trade_ret"] - (-0.5 - wa.ROUND_TRIP_COST)) < 1e-9
+    # The price gapped through the -50% stop to 0.45, so the stop fills there, not at a perfect -50%.
+    assert abs(row["trade_ret"] - (-0.55 - wa.ROUND_TRIP_COST)) < 1e-9
 
 
 def test_no_peeking_at_info_fetched_after_the_snapshot():
@@ -124,3 +125,11 @@ def test_export_writes_features_and_labels(tmp_path):
     assert wa.export_csv(synthetic(n=50), str(out), age=15, now=NOW) == 50
     header = out.read_text().splitlines()[0].split(",")
     assert "pump2x" in header and "buyer_ratio_m5" in header and "pool" in header
+
+
+def test_a_single_wick_is_not_a_pump():
+    store = WatchStore(":memory:")
+    wick = [[T0 + 20 * 60, 1.0, 3.0, 0.9, 1.1, 50]]  # high 3x for one trade, closes at 1.1x
+    add_pool(store, "P", "M", T0, snaps={15: snap(1.0)}, candles=wick)
+    [row] = wa.build_dataset(store, 15, now=NOW)
+    assert row["best_mult"] == 3.0 and row["best_close_mult"] == 1.1 and not row["pump2x"]

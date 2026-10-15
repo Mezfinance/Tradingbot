@@ -399,10 +399,11 @@ class Watcher:
             full: dict = {}
             text = []
             for label in ("pump2x", "clean2x", "pump5x"):
-                summ = wa.summary(self.store, label)
-                detail = wa.analyse(self.store, 15, label)
-                full[label] = {"summary": summ, "detail_15m": detail}
-                text += [f"===== {label} =====", wa.render(detail, summ), ""]
+                for subset in (None, "enriched"):
+                    summ = wa.summary(self.store, label, subset=subset)
+                    detail = wa.analyse(self.store, 15, label, subset=subset)
+                    full[f"{label}:{subset or 'all'}"] = {"summary": summ, "detail_15m": detail}
+                    text += [f"===== {label}, {subset or 'all'} tokens =====", wa.render(detail, summ), ""]
             (out / "report.json").write_text(json.dumps(full, indent=2, default=str))
             (out / "report.txt").write_text("\n".join(text))
             for age in wa.FEATURE_AGES:

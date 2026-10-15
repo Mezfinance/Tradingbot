@@ -29,6 +29,7 @@ from collections import defaultdict
 
 import numpy as np
 
+from tradingbot.watch_features import Context
 from tradingbot.watcher import LAUNCHPAD_DEXES, WatchStore
 
 DAY_S = 86400
@@ -78,24 +79,31 @@ def _future_paths(store: WatchStore) -> dict[str, list[tuple[float, float, float
 
 
 def _outcome(path: list, start_ts: float, entry: float) -> dict | None:
-    """Best/worst after start_ts within 24h, the order of +100% / -50%, and a simulated trade."""
+    """Best/worst after start_ts within 24h, the order of +100% / -50%, and a simulated trade.
+
+    Pumps are judged on 5-minute CLOSES: a single wick in a thin pool is one trade nobody else
+    could have sold into. The stop fills at the stop price or worse (the candle's close if it
+    gapped through); if one candle spans both levels, the stop is assumed to come first.
+    """
     window = [p for p in path if start_ts < p[0] <= start_ts + DAY_S]
     if not window or entry <= 0:
         return None
-    best = max(p[1] for p in window) / entry
+    best_high = max(p[1] for p in window) / entry
+    best_close = max(p[3] for p in window) / entry
     worst = min(p[2] for p in window) / entry
     clean, trade = False, None
-    for _ts, high, low, _close in window:
-        if low <= entry * SL_MULT:  # conservative: if one candle spans both, assume the stop hit first
-            trade = SL_MULT - 1
+    for _ts, _high, low, close in window:
+        if low <= entry * SL_MULT:
+            trade = min(SL_MULT, close / entry) - 1
             break
-        if high >= entry * TP_MULT:
+        if close >= entry * TP_MULT:
             clean, trade = True, TP_MULT - 1
             break
     if trade is None:
         trade = window[-1][3] / entry - 1
-    return {"best_mult": best, "worst_mult": worst, "pump2x": best >= 2, "pump5x": best >= 5,
-            "clean2x": clean, "trade_ret": trade - ROUND_TRIP_COST}
+    return {"best_mult": best_high, "best_close_mult": best_close, "worst_mult": worst,
+            "pump2x": best_close >= 2, "pump5x": best_close >= 5, "clean2x": clean,
+            "trade_ret": trade - ROUND_TRIP_COST}
 
 
 def _snap_features(d: dict, prefix: str = "") -> dict:
@@ -161,6 +169,7 @@ def build_dataset(store: WatchStore, age: int, now: float | None = None) -> list
     for r in store.query("SELECT pool, age_min, ts, data FROM watch_snaps WHERE data IS NOT NULL AND data != '{}'"):
         snaps[r["pool"]][r["age_min"]] = (r["ts"], json.loads(r["data"]))
     paths = _future_paths(store)
+    ctx = Context(store)
 
     # Developer track record: launches and pumps among the developer's EARLIER tokens.
     by_dev: dict[str, list[tuple[float, str]]] = defaultdict(list)
@@ -203,12 +212,13 @@ def build_dataset(store: WatchStore, age: int, now: float | None = None) -> list
                 row["dev_prior_launches"] = _log1p(len(prior))
                 row["dev_prior_pump_rate"] = (sum(outcome_at_age[q]["pump2x"] for q in done) / len(done)
                                               if done else None)
+        row.update(ctx.features(pool, p, ts, info_ok=bool(p["info"] and p["info_ts"] and p["info_ts"] <= ts)))
         row.update(out)
         rows.append(row)
     return rows
 
 
-LABEL_KEYS = ("best_mult", "worst_mult", "pump2x", "pump5x", "clean2x", "trade_ret")
+LABEL_KEYS = ("best_mult", "best_close_mult", "worst_mult", "pump2x", "pump5x", "clean2x", "trade_ret")
 ID_KEYS = ("pool", "mint", "dex", "created_ts", "age")
 
 
@@ -260,9 +270,17 @@ def logistic(x: np.ndarray, y: np.ndarray, l2: float = 1.0, iters: int = 3000, l
     return w, b
 
 
-def analyse(store: WatchStore, age: int = 15, label: str = "pump2x", now: float | None = None) -> dict:
-    rows = build_dataset(store, age, now)
-    out: dict = {"age_min": age, "label": label, "rows": len(rows)}
+SUBSETS = {
+    None: lambda r: True,
+    # Tokens with the paid wallet-level data (Helius): graduations and launches with real buyers at 5 min.
+    "enriched": lambda r: r.get("hel_early_buyers") is not None or r.get("hel_top10_share") is not None,
+}
+
+
+def analyse(store: WatchStore, age: int = 15, label: str = "pump2x", now: float | None = None,
+            subset: str | None = None, rows: list[dict] | None = None) -> dict:
+    rows = [r for r in (rows if rows is not None else build_dataset(store, age, now)) if SUBSETS[subset](r)]
+    out: dict = {"age_min": age, "label": label, "subset": subset or "all", "rows": len(rows)}
     if len(rows) < MIN_ROWS:
         out["note"] = f"need at least {MIN_ROWS} finished rows; have {len(rows)} (pools finish 24h after creation)"
         return out
@@ -321,11 +339,12 @@ def analyse(store: WatchStore, age: int = 15, label: str = "pump2x", now: float 
     return out
 
 
-def summary(store: WatchStore, label: str = "pump2x", now: float | None = None) -> list[dict]:
+def summary(store: WatchStore, label: str = "pump2x", now: float | None = None,
+            subset: str | None = None) -> list[dict]:
     """Held-out quality per feature age, to pick when to decide."""
     res = []
     for age in FEATURE_AGES:
-        a = analyse(store, age, label, now)
+        a = analyse(store, age, label, now, subset)
         res.append({k: a.get(k) for k in ("age_min", "rows", "base_rate", "test_auc", "test_lift",
                                           "trade_all_test_mean", "note")}
                    | {"top_decile_mean_ret": (a.get("trade_top_decile") or {}).get("mean_ret")})
@@ -346,7 +365,8 @@ def render(a: dict, summ: list[dict] | None = None) -> str:
                          f"{(s['test_auc'] or 0):>7.3f}{(s['test_lift'] or 0):>7.2f}"
                          f"{pct(s['trade_all_test_mean']):>11}{pct(s['top_decile_mean_ret']):>14}")
         lines.append("")
-    lines.append(f"DETAIL at {a['age_min']} min, label {a['label']}: {a['rows']} rows")
+    lines.append(f"DETAIL at {a['age_min']} min, label {a['label']}, tokens: {a.get('subset', 'all')}: "
+                 f"{a['rows']} rows")
     if a.get("note"):
         lines.append(f"  {a['note']}")
         return "\n".join(lines)
