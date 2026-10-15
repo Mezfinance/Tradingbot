@@ -58,7 +58,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "backup-now", "backup-list", "learn-now", "postmortems", "playbook", "optimize-now", "settings",
                                             "settings-rollback", "code-versions", "code-diff", "code-rollback",
                                             "propose", "proposals", "watch-status", "watch-report",
-                                            "watch-export"])
+                                            "watch-export", "watch-links", "watch-report-now"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -178,6 +178,25 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "watch-status":
         from tradingbot.watcher import Watcher
         print(json.dumps(Watcher.from_config(cfg).status(), indent=2))
+        return
+
+    if args.command == "watch-links":
+        import os
+        from tradingbot.backups import s3_client
+        from tradingbot.watcher import download_links
+        client = s3_client()
+        if client is None:
+            print("no bucket configured (fly storage create); reports are only on the volume under /data/reports")
+            return
+        print(json.dumps(download_links(client, os.environ["BUCKET_NAME"]), indent=2))
+        return
+
+    if args.command == "watch-report-now":
+        from datetime import datetime, timezone
+        from tradingbot.watcher import Watcher
+        w = Watcher.from_config(cfg)
+        out = w.write_report(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        print(f"report written to {out}" if out else "report failed; see the log line above")
         return
 
     if args.command in ("watch-report", "watch-export"):

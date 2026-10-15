@@ -127,3 +127,39 @@ def test_daily_backup_uploads_once(tmp_path, monkeypatch):
 def test_compact_flattens_windows():
     c = compact(pool("A", "MA")["attributes"])
     assert c["buys_m5"] == 10 and c["vol_m5"] == 800.0 and c["chg_m5"] == 12.5 and c["buys_h1"] is None
+
+
+def test_daily_report_is_written_uploaded_once_and_linkable(tmp_path, monkeypatch):
+    import boto3
+    from moto import mock_aws
+
+    from tests.test_watch_analysis import synthetic
+    from tradingbot.watcher import download_links
+
+    monkeypatch.setenv("BUCKET_NAME", "bkt")
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", "x")
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "x")
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket="bkt")
+        store = WatchStore(str(tmp_path / "watch.db"))
+        for row in synthetic(n=300).query("SELECT * FROM watch_pools"):  # copy synthetic pools in
+            store.execute("INSERT INTO watch_pools VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", tuple(row))
+        cfg = Config(db_path=str(tmp_path / "bot.db"))
+        w = Watcher(cfg, FakeGecko(), store, s3_factory=lambda: s3)
+        day = datetime(2026, 10, 16, 2, tzinfo=timezone.utc)
+        assert w.report_if_due(day, wait=True) is not None
+        assert w.report_if_due(day) is None  # once per day
+        folder = tmp_path / "reports" / "watch-2026-10-16"
+        assert {"status.json", "report.json", "report.txt"} <= {f.name for f in folder.iterdir()}
+        assert "pump2x" in (folder / "report.txt").read_text()
+        s3.put_object(Bucket="bkt", Key="watch/watch-2026-10-16.db.gz", Body=b"db")
+        links = download_links(s3, "bkt")
+        assert links["latest_report"] == "watch-2026-10-16"
+        assert "report.txt" in links["report_files"] and links["report_files"]["report.txt"].startswith("https://")
+        assert list(links["latest_backup"]) == ["watch-2026-10-16.db.gz"]
+
+
+def test_new_launchpads_are_sampled():
+    from tradingbot.watcher import LAUNCHPAD_DEXES
+    assert {"stonkfun", "moonit"} <= LAUNCHPAD_DEXES

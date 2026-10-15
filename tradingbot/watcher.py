@@ -38,7 +38,9 @@ from tradingbot.data.geckoterminal import NOT_MEMECOINS, GeckoTerminal, base_tok
 log = logging.getLogger(__name__)
 
 # Bonding-curve launchpads: tens of thousands of launches a day, so these are sampled.
-LAUNCHPAD_DEXES = {"pump-fun", "meteora-dbc", "raydium-launchlab", "letsbonk", "moonshot", "boop-fun", "bags-fm"}
+LAUNCHPAD_DEXES = {"pump-fun", "meteora-dbc", "raydium-launchlab", "letsbonk", "moonshot", "moonit", "boop-fun",
+                   "bags-fm", "stonkfun"}
+REPORT_KEEP_LOCAL = 3  # dated report folders kept on the volume (all are in the bucket)
 WINDOWS = ("m5", "m15", "m30", "h1", "h6", "h24")
 MAX_PAGES = 3  # new_pools pages per poll; ~20 pools a page
 SNAP_CALLS_PER_STEP = 4  # 30 pools per call
@@ -207,6 +209,7 @@ class Watcher:
         done = {"new": self.discover(now), "snaps": self.snapshot(now), "info": self.fetch_info(now),
                 "ohlcv": self.fetch_ohlcv(now)}
         self.backup_if_due()
+        self.report_if_due()
         self.store.set_state("heartbeat", repr(time.time()))
         return done
 
@@ -329,6 +332,59 @@ class Watcher:
             log.error("watch backup failed: %s: %s", type(exc).__name__, exc)
         self.store.set_state("last_backup", date)
 
+    # --- daily report --------------------------------------------------------------
+    def report_if_due(self, now: datetime | None = None, wait: bool = False) -> threading.Thread | None:
+        """Once a UTC day, write the analysis to <db dir>/reports/watch-DATE/ and the bucket.
+
+        Runs in its own thread so a slow analysis never holds up data collection.
+        """
+        now = now or datetime.now(timezone.utc)
+        date = now.strftime("%Y-%m-%d")
+        if (self.store.path == ":memory:" or self.store.get_state("last_report") == date
+                or getattr(self, "_report_thread", None) is not None and self._report_thread.is_alive()):
+            return None
+        self.store.set_state("last_report", date)
+        t = threading.Thread(target=self.write_report, args=(date,), name="watch-report", daemon=True)
+        self._report_thread = t
+        t.start()
+        if wait:
+            t.join()
+        return t
+
+    def write_report(self, date: str) -> Path | None:
+        from tradingbot import watch_analysis as wa
+        try:
+            root = Path(self.store.path).resolve().parent / "reports"
+            out = root / f"watch-{date}"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "status.json").write_text(json.dumps(self.status(), indent=2))
+            full: dict = {}
+            text = []
+            for label in ("pump2x", "clean2x", "pump5x"):
+                summ = wa.summary(self.store, label)
+                detail = wa.analyse(self.store, 15, label)
+                full[label] = {"summary": summ, "detail_15m": detail}
+                text += [f"===== {label} =====", wa.render(detail, summ), ""]
+            (out / "report.json").write_text(json.dumps(full, indent=2, default=str))
+            (out / "report.txt").write_text("\n".join(text))
+            for age in wa.FEATURE_AGES:
+                raw = out / f"rows-{age}m.csv"
+                if wa.export_csv(self.store, str(raw), age):
+                    with open(raw, "rb") as src, gzip.open(f"{raw}.gz", "wb", compresslevel=6) as dst:
+                        shutil.copyfileobj(src, dst, length=1 << 20)
+                raw.unlink(missing_ok=True)
+            for old in sorted(root.glob("watch-*"))[:-REPORT_KEEP_LOCAL]:
+                shutil.rmtree(old, ignore_errors=True)
+            client = self.s3_factory() if self.s3_factory else None
+            if client is not None:
+                for f in sorted(out.iterdir()):
+                    client.upload_file(str(f), os.environ["BUCKET_NAME"], f"watch/reports/{out.name}/{f.name}")
+            log.info("watch report %s written%s", date, " and uploaded" if client is not None else "")
+            return out
+        except Exception as exc:  # noqa: BLE001 (a failed report must not stop collection)
+            log.error("watch report failed: %s: %s", type(exc).__name__, exc)
+            return None
+
     # --- status ------------------------------------------------------------------
     def status(self) -> dict:
         q = self.store.query
@@ -347,3 +403,36 @@ class Watcher:
             "last_backup": self.store.get_state("last_backup"),
             "db_mb": round(os.path.getsize(self.store.path) / 1e6, 1) if self.store.path != ":memory:" else 0,
         }
+
+
+LINK_EXPIRY_S = 7 * DAY_S  # the longest an S3 presigned link may live
+
+
+def download_links(client, bucket: str, expires_s: int = LINK_EXPIRY_S) -> dict:
+    """Presigned download links for the newest watch report and database backup in the bucket."""
+    keys: list[str] = []
+    token = None
+    while True:
+        kw = {"Bucket": bucket, "Prefix": "watch/"}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = client.list_objects_v2(**kw)
+        keys += [o["Key"] for o in resp.get("Contents", [])]
+        if not resp.get("IsTruncated"):
+            break
+        token = resp.get("NextContinuationToken")
+    reports = sorted({k.split("/")[2] for k in keys if k.startswith("watch/reports/") and k.count("/") >= 3})
+    backups = sorted(k for k in keys if k.startswith("watch/watch-") and k.endswith(".db.gz"))
+
+    def link(key: str) -> str:
+        return client.generate_presigned_url("get_object", Params={"Bucket": bucket, "Key": key},
+                                             ExpiresIn=expires_s)
+
+    latest = reports[-1] if reports else None
+    return {
+        "latest_report": latest,
+        "report_files": {k.rsplit("/", 1)[1]: link(k) for k in keys if latest and k.startswith(f"watch/reports/{latest}/")},
+        "latest_backup": {backups[-1].rsplit("/", 1)[1]: link(backups[-1])} if backups else {},
+        "older_reports": reports[:-1],
+        "links_valid_days": round(expires_s / DAY_S, 1),
+    }
