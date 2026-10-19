@@ -62,20 +62,32 @@ def _ratio(a, b) -> float | None:
 
 # --- dataset -------------------------------------------------------------------------
 def _future_paths(store: WatchStore) -> dict[str, list[tuple[float, float, float, float]]]:
-    """mint -> [(ts, high, low, close)] from candles of every pool of that mint, plus snapshot prices."""
+    """mint -> [(ts, high, low, close)] from candles of every pool of that mint, plus snapshot prices.
+
+    Only prices from a pool that was trading at the time count: a launch pool that has graduated keeps
+    reporting its last (graduation) price, and mixing that stale price with the new pool's live one
+    turned every post-graduation dump into a fake 2x.
+    """
     paths: dict[str, list] = defaultdict(list)
     for r in store.query("SELECT mint, ohlcv FROM watch_pools WHERE ohlcv IS NOT NULL AND ohlcv != '[]'"):
         for c in json.loads(r["ohlcv"]):
+            if len(c) > 5 and not (_f(c[5]) or 0) > 0:
+                continue  # no volume: no trade at this price
             ts, _o, h, low, close = (float(c[0]), c[1], c[2], c[3], c[4])
             paths[r["mint"]].append((ts + 300, float(h), float(low), float(close)))  # candle known at its close
     for r in store.query("SELECT p.mint, s.ts, s.data FROM watch_snaps s JOIN watch_pools p USING(pool) "
                          "WHERE s.data IS NOT NULL AND s.data != '{}'"):
-        price = _f(json.loads(r["data"]).get("price"))
-        if price:
+        d = json.loads(r["data"])
+        price = _f(d.get("price"))
+        if price and (d.get("buys_m5") or 0) + (d.get("sells_m5") or 0) > 0:
             paths[r["mint"]].append((r["ts"], price, price, price))
     for v in paths.values():
         v.sort()
     return paths
+
+
+FLAT_OUTCOME = {"best_mult": 1.0, "best_close_mult": 1.0, "worst_mult": 1.0, "pump2x": False, "pump5x": False,
+                "clean2x": False, "trade_ret": -ROUND_TRIP_COST}
 
 
 def _outcome(path: list, start_ts: float, entry: float) -> dict | None:
@@ -196,6 +208,8 @@ def build_dataset(store: WatchStore, age: int, now: float | None = None) -> list
         ts, d = snaps[pool][age]
         entry = _f(d.get("price"))
         out = _outcome(paths.get(p["mint"], []), ts, entry or 0)
+        if out is None and entry and any(a > age for a in snaps[pool]):
+            out = FLAT_OUTCOME  # watched afterwards but nobody traded it again: no pump, stuck at the entry price
         if out is None:
             continue
         outcome_at_age[pool] = out

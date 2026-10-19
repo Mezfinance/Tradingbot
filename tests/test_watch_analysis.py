@@ -155,3 +155,21 @@ def test_paid_value_compares_models_with_and_without_the_paid_features():
     assert h["auc_with"] > 0.9 and h["auc_gain"] > 0.3
     assert "need" in pv["x"]["note"]
     assert "held-out AUC with its 1 features" in render_paid_value(pv)
+
+
+def test_a_dead_launch_pools_stale_price_is_not_a_pump():
+    # The curve pool graduated at price 1.0 and kept reporting it with no trades; the new pool then halved.
+    store = WatchStore(":memory:")
+    stale = dict(snap(1.0), buys_m5=0, sells_m5=0)
+    add_pool(store, "CURVE", "MINT", T0 - 3600, snaps={60: snap(1.0), 180: stale, 360: stale, 1440: stale})
+    add_pool(store, "GRAD", "MINT", T0, dex="pumpswap", snaps={15: snap(0.4), 60: snap(0.3), 360: snap(0.35)})
+    [row] = [r for r in wa.build_dataset(store, 15, now=NOW) if r["pool"] == "GRAD"]
+    assert not row["pump2x"] and row["best_mult"] < 1
+
+
+def test_a_token_nobody_traded_again_counts_as_flat_not_missing():
+    store = WatchStore(":memory:")
+    dead = dict(snap(1.0), buys_m5=0, sells_m5=0)
+    add_pool(store, "DEAD", "M", T0, snaps={15: snap(1.0), 60: dead, 1440: dead})
+    [row] = wa.build_dataset(store, 15, now=NOW)
+    assert not row["pump2x"] and row["trade_ret"] == -wa.ROUND_TRIP_COST
