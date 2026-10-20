@@ -27,6 +27,8 @@ import logging
 import os
 import shutil
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 from datetime import datetime, timezone
@@ -40,6 +42,9 @@ log = logging.getLogger(__name__)
 # Bonding-curve launchpads: tens of thousands of launches a day, so these are sampled.
 LAUNCHPAD_DEXES = {"pump-fun", "meteora-dbc", "raydium-launchlab", "letsbonk", "moonshot", "moonit", "boop-fun",
                    "bags-fm", "stonkfun"}
+REPORT_MAX_TRIES = 3  # attempts per UTC day (a crash would otherwise retry forever)
+REPORT_RETRY_S = 3600
+REPORT_TIMEOUT_S = 4 * 3600
 REPORT_KEEP_LOCAL = 3  # dated report folders kept on the volume (all are in the bucket)
 WINDOWS = ("m5", "m15", "m30", "h1", "h6", "h24")
 MAX_PAGES = 3  # new_pools pages per poll; ~20 pools a page
@@ -190,10 +195,15 @@ class WatchStore:
         self.path = path
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(path, check_same_thread=False)
+        self.db = sqlite3.connect(path, check_same_thread=False, timeout=60)
         self.db.row_factory = sqlite3.Row
         self.lock = threading.RLock()
         with self.lock:
+            if path != ":memory:":
+                # WAL: readers in other processes (the report, `fly machine exec` commands) never block the
+                # watcher's writes, and its writes never block them.
+                self.db.execute("PRAGMA journal_mode=WAL")
+                self.db.execute("PRAGMA synchronous=NORMAL")
             self.db.executescript(SCHEMA)
             self.db.commit()
 
@@ -230,17 +240,20 @@ class WatchStore:
 
 
 class Watcher:
-    def __init__(self, cfg: Config, gecko: GeckoTerminal, store: WatchStore, s3_factory=None):
+    def __init__(self, cfg: Config, gecko: GeckoTerminal, store: WatchStore, s3_factory=None,
+                 report_in_subprocess: bool = False):
         self.cfg, self.gecko, self.store = cfg, gecko, store
         self.ages = sorted(int(a) for a in cfg.watch_ages_min.split(",") if a.strip())
         self.s3_factory = s3_factory
+        self.report_in_subprocess = report_in_subprocess
         self._seen: dict[str, bool] = {}  # every new pool seen recently -> is a launchpad pool (before sampling)
         self.seen_counts = [0, 0]  # new pools, of which launchpad, since the market row was last written
 
     @classmethod
     def from_config(cls, cfg: Config) -> "Watcher":
         from tradingbot.backups import s3_client
-        return cls(cfg, GeckoTerminal(), WatchStore(watch_db_path(cfg)), s3_factory=s3_client)
+        return cls(cfg, GeckoTerminal(), WatchStore(watch_db_path(cfg)), s3_factory=s3_client,
+                   report_in_subprocess=True)
 
     # --- one pass ----------------------------------------------------------------
     def step(self, now: float | None = None) -> dict:
@@ -395,20 +408,44 @@ class Watcher:
     def report_if_due(self, now: datetime | None = None, wait: bool = False) -> threading.Thread | None:
         """Once a UTC day, write the analysis to <db dir>/reports/watch-DATE/ and the bucket.
 
-        Runs in its own thread so a slow analysis never holds up data collection.
+        Runs in its own thread so a slow analysis never holds up data collection, and (on the server) in its
+        own process, so running out of memory kills the report and never the bot. A failed attempt is retried
+        up to REPORT_MAX_TRIES times, REPORT_RETRY_S apart; `last_report` is set only when a report is written.
         """
         now = now or datetime.now(timezone.utc)
         date = now.strftime("%Y-%m-%d")
         if (self.store.path == ":memory:" or self.store.get_state("last_report") == date
                 or getattr(self, "_report_thread", None) is not None and self._report_thread.is_alive()):
             return None
-        self.store.set_state("last_report", date)
-        t = threading.Thread(target=self.write_report, args=(date,), name="watch-report", daemon=True)
+        tries, last = (self.store.get_state(f"report_try:{date}") or "0,0").split(",")
+        if int(tries) >= REPORT_MAX_TRIES or now.timestamp() - float(last) < REPORT_RETRY_S:
+            return None
+        self.store.set_state(f"report_try:{date}", f"{int(tries) + 1},{now.timestamp()}")
+        target = self._report_in_child if self.report_in_subprocess else self.write_report
+        t = threading.Thread(target=target, args=(date,), name="watch-report", daemon=True)
         self._report_thread = t
         t.start()
         if wait:
             t.join()
         return t
+
+    def _report_in_child(self, date: str) -> None:
+        """`python -m tradingbot watch-report-now DATE` in a child process that the kernel kills first when
+        memory runs out (oom_score_adj 1000), so the bot keeps running whatever the report needs."""
+        def first_to_die():
+            try:
+                with open("/proc/self/oom_score_adj", "w") as fh:
+                    fh.write("1000")
+            except OSError:
+                pass
+        try:
+            res = subprocess.run([sys.executable, "-m", "tradingbot", "watch-report-now", date],
+                                 preexec_fn=first_to_die, timeout=REPORT_TIMEOUT_S)
+            if res.returncode != 0:
+                log.error("watch report %s: child exited %s%s", date, res.returncode,
+                          " (killed: out of memory?)" if res.returncode in (-9, 137) else "")
+        except Exception as exc:  # noqa: BLE001 (a failed report must not stop collection)
+            log.error("watch report %s could not run: %s: %s", date, type(exc).__name__, exc)
 
     def write_report(self, date: str) -> Path | None:
         from tradingbot import watch_analysis as wa
@@ -417,32 +454,35 @@ class Watcher:
             out = root / f"watch-{date}"
             out.mkdir(parents=True, exist_ok=True)
             (out / "status.json").write_text(json.dumps(self.status(), indent=2))
-            full: dict = {}
-            text = []
-            rows_by_age = {age: wa.build_dataset(self.store, age) for age in wa.FEATURE_AGES}  # built once
-            for label in ("pump2x", "clean2x", "pump5x"):
-                for subset in (None, "enriched"):
-                    summ = wa.summary(self.store, label, subset=subset, rows_by_age=rows_by_age)
-                    detail = wa.analyse(self.store, 15, label, subset=subset, rows=rows_by_age[15])
-                    full[f"{label}:{subset or 'all'}"] = {"summary": summ, "detail_15m": detail}
-                    text += [f"===== {label}, {subset or 'all'} tokens =====", wa.render(detail, summ), ""]
-            pv = wa.paid_value(rows_by_age[15], "pump2x")  # is Helius / X worth paying for (15-min features)
-            full["paid_value_15m"] = pv
-            text = [wa.render_paid_value(pv), ""] + text
-            (out / "report.json").write_text(json.dumps(full, indent=2, default=str))
-            (out / "report.txt").write_text("\n".join(text))
-            for age in wa.FEATURE_AGES:
+            labels, subsets = ("pump2x", "clean2x", "pump5x"), (None, "enriched")
+            extra: dict = {}
+
+            def per_age(age: int, rows: list[dict]) -> None:
+                if age == 15:  # is Helius / X worth paying for (15-min features)
+                    extra["paid_value"] = wa.paid_value(rows, "pump2x")
                 raw = out / f"rows-{age}m.csv"
-                if wa.export_csv(self.store, str(raw), age, rows=rows_by_age[age]):
+                if wa.export_csv(self.store, str(raw), age, rows=rows):
                     with open(raw, "rb") as src, gzip.open(f"{raw}.gz", "wb", compresslevel=6) as dst:
                         shutil.copyfileobj(src, dst, length=1 << 20)
                 raw.unlink(missing_ok=True)
+
+            res = wa.report_by_age(self.store, labels, subsets, detail_age=15, on_rows=per_age)
+            full: dict = {"paid_value_15m": extra.get("paid_value")}
+            text = [wa.render_paid_value(extra["paid_value"]), ""] if extra.get("paid_value") else []
+            for label in labels:
+                for subset in subsets:
+                    summ, detail = res["summary"][(label, subset)], res["detail"][(label, subset)]
+                    full[f"{label}:{subset or 'all'}"] = {"summary": summ, "detail_15m": detail}
+                    text += [f"===== {label}, {subset or 'all'} tokens =====", wa.render(detail, summ), ""]
+            (out / "report.json").write_text(json.dumps(full, indent=2, default=str))
+            (out / "report.txt").write_text("\n".join(text))
             for old in sorted(root.glob("watch-*"))[:-REPORT_KEEP_LOCAL]:
                 shutil.rmtree(old, ignore_errors=True)
             client = self.s3_factory() if self.s3_factory else None
             if client is not None:
                 for f in sorted(out.iterdir()):
                     client.upload_file(str(f), os.environ["BUCKET_NAME"], f"watch/reports/{out.name}/{f.name}")
+            self.store.set_state("last_report", date)
             log.info("watch report %s written%s", date, " and uploaded" if client is not None else "")
             return out
         except Exception as exc:  # noqa: BLE001 (a failed report must not stop collection)

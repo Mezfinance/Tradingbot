@@ -13,6 +13,7 @@ import bisect
 import json
 import math
 import re
+import sys
 from collections import defaultdict
 
 from tradingbot.watcher import WatchStore
@@ -24,6 +25,39 @@ NARRATIVE_CATEGORIES = (
     "brand_impersonation", "crypto_meta", "culture_entertainment", "joke_nsfw", "other")
 STOPWORDS = {"sol", "the", "coin", "token", "official", "and", "for", "inu", "pump", "fun", "usd", "usdc"}
 WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _interned(pairs):
+    """json object hook: one shared copy of every key and short string (field names, wallet addresses)."""
+    return {sys.intern(k): (sys.intern(v) if isinstance(v, str) and len(v) < 64 else v) for k, v in pairs}
+
+
+def _intern_lists(x):
+    if isinstance(x, list):
+        return [_intern_lists(v) for v in x]
+    if isinstance(x, str) and len(x) < 64:
+        return sys.intern(x)
+    return x
+
+
+def loads(text: str | None):
+    """json.loads for the watcher's stored JSON, sharing repeated strings (a week of rows is millions)."""
+    if not text:
+        return {}
+    data = json.loads(text, object_pairs_hook=_interned)
+    for key in ("trades", "holders", "posts"):  # lists of lists of wallet addresses
+        if isinstance(data, dict) and isinstance(data.get(key), list):
+            data[key] = _intern_lists(data[key])
+    return data
+
+
+def load_snaps(store: WatchStore) -> dict[str, list[tuple[float, int, dict]]]:
+    """pool -> [(ts, age_min, snapshot)] in time order, parsed once and shared by every user."""
+    snaps: dict[str, list[tuple[float, int, dict]]] = defaultdict(list)
+    for r in store.query("SELECT pool, age_min, ts, data FROM watch_snaps WHERE data IS NOT NULL AND data != '{}' "
+                         "ORDER BY ts"):
+        snaps[r["pool"]].append((r["ts"], r["age_min"], loads(r["data"])))
+    return snaps
 
 
 def _log1p(x) -> float | None:
@@ -49,12 +83,13 @@ def _gini(values: list[float]) -> float | None:
 
 
 class Context:
-    def __init__(self, store: WatchStore, cfg=None):
+    def __init__(self, store: WatchStore, cfg=None, snaps: dict | None = None):
         pools = [dict(r) for r in store.query("SELECT pool, mint, name, created_ts, first FROM watch_pools")]
         self.created = {p["pool"]: p["created_ts"] for p in pools}
+        self.snaps = snaps if snaps is not None else load_snaps(store)
         self.enrich: dict[str, dict[str, tuple[float, dict]]] = defaultdict(dict)
         for r in store.query("SELECT pool, kind, ts, data FROM watch_enrich"):
-            self.enrich[r["pool"]][r["kind"]] = (r["ts"], json.loads(r["data"]) if r["data"] else {})
+            self.enrich[r["pool"]][r["kind"]] = (r["ts"], loads(r["data"]))
 
         # When each token first traded at 2x its first-seen price, from live snapshots.
         first_price = {}
@@ -65,13 +100,12 @@ class Context:
                 first_price[p["pool"]] = 0.0
         mint_of = {p["pool"]: p["mint"] for p in pools}
         self.t2x: dict[str, float] = {}
-        for r in store.query("SELECT pool, ts, data FROM watch_snaps WHERE data IS NOT NULL AND data != '{}' "
-                             "ORDER BY ts"):
-            fp = first_price.get(r["pool"]) or 0
-            price = json.loads(r["data"]).get("price") or 0
-            m = mint_of.get(r["pool"])
+        for ts, pool, price in sorted((ts, pool, d.get("price") or 0) for pool, ss in self.snaps.items()
+                                      for ts, _a, d in ss):
+            fp = first_price.get(pool) or 0
+            m = mint_of.get(pool)
             if fp > 0 and price >= 2 * fp and m and m not in self.t2x:
-                self.t2x[m] = r["ts"]
+                self.t2x[m] = ts
         self.t2x_sorted = sorted(self.t2x.values())
         self.created_sorted = sorted(self.created.values())
 

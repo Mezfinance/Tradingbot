@@ -173,3 +173,14 @@ def test_a_token_nobody_traded_again_counts_as_flat_not_missing():
     add_pool(store, "DEAD", "M", T0, snaps={15: snap(1.0), 60: dead, 1440: dead})
     [row] = wa.build_dataset(store, 15, now=NOW)
     assert not row["pump2x"] and row["trade_ret"] == -wa.ROUND_TRIP_COST
+
+
+def test_shared_inputs_give_the_same_rows_and_skip_empty_factors():
+    store = synthetic(n=300)
+    shared: dict = {}
+    for age in (15, 15):
+        assert wa.build_dataset(store, age, now=NOW, shared=shared) == wa.build_dataset(store, age, now=NOW)
+    assert all(v is not None for r in wa.build_dataset(store, 15, now=NOW) for v in r.values())
+    res = wa.report_by_age(store, ("pump2x",), (None,), now=NOW)
+    assert [e["age_min"] for e in res["summary"][("pump2x", None)]] == list(wa.FEATURE_AGES)
+    assert res["detail"][("pump2x", None)]["rows"] == len(wa.build_dataset(store, 15, now=NOW))

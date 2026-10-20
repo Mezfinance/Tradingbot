@@ -202,7 +202,7 @@ def main(argv: list[str] | None = None) -> None:
         from datetime import datetime, timezone
         from tradingbot.watcher import Watcher
         w = Watcher.from_config(cfg)
-        out = w.write_report(datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        out = w.write_report(args.path or datetime.now(timezone.utc).strftime("%Y-%m-%d"))
         print(f"report written to {out}" if out else "report failed; see the log line above")
         return
 
@@ -222,8 +222,8 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps(pv, indent=2) if args.json else watch_analysis.render_paid_value(pv))
             return
         subset = "control" if args.control else "enriched" if args.enriched else None
-        detail = watch_analysis.analyse(store, args.age, args.label, subset=subset)
-        summ = watch_analysis.summary(store, args.label, subset=subset)
+        res = watch_analysis.report_by_age(store, (args.label,), (subset,), detail_age=args.age)
+        detail, summ = res["detail"][(args.label, subset)], res["summary"][(args.label, subset)]
         print(json.dumps({"summary": summ, "detail": detail}, indent=2, default=str) if args.json
               else watch_analysis.render(detail, summ))
         return

@@ -188,3 +188,41 @@ def test_token_info_gives_up_after_three_failures():
     for minute in (16, 27, 38, 49):
         w.fetch_info(T0 + minute * 60)
     assert w.store.query("SELECT info FROM watch_pools")[0]["info"] == "{}"
+
+
+def test_failed_report_is_retried_later_and_only_success_marks_the_day(tmp_path):
+    store = WatchStore(str(tmp_path / "watch.db"))
+    w = Watcher(Config(db_path=str(tmp_path / "bot.db")), FakeGecko(), store)
+    calls = []
+    w.write_report = lambda date: calls.append(date)  # fails: never sets last_report
+    day = datetime(2026, 10, 16, 0, 10, tzinfo=timezone.utc)
+    assert w.report_if_due(day, wait=True) is not None
+    assert w.report_if_due(day.replace(minute=40), wait=True) is None  # too soon after the failed try
+    later = day.replace(hour=1, minute=15)
+    assert w.report_if_due(later, wait=True) is not None
+    assert w.report_if_due(later.replace(hour=3), wait=True) is not None
+    assert w.report_if_due(later.replace(hour=5), wait=True) is None  # gave up after 3 tries
+    assert calls == ["2026-10-16"] * 3
+    store.set_state("last_report", "2026-10-17")
+    assert w.report_if_due(datetime(2026, 10, 17, 9, tzinfo=timezone.utc)) is None  # done for that day
+
+
+def test_server_report_runs_in_a_child_process(tmp_path, monkeypatch):
+    import subprocess
+    seen = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"], seen["kw"] = cmd, kw
+        return SimpleNamespace(returncode=-9)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    w = Watcher(Config(db_path=str(tmp_path / "bot.db")), FakeGecko(), WatchStore(str(tmp_path / "watch.db")),
+                report_in_subprocess=True)
+    w.report_if_due(datetime(2026, 10, 16, 0, 10, tzinfo=timezone.utc), wait=True)
+    assert seen["cmd"][1:] == ["-m", "tradingbot", "watch-report-now", "2026-10-16"]
+    assert callable(seen["kw"]["preexec_fn"])  # marks the child first in line for the OOM killer
+    assert w.store.get_state("last_report") is None  # a killed child leaves the day open for a retry
+
+
+def test_watch_db_uses_wal_so_readers_never_block_the_watcher(tmp_path):
+    store = WatchStore(str(tmp_path / "watch.db"))
+    assert store.query("PRAGMA journal_mode")[0][0] == "wal"

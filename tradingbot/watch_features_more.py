@@ -69,10 +69,7 @@ class More:
         for r in rows:
             self.pools_by_mint[r["mint"]].append(r)
         self.first_price = {r["pool"]: _f(json.loads(r["first"] or "{}").get("price")) for r in rows}
-        self.snaps: dict[str, list[tuple[float, int, dict]]] = defaultdict(list)
-        for r in store.query("SELECT pool, age_min, ts, data FROM watch_snaps WHERE data IS NOT NULL AND data != '{}' "
-                             "ORDER BY ts"):
-            self.snaps[r["pool"]].append((r["ts"], r["age_min"], json.loads(r["data"])))
+        self.snaps = ctx.snaps  # pool -> [(ts, age_min, snapshot)], parsed once by Context
 
         # When each token first fell to 10% of its first price (a rug) and first reached 5x.
         self.trug, self.t5x = {}, {}

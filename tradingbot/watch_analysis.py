@@ -22,6 +22,7 @@ Then:
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import math
 import time
@@ -29,7 +30,7 @@ from collections import defaultdict
 
 import numpy as np
 
-from tradingbot.watch_features import Context
+from tradingbot.watch_features import Context, load_snaps
 from tradingbot.watcher import LAUNCHPAD_DEXES, WatchStore
 
 DAY_S = 86400
@@ -61,7 +62,7 @@ def _ratio(a, b) -> float | None:
 
 
 # --- dataset -------------------------------------------------------------------------
-def _future_paths(store: WatchStore) -> dict[str, list[tuple[float, float, float, float]]]:
+def _future_paths(store: WatchStore, snaps: dict | None = None) -> dict[str, list[tuple[float, float, float, float]]]:
     """mint -> [(ts, high, low, close)] from candles of every pool of that mint, plus snapshot prices.
 
     Only prices from a pool that was trading at the time count: a launch pool that has graduated keeps
@@ -75,12 +76,12 @@ def _future_paths(store: WatchStore) -> dict[str, list[tuple[float, float, float
                 continue  # no volume: no trade at this price
             ts, _o, h, low, close = (float(c[0]), c[1], c[2], c[3], c[4])
             paths[r["mint"]].append((ts + 300, float(h), float(low), float(close)))  # candle known at its close
-    for r in store.query("SELECT p.mint, s.ts, s.data FROM watch_snaps s JOIN watch_pools p USING(pool) "
-                         "WHERE s.data IS NOT NULL AND s.data != '{}'"):
-        d = json.loads(r["data"])
-        price = _f(d.get("price"))
-        if price and (d.get("buys_m5") or 0) + (d.get("sells_m5") or 0) > 0:
-            paths[r["mint"]].append((r["ts"], price, price, price))
+    mint_of = {r["pool"]: r["mint"] for r in store.query("SELECT pool, mint FROM watch_pools")}
+    for pool, ss in (snaps if snaps is not None else load_snaps(store)).items():
+        for ts, _age, d in ss:
+            price = _f(d.get("price"))
+            if price and pool in mint_of and (d.get("buys_m5") or 0) + (d.get("sells_m5") or 0) > 0:
+                paths[mint_of[pool]].append((ts, price, price, price))
     for v in paths.values():
         v.sort()
     return paths
@@ -175,22 +176,38 @@ def _info_features(info: dict) -> dict:
     }
 
 
-def build_dataset(store: WatchStore, age: int, now: float | None = None) -> list[dict]:
-    """Rows for pools whose 24h outcome after `age` minutes is complete."""
-    now = now or time.time()
-    pools = {r["pool"]: dict(r) for r in store.query(
-        "SELECT pool, mint, dex, name, created_ts, first, info, info_ts FROM watch_pools WHERE created_ts <= ?",
-        (now - DAY_S - age * 60 - 1800,))}
+def _shared_inputs(store: WatchStore) -> dict:
+    """Everything build_dataset reads that does not depend on the age (build once, reuse for every age)."""
+    by_pool = load_snaps(store)  # parsed once: the factor context and the rows share the same dicts
     snaps: dict[str, dict[int, tuple[float, dict]]] = defaultdict(dict)
-    for r in store.query("SELECT pool, age_min, ts, data FROM watch_snaps WHERE data IS NOT NULL AND data != '{}'"):
-        snaps[r["pool"]][r["age_min"]] = (r["ts"], json.loads(r["data"]))
-    paths = _future_paths(store)
+    for pool, ss in by_pool.items():
+        for ts, age, d in ss:
+            snaps[pool][age] = (ts, d)
     try:
         from tradingbot.config import Config
         cfg = Config.from_env()  # the operator's wallet / caller lists reach the factors
     except Exception:  # noqa: BLE001 (analysis must run even with odd env settings)
         cfg = None
-    ctx = Context(store, cfg)
+    return {"snaps": snaps, "paths": _future_paths(store, by_pool), "ctx": Context(store, cfg, snaps=by_pool)}
+
+
+def build_dataset(store: WatchStore, age: int, now: float | None = None, shared: dict | None = None) -> list[dict]:
+    """Rows for pools whose 24h outcome after `age` minutes is complete.
+
+    Pass the same `shared` dict when building several ages: the snapshots, price paths and factor
+    context are then loaded once. Factors with no value are left out of a row (read them with .get).
+    """
+    if now is None:  # the data's own clock: on a backup, pools whose 24h ran past the copy are not finished
+        last = store.query("SELECT MAX(ts) AS t FROM watch_snaps")[0]["t"]
+        now = min(time.time(), last) if last else time.time()
+    pools = {r["pool"]: dict(r) for r in store.query(
+        "SELECT pool, mint, dex, name, created_ts, first, info, info_ts FROM watch_pools WHERE created_ts <= ?",
+        (now - DAY_S - age * 60 - 1800,))}
+    if shared is None:
+        shared = {}
+    if not shared:
+        shared.update(_shared_inputs(store))
+    snaps, paths, ctx = shared["snaps"], shared["paths"], shared["ctx"]
 
     # Developer track record: launches and pumps among the developer's EARLIER tokens.
     by_dev: dict[str, list[tuple[float, str]]] = defaultdict(list)
@@ -238,7 +255,7 @@ def build_dataset(store: WatchStore, age: int, now: float | None = None) -> list
         row.update(ctx.features(pool, p, ts, info_ok=bool(p["info"] and p["info_ts"] and p["info_ts"] <= ts), snap=d))
         row["hel_selection"], row["x_selection"] = ctx.selection(pool, "helius", ts), ctx.selection(pool, "x", ts)
         row.update(out)
-        rows.append(row)
+        rows.append({k: v for k, v in row.items() if v is not None})  # about half the factors are empty
     return rows
 
 
@@ -438,13 +455,40 @@ def render_paid_value(pv: dict) -> str:
 def summary(store: WatchStore, label: str = "pump2x", now: float | None = None,
             subset: str | None = None, rows_by_age: dict | None = None) -> list[dict]:
     """Held-out quality per feature age, to pick when to decide."""
-    res = []
-    for age in FEATURE_AGES:
-        a = analyse(store, age, label, now, subset, rows=(rows_by_age or {}).get(age))
-        res.append({k: a.get(k) for k in ("age_min", "rows", "base_rate", "test_auc", "test_lift",
-                                          "trade_all_test_mean", "note")}
-                   | {"top_decile_mean_ret": (a.get("trade_top_decile") or {}).get("mean_ret")})
-    return res
+    return [summary_entry(analyse(store, age, label, now, subset, rows=(rows_by_age or {}).get(age)))
+            for age in FEATURE_AGES]
+
+
+def report_by_age(store: WatchStore, labels=("pump2x",), subsets=(None,), detail_age: int = 15,
+                  now: float | None = None, on_rows=None) -> dict:
+    """Analyse every feature age with one age's rows in memory at a time (a week of rows for all four
+    ages does not fit a small machine). `on_rows(age, rows)` sees each age's rows before they are freed.
+    Returns {"summary": {(label, subset): [entry per age]}, "detail": {(label, subset): analyse at detail_age}}."""
+    shared: dict = {}
+    summ = {(lb, sb): [] for lb in labels for sb in subsets}
+    detail: dict = {}
+    ages = list(FEATURE_AGES) + ([detail_age] if detail_age not in FEATURE_AGES else [])
+    for age in ages:
+        rows = build_dataset(store, age, now, shared)
+        for lb in labels:
+            for sb in subsets:
+                a = analyse(store, age, lb, now, sb, rows=rows)
+                if age in FEATURE_AGES:
+                    summ[(lb, sb)].append(summary_entry(a))
+                if age == detail_age:
+                    detail[(lb, sb)] = a
+        if on_rows is not None:
+            on_rows(age, rows)
+        del rows
+        gc.collect()
+    return {"summary": summ, "detail": detail}
+
+
+def summary_entry(a: dict) -> dict:
+    """The one-line view of an analyse() result used in the by-age table."""
+    return ({k: a.get(k) for k in ("age_min", "rows", "base_rate", "test_auc", "test_lift", "trade_all_test_mean",
+                                   "note")}
+            | {"top_decile_mean_ret": (a.get("trade_top_decile") or {}).get("mean_ret")})
 
 
 def render(a: dict, summ: list[dict] | None = None) -> str:
