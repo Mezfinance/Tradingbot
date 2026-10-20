@@ -700,15 +700,17 @@ class Enricher:
     # --- status ------------------------------------------------------------------
     def status(self) -> dict:
         q = self.store.query
+        day_ago = time.time() - 86400  # last 24h only: reading every stored row (Helius trades) is too slow
         return {
-            "enriched": {r["kind"]: r["n"] for r in q(
-                "SELECT kind, COUNT(*) AS n FROM watch_enrich WHERE data NOT IN ('{}') "
-                "AND data NOT LIKE '%skipped%' GROUP BY kind")},
-            "paid_selection": {kind: {r["sel"]: r["n"] for r in q(
+            "enriched_24h": {r["kind"]: r["n"] for r in q(
+                "SELECT kind, COUNT(*) AS n FROM watch_enrich WHERE ts > ? AND data NOT IN ('{}') "
+                "AND data NOT LIKE '%skipped%' GROUP BY kind", (day_ago,))},
+            "paid_selection_24h": {kind: {r["sel"]: r["n"] for r in q(
                 "SELECT CASE WHEN json_extract(data, '$.copied_from') IS NOT NULL THEN 'copied' "
                 "WHEN json_extract(data, '$.skipped') IS NOT NULL THEN json_extract(data, '$.skipped') "
                 "ELSE COALESCE(json_extract(data, '$.selection'), 'before rationing') END AS sel, COUNT(*) AS n "
-                "FROM watch_enrich WHERE kind=? AND data != '{}' GROUP BY sel", (kind,))} for kind in RANKED},
+                "FROM watch_enrich WHERE ts > ? AND kind=? AND data != '{}' GROUP BY sel", (day_ago, kind))}
+                for kind in RANKED},
             "list_rows": q("SELECT COUNT(*) AS n FROM watch_lists")[0]["n"],
             "telegram_mentions": q("SELECT COUNT(*) AS n FROM watch_mentions")[0]["n"],
             "market_rows": q("SELECT COUNT(*) AS n FROM watch_market")[0]["n"],

@@ -354,5 +354,5 @@ def test_status_shows_how_paid_lookups_were_chosen():
     e.helius_budget.allows = lambda cost, now=None: True
     for _ in range(3):
         e.run_tasks(T0 + 20 * 60)
-    sel = e.status()["paid_selection"]["helius"]
+    sel = e.status()["paid_selection_24h"]["helius"]
     assert sel == {"all": 1, "copied": 1, "not active enough": 1}

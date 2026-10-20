@@ -110,10 +110,13 @@ class GeckoTerminal:
         data = self._get(f"/networks/{self.network}/tokens/{mint}/info")
         return ((data or {}).get("data") or {}).get("attributes")
 
-    def ohlcv(self, pool: str, minutes: int = 5, limit: int = 300) -> list[list[float]] | None:
-        """[ts, open, high, low, close, volume] candles, oldest first."""
-        data = self._get(f"/networks/{self.network}/pools/{pool}/ohlcv/minute",
-                         {"aggregate": minutes, "limit": limit})
+    def ohlcv(self, pool: str, minutes: int = 5, limit: int = 300, before: int | None = None) -> list[list[float]] | None:
+        """[ts, open, high, low, close, volume] candles, oldest first: the `limit` candles ending at `before`
+        (unix seconds), or the latest ones without it."""
+        params = {"aggregate": minutes, "limit": limit}
+        if before is not None:
+            params["before_timestamp"] = before
+        data = self._get(f"/networks/{self.network}/pools/{pool}/ohlcv/minute", params)
         if data is None:
             return None
         rows = ((data.get("data") or {}).get("attributes") or {}).get("ohlcv_list") or []

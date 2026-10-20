@@ -41,8 +41,9 @@ class FakeGecko:
         self.calls.append(("info", mint))
         return self.info
 
-    def ohlcv(self, pool):
+    def ohlcv(self, pool, before=None):
         self.calls.append(("ohlcv", pool))
+        self.ohlcv_before = before
         return self.candles
 
 
@@ -109,6 +110,7 @@ def test_candles_only_for_pools_that_traded():
     assert rows["Q"]["ohlcv"] == "[]" and rows["Q"]["closed"] == 1
     assert json.loads(rows["T"]["ohlcv"]) == [[T0, 1, 3, 1, 2, 100]] and rows["T"]["closed"] == 1
     assert [c for c in g.calls if c[0] == "ohlcv"] == [("ohlcv", "T")]
+    assert g.ohlcv_before == int(T0 + 25 * 3600) == int(rows["T"]["ohlcv_end"])  # the first 25h, however late
 
 
 def test_daily_backup_uploads_once(tmp_path, monkeypatch):
@@ -144,7 +146,8 @@ def test_daily_report_is_written_uploaded_once_and_linkable(tmp_path, monkeypatc
         s3.create_bucket(Bucket="bkt")
         store = WatchStore(str(tmp_path / "watch.db"))
         for row in synthetic(n=300).query("SELECT * FROM watch_pools"):  # copy synthetic pools in
-            store.execute("INSERT INTO watch_pools VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", tuple(row))
+            store.execute(f"INSERT INTO watch_pools({','.join(row.keys())}) VALUES ({','.join('?' * len(row))})",
+                          tuple(row))
         cfg = Config(db_path=str(tmp_path / "bot.db"))
         w = Watcher(cfg, FakeGecko(), store, s3_factory=lambda: s3)
         day = datetime(2026, 10, 16, 2, tzinfo=timezone.utc)
@@ -226,3 +229,47 @@ def test_server_report_runs_in_a_child_process(tmp_path, monkeypatch):
 def test_watch_db_uses_wal_so_readers_never_block_the_watcher(tmp_path):
     store = WatchStore(str(tmp_path / "watch.db"))
     assert store.query("PRAGMA journal_mode")[0][0] == "wal"
+
+
+def test_failed_candle_fetch_is_retried_then_given_up():
+    g = FakeGecko({1: [pool("T", "MT")]}, live={"T": pool("T", "MT", vol24="90000")})
+    w, _ = make(g, watch_ages_min="1440")
+    w.discover(T0)
+    w.snapshot(T0 + 1440 * 60 + 10)
+    g.candles = None  # request fails
+    for i in range(3):
+        w.fetch_ohlcv(T0 + 26 * 3600 + i)
+        closed = w.store.query("SELECT closed FROM watch_pools")[0]["closed"]
+        assert closed == (1 if i == 2 else 0)
+
+
+def test_late_latest_300_candles_are_refetched_for_the_right_window():
+    g = FakeGecko()
+    w, _ = make(g)
+    w.store.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts, ohlcv, ohlcv_ts, closed) "
+                    "VALUES('OLD','M','pumpswap','x',?,?,?,?,1)", (T0, T0, json.dumps([[T0 + 9 * 3600, 1, 1, 1, 1, 1]]),
+                                                                    T0 + 3 * 86400))
+    w.store.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts, ohlcv, ohlcv_ts, closed) "
+                    "VALUES('QUIETLATE','M3','pumpswap','x',?,?,?,?,1)", (T0, T0, json.dumps([[T0, 1, 1, 1, 1, 1]]),
+                                                                          T0 + 3 * 86400))
+    w.store.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts, ohlcv, ohlcv_ts, closed) "
+                    "VALUES('ONTIME','M2','pumpswap','x',?,?,'[[1,1,1,1,1,1]]',?,1)", (T0, T0, T0 + 25 * 3600))
+    w.fetch_ohlcv(T0 + 4 * 86400)
+    assert [c for c in g.calls if c[0] == "ohlcv"] == [("ohlcv", "OLD")]
+    assert w.store.query("SELECT ohlcv_end FROM watch_pools WHERE pool='OLD'")[0]["ohlcv_end"] == T0 + 25 * 3600
+    w._refetch = None  # a restart rebuilds the queue: nothing left to do
+    w.fetch_ohlcv(T0 + 4 * 86400 + 60)
+    assert len([c for c in g.calls if c[0] == "ohlcv"]) == 1
+
+
+def test_token_info_newest_first_and_given_up_once_too_late_to_use():
+    g = FakeGecko()
+    w, _ = make(g)
+    for i, created in enumerate((T0, T0 + 3000, T0 + 3300)):
+        w.store.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts) VALUES(?,?,?,?,?,?)",
+                        (f"P{i}", f"M{i}", "pumpswap", "x", created, created))
+    now = T0 + 3300 + 16 * 60
+    w.fetch_info(now)
+    rows = {r["pool"]: r for r in w.store.query("SELECT pool, info, info_ts FROM watch_pools")}
+    assert rows["P0"]["info"] == "{}"  # due 61 min ago: too late for the 60-minute snapshot, no call spent
+    assert [c[1] for c in g.calls if c[0] == "info"][:2] == ["M2", "M1"]  # newest first

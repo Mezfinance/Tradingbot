@@ -49,10 +49,13 @@ REPORT_KEEP_LOCAL = 3  # dated report folders kept on the volume (all are in the
 WINDOWS = ("m5", "m15", "m30", "h1", "h6", "h24")
 MAX_PAGES = 3  # new_pools pages per poll; ~20 pools a page
 SNAP_CALLS_PER_STEP = 4  # 30 pools per call
-INFO_CALLS_PER_STEP = 3
+INFO_CALLS_PER_STEP = 4
+INFO_USEFUL_S = 45 * 60  # info arriving later than this misses the 60-minute snapshot: not worth a call
 INFO_MAX_TRIES = 3
 INFO_RETRY_S = 600
-OHLCV_CALLS_PER_STEP = 1
+OHLCV_CALLS_PER_STEP = 2
+OHLCV_MAX_TRIES = 3
+OHLCV_WINDOW_S = 300 * 5 * 60  # 300 five-minute candles: the pool's first 25 hours
 DAY_S = 86400
 
 SCHEMA = """
@@ -83,6 +86,7 @@ CREATE TABLE IF NOT EXISTS watch_enrich (
     pool TEXT NOT NULL, kind TEXT NOT NULL, ts REAL NOT NULL, data TEXT,
     PRIMARY KEY (pool, kind)
 );
+CREATE INDEX IF NOT EXISTS watch_enrich_ts ON watch_enrich(ts);
 -- attention lists over time (DexScreener boosts/profiles, GeckoTerminal trending)
 CREATE TABLE IF NOT EXISTS watch_lists (ts REAL NOT NULL, list TEXT NOT NULL, rank INTEGER, mint TEXT, amount REAL);
 CREATE INDEX IF NOT EXISTS watch_lists_mint ON watch_lists(mint, ts);
@@ -205,6 +209,9 @@ class WatchStore:
                 self.db.execute("PRAGMA journal_mode=WAL")
                 self.db.execute("PRAGMA synchronous=NORMAL")
             self.db.executescript(SCHEMA)
+            cols = {r[1] for r in self.db.execute("PRAGMA table_info(watch_pools)")}
+            if "ohlcv_end" not in cols:  # end of the candle window asked for (NULL: old 'latest 300' fetch)
+                self.db.execute("ALTER TABLE watch_pools ADD COLUMN ohlcv_end REAL")
             self.db.commit()
 
     def execute(self, sql: str, params=()) -> sqlite3.Cursor:
@@ -324,18 +331,23 @@ class Watcher:
         return taken
 
     def fetch_info(self, now: float) -> int:
-        """Token info once per pool. A failed fetch (usually GeckoTerminal's rate limit) is retried up to
-        INFO_MAX_TRIES times, INFO_RETRY_S apart; only a pool still failing 2 hours late is given up on."""
+        """Token info once per pool, newest pools first: info only feeds a factor if it was fetched before the
+        snapshot being scored, so a pool still waiting INFO_USEFUL_S after it became due is given up on (its
+        15/30/60-minute snapshots are taken by then). A failed fetch (usually GeckoTerminal's rate limit) is
+        retried up to INFO_MAX_TRIES times, INFO_RETRY_S apart."""
+        due_after = self.cfg.watch_info_age_min * 60
+        self.store.execute("UPDATE watch_pools SET info='{}', info_ts=? WHERE info_ts IS NULL AND created_ts < ?",
+                           (now, now - due_after - INFO_USEFUL_S))
         due = self.store.query(
             """SELECT pool, mint, created_ts FROM watch_pools WHERE info_ts IS NULL AND created_ts <= ?
-               ORDER BY created_ts LIMIT ?""", (now - self.cfg.watch_info_age_min * 60, INFO_CALLS_PER_STEP * 20))
+               ORDER BY created_ts DESC LIMIT ?""", (now - due_after, INFO_CALLS_PER_STEP * 20))
         tries = getattr(self, "_info_tries", None)
         if tries is None:
             tries = self._info_tries = {}
         calls = 0
         for r in due:
             n, next_ts = tries.get(r["pool"], (0, 0.0))
-            if now - r["created_ts"] > self.cfg.watch_info_age_min * 60 + 7200 or n >= INFO_MAX_TRIES:
+            if n >= INFO_MAX_TRIES:
                 self.store.execute("UPDATE watch_pools SET info='{}', info_ts=? WHERE pool=?", (now, r["pool"]))
                 tries.pop(r["pool"], None)
                 continue
@@ -354,13 +366,18 @@ class Watcher:
         return calls
 
     def fetch_ohlcv(self, now: float) -> int:
-        """After 24h: candles for pools that traded; quiet pools are closed without them."""
+        """After 24h: 5-min candles of the pool's first OHLCV_WINDOW_S (asked for by end time, so a late fetch
+        still gets the right window) for pools that traded; quiet pools are closed without them. Spare calls
+        re-fetch pools whose candles were taken as 'the latest 300' before this fix (`ohlcv_end` NULL)."""
         last_age = self.ages[-1] if self.ages else 1440
         due = self.store.query(
-            """SELECT p.pool, s.data FROM watch_pools p
+            """SELECT p.pool, p.created_ts, s.data FROM watch_pools p
                LEFT JOIN watch_snaps s ON s.pool=p.pool AND s.age_min=?
                WHERE p.closed=0 AND p.created_ts <= ? ORDER BY p.created_ts LIMIT 50""",
             (last_age, now - max(last_age * 60, DAY_S) - 1800))
+        tries = getattr(self, "_ohlcv_tries", None)
+        if tries is None:
+            tries = self._ohlcv_tries = {}
         calls = 0
         for r in due:
             snap = json.loads(r["data"]) if r["data"] else {}
@@ -371,11 +388,41 @@ class Watcher:
                 continue
             if calls >= OHLCV_CALLS_PER_STEP:
                 break
-            candles = self.gecko.ohlcv(r["pool"])
             calls += 1
-            self.store.execute("UPDATE watch_pools SET ohlcv=?, ohlcv_ts=?, closed=1 WHERE pool=?",
-                               (json.dumps(candles or []), now, r["pool"]))
+            if self._store_candles(r["pool"], r["created_ts"], now):
+                tries.pop(r["pool"], None)
+            elif tries.get(r["pool"], 0) + 1 >= OHLCV_MAX_TRIES:  # keeps failing: close without candles
+                self.store.execute("UPDATE watch_pools SET ohlcv='[]', ohlcv_ts=?, closed=1 WHERE pool=?",
+                                   (now, r["pool"]))
+                tries.pop(r["pool"], None)
+            else:
+                tries[r["pool"]] = tries.get(r["pool"], 0) + 1
+        while calls < OHLCV_CALLS_PER_STEP and self._refetch_queue():
+            pool, created = self._refetch.pop()
+            calls += 1
+            self._store_candles(pool, created, now)
         return calls
+
+    def _store_candles(self, pool: str, created: float, now: float) -> bool:
+        end = created + OHLCV_WINDOW_S
+        candles = self.gecko.ohlcv(pool, before=int(end))
+        if candles is None:
+            return False
+        self.store.execute("UPDATE watch_pools SET ohlcv=?, ohlcv_ts=?, ohlcv_end=?, closed=1 WHERE pool=?",
+                           (json.dumps([c for c in candles if c[0] >= created - 300]), now, end, pool))
+        return True
+
+    def _refetch_queue(self) -> list:
+        """Pools whose candles were fetched late as 'the latest 300' (missing the start), built once per run."""
+        if getattr(self, "_refetch", None) is None:
+            # 'Latest 300' counts only 5-min periods with trades, so most late fetches still start at creation;
+            # only busy tokens (the interesting ones) lost their start. Read once per run.
+            self._refetch = [(r["pool"], r["created_ts"]) for r in self.store.query(
+                """SELECT pool, created_ts, ohlcv FROM watch_pools WHERE ohlcv_end IS NULL AND closed=1
+                   AND ohlcv_ts > created_ts + ? AND ohlcv != '[]' ORDER BY created_ts""",
+                (OHLCV_WINDOW_S,)) if json.loads(r["ohlcv"])[0][0] > r["created_ts"] + 3600][::-1]
+            # (reversed so pop() takes the oldest first: its history is the first to age out)
+        return self._refetch
 
     # --- backup ------------------------------------------------------------------
     def backup_if_due(self, now: datetime | None = None) -> None:
