@@ -36,4 +36,4 @@ primary_region = "iad"
 
 [[vm]]
   size = "shared-cpu-1x"
-  memory = "512mb"
+  memory = "2048mb"  # the daily watch report needs ~1.1 GB on a week of data (runs in its own process)
