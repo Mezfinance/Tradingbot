@@ -91,3 +91,33 @@ def test_watcher_hands_five_minute_snapshots_to_the_listener():
     w.discover(T0)
     w.snapshot(T0 + 5 * 60 + 5)
     assert seen == [("A", "MA", 5, True)]
+
+
+def test_a_position_with_no_route_out_backs_off_and_is_valued_at_zero(cfg, good_pair, monkeypatch):
+    from tradingbot import engine as eng_mod
+    from tradingbot.execution.base import failed
+    from tradingbot.report import build, render
+    j = Journal(":memory:")
+    paper = PaperExecutor(cfg)
+    eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                 model_executor=paper)
+    book = eng.books[mb.NAME]
+    fill = paper.buy(good_pair.token_address, 100.0, good_pair.price_usd)
+    pos = eng._open_position(book, good_pair.token_address, "RUG", fill, good_pair.price_usd, None)
+    sells = []
+    paper.sell = lambda token, qty, price: sells.append(1) or failed(0.0, "no route")
+    crash = {good_pair.token_address: good_pair.price_usd * 0.3}  # through the -50% stop
+    clock = [pos.opened_at + 60]
+    monkeypatch.setattr(eng_mod.time, "time", lambda: clock[0])
+    eng.current_prices = lambda tokens: crash
+    for _ in range(6):  # a minute of 10-second monitor passes
+        eng.manage_positions()
+        clock[0] += 10
+    assert len(sells) == 1  # one attempt, then a 2-minute back-off
+    assert j.query("SELECT COUNT(*) FROM events WHERE kind='tx_failed'")[0][0] == 0
+    assert j.query("SELECT COUNT(*) FROM events WHERE kind='exit_blocked'")[0][0] == 1
+    assert eng.equity(book, crash) > book.cash  # not yet written off
+    clock[0] += eng_mod.STUCK_AFTER_S
+    assert eng.equity(book, crash) == book.cash  # can't be sold: worth nothing
+    text = render(build(j, cfg))
+    assert "EXIT BLOCKED" in text

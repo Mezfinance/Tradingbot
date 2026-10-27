@@ -211,7 +211,8 @@ def main(argv: list[str] | None = None) -> None:
         return
 
     if args.command == "model-status":
-        from tradingbot import model_book
+        import time
+        from tradingbot import model_book, report
         from tradingbot.journal import Journal
         path = model_book.model_path(cfg)
         meta = json.loads(path.read_text()) if path.exists() else None
@@ -226,7 +227,10 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps({"model": {k: meta[k] for k in ("threshold", "meta")} if meta else "not trained yet",
                           "buys": j.query("SELECT COUNT(*) AS n FROM events WHERE strategy=? AND kind='model_buy'",
                                           (model_book.NAME,))[0]["n"],
-                          "open": len(j.open_positions(model_book.NAME)),
+                          "open": [{"symbol": p.symbol, "cost_usd": round(p.cost_usd, 2),
+                                    "hours": round((time.time() - (p.opened_at or time.time())) / 3600, 1),
+                                    "exit_blocked": report._exit_blocked(j, model_book.NAME, p)}
+                                   for p in j.open_positions(model_book.NAME)],
                           "skip_reasons": skips}, indent=2, default=str))
         return
 

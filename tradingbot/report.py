@@ -9,6 +9,7 @@ strategy's average look good.
 from __future__ import annotations
 
 import json
+import time
 import random
 import re
 import statistics
@@ -57,6 +58,19 @@ def _reason_key(detail: str) -> str:
     return re.sub(r"[-+]?\d[\d.,]*%?", "#", detail or "?")
 
 
+def _exit_blocked(j: Journal, name: str, pos) -> str | None:
+    """'since HH:MM UTC: <reason>' when the position has had no route out (exit_blocked events or old
+    no-route tx_failed spam), else None."""
+    rows = j.query(
+        "SELECT MIN(ts) AS since, MAX(ts) AS last, MAX(detail) AS detail FROM events WHERE strategy=? AND token=? "
+        "AND ts >= ? AND (kind='exit_blocked' OR (kind='tx_failed' AND usd = 0 AND detail LIKE '%route%'))",
+        (name, pos.token_address, pos.opened_at or 0))
+    if not rows or rows[0]["since"] is None:
+        return None
+    since = time.strftime("%m-%d %H:%M", time.gmtime(rows[0]["since"]))
+    return f"since {since} UTC ({(rows[0]['last'] - rows[0]['since']) / 3600:.1f}h): {rows[0]['detail']}"
+
+
 def strategy_stats(j: Journal, name: str, start_cash: float) -> dict:
     eq_rows = j.query("SELECT equity FROM equity WHERE strategy=? ORDER BY ts", (name,))
     series = [r["equity"] for r in eq_rows]
@@ -77,9 +91,10 @@ def strategy_stats(j: Journal, name: str, start_cash: float) -> dict:
     fees = j.query(
         """SELECT COALESCE(SUM(f.fee_usd), 0) AS s FROM fills f JOIN positions p ON p.id=f.position_id
            WHERE p.strategy=?""", (name,))[0]["s"]
+    # A "failed" sell with no route sent nothing (older versions logged one every monitor pass): not a tx.
     failed = j.query(
-        "SELECT COUNT(*) AS n, COALESCE(SUM(usd), 0) AS s FROM events WHERE kind='tx_failed' AND strategy=?",
-        (name,))[0]
+        "SELECT COUNT(*) AS n, COALESCE(SUM(usd), 0) AS s FROM events WHERE kind='tx_failed' AND strategy=? "
+        "AND NOT (usd = 0 AND (detail LIKE '%no route%' OR detail LIKE '%route vanished%'))", (name,))[0]
     api = j.query("SELECT COALESCE(SUM(usd), 0) AS s FROM costs WHERE strategy=?", (name,))[0]["s"]
 
     slip = {}
@@ -103,7 +118,7 @@ def strategy_stats(j: Journal, name: str, start_cash: float) -> dict:
         "max_drawdown_pct": max_drawdown_pct([start_cash] + series),
         "open_positions": [
             {"symbol": p.symbol, "cost_usd": round(p.cost_usd, 2), "qty": p.qty, "entry": p.entry_price,
-             "stop": p.stop_price, "tp_hits": p.tp_hits}
+             "stop": p.stop_price, "tp_hits": p.tp_hits, "exit_blocked": _exit_blocked(j, name, p)}
             for p in open_pos
         ],
         "closed_trades": len(closed),
@@ -320,7 +335,8 @@ def render(rep: dict) -> str:
             lines.append(f"[{s['strategy']}] exits: {s['exit_reasons'] or '-'}")
             lines.append(f"[{s['strategy']}] skipped entries: {s['top_skip_reasons'] or '-'}")
             for p in s["open_positions"]:
-                lines.append(f"[{s['strategy']}] open: {p['symbol']} cost ${p['cost_usd']} tp_hits={p['tp_hits']}")
+                blocked = f"  EXIT BLOCKED {p['exit_blocked']} (valued at $0 after 30 min)" if p.get("exit_blocked") else ""
+                lines.append(f"[{s['strategy']}] open: {p['symbol']} cost ${p['cost_usd']} tp_hits={p['tp_hits']}{blocked}")
             if not s["enough_trades"]:
                 lines.append(f"[{s['strategy']}] only {s['closed_trades']} closed trades; "
                              f"need {MIN_TRADES_FOR_CONCLUSION}+ before drawing conclusions")

@@ -40,6 +40,8 @@ REANALYSE_AFTER_S = 6 * 3600
 RECHECK_REJECTED_S = 30 * 60
 DUST_QTY = 1e-12
 EQUITY_SNAPSHOT_S = 60
+EXIT_RETRY_S = 120  # a sell with no route is retried this often
+STUCK_AFTER_S = 1800  # ...and after this long the position is valued at zero (it cannot be sold)
 QUOTE_PRICE_MAX = 10  # positions per monitor pass priced from a swap quote when no feed lists the token
 MODEL_POLL_S = 5  # how often queued model5 signals are bought
 MODEL_SIGNAL_MAX_AGE_S = 180  # a signal older than this is stale (the edge is in the first minutes)
@@ -85,6 +87,7 @@ class Engine:
         self.backups = DailyBackup(journal, cfg)
         self._cooldown: dict[str, float] = journal.load_cooldowns()  # token -> time it may be re-screened
         self._last_prices: dict[str, float] = {}
+        self._blocked: dict[int, dict] = {}  # position id -> exit blocked (no route): since, next try, note
         self._last_snapshot = 0.0
         self._stop = threading.Event()
         self.restart_reason: str | None = None
@@ -236,6 +239,9 @@ class Engine:
                 if price is None:
                     log.warning("no price for open position %s (%s)", pos.symbol, pos.strategy)
                 continue
+            blocked = self._blocked.get(pos.id)
+            if blocked and now < blocked["next"]:
+                continue  # no route out last time: retry every EXIT_RETRY_S, not every pass
             before = (pos.tp_hits, pos.stop_price)
             for qty, reason in risk.plan_exits(pos, price, now, book.exit_cfg or self.cfg):
                 if not self._sell(book, pos, qty, price, reason):
@@ -251,15 +257,20 @@ class Engine:
             return
         self._last_snapshot = time.time()
         for book in self.books.values():
-            held = sum(p.qty * prices.get(p.token_address, p.entry_price)
-                       for p in self.journal.open_positions(book.name))
+            held = sum(self._position_value(p, prices) for p in self.journal.open_positions(book.name))
             self.journal.snapshot_equity(book.name, book.cash, held)
+
+    def _position_value(self, pos: Position, prices: dict[str, float]) -> float:
+        """Market value; a position nobody can sell (no route for STUCK_AFTER_S) is worth nothing."""
+        blocked = self._blocked.get(pos.id)
+        if blocked and time.time() - blocked["since"] >= STUCK_AFTER_S:
+            return 0.0
+        return pos.qty * prices.get(pos.token_address, pos.entry_price)
 
     def equity(self, book: Book | None = None, prices: dict[str, float] | None = None) -> float:
         book = book or self.books[MAIN]
         prices = self._last_prices if prices is None else prices
-        held = sum(p.qty * prices.get(p.token_address, p.entry_price)
-                   for p in self.journal.open_positions(book.name))
+        held = sum(self._position_value(p, prices) for p in self.journal.open_positions(book.name))
         return book.cash + held
 
     def entries_allowed(self, book: Book | None = None) -> bool:
@@ -545,11 +556,15 @@ class Engine:
 
     def _sell(self, book: Book, pos: Position, qty: float, price: float, reason: str) -> bool:
         fill = book.executor.sell(pos.token_address, min(qty, pos.qty), price)
+        if fill is not None and not fill.ok and fill.usd == 0:
+            self._exit_blocked(book, pos, reason, fill.note)  # nothing was sent: no route out
+            return False
         if fill is None or not fill.ok:
             if fill is not None:
                 self._charge_failed(book, pos.token_address, fill)
             log.error("[%s] sell failed for %s (%s); will retry", book.name, pos.symbol, reason)
             return False
+        self._blocked.pop(pos.id, None)
         with self.lock:
             pos.qty -= fill.qty
             pos.realized_usd += fill.usd
@@ -564,6 +579,25 @@ class Engine:
         log.info("[%s] SELL %s %s qty=%.6g @ %.10g -> $%.2f",
                  book.name, pos.symbol, reason, fill.qty, fill.price, fill.usd)
         return True
+
+    def _exit_blocked(self, book: Book, pos: Position, reason: str, note: str) -> None:
+        """No route to sell (often a rug: liquidity pulled). Retry every EXIT_RETRY_S; record it once an
+        hour instead of a failed transaction every monitor pass (nothing is sent, nothing is paid)."""
+        now = time.time()
+        if pos.id not in self._blocked:  # after a restart, keep counting from the first recorded block
+            first = self.journal.query(
+                "SELECT MIN(ts) AS t FROM events WHERE strategy=? AND token=? AND ts >= ? AND (kind='exit_blocked' "
+                "OR (kind='tx_failed' AND usd = 0 AND detail LIKE '%route%'))",
+                (book.name, pos.token_address, pos.opened_at or 0))[0]["t"]
+            self._blocked[pos.id] = {"since": first or now, "logged": 0.0, "note": note}
+        b = self._blocked[pos.id]
+        b["next"], b["note"] = now + EXIT_RETRY_S, note or "no route"
+        if now - b["logged"] >= 3600:
+            b["logged"] = now
+            self.journal.log_event("exit_blocked", pos.token_address,
+                                   f"{reason}: {b['note']} (blocked {(now - b['since']) / 60:.0f} min)", strategy=book.name)
+            log.warning("[%s] cannot sell %s (%s): %s; retrying every %ds", book.name, pos.symbol, reason,
+                        b["note"], EXIT_RETRY_S)
 
     def _charge_failed(self, book: Book, token: str, fill: Fill) -> None:
         """A reverted transaction still costs its network fee."""
