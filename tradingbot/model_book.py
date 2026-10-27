@@ -100,9 +100,8 @@ def training_rows(store, now: float | None = None, days: float = 4) -> list[dict
             continue
         ts, d = at
         entry = wa._f(d.get("price"))
-        out = wa._outcome(paths.get(p["mint"], []), ts, entry or 0)
-        if out is None and entry and any(age > AGE_MIN for _, age, _ in ss):
-            out = wa.FLAT_OUTCOME
+        out = wa.label(paths.get(p["mint"], []), ts, entry or 0, [(t, x) for t, _, x in ss], wa._f(d.get("liq")),
+                       any(age > AGE_MIN for _, age, _ in ss))
         if out is None:
             continue
         row = {"pool": p["pool"], "created_ts": p["created_ts"]}

@@ -106,19 +106,55 @@ def _future_paths(store: WatchStore, snaps: dict | None = None,
 
 
 FLAT_OUTCOME = {"best_mult": 1.0, "best_close_mult": 1.0, "worst_mult": 1.0, "pump2x": False, "pump5x": False,
-                "clean2x": False, "trade_ret": -ROUND_TRIP_COST}
+                "clean2x": False, "trade_ret": -ROUND_TRIP_COST, "rugged": False}
+# A pool whose liquidity falls below this share of its liquidity at entry, with no trading in the token
+# afterwards on any pool, was emptied: holders lose everything. These used to fall into FLAT_OUTCOME
+# (-6%): on 10-26, 240 of 246 'flat' top picks were pulled pools, which hid most of model5's losses.
+RUG_LIQ_SHARE = 0.10
+RUG_OUTCOME = {"best_mult": 1.0, "best_close_mult": 1.0, "worst_mult": 0.0, "pump2x": False, "pump5x": False,
+               "clean2x": False, "trade_ret": -1.0, "rugged": True}
 
 
-def _outcome(path: list, start_ts: float, entry: float) -> dict | None:
+def rug_ts(pool_snaps, start_ts: float, entry_liq: float | None) -> float | None:
+    """First snapshot after start_ts (within 24h) showing the pool's liquidity collapsed; `pool_snaps` is an
+    iterable of (ts, snapshot)."""
+    if not entry_liq:
+        return None
+    for ts, d in sorted(pool_snaps, key=lambda x: x[0]):
+        if start_ts < ts <= start_ts + DAY_S:
+            liq = _f(d.get("liq"))
+            if liq is not None and liq < RUG_LIQ_SHARE * entry_liq:
+                return ts
+    return None
+
+
+def label(path: list, start_ts: float, entry: float, pool_snaps, entry_liq: float | None,
+          watched_after: bool) -> dict | None:
+    """The 24h outcome of buying at start_ts, counting an emptied pool as a total loss."""
+    pulled = rug_ts(pool_snaps, start_ts, entry_liq)
+    out = _outcome(path, start_ts, entry, pulled)
+    if out is None and entry and watched_after:
+        out = RUG_OUTCOME if pulled is not None else FLAT_OUTCOME
+    return out
+
+
+def _outcome(path: list, start_ts: float, entry: float, pulled_ts: float | None = None) -> dict | None:
     """Best/worst after start_ts within 24h, the order of +100% / -50%, and a simulated trade.
 
     Pumps are judged on 5-minute CLOSES: a single wick in a thin pool is one trade nobody else
     could have sold into. The stop fills at the stop price or worse (the candle's close if it
     gapped through); if one candle spans both levels, the stop is assumed to come first.
+    With `pulled_ts` (the pool was emptied then) and no trading in the token afterwards, a trade still
+    open at that point loses everything.
     """
     window = [p for p in path if start_ts < p[0] <= start_ts + DAY_S]
     if not window or entry <= 0:
         return None
+    rugged = pulled_ts is not None and not any(p[0] > pulled_ts for p in window)
+    if rugged:
+        window = [p for p in window if p[0] <= pulled_ts]
+        if not window:
+            return dict(RUG_OUTCOME)
     best_high = max(p[1] for p in window) / entry
     best_close = max(p[3] for p in window) / entry
     worst = min(p[2] for p in window) / entry
@@ -130,11 +166,15 @@ def _outcome(path: list, start_ts: float, entry: float) -> dict | None:
         if close >= entry * TP_MULT:
             clean, trade = True, TP_MULT - 1
             break
+    if trade is None and rugged:
+        return {"best_mult": best_high, "best_close_mult": best_close, "worst_mult": 0.0,
+                "pump2x": best_close >= 2, "pump5x": best_close >= 5, "clean2x": False, "trade_ret": -1.0,
+                "rugged": True}
     if trade is None:
         trade = window[-1][3] / entry - 1
-    return {"best_mult": best_high, "best_close_mult": best_close, "worst_mult": worst,
+    return {"best_mult": best_high, "best_close_mult": best_close, "worst_mult": 0.0 if rugged else worst,
             "pump2x": best_close >= 2, "pump5x": best_close >= 5, "clean2x": clean,
-            "trade_ret": trade - ROUND_TRIP_COST}
+            "trade_ret": trade - ROUND_TRIP_COST, "rugged": rugged}
 
 
 def _snap_features(d: dict, prefix: str = "") -> dict:
@@ -252,9 +292,9 @@ def build_dataset(store: WatchStore, age: int, now: float | None = None, shared:
             continue
         ts, d = snaps[pool][age]
         entry = _f(d.get("price"))
-        out = _outcome(paths.get(p["mint"], []), ts, entry or 0)
-        if out is None and entry and any(a > age for a in snaps[pool]):
-            out = FLAT_OUTCOME  # watched afterwards but nobody traded it again: no pump, stuck at the entry price
+        # Watched afterwards but nobody traded it again: flat at the entry price, or lost if the pool was emptied.
+        out = label(paths.get(p["mint"], []), ts, entry or 0, snaps[pool].values(), _f(d.get("liq")),
+                    any(a > age for a in snaps[pool]))
         if out is None:
             continue
         outcome_at_age[pool] = out
@@ -287,7 +327,7 @@ def build_dataset(store: WatchStore, age: int, now: float | None = None, shared:
     return rows
 
 
-LABEL_KEYS = ("best_mult", "best_close_mult", "worst_mult", "pump2x", "pump5x", "clean2x", "trade_ret")
+LABEL_KEYS = ("best_mult", "best_close_mult", "worst_mult", "pump2x", "pump5x", "clean2x", "trade_ret", "rugged")
 ID_KEYS = ("pool", "mint", "dex", "created_ts", "age", "hel_selection", "x_selection")
 
 

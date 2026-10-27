@@ -198,3 +198,23 @@ def test_report_window_keeps_recent_rows_and_loads_a_warmup_day():
     assert sorted(r["pool"] for r in rows) == ["P16", "P17", "P18"]  # the 3 finished days, not the warm-up
     res = wa.report_by_age(store, ("pump2x",), (None,), now=now, days=3)
     assert res["detail"][("pump2x", None)]["rows"] == 3
+
+
+def test_an_emptied_pool_is_a_total_loss_not_flat():
+    """10-26: 240 of 246 top picks labelled FLAT (-6%) had their liquidity pulled to ~$0."""
+    from tradingbot import watch_analysis as wa
+    start, entry = 1_000.0, 1.0
+    pulled = [(start + 600, {"liq": 0.5}), (start + 1800, {"liq": 0.5})]  # $20k -> $0.50
+    kept = [(start + 600, {"liq": 19_000.0})]
+    # Nobody traded it after the entry snapshot.
+    assert wa.label([], start, entry, pulled, 20_000.0, True)["trade_ret"] == -1.0
+    assert wa.label([], start, entry, kept, 20_000.0, True) == wa.FLAT_OUTCOME
+    # Traded a little, then emptied while the trade was still open.
+    out = wa.label([(start + 300, 1.2, 1.1, 1.2)], start, entry, pulled, 20_000.0, True)
+    assert out["rugged"] and out["trade_ret"] == -1.0 and out["worst_mult"] == 0.0
+    # Took profit before the pull: the trade is a win.
+    out = wa.label([(start + 300, 2.3, 1.1, 2.2)], start, entry, pulled, 20_000.0, True)
+    assert out["clean2x"] and out["trade_ret"] > 0.9 and out["pump2x"]
+    # Graduation: the launch pool empties but the token keeps trading on its new pool.
+    out = wa.label([(start + 900, 1.3, 1.2, 1.3), (start + 3000, 1.4, 1.3, 1.4)], start, entry, pulled, 20_000.0, True)
+    assert not out["rugged"] and out["trade_ret"] > 0
