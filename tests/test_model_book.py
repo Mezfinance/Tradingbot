@@ -180,3 +180,49 @@ def test_a_take_profit_needs_a_sell_quote_that_clears_the_target(cfg, good_pair)
     eng2.current_prices = lambda tokens, held=None: {"RUGMINT": 2.5e-5 * 2.3}
     eng2.manage_positions()
     assert [r for (r,) in j2.query("SELECT reason FROM fills WHERE side='sell'")] == ["take_profit_1"]
+
+
+class FakeExtras:
+    def __init__(self, liquidity):
+        self.liquidity = liquidity
+
+    def jupiter_token(self, mint):
+        return {"holderCount": 420, "liquidity": self.liquidity, "organicScore": 12.0,
+                "audit": {"topHoldersPercentage": 31.0, "devMints": 2}}
+
+
+def test_rug_logging_records_the_entry_audit_and_why_a_trade_lost(cfg, good_pair):
+    eng, j, pos = _held_position(cfg, good_pair, RuggedJupiter())
+    eng.extras = FakeExtras(liquidity=40_000.0)
+    eng._log_model_audit(eng.books[mb.NAME], {"mint": "RUGMINT", "score": 1.2, "liq": 30_000.0})
+    [audit] = [json.loads(r["detail"]) for r in j.query("SELECT detail FROM events WHERE kind='model_entry_audit'")]
+    assert audit["holders"] == 420 and audit["top_holders_pct"] == 31.0 and audit["snapshot_liq"] == 30_000.0
+    eng.extras.liquidity = 1_000.0  # pulled: under 25% of the 40k at entry
+    eng.manage_positions()  # sells at ~0 through the stop
+    [cause] = [json.loads(r["detail"]) for r in j.query("SELECT detail FROM events WHERE kind='model_exit_cause'")]
+    assert cause["cause"] == "liquidity_pulled" and cause["return_pct"] <= -80
+    s = mb.rug_summary(j)
+    assert s["finished_trades"] == 1 and s["rugs"] == 1 and s["rug_rate_pct"] == 100.0
+    assert s["losing_exit_causes"] == {"liquidity_pulled": 1}
+    assert s["entry_audit_rugs"]["median"]["holders"] == 420
+
+
+def test_exit_cause_classes():
+    ex = FakeExtras(liquidity=50_000.0)
+    assert mb.exit_cause(ex, "M", 50_000.0, -0.9, blocked=True)["cause"] == "no_route"
+    assert mb.exit_cause(ex, "M", 50_000.0, -0.9, blocked=False)["cause"] == "dumped"
+    assert mb.exit_cause(ex, "M", 50_000.0, -0.55, blocked=False)["cause"] == "stopped"
+    assert mb.exit_cause(None, "M", None, -0.9, blocked=False)["cause"] == "dumped"  # no audit source: price only
+
+
+def test_a_blocked_exit_records_its_cause_once(cfg, good_pair, monkeypatch):
+    from tradingbot.execution.base import failed
+    eng, j, pos = _held_position(cfg, good_pair, None)
+    eng.extras = FakeExtras(liquidity=None)
+    eng.books[mb.NAME].executor.sell = lambda token, qty, price: failed(0.0, "no route")
+    eng.current_prices = lambda tokens, held=None: {"RUGMINT": 1e-6}
+    eng.manage_positions()
+    eng._blocked.clear()  # as after a restart
+    eng.manage_positions()
+    causes = [json.loads(r["detail"])["cause"] for r in j.query("SELECT detail FROM events WHERE kind='model_exit_cause'")]
+    assert causes == ["no_route"]

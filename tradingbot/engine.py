@@ -11,6 +11,7 @@ The "claude" book is the real strategy; other books are baselines (see shadows.p
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
 import random
@@ -63,8 +64,9 @@ class Engine:
                  executor: Executor, journal: Journal, jupiter: Jupiter | None = None,
                  shadow_executors: dict[str, Executor] | None = None,
                  canary_executor: Executor | None = None, gecko=None, triage=None,
-                 model_executor: Executor | None = None):
+                 model_executor: Executor | None = None, extras=None):
         self.cfg, self.dex, self.rug, self.analyst = cfg, dex, rug, analyst
+        self.extras = extras  # optional free-source client (data/extras.py): model5's holder audits
         self.triage = triage  # optional cheap first pass before the analyst (tradingbot/triage.py)
         self.gecko = gecko  # optional GeckoTerminal discovery (trending by trading activity)
         self.journal = journal
@@ -580,7 +582,41 @@ class Engine:
         self._open_position(book, sig["mint"], symbol, fill, trigger, None)
         self.journal.log_event("model_buy", sig["mint"], f"score {sig['score']:.3f} liq ${sig['liq']:,.0f}",
                                strategy=book.name)
+        self._log_model_audit(book, sig)
         return None
+
+    def _log_model_audit(self, book: Book, sig: dict) -> None:
+        """Holder audit at the moment of buying (model_entry_audit), for the live rug analysis."""
+        from tradingbot import model_book as mb
+        try:
+            audit = mb.entry_audit(self.extras, sig["mint"])
+        except Exception:  # noqa: BLE001 (logging must never stop trading)
+            log.warning("entry audit failed for %s", sig["mint"], exc_info=True)
+            audit = {}
+        audit.update({"score": round(sig["score"], 4), "snapshot_liq": sig["liq"]})
+        self.journal.log_event("model_entry_audit", sig["mint"], json.dumps(audit), strategy=book.name)
+
+    def _log_exit_cause(self, book: Book, pos: Position, blocked: bool) -> None:
+        """Why a model5 trade lost (model_exit_cause): no route, liquidity pulled, dumped or an ordinary stop."""
+        from tradingbot import model_book as mb
+        if book.name != mb.NAME or not pos.cost_usd:
+            return
+        if self.journal.query("SELECT 1 FROM events WHERE strategy=? AND kind='model_exit_cause' AND token=? "
+                              "AND ts >= ?", (book.name, pos.token_address, pos.opened_at or 0)):
+            return  # already recorded (e.g. blocked before a restart)
+        entry = self.journal.query("SELECT detail FROM events WHERE strategy=? AND kind='model_entry_audit' "
+                                   "AND token=? ORDER BY ts DESC LIMIT 1", (book.name, pos.token_address))
+        audit = json.loads(entry[0]["detail"]) if entry else {}
+        entry_liq = audit.get("liquidity") or audit.get("snapshot_liq")
+        try:
+            cause = mb.exit_cause(self.extras, pos.token_address, entry_liq,
+                                  pos.realized_usd / pos.cost_usd - 1, blocked)
+        except Exception:  # noqa: BLE001
+            log.warning("exit-cause check failed for %s", pos.symbol, exc_info=True)
+            cause = {"cause": "no_route" if blocked else "unknown"}
+        cause["position_id"] = pos.id
+        self.journal.log_event("model_exit_cause", pos.token_address, json.dumps(cause), strategy=book.name)
+        log.info("[%s] %s lost: %s", book.name, pos.symbol, cause["cause"])
 
     def _sell(self, book: Book, pos: Position, qty: float, price: float, reason: str) -> bool:
         fill = book.executor.sell(pos.token_address, min(qty, pos.qty), price)
@@ -606,6 +642,8 @@ class Engine:
                 pos.exit_reason = reason
         log.info("[%s] SELL %s %s qty=%.6g @ %.10g -> $%.2f",
                  book.name, pos.symbol, reason, fill.qty, fill.price, fill.usd)
+        if pos.closed_at is not None and pos.realized_usd < pos.cost_usd:
+            self._log_exit_cause(book, pos, blocked=False)
         return True
 
     def _exit_blocked(self, book: Book, pos: Position, reason: str, note: str) -> None:
@@ -618,6 +656,7 @@ class Engine:
                 "OR (kind='tx_failed' AND usd = 0 AND detail LIKE '%route%'))",
                 (book.name, pos.token_address, pos.opened_at or 0))[0]["t"]
             self._blocked[pos.id] = {"since": first or now, "logged": 0.0, "note": note}
+            self._log_exit_cause(book, pos, blocked=True)
         b = self._blocked[pos.id]
         b["next"], b["note"] = now + EXIT_RETRY_S, note or "no route"
         if now - b["logged"] >= 3600:

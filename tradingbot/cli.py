@@ -51,9 +51,10 @@ def build_engine(cfg: Config, with_analyst: bool = True):
     # model5 is always simulated, with its own impact cap (the Claude book's 3% suits older, deeper pools).
     model_executor = (SimExecutor(replace(cfg, max_price_impact_pct=cfg.model_book_max_impact_pct), jupiter)
                       if cfg.model_book else None)
+    from tradingbot.data.extras import Extras
     return Engine(cfg, DexScreener(), RugCheck(), analyst, executor, Journal(cfg.db_path), jupiter,
                   shadow_executors=shadow_executors, canary_executor=canary, gecko=GeckoTerminal(),
-                  triage=triage, model_executor=model_executor)
+                  triage=triage, model_executor=model_executor, extras=Extras() if cfg.model_book else None)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -217,6 +218,9 @@ def main(argv: list[str] | None = None) -> None:
         path = model_book.model_path(cfg)
         meta = json.loads(path.read_text()) if path.exists() else None
         j = Journal(cfg.db_path)
+        from tradingbot.engine import STUCK_AFTER_S
+        stuck = {p.id for p in j.open_positions(model_book.NAME)
+                 if (b := report._blocked(j, model_book.NAME, p)) and time.time() - b[0] >= STUCK_AFTER_S}
         skips: dict[str, int] = {}
         for r in j.query("SELECT detail FROM events WHERE strategy=? AND kind='entry_skipped'", (model_book.NAME,)):
             key = r["detail"].split(" (")[0].split(" since")[0]
@@ -231,7 +235,8 @@ def main(argv: list[str] | None = None) -> None:
                                     "hours": round((time.time() - (p.opened_at or time.time())) / 3600, 1),
                                     "exit_blocked": report._exit_blocked(j, model_book.NAME, p)}
                                    for p in j.open_positions(model_book.NAME)],
-                          "skip_reasons": skips}, indent=2, default=str))
+                          "skip_reasons": skips,
+                          "rugs": model_book.rug_summary(j, stuck)}, indent=2, default=str))
         return
 
     if args.command == "watch-report-now":

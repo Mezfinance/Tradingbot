@@ -148,6 +148,80 @@ def train_and_save(store, cfg: Config) -> Path | None:
     return path
 
 
+# --- rug logging -------------------------------------------------------------------------------
+# The research found ~11.5% of top-2% picks rug (the -50% stop gaps to <=0.26x) and that holder data
+# fetched at 15 minutes added nothing. These record, for the book's own trades, the holder audit at the
+# moment of buying and why each losing trade lost, so the live rug rate and its cost can be compared.
+RUG_RETURN = -0.80  # a trade that lost >=80%: the stop did not protect it
+LIQ_PULLED_SHARE = 0.25  # liquidity now below 25% of entry liquidity = pulled, not dumped into
+
+
+def entry_audit(extras, mint: str) -> dict:
+    """Jupiter's holder audit right now (free, one call)."""
+    t = extras.jupiter_token(mint) if extras is not None else None
+    if not t:
+        return {}
+    audit = t.get("audit") or {}
+    return {"holders": t.get("holderCount"), "top_holders_pct": audit.get("topHoldersPercentage"),
+            "dev_balance_pct": audit.get("devBalancePercentage"), "dev_mints": audit.get("devMints"),
+            "dev_migrations": audit.get("devMigrations"), "organic_score": t.get("organicScore"),
+            "liquidity": t.get("liquidity"), "is_sus": audit.get("isSus"),
+            "mint_authority_off": audit.get("mintAuthorityDisabled"),
+            "freeze_authority_off": audit.get("freezeAuthorityDisabled")}
+
+
+def exit_cause(extras, mint: str, entry_liq: float | None, ret: float, blocked: bool) -> dict:
+    """Why a losing trade lost: no_route (could not sell at all), liquidity_pulled, dumped (pool intact,
+    price crashed past the stop) or stopped (an ordinary -50..-80% stop)."""
+    now = entry_audit(extras, mint)
+    liq = now.get("liquidity")
+    if blocked:
+        cause = "no_route"
+    elif liq is not None and entry_liq and liq < LIQ_PULLED_SHARE * entry_liq:
+        cause = "liquidity_pulled"
+    elif ret <= RUG_RETURN:
+        cause = "dumped"
+    else:
+        cause = "stopped"
+    return {"cause": cause, "return_pct": round(ret * 100, 1), "entry_liq": entry_liq, "liq_now": liq,
+            "holders_now": now.get("holders"), "top_holders_pct_now": now.get("top_holders_pct")}
+
+
+def rug_summary(journal, stuck: set[int] | None = None) -> dict:
+    """Live rug rate and causes for the book's finished trades, and entry audits of rugs vs the rest."""
+    stuck = stuck or set()
+    audits = {r["token"]: json.loads(r["detail"]) for r in journal.query(
+        "SELECT token, detail FROM events WHERE strategy=? AND kind='model_entry_audit' ORDER BY ts", (NAME,))}
+    causes: dict[str, int] = {}
+    for r in journal.query("SELECT detail FROM events WHERE strategy=? AND kind='model_exit_cause'", (NAME,)):
+        c = json.loads(r["detail"]).get("cause", "?")
+        causes[c] = causes.get(c, 0) + 1
+    trades = []
+    for p in journal.query("SELECT id, token, cost_usd, realized_usd, closed_at FROM positions WHERE strategy=?",
+                           (NAME,)):
+        if p["closed_at"] is None and p["id"] not in stuck:
+            continue
+        ret = (p["realized_usd"] or 0) / p["cost_usd"] - 1 if p["cost_usd"] else 0.0
+        trades.append((ret, audits.get(p["token"])))
+    rugs = [a for r, a in trades if r <= RUG_RETURN]
+    rest = [a for r, a in trades if r > RUG_RETURN]
+
+    def medians(rows):
+        rows = [a for a in rows if a]
+        out = {}
+        for k in ("holders", "top_holders_pct", "dev_balance_pct", "dev_mints", "organic_score", "liquidity"):
+            vals = sorted(float(a[k]) for a in rows if isinstance(a.get(k), (int, float)) and not isinstance(a[k], bool))
+            out[k] = round(vals[len(vals) // 2], 2) if vals else None
+        sus = [a["is_sus"] for a in rows if a.get("is_sus") is not None]
+        return {"n_with_audit": len(rows), "median": out,
+                "flagged_suspicious_pct": round(100 * sum(sus) / len(sus), 1) if sus else None}
+
+    return {"finished_trades": len(trades), "rugs": len(rugs),
+            "rug_rate_pct": round(100 * len(rugs) / len(trades), 1) if trades else None,
+            "research_rug_rate_pct": 11.5, "losing_exit_causes": causes,
+            "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
+
+
 class ModelBook:
     """Scores 5-minute snapshots and queues the top ones for the engine's `model` thread to buy."""
 
