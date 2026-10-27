@@ -19,6 +19,8 @@ from collections import defaultdict
 from tradingbot.watcher import WatchStore
 
 HOUR = 3600.0
+LAZY_KINDS = ("helius",)  # enrichment kinds read from the database per pool instead of held in memory
+LAZY_CACHE = 256
 KOL_FOLLOWERS = 50_000
 NARRATIVE_CATEGORIES = (
     "animal", "ai_tech", "political", "celebrity_person", "news_event", "tweet_moment", "meme_reference",
@@ -51,11 +53,13 @@ def loads(text: str | None):
     return data
 
 
-def load_snaps(store: WatchStore) -> dict[str, list[tuple[float, int, dict]]]:
-    """pool -> [(ts, age_min, snapshot)] in time order, parsed once and shared by every user."""
+def load_snaps(store: WatchStore, since: float | None = None) -> dict[str, list[tuple[float, int, dict]]]:
+    """pool -> [(ts, age_min, snapshot)] in time order, parsed once and shared by every user
+    (only pools created at or after `since`, when given)."""
     snaps: dict[str, list[tuple[float, int, dict]]] = defaultdict(list)
-    for r in store.query("SELECT pool, age_min, ts, data FROM watch_snaps WHERE data IS NOT NULL AND data != '{}' "
-                         "ORDER BY ts"):
+    for r in store.query("SELECT s.pool, s.age_min, s.ts, s.data FROM watch_snaps s JOIN watch_pools p USING(pool) "
+                         "WHERE s.data IS NOT NULL AND s.data != '{}' AND p.created_ts >= ? ORDER BY s.ts",
+                         (since or 0.0,)):
         snaps[r["pool"]].append((r["ts"], r["age_min"], loads(r["data"])))
     return snaps
 
@@ -83,13 +87,38 @@ def _gini(values: list[float]) -> float | None:
 
 
 class Context:
-    def __init__(self, store: WatchStore, cfg=None, snaps: dict | None = None):
-        pools = [dict(r) for r in store.query("SELECT pool, mint, name, created_ts, first FROM watch_pools")]
+    def __init__(self, store: WatchStore, cfg=None, snaps: dict | None = None, since: float | None = None):
+        """`since`: only pools created from then on (and attention lists from then on) are loaded; the
+        report uses it to keep memory bounded as the watcher's history grows."""
+        since = since or 0.0
+        pools = [dict(r) for r in store.query("SELECT pool, mint, name, created_ts, first FROM watch_pools "
+                                              "WHERE created_ts >= ?", (since,))]
         self.created = {p["pool"]: p["created_ts"] for p in pools}
-        self.snaps = snaps if snaps is not None else load_snaps(store)
+        self._mint_of = {p["pool"]: p["mint"] for p in pools}  # needed while Helius rows stream in
+        self.snaps = snaps if snaps is not None else load_snaps(store, since)
+        self.store = store
         self.enrich: dict[str, dict[str, tuple[float, dict]]] = defaultdict(dict)
-        for r in store.query("SELECT pool, kind, ts, data FROM watch_enrich"):
+        for r in store.query("SELECT e.pool, e.kind, e.ts, e.data FROM watch_enrich e JOIN watch_pools p USING(pool) "
+                             "WHERE p.created_ts >= ? AND e.kind NOT IN (%s)" % ",".join("?" * len(LAZY_KINDS)),
+                             (since, *LAZY_KINDS)):
             self.enrich[r["pool"]][r["kind"]] = (r["ts"], loads(r["data"]))
+        # Helius rows (transaction lists) are most of the memory: stream them once for the cross-token
+        # wallet index, keep a stub, and load a pool's full row only when its features are computed.
+        self._lazy_cache: dict[tuple[str, str], dict] = {}
+        lazy_rows = []
+        for kind in LAZY_KINDS:
+            for r in store.iterate("SELECT e.pool, e.ts, e.data FROM watch_enrich e JOIN watch_pools p USING(pool) "
+                                   "WHERE p.created_ts >= ? AND e.kind=?", (since, kind)):
+                data = loads(r["data"])
+                stub = {k: data[k] for k in ("selection", "skipped", "copied_from") if k in data}
+                if data and "skipped" not in data:
+                    stub["_lazy"] = True
+                    lazy_rows.append((r["pool"], data))
+                self.enrich[r["pool"]][kind] = (r["ts"], stub)
+                if len(lazy_rows) >= 500:
+                    self._index_wallets(lazy_rows)
+                    lazy_rows = []
+        self._pending_wallet_rows = lazy_rows
 
         # When each token first traded at 2x its first-seen price, from live snapshots.
         first_price = {}
@@ -129,8 +158,9 @@ class Context:
 
         # Attention lists and Telegram mentions per token, in time order.
         self.lists: dict[str, list[tuple[float, str, int, float]]] = defaultdict(list)
-        for r in store.query("SELECT ts, list, rank, mint, amount FROM watch_lists ORDER BY ts"):
-            self.lists[r["mint"]].append((r["ts"], r["list"], r["rank"], r["amount"] or 0.0))
+        for r in store.iterate("SELECT ts, list, rank, mint, amount FROM watch_lists WHERE ts >= ? ORDER BY ts",
+                               (since,)):
+            self.lists[r["mint"]].append((r["ts"], sys.intern(r["list"]), r["rank"], r["amount"] or 0.0))
         self.mentions: dict[str, list[tuple[float, str]]] = defaultdict(list)
         for r in store.query("SELECT mint, channel, post_ts FROM watch_mentions WHERE post_ts IS NOT NULL"):
             self.mentions[r["mint"]].append((r["post_ts"], r["channel"]))
@@ -140,29 +170,46 @@ class Context:
 
         # Images seen on other tokens, and which wallets bought early into which tokens.
         self.image_seen: dict[str, list[tuple[float, str]]] = defaultdict(list)
-        self.early_wallets: dict[str, list[tuple[float, str]]] = defaultdict(list)
         for pool, kinds in self.enrich.items():
-            mint, created = mint_of.get(pool), self.created.get(pool, 0)
             img = kinds.get("image", (0, {}))[1].get("dhash")
             if img:
-                self.image_seen[img].append((created, mint))
-            hel = kinds.get("helius", (0, {}))[1]
-            if hel.get("copied_from"):
-                continue  # the same token's launch pool already counted these wallets
-            accounts = set(hel.get("pool_accounts") or [])
-            for w in {t[2] for t in hel.get("trades") or [] if t[3] > 0 and t[2] not in accounts}:
-                self.early_wallets[w].append((created, mint))
+                self.image_seen[img].append((self.created.get(pool, 0), mint_of.get(pool)))
+        self._index_wallets(self._pending_wallet_rows)
+        del self._pending_wallet_rows
         for v in self.early_wallets.values():
             v.sort()
         from tradingbot.watch_features_more import More  # the long tail of factors (FACTORS.md)
         self.more = More(self, store, cfg)
 
     # --- helpers -------------------------------------------------------------------
+    def _index_wallets(self, rows: list[tuple[str, dict]]) -> None:
+        """early_wallets: wallet -> [(created, mint)] of tokens it bought early (from Helius trades)."""
+        if not hasattr(self, "early_wallets"):
+            self.early_wallets: dict[str, list[tuple[float, str]]] = defaultdict(list)
+        mint_of = self._mint_of
+        for pool, hel in rows:
+            if hel.get("copied_from"):
+                continue  # the same token's launch pool already counted these wallets
+            accounts = set(hel.get("pool_accounts") or [])
+            for w in {t[2] for t in hel.get("trades") or [] if t[3] > 0 and t[2] not in accounts}:
+                self.early_wallets[w].append((self.created.get(pool, 0), mint_of.get(pool)))
+
     def _known(self, pool: str, kind: str, ts: float) -> dict | None:
         got = self.enrich.get(pool, {}).get(kind)
         if not got or got[0] > ts or not got[1] or "skipped" in got[1]:
             return None
+        if got[1].get("_lazy"):
+            return self._load_lazy(pool, kind)
         return got[1]
+
+    def _load_lazy(self, pool: str, kind: str) -> dict:
+        key = (pool, kind)
+        if key not in self._lazy_cache:
+            if len(self._lazy_cache) >= LAZY_CACHE:
+                self._lazy_cache.pop(next(iter(self._lazy_cache)))
+            rows = self.store.query("SELECT data FROM watch_enrich WHERE pool=? AND kind=?", (pool, kind))
+            self._lazy_cache[key] = loads(rows[0]["data"]) if rows else {}
+        return self._lazy_cache[key]
 
     def selection(self, pool: str, kind: str, ts: float) -> str:
         """How a paid lookup was chosen, for judging the paid data on an unbiased slice:

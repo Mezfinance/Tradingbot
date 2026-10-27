@@ -44,6 +44,7 @@ from tradingbot.watcher import LAUNCHPAD_DEXES, WatchStore
 log = logging.getLogger(__name__)
 
 TASK_LIMIT_PER_STEP = 40
+GECKO_LISTS_EVERY_S = 600  # GeckoTerminal trending ranks (DexScreener lists keep enrich_lists_every_s)
 PER_KIND_PER_STEP = 6  # every task type gets a turn each pass
 WINDOWS = {  # kind -> (earliest age, latest age) in minutes; outside the window the task is skipped
     "pumpfun5": (5, 25), "pumpfun15": (15, 45), "orders": (15, 120), "narrative": (15, 360),
@@ -217,9 +218,11 @@ class Enricher:
         rows = []
         for name, items in self.dex.lists().items():
             rows += [(now, f"dex:{name}", rank, mint, amount) for rank, mint, amount in items]
-        for duration in ("5m", "1h"):
-            rows += [(now, f"gecko:trending_{duration}", rank, mint, 0.0)
-                     for rank, mint in enumerate(self.gecko.trending_ranked(duration), 1)]
+        if now - self._last.get("gecko_lists", 0.0) >= GECKO_LISTS_EVERY_S:  # GeckoTerminal calls are scarce
+            self._last["gecko_lists"] = now
+            for duration in ("5m", "1h"):
+                rows += [(now, f"gecko:trending_{duration}", rank, mint, 0.0)
+                         for rank, mint in enumerate(self.gecko.trending_ranked(duration), 1)]
         self.store.executemany("INSERT INTO watch_lists(ts, list, rank, mint, amount) VALUES(?,?,?,?,?)", rows)
         return len(rows)
 
@@ -717,6 +720,7 @@ class Enricher:
             "wallets_cached": q("SELECT COUNT(*) AS n FROM watch_wallets")[0]["n"],
             "spend_today": {b.name: round(b.spent(), 4) for b in (self.helius_budget, self.x_budget,
                                                                    self.narrative_budget)},
+            "pumpfun_blocked": time.monotonic() < getattr(self.pump, "blocked_until", 0.0),
             "keys": {"helius": self.helius.enabled, "x": self.x.enabled, "anthropic": self.llm_client is not None},
         }
 

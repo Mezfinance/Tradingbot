@@ -15,6 +15,7 @@ log = logging.getLogger(__name__)
 BASE = "https://frontend-api-v3.pump.fun"
 HEADERS = {"User-Agent": "Mozilla/5.0", "Origin": "https://pump.fun", "Accept": "application/json"}
 MIN_INTERVAL_S = 0.5
+BLOCK_PAUSE_S = 1800
 
 
 class PumpFun:
@@ -23,8 +24,11 @@ class PumpFun:
         self.min_interval_s = min_interval_s
         self._lock = threading.Lock()
         self._last = 0.0
+        self.blocked_until = 0.0
 
     def _get(self, path: str, params: dict | None = None) -> dict | None:
+        if time.monotonic() < self.blocked_until:  # behind Cloudflare's bot check: don't hammer it
+            return None
         with self._lock:
             wait = self._last + self.min_interval_s - time.monotonic()
             if wait > 0:
@@ -35,9 +39,15 @@ class PumpFun:
         except httpx.HTTPError as exc:
             log.debug("pump.fun %s failed: %s", path, exc)
             return None
+        if resp.status_code == 403:  # Cloudflare "Just a moment..." page (seen from 2026-10-22)
+            if not self.blocked_until:
+                log.warning("pump.fun returned 403 (bot check); pausing its lookups for %ds at a time", BLOCK_PAUSE_S)
+            self.blocked_until = time.monotonic() + BLOCK_PAUSE_S
+            return None
         if resp.status_code != 200:
             log.debug("pump.fun %s -> HTTP %s", path, resp.status_code)
             return None
+        self.blocked_until = 0.0
         try:
             return resp.json()
         except ValueError:

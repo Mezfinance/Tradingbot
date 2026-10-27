@@ -181,6 +181,20 @@ def test_shared_inputs_give_the_same_rows_and_skip_empty_factors():
     for age in (15, 15):
         assert wa.build_dataset(store, age, now=NOW, shared=shared) == wa.build_dataset(store, age, now=NOW)
     assert all(v is not None for r in wa.build_dataset(store, 15, now=NOW) for v in r.values())
-    res = wa.report_by_age(store, ("pump2x",), (None,), now=NOW)
+    res = wa.report_by_age(store, ("pump2x",), (None,), now=NOW, days=None)
     assert [e["age_min"] for e in res["summary"][("pump2x", None)]] == list(wa.FEATURE_AGES)
     assert res["detail"][("pump2x", None)]["rows"] == len(wa.build_dataset(store, 15, now=NOW))
+
+
+def test_report_window_keeps_recent_rows_and_loads_a_warmup_day():
+    store = WatchStore(":memory:")
+    for i in range(20):  # one pool a day, oldest first
+        created = T0 + i * 86400
+        add_pool(store, f"P{i}", f"M{i}", created, snaps={5: snap(1.0), 15: snap(1.0)},
+                 candles=candle_path(created, 15, [1.5, 2.5]))
+    now = T0 + 20 * 86400
+    since = now - wa.DAY_S - 1800 - 3 * wa.DAY_S - wa.WARMUP_S
+    rows = wa.build_dataset(store, 15, now=now, since=since)
+    assert sorted(r["pool"] for r in rows) == ["P16", "P17", "P18"]  # the 3 finished days, not the warm-up
+    res = wa.report_by_age(store, ("pump2x",), (None,), now=now, days=3)
+    assert res["detail"][("pump2x", None)]["rows"] == 3

@@ -35,7 +35,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tradingbot.config import Config
-from tradingbot.data.geckoterminal import NOT_MEMECOINS, GeckoTerminal, base_token, dex_id
+from tradingbot.data.geckoterminal import NOT_MEMECOINS, GeckoTerminal, base_token, dex_id, gecko_interval
 
 log = logging.getLogger(__name__)
 
@@ -229,6 +229,14 @@ class WatchStore:
         with self.lock:
             return self.db.execute(sql, params).fetchall()
 
+    def iterate(self, sql: str, params=()):
+        """Rows one at a time on a cursor of their own (for scans too big to hold at once). Holds the
+        store lock until exhausted, so only for the report process and offline analysis."""
+        with self.lock:
+            cur = self.db.execute(sql, params)
+            for row in cur:
+                yield row
+
     def get_state(self, key: str) -> str | None:
         rows = self.query("SELECT value FROM watch_state WHERE key=?", (key,))
         return rows[0]["value"] if rows else None
@@ -265,8 +273,8 @@ class Watcher:
     # --- one pass ----------------------------------------------------------------
     def step(self, now: float | None = None) -> dict:
         now = now or time.time()
-        done = {"new": self.discover(now), "snaps": self.snapshot(now), "info": self.fetch_info(now),
-                "ohlcv": self.fetch_ohlcv(now)}
+        done = {"new": self.discover(now), "snaps": self.snapshot(now), "ohlcv": self.fetch_ohlcv(now),
+                "info": self.fetch_info(now)}  # candles before info: see geckoterminal priorities
         self.backup_if_due()
         self.report_if_due()
         self.store.set_state("heartbeat", repr(time.time()))
@@ -353,7 +361,7 @@ class Watcher:
                 continue
             if now < next_ts:
                 continue
-            if calls >= INFO_CALLS_PER_STEP:
+            if calls >= (INFO_CALLS_PER_STEP if gecko_interval() < 5 else 2):  # fewer while rate-limited
                 break
             info = self.gecko.token_info(r["mint"])
             calls += 1
@@ -553,6 +561,7 @@ class Watcher:
             "closed": q("SELECT COUNT(*) AS n FROM watch_pools WHERE closed=1")[0]["n"],
             "last_backup": self.store.get_state("last_backup"),
             "db_mb": round(os.path.getsize(self.store.path) / 1e6, 1) if self.store.path != ":memory:" else 0,
+            "gecko_interval_s": round(gecko_interval(), 1),  # rises above 2.2 while GeckoTerminal rate-limits us
         }
 
 

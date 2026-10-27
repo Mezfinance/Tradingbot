@@ -90,3 +90,51 @@ def test_claude_is_told_where_a_token_came_from(cfg, good_pair, safe):
 def test_established_tokens_now_pass_the_age_filter(cfg, good_pair, safe):
     week_old = replace(good_pair, created_at_ms=int((good_pair.fetched_at - 7 * 86400) * 1000))
     assert not any("too old" in r for r in evaluate(week_old, safe, cfg).rejections)
+
+
+def test_gecko_gate_serves_higher_priority_first_and_backs_off_on_429():
+    import threading
+    import time
+    from tradingbot.data import geckoterminal as gt
+    gate = gt._Gate()
+    gate.next_free = time.monotonic() + 0.2  # busy for a moment, so all three queue up
+    order = []
+    threads = [threading.Thread(target=lambda p=p: (gate.acquire(p, 0.01), order.append(p)))
+               for p in (gt.P_EXTRA, gt.P_INFO, gt.P_SNAPSHOT)]
+    for t in threads:
+        t.start()
+        time.sleep(0.02)
+    for t in threads:
+        t.join(5)
+    assert order == [gt.P_SNAPSHOT, gt.P_INFO, gt.P_EXTRA]
+    before = gate.interval
+    gate.throttled()
+    assert gate.interval == before * 1.5
+    for _ in range(100):
+        gate.ok()
+    assert gate.interval == gt.MIN_INTERVAL_S
+
+
+def test_trending_discovery_is_reused_for_ten_minutes():
+    calls = []
+
+    def handler(req):
+        calls.append(req.url.path)
+        return httpx.Response(200, json={"data": []})
+    g = GeckoTerminal(httpx.Client(transport=httpx.MockTransport(handler), base_url="https://g"), min_interval_s=0)
+    g.discover_ttl_s = 600
+    g.discover()
+    g.discover()
+    assert len(calls) == 2  # two trending windows, fetched once
+
+
+def test_pumpfun_pauses_when_cloudflare_blocks_it():
+    from tradingbot.data.pumpfun import PumpFun
+    calls = []
+
+    def handler(req):
+        calls.append(1)
+        return httpx.Response(403, text="<title>Just a moment...</title>")
+    pf = PumpFun(httpx.Client(transport=httpx.MockTransport(handler), base_url="https://p"), min_interval_s=0)
+    assert pf.coin("M") is None and pf.coin("M2") is None
+    assert len(calls) == 1

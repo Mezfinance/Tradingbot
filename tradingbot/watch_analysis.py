@@ -39,6 +39,8 @@ TRAIN_SHARE = 0.7
 ROUND_TRIP_COST = 0.06  # measured: a $50 simulated round trip on a real token cost 6.15%
 TP_MULT, SL_MULT = 2.0, 0.5
 MIN_ROWS = 200
+REPORT_DAYS = 4  # finished days in the daily report: ~1.3 GB on a 2 GB machine (7 loaded days took 1.73 GB)
+WARMUP_S = DAY_S  # history loaded before the first row, for look-back factors
 
 
 def _f(x) -> float | None:
@@ -62,7 +64,8 @@ def _ratio(a, b) -> float | None:
 
 
 # --- dataset -------------------------------------------------------------------------
-def _future_paths(store: WatchStore, snaps: dict | None = None) -> dict[str, list[tuple[float, float, float, float]]]:
+def _future_paths(store: WatchStore, snaps: dict | None = None,
+                  since: float | None = None) -> dict[str, list[tuple[float, float, float, float]]]:
     """mint -> [(ts, high, low, close)] from candles of every pool of that mint, plus snapshot prices.
 
     Only prices from a pool that was trading at the time count: a launch pool that has graduated keeps
@@ -70,18 +73,33 @@ def _future_paths(store: WatchStore, snaps: dict | None = None) -> dict[str, lis
     turned every post-graduation dump into a fake 2x.
     """
     paths: dict[str, list] = defaultdict(list)
-    for r in store.query("SELECT mint, ohlcv FROM watch_pools WHERE ohlcv IS NOT NULL AND ohlcv != '[]'"):
-        for c in json.loads(r["ohlcv"]):
+    pools = store.query("SELECT pool, mint, created_ts, ohlcv IS NOT NULL AND ohlcv != '[]' AS has_c FROM watch_pools")
+    mint_of = {r["pool"]: r["mint"] for r in pools}
+    # Labels need every pool of a token, even one created before the window (an older pool of the same mint).
+    mints = {r["mint"] for r in pools if r["created_ts"] >= (since or 0.0)}
+    for r in pools:
+        if not r["has_c"] or r["mint"] not in mints:
+            continue
+        for c in json.loads(store.query("SELECT ohlcv FROM watch_pools WHERE pool=?", (r["pool"],))[0]["ohlcv"]):
             if len(c) > 5 and not (_f(c[5]) or 0) > 0:
                 continue  # no volume: no trade at this price
             ts, _o, h, low, close = (float(c[0]), c[1], c[2], c[3], c[4])
             paths[r["mint"]].append((ts + 300, float(h), float(low), float(close)))  # candle known at its close
-    mint_of = {r["pool"]: r["mint"] for r in store.query("SELECT pool, mint FROM watch_pools")}
-    for pool, ss in (snaps if snaps is not None else load_snaps(store)).items():
+
+    def add(pool, ts, d):
+        price = _f(d.get("price"))
+        if price and pool in mint_of and (d.get("buys_m5") or 0) + (d.get("sells_m5") or 0) > 0:
+            paths[mint_of[pool]].append((ts, price, price, price))
+    for pool, ss in (snaps if snaps is not None else load_snaps(store, since)).items():
         for ts, _age, d in ss:
-            price = _f(d.get("price"))
-            if price and pool in mint_of and (d.get("buys_m5") or 0) + (d.get("sells_m5") or 0) > 0:
-                paths[mint_of[pool]].append((ts, price, price, price))
+            add(pool, ts, d)
+    if since:  # snapshots of older pools of the same tokens, taken inside the window
+        older = {r["pool"] for r in pools if r["created_ts"] < since and r["mint"] in mints}
+        for r in store.iterate("SELECT s.pool, s.ts, s.data FROM watch_snaps s JOIN watch_pools p USING(pool) "
+                               "WHERE p.created_ts < ? AND s.ts >= ? AND s.data IS NOT NULL AND s.data != '{}'",
+                               (since, since)):
+            if r["pool"] in older:
+                add(r["pool"], r["ts"], json.loads(r["data"]))
     for v in paths.values():
         v.sort()
     return paths
@@ -176,9 +194,9 @@ def _info_features(info: dict) -> dict:
     }
 
 
-def _shared_inputs(store: WatchStore) -> dict:
+def _shared_inputs(store: WatchStore, since: float | None = None) -> dict:
     """Everything build_dataset reads that does not depend on the age (build once, reuse for every age)."""
-    by_pool = load_snaps(store)  # parsed once: the factor context and the rows share the same dicts
+    by_pool = load_snaps(store, since)  # parsed once: the factor context and the rows share the same dicts
     snaps: dict[str, dict[int, tuple[float, dict]]] = defaultdict(dict)
     for pool, ss in by_pool.items():
         for ts, age, d in ss:
@@ -188,25 +206,35 @@ def _shared_inputs(store: WatchStore) -> dict:
         cfg = Config.from_env()  # the operator's wallet / caller lists reach the factors
     except Exception:  # noqa: BLE001 (analysis must run even with odd env settings)
         cfg = None
-    return {"snaps": snaps, "paths": _future_paths(store, by_pool), "ctx": Context(store, cfg, snaps=by_pool)}
+    return {"snaps": snaps, "paths": _future_paths(store, by_pool, since),
+            "ctx": Context(store, cfg, snaps=by_pool, since=since), "since": since}
 
 
-def build_dataset(store: WatchStore, age: int, now: float | None = None, shared: dict | None = None) -> list[dict]:
+def data_now(store: WatchStore) -> float:
+    """The data's own clock: on a backup, pools whose 24h ran past the copy are not finished."""
+    last = store.query("SELECT MAX(ts) AS t FROM watch_snaps")[0]["t"]
+    return min(time.time(), last) if last else time.time()
+
+
+def build_dataset(store: WatchStore, age: int, now: float | None = None, shared: dict | None = None,
+                  since: float | None = None) -> list[dict]:
     """Rows for pools whose 24h outcome after `age` minutes is complete.
 
     Pass the same `shared` dict when building several ages: the snapshots, price paths and factor
     context are then loaded once. Factors with no value are left out of a row (read them with .get).
+    With `since`, only data from pools created from then on is loaded, and rows start one day later
+    (WARMUP_S), so look-back factors (developer record, theme heat, smart wallets) have some history.
     """
-    if now is None:  # the data's own clock: on a backup, pools whose 24h ran past the copy are not finished
-        last = store.query("SELECT MAX(ts) AS t FROM watch_snaps")[0]["t"]
-        now = min(time.time(), last) if last else time.time()
+    if now is None:
+        now = data_now(store)
     pools = {r["pool"]: dict(r) for r in store.query(
-        "SELECT pool, mint, dex, name, created_ts, first, info, info_ts FROM watch_pools WHERE created_ts <= ?",
-        (now - DAY_S - age * 60 - 1800,))}
+        "SELECT pool, mint, dex, name, created_ts, first, info, info_ts FROM watch_pools "
+        "WHERE created_ts <= ? AND created_ts >= ?", (now - DAY_S - age * 60 - 1800, since or 0.0))}
+    rows_from = since + WARMUP_S if since else -math.inf
     if shared is None:
         shared = {}
     if not shared:
-        shared.update(_shared_inputs(store))
+        shared.update(_shared_inputs(store, since))
     snaps, paths, ctx = shared["snaps"], shared["paths"], shared["ctx"]
 
     # Developer track record: launches and pumps among the developer's EARLIER tokens.
@@ -220,7 +248,7 @@ def build_dataset(store: WatchStore, age: int, now: float | None = None, shared:
     outcome_at_age: dict[str, dict] = {}
     rows = []
     for pool, p in sorted(pools.items(), key=lambda kv: kv[1]["created_ts"]):
-        if age not in snaps[pool]:
+        if age not in snaps[pool] or p["created_ts"] < rows_from:
             continue
         ts, d = snaps[pool][age]
         entry = _f(d.get("price"))
@@ -460,16 +488,19 @@ def summary(store: WatchStore, label: str = "pump2x", now: float | None = None,
 
 
 def report_by_age(store: WatchStore, labels=("pump2x",), subsets=(None,), detail_age: int = 15,
-                  now: float | None = None, on_rows=None) -> dict:
+                  now: float | None = None, on_rows=None, days: float | None = REPORT_DAYS) -> dict:
     """Analyse every feature age with one age's rows in memory at a time (a week of rows for all four
     ages does not fit a small machine). `on_rows(age, rows)` sees each age's rows before they are freed.
     Returns {"summary": {(label, subset): [entry per age]}, "detail": {(label, subset): analyse at detail_age}}."""
     shared: dict = {}
+    if now is None:
+        now = data_now(store)
+    since = (now - DAY_S - 1800 - days * DAY_S - WARMUP_S) if days else None
     summ = {(lb, sb): [] for lb in labels for sb in subsets}
     detail: dict = {}
     ages = list(FEATURE_AGES) + ([detail_age] if detail_age not in FEATURE_AGES else [])
     for age in ages:
-        rows = build_dataset(store, age, now, shared)
+        rows = build_dataset(store, age, now, shared, since)
         for lb in labels:
             for sb in subsets:
                 a = analyse(store, age, lb, now, sb, rows=rows)

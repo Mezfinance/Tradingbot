@@ -10,6 +10,7 @@ primary_region = "iad"
   TB_MODE = "paper"
   TB_DB_PATH = "/data/tradingbot.db"
   TB_HEALTH_PORT = "8080"
+  TB_CLAUDE_TRADING = "0"  # no Opus buy/pass analysis, triage or learning: 0 Claude buys in two weeks
 
 # The journal. Daily snapshots are kept for 14 days; the volume grows itself if it fills.
 [mounts]

@@ -267,7 +267,7 @@ def main(argv: list[str] | None = None) -> None:
         print(replay.report(Journal(cfg.db_path), cfg, overrides, args.group, args.size, args.split))
         return
 
-    engine = build_engine(cfg, with_analyst=args.command != "scan")
+    engine = build_engine(cfg, with_analyst=args.command != "scan" and cfg.claude_trading)
     if args.command == "scan":
         survivors = engine.screen()
         for snap, result, _ in survivors:

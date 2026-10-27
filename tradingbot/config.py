@@ -81,6 +81,10 @@ class Config:
     min_factor_score: float = 0.55  # 0..1 composite needed to reach Claude
 
     # --- Claude analyst -------------------------------------------------
+    # Off = no Opus analyst, no triage, no learning thread (they only serve Claude's own trades); the
+    # watcher's cheap Haiku narrative tags still use ANTHROPIC_API_KEY. Turned off on Fly 2026-10-27
+    # after two weeks of zero Claude buys.
+    claude_trading: bool = True
     model: str = "claude-opus-5-5"
     effort: str = "medium"
     max_web_searches: int = 8  # 5 was too few to also check the contract and deployer
