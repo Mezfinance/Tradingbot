@@ -80,6 +80,21 @@ class Config:
     partial_lock_size_factor: float = 0.5  # fraction of the normal position size
     min_factor_score: float = 0.55  # 0..1 composite needed to reach Claude
 
+    # --- model5: the 5-minute pump model's paper book (tradingbot/model_book.py) ---
+    model_book: bool = True
+    model_book_cash_usd: float = 10_000.0
+    model_book_usd: float = 100.0  # per trade, never more than model_book_liq_share of the pool
+    model_book_liq_share: float = 0.02
+    model_book_min_liq_usd: float = 5_000.0
+    model_book_top_pct: float = 2.0  # buy pools scoring in the top this-% of recent pools
+    model_book_max_open: int = 120
+    model_book_daily_loss_pct: float = 15.0  # of the book's equity; halts its entries for the UTC day
+    model_book_max_drift_pct: float = 25.0  # skip if the live price ran this far above the snapshot
+    model_book_tp_pct: float = 100.0
+    model_book_sl_pct: float = 50.0
+    model_book_hold_h: float = 24.0
+    model_train_days: float = 4.0
+
     # --- Claude analyst -------------------------------------------------
     # Off = no Opus analyst, no triage, no learning thread (they only serve Claude's own trades); the
     # watcher's cheap Haiku narrative tags still use ANTHROPIC_API_KEY. Turned off on Fly 2026-10-27

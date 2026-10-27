@@ -261,6 +261,7 @@ class Watcher:
         self.ages = sorted(int(a) for a in cfg.watch_ages_min.split(",") if a.strip())
         self.s3_factory = s3_factory
         self.report_in_subprocess = report_in_subprocess
+        self.on_snapshot = None  # callable(pool_row, age_min, snapshot) for each new snapshot (model5)
         self._seen: dict[str, bool] = {}  # every new pool seen recently -> is a launchpad pool (before sampling)
         self.seen_counts = [0, 0]  # new pools, of which launchpad, since the market row was last written
 
@@ -331,12 +332,25 @@ class Watcher:
             missed = [(r["pool"], age, now, None) for r in due if now - (r["created_ts"] + age * 60) > late_limit]
             fresh = [r["pool"] for r in due if now - (r["created_ts"] + age * 60) <= late_limit]
             data = self.gecko.pools(fresh) if fresh else {}
-            rows = [(p, age, now, json.dumps(compact(data[p])) if p in data else "{}") for p in fresh]
+            snaps = {p: compact(data[p]) for p in fresh if p in data}
+            rows = [(p, age, now, json.dumps(snaps[p]) if p in snaps else "{}") for p in fresh]
             self.store.executemany("INSERT OR IGNORE INTO watch_snaps(pool, age_min, ts, data) VALUES(?,?,?,?)",
                                    rows + missed)
+            if self.on_snapshot is not None and snaps:
+                self._notify(age, snaps)
             taken += len(rows)
             budget -= len(due)
         return taken
+
+    def _notify(self, age: int, snaps: dict[str, dict]) -> None:
+        """Hand fresh snapshots to a listener (the engine's model5 book); its errors never stop collection."""
+        marks = ",".join("?" * len(snaps))
+        for p in self.store.query(f"SELECT pool, mint, dex, name, created_ts, first FROM watch_pools "
+                                  f"WHERE pool IN ({marks})", tuple(snaps)):
+            try:
+                self.on_snapshot(dict(p), age, snaps[p["pool"]])
+            except Exception as exc:  # noqa: BLE001
+                log.warning("snapshot listener failed for %s: %s: %s", p["pool"], type(exc).__name__, exc)
 
     def fetch_info(self, now: float) -> int:
         """Token info once per pool, newest pools first: info only feeds a factor if it was fetched before the
@@ -493,6 +507,14 @@ class Watcher:
                     fh.write("1000")
             except OSError:
                 pass
+        if self.cfg.model_book:  # first: the paper book trades on it; the report is research
+            try:
+                res = subprocess.run([sys.executable, "-m", "tradingbot", "watch-model-train"],
+                                     preexec_fn=first_to_die, timeout=REPORT_TIMEOUT_S)
+                if res.returncode != 0:
+                    log.error("model5 training: child exited %s", res.returncode)
+            except Exception as exc:  # noqa: BLE001
+                log.error("model5 training could not run: %s: %s", type(exc).__name__, exc)
         try:
             res = subprocess.run([sys.executable, "-m", "tradingbot", "watch-report-now", date],
                                  preexec_fn=first_to_die, timeout=REPORT_TIMEOUT_S)

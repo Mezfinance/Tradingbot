@@ -47,9 +47,10 @@ def build_engine(cfg: Config, with_analyst: bool = True):
         triage = Triage(cfg, analyst.client)
     from tradingbot.data.geckoterminal import GeckoTerminal
 
+    model_executor = SimExecutor(cfg, jupiter) if cfg.model_book else None  # model5 is always simulated
     return Engine(cfg, DexScreener(), RugCheck(), analyst, executor, Journal(cfg.db_path), jupiter,
                   shadow_executors=shadow_executors, canary_executor=canary, gecko=GeckoTerminal(),
-                  triage=triage)
+                  triage=triage, model_executor=model_executor)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -58,7 +59,8 @@ def main(argv: list[str] | None = None) -> None:
                                             "backup-now", "backup-list", "learn-now", "postmortems", "playbook", "optimize-now", "settings",
                                             "settings-rollback", "code-versions", "code-diff", "code-rollback",
                                             "propose", "proposals", "watch-status", "watch-report",
-                                            "watch-export", "watch-links", "watch-report-now"])
+                                            "watch-export", "watch-links", "watch-report-now",
+                                            "watch-model-train", "model-status"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -196,6 +198,32 @@ def main(argv: list[str] | None = None) -> None:
             print("no bucket configured (fly storage create); reports are only on the volume under /data/reports")
             return
         print(json.dumps(download_links(client, os.environ["BUCKET_NAME"]), indent=2))
+        return
+
+    if args.command == "watch-model-train":
+        from tradingbot import model_book
+        from tradingbot.watcher import WatchStore, watch_db_path
+        out = model_book.train_and_save(WatchStore(watch_db_path(cfg)), cfg)
+        print(f"model written to {out}" if out else "not enough finished data to train yet")
+        return
+
+    if args.command == "model-status":
+        from tradingbot import model_book
+        from tradingbot.journal import Journal
+        path = model_book.model_path(cfg)
+        meta = json.loads(path.read_text()) if path.exists() else None
+        j = Journal(cfg.db_path)
+        skips: dict[str, int] = {}
+        for r in j.query("SELECT detail FROM events WHERE strategy=? AND kind='entry_skipped'", (model_book.NAME,)):
+            key = r["detail"].split(" (")[0].split(" since")[0]
+            key = "price ran since the snapshot" if key.startswith("price ran") else key
+            key = "round-trip loss too high" if key.startswith("round-trip loss") else key
+            skips[key] = skips.get(key, 0) + 1
+        print(json.dumps({"model": {k: meta[k] for k in ("threshold", "meta")} if meta else "not trained yet",
+                          "buys": j.query("SELECT COUNT(*) AS n FROM events WHERE strategy=? AND kind='model_buy'",
+                                          (model_book.NAME,))[0]["n"],
+                          "open": len(j.open_positions(model_book.NAME)),
+                          "skip_reasons": skips}, indent=2, default=str))
         return
 
     if args.command == "watch-report-now":

@@ -12,6 +12,7 @@ The "claude" book is the real strategy; other books are baselines (see shadows.p
 from __future__ import annotations
 
 import logging
+import queue
 import random
 import threading
 import time
@@ -39,6 +40,8 @@ REANALYSE_AFTER_S = 6 * 3600
 RECHECK_REJECTED_S = 30 * 60
 DUST_QTY = 1e-12
 EQUITY_SNAPSHOT_S = 60
+MODEL_POLL_S = 5  # how often queued model5 signals are bought
+MODEL_SIGNAL_MAX_AGE_S = 180  # a signal older than this is stale (the edge is in the first minutes)
 
 Survivor = tuple[PairSnapshot, FactorResult, SafetyReport | None]
 
@@ -49,13 +52,15 @@ class Book:
     executor: Executor
     cash: float
     fixed_usd: float | None = None  # fixed trade size instead of risk-based sizing (canary)
+    exit_cfg: Config | None = None  # the book's own stop / take-profit / hold rules (model5); None = cfg
 
 
 class Engine:
     def __init__(self, cfg: Config, dex: DexScreener, rug: RugCheck, analyst: Analyst | None,
                  executor: Executor, journal: Journal, jupiter: Jupiter | None = None,
                  shadow_executors: dict[str, Executor] | None = None,
-                 canary_executor: Executor | None = None, gecko=None, triage=None):
+                 canary_executor: Executor | None = None, gecko=None, triage=None,
+                 model_executor: Executor | None = None):
         self.cfg, self.dex, self.rug, self.analyst = cfg, dex, rug, analyst
         self.triage = triage  # optional cheap first pass before the analyst (tradingbot/triage.py)
         self.gecko = gecko  # optional GeckoTerminal discovery (trending by trading activity)
@@ -66,6 +71,13 @@ class Engine:
             self.books[name] = self._open_book(name, ex)
         if canary_executor is not None and cfg.canary_every_n > 0:
             self.books[CANARY] = self._open_book(CANARY, canary_executor, cfg.canary_budget_usd, cfg.canary_usd)
+        self.model_book = None
+        if model_executor is not None and cfg.model_book:
+            from tradingbot import model_book as mb
+            book = self._open_book(mb.NAME, model_executor, cfg.model_book_cash_usd, cfg.model_book_usd)
+            book.exit_cfg = mb.exit_config(cfg)
+            self.books[mb.NAME] = book
+            self.model_book = mb.ModelBook(cfg)
         self._rng = random.Random(cfg.shadow_seed)
         self.lock = threading.RLock()  # guards book cash and position state
         self.tracker = Tracker(journal, dex, jupiter)
@@ -143,6 +155,10 @@ class Engine:
         if self.cfg.watch and self.cfg.db_path != ":memory:":
             from tradingbot.watcher import Watcher  # research only: records new pools, never trades
             watcher = Watcher.from_config(self.cfg)
+            if self.model_book is not None:
+                watcher.on_snapshot = self.model_book.consider
+                threading.Thread(target=self._loop, name="model", daemon=True,
+                                 args=(MODEL_POLL_S, self.buy_model_signals)).start()
             threading.Thread(target=self._loop, name="watcher", daemon=True,
                              args=(self.cfg.watch_poll_s, watcher.step)).start()
             if self.cfg.enrich:
@@ -214,7 +230,7 @@ class Engine:
                     log.warning("no price for open position %s (%s)", pos.symbol, pos.strategy)
                 continue
             before = (pos.tp_hits, pos.stop_price)
-            for qty, reason in risk.plan_exits(pos, price, now, self.cfg):
+            for qty, reason in risk.plan_exits(pos, price, now, book.exit_cfg or self.cfg):
                 if not self._sell(book, pos, qty, price, reason):
                     # Roll the ladder back so the missed target is retried next pass.
                     pos.tp_hits, pos.stop_price = before
@@ -362,7 +378,7 @@ class Engine:
 
     def after_screen(self, survivors: list[Survivor], analysed: list[tuple[Survivor, str]]) -> None:
         """Let each baseline book pick from the same candidates Claude saw."""
-        baselines = [b for b in self.books.values() if b.name not in BOOK_PRIORITY]
+        baselines = [b for b in self.books.values() if b.name not in BOOK_PRIORITY and b.exit_cfg is None]
         if not baselines:
             return
         buy_rate = shadows.claude_buy_rate(self.journal, self.cfg)
@@ -431,19 +447,91 @@ class Engine:
         if not fill.ok:
             self._charge_failed(book, snap.token_address, fill)
             return False
+        self._open_position(book, snap.token_address, snap.symbol, fill, fresh.price_usd, decision_id)
+        return True
+
+    def _open_position(self, book: Book, token: str, symbol: str, fill: Fill, trigger: float,
+                       decision_id: int | None) -> Position:
         with self.lock:
             book.cash -= fill.usd
             self.journal.set_cash(book.cash, book.name)
             pos = Position(
-                id=None, token_address=snap.token_address, symbol=snap.symbol, entry_price=fill.price,
+                id=None, token_address=token, symbol=symbol, entry_price=fill.price,
                 qty=fill.qty, initial_qty=fill.qty, cost_usd=fill.usd, opened_at=time.time(),
-                stop_price=risk.initial_stop(fill.price, self.cfg), peak_price=fill.price, strategy=book.name,
+                stop_price=risk.initial_stop(fill.price, book.exit_cfg or self.cfg), peak_price=fill.price,
+                strategy=book.name,
             )
             self.journal.save_position(pos, decision_id)
             self.journal.log_fill(pos.id, "buy", fill.qty, fill.price, fill.usd, fill.fee_usd, "entry", fill.tx,
-                                  trigger_price=fresh.price_usd)
-        log.info("[%s] BUY %s $%.2f @ %.10g (stop %.10g)", book.name, snap.symbol, fill.usd, fill.price, pos.stop_price)
-        return True
+                                  trigger_price=trigger)
+        log.info("[%s] BUY %s $%.2f @ %.10g (stop %.10g)", book.name, symbol, fill.usd, fill.price, pos.stop_price)
+        return pos
+
+    # --- model5: the 5-minute pump model's paper book ----------------------------------
+    def buy_model_signals(self) -> int:
+        """Buy the pools the model queued (from the watcher thread). Own checks: the Claude book's age and
+        liquidity filters are tuned for older tokens and would reject every 5-minute pool."""
+        from tradingbot import model_book as mb
+        bought = 0
+        while self.model_book is not None:
+            try:
+                sig = self.model_book.signals.get_nowait()
+            except queue.Empty:
+                break
+            book = self.books[mb.NAME]
+            reason = self._model_skip_reason(book, sig)
+            if reason is None:
+                reason = self._buy_model(book, sig)
+            if reason:
+                self.journal.log_event("entry_skipped", sig["mint"], reason, strategy=book.name)
+                log.info("[%s] skip %s: %s", book.name, sig["name"][:24], reason)
+            else:
+                bought += 1
+        return bought
+
+    def _model_skip_reason(self, book: Book, sig: dict) -> str | None:
+        c = self.cfg
+        if time.time() - sig["ts"] > MODEL_SIGNAL_MAX_AGE_S:
+            return "signal too old"
+        open_ = self.journal.open_positions(book.name)
+        if any(p.token_address == sig["mint"] for p in open_):
+            return "already held"
+        if len(open_) >= c.model_book_max_open:
+            return "max open positions"
+        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        if -self.journal.realized_since(day_start, book.name) >= self.equity(book) * c.model_book_daily_loss_pct / 100:
+            return "daily loss limit"
+        return None
+
+    def _buy_model(self, book: Book, sig: dict) -> str | None:
+        c = self.cfg
+        usd = min(c.model_book_usd, c.model_book_liq_share * sig["liq"], book.cash)
+        if usd < 5:
+            return "size too small (cash or liquidity)"
+        trigger = sig["price"]
+        if self.jupiter is not None:
+            live = self.jupiter.prices([sig["mint"]]).get(sig["mint"])
+            if live is None:
+                return "no live price"
+            if (live.usd / sig["price"] - 1) * 100 > c.model_book_max_drift_pct:
+                return f"price ran {(live.usd / sig['price'] - 1) * 100:+.0f}% since the snapshot"
+            trigger = live.usd
+            rt = self.jupiter.round_trip(sig["mint"], usd)
+            if rt is None:
+                return "no swap route"
+            if rt[0] > c.max_round_trip_loss_pct:
+                return f"round-trip loss {rt[0]:.1f}% (honeypot/tax/thin pool)"
+        fill = book.executor.buy(sig["mint"], usd, trigger)
+        if fill is None:
+            return "executor declined"
+        if not fill.ok:
+            self._charge_failed(book, sig["mint"], fill)
+            return "transaction failed"
+        symbol = (sig["name"].split(" / ")[0] or sig["mint"][:6])[:16]
+        self._open_position(book, sig["mint"], symbol, fill, trigger, None)
+        self.journal.log_event("model_buy", sig["mint"], f"score {sig['score']:.3f} liq ${sig['liq']:,.0f}",
+                               strategy=book.name)
+        return None
 
     def _sell(self, book: Book, pos: Position, qty: float, price: float, reason: str) -> bool:
         fill = book.executor.sell(pos.token_address, min(qty, pos.qty), price)

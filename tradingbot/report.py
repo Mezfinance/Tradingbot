@@ -270,7 +270,8 @@ def build(j: Journal, cfg: Config) -> dict:
     funnel = j.query(
         "SELECT stage, COUNT(*) AS n FROM decisions GROUP BY stage")
     return {
-        "strategies": [strategy_stats(j, n, cfg.starting_cash_usd) for n in names],
+        "strategies": [strategy_stats(j, n, cfg.model_book_cash_usd if n == "model5" else cfg.starting_cash_usd)
+                       for n in names],
         "claude_selection": claude_selection(j),
         "downtime": downtime(j),
         "social": social(j),
