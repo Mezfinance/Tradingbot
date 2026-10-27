@@ -258,3 +258,19 @@ def test_the_report_shows_only_the_model5_book_with_its_rugs(cfg, good_pair):
     text = render_model(rep)
     assert "MODEL5 PAPER BOOK" in text and "liquidity_pulled" in text and "1 of 1 finished trades" in text
     assert "filters_only" not in text and "Claude API" not in text and "not trained yet" in text
+
+
+def test_short_hold_exits_after_ten_minutes_and_old_pools_are_skipped(cfg, good_pair):
+    """10-28: model5 holds 10 minutes (most rugs come after the 15-minute mark) and only buys pools young
+    enough for the tested window."""
+    import time as real_time
+    book_cfg = mb.exit_config(cfg)
+    assert book_cfg.max_hold_hours * 60 == 10
+    eng, j, pos = _held_position(cfg, good_pair, None)
+    eng.current_prices = lambda tokens, held=None: {"RUGMINT": pos.entry_price * 1.2}
+    assert risk.plan_exits(pos, pos.entry_price * 1.2, pos.opened_at + 9 * 60, book_cfg) == []
+    assert risk.plan_exits(pos, pos.entry_price * 1.2, pos.opened_at + 10 * 60 + 1, book_cfg)[0][1] == "time_stop"
+    sig = {"mint": "NEW", "name": "N / SOL", "score": 1.0, "price": 1.0, "liq": 9000.0, "ts": real_time.time()}
+    book = eng.books[mb.NAME]
+    assert eng._model_skip_reason(book, dict(sig, created_ts=real_time.time() - 6 * 60)) is None
+    assert eng._model_skip_reason(book, dict(sig, created_ts=real_time.time() - 11 * 60)) == "pool too old for the short hold"

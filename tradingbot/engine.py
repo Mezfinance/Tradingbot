@@ -551,6 +551,8 @@ class Engine:
         c = self.cfg
         if time.time() - sig["ts"] > MODEL_SIGNAL_MAX_AGE_S:
             return "signal too old"
+        if sig.get("created_ts") and (time.time() - sig["created_ts"]) / 60 > c.model_book_max_entry_age_min:
+            return "pool too old for the short hold"
         open_ = self.journal.open_positions(book.name)
         if any(p.token_address == sig["mint"] for p in open_):
             return "already held"

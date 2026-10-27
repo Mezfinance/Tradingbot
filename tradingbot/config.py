@@ -93,7 +93,10 @@ class Config:
     model_book_max_impact_pct: float = 5.0  # its buys are up to 2% of a pool, so 2-4% impact is normal
     model_book_tp_pct: float = 100.0
     model_book_sl_pct: float = 50.0
-    model_book_hold_h: float = 24.0
+    # 10-minute hold (10-28 backtest on 1-min candles: picks held 10 min +17%/trade, held 24h -26%; most rugs
+    # come after the 15-minute mark). Live paper test; not yet proven.
+    model_book_hold_min: float = 10.0
+    model_book_max_entry_age_min: float = 10.0  # skip pools older than this at the buy (the tested window)
     model_train_days: float = 4.0
 
     # --- Claude analyst -------------------------------------------------

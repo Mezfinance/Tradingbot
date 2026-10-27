@@ -445,7 +445,8 @@ def build_model(j: Journal, cfg: Config) -> dict:
 
 def render_model(rep: dict) -> str:
     s, r, m = rep["book"], rep["rugs"], rep["model"]
-    lines = ["MODEL5 PAPER BOOK (5-minute pump model; simulated fills on real Jupiter quotes)", ""]
+    lines = ["MODEL5 PAPER BOOK (5-minute pump model, 10-minute hold since 10-28; simulated fills on real Jupiter quotes)",
+             "  backtest expectation (74 trades): +17%/trade, median +16%, 65% wins, 90% range -1%..+35%", ""]
     rows = [
         ("equity $", s["equity"], ""), ("return %", s["return_pct"], "%"),
         ("max drawdown %", s["max_drawdown_pct"], "%"),
@@ -469,7 +470,7 @@ def render_model(rep: dict) -> str:
         lines.append("  none")
     lines += ["", "RUGS (trade lost >=80%, incl. stuck positions)",
               f"  live: {r['rugs']} of {r['finished_trades']} finished trades = {_fmt(r['rug_rate_pct'], '%', 1)}"
-              f"   (research with rug-aware labels: ~28% of top-2% picks)",
+              f"   (backtest with a 10-min hold: ~16% of picks; 24h hold: ~76%)",
               f"  causes of losing exits: {r['losing_exit_causes'] or '-'}"]
     for label, key in (("rugs", "entry_audit_rugs"), ("others", "entry_audit_others")):
         a = r[key]

@@ -13,7 +13,8 @@ were measured for real. This module turns that into a paper strategy:
   queued; the engine's `model` thread buys them through the quote-based simulator, so the book measures
   the real slippage and failed transactions the research could only assume (6% round trip).
 
-Exits for this book are its own (`exit_config`): +100% take profit, -50% stop, 24h, as in the research.
+Exits for this book are its own (`exit_config`): +100% take profit, -50% stop, out after `model_book_hold_min`
+(10 minutes since 10-28: most rugs come after the 15-minute mark).
 No Claude anywhere.
 """
 
@@ -58,9 +59,9 @@ def features(pool: dict, snap: dict) -> dict:
 
 
 def exit_config(cfg: Config) -> Config:
-    """This book's exits, as in the research: one take-profit at +100%, a -50% stop, out after 24h."""
+    """This book's exits: one take-profit at +100%, a -50% stop, out after `model_book_hold_min` minutes."""
     return replace(cfg, stop_loss_pct=cfg.model_book_sl_pct, take_profit_pcts=(cfg.model_book_tp_pct,),
-                   take_profit_fractions=(1.0,), max_hold_hours=cfg.model_book_hold_h)
+                   take_profit_fractions=(1.0,), max_hold_hours=cfg.model_book_hold_min / 60)
 
 
 class Model:
@@ -217,7 +218,8 @@ def rug_summary(journal, stuck: set[int] | None = None) -> dict:
 
     return {"finished_trades": len(trades), "rugs": len(rugs),
             "rug_rate_pct": round(100 * len(rugs) / len(trades), 1) if trades else None,
-            "research_rug_rate_pct": 11.5, "losing_exit_causes": causes,
+            "research_rug_rate_pct": 16.0,  # 10-min hold backtest (10-28): 16-18% of picks
+            "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 
 
@@ -261,7 +263,8 @@ class ModelBook:
             return None
         try:
             self.signals.put_nowait({"pool": pool["pool"], "mint": pool["mint"], "name": pool.get("name") or "",
-                                     "score": score, "price": wa._f(snap["price"]), "liq": liq, "ts": time.time()})
+                                     "score": score, "price": wa._f(snap["price"]), "liq": liq, "ts": time.time(),
+                                     "created_ts": pool.get("created_ts")})
         except queue.Full:
             return None
         return score
