@@ -119,5 +119,13 @@ def test_a_position_with_no_route_out_backs_off_and_is_valued_at_zero(cfg, good_
     assert eng.equity(book, crash) > book.cash  # not yet written off
     clock[0] += eng_mod.STUCK_AFTER_S
     assert eng.equity(book, crash) == book.cash  # can't be sold: worth nothing
-    text = render(build(j, cfg))
-    assert "EXIT BLOCKED" in text
+    import time as real_time
+    from tradingbot import report as report_mod
+    later = real_time.time() + eng_mod.STUCK_AFTER_S + 60  # events carry wall-clock time
+    monkeypatch.setattr(report_mod.time, "time", lambda: later)
+    rep = build(j, cfg)
+    m5 = next(s for s in rep["strategies"] if s["strategy"] == mb.NAME)
+    assert m5["closed_trades"] == 1 and m5["stuck_trades"] == 1 and m5["win_rate"] == 0
+    assert m5["mean_trade_return_pct"] == -100.0 and m5["exit_reasons"] == {"stuck": 1}
+    text = render(rep)
+    assert "EXIT BLOCKED" in text and "of which stuck" in text

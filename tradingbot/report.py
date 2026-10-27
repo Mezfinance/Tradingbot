@@ -58,17 +58,24 @@ def _reason_key(detail: str) -> str:
     return re.sub(r"[-+]?\d[\d.,]*%?", "#", detail or "?")
 
 
-def _exit_blocked(j: Journal, name: str, pos) -> str | None:
-    """'since HH:MM UTC: <reason>' when the position has had no route out (exit_blocked events or old
-    no-route tx_failed spam), else None."""
+def _blocked(j: Journal, name: str, pos) -> tuple[float, str] | None:
+    """(since, reason) when the position has had no route out (exit_blocked events, or the no-route
+    tx_failed rows older versions logged every monitor pass), else None."""
     rows = j.query(
-        "SELECT MIN(ts) AS since, MAX(ts) AS last, MAX(detail) AS detail FROM events WHERE strategy=? AND token=? "
-        "AND ts >= ? AND (kind='exit_blocked' OR (kind='tx_failed' AND usd = 0 AND detail LIKE '%route%'))",
+        "SELECT MIN(ts) AS since, MAX(detail) AS detail FROM events WHERE strategy=? AND token=? AND ts >= ? "
+        "AND (kind='exit_blocked' OR (kind='tx_failed' AND usd = 0 AND detail LIKE '%route%'))",
         (name, pos.token_address, pos.opened_at or 0))
     if not rows or rows[0]["since"] is None:
         return None
-    since = time.strftime("%m-%d %H:%M", time.gmtime(rows[0]["since"]))
-    return f"since {since} UTC ({(rows[0]['last'] - rows[0]['since']) / 3600:.1f}h): {rows[0]['detail']}"
+    return rows[0]["since"], rows[0]["detail"]
+
+
+def _exit_blocked(j: Journal, name: str, pos) -> str | None:
+    b = _blocked(j, name, pos)
+    if b is None:
+        return None
+    since = time.strftime("%m-%d %H:%M", time.gmtime(b[0]))
+    return f"since {since} UTC ({(time.time() - b[0]) / 3600:.1f}h): {b[1]}"
 
 
 def strategy_stats(j: Journal, name: str, start_cash: float) -> dict:
@@ -83,6 +90,13 @@ def strategy_stats(j: Journal, name: str, start_cash: float) -> dict:
         "SELECT realized_usd, cost_usd, exit_reason FROM positions WHERE strategy=? AND closed_at IS NOT NULL",
         (name,),
     )
+    # A position nobody can sell (no route for STUCK_AFTER_S) counts as a finished trade worth what it
+    # already returned: leaving it out would keep every rug out of the win rate and average trade.
+    from tradingbot.engine import STUCK_AFTER_S
+    stuck = [p for p in open_pos
+             if (b := _blocked(j, name, p)) is not None and time.time() - b[0] >= STUCK_AFTER_S]
+    closed = list(closed) + [{"realized_usd": p.realized_usd, "cost_usd": p.cost_usd, "exit_reason": "stuck"}
+                             for p in stuck]
     pnls = [r["realized_usd"] - r["cost_usd"] for r in closed]
     rets = [(r["realized_usd"] / r["cost_usd"] - 1) * 100 for r in closed if r["cost_usd"]]
     gross_win = sum(p for p in pnls if p > 0)
@@ -122,6 +136,7 @@ def strategy_stats(j: Journal, name: str, start_cash: float) -> dict:
             for p in open_pos
         ],
         "closed_trades": len(closed),
+        "stuck_trades": len(stuck),
         "win_rate": sum(p > 0 for p in pnls) / len(pnls) if pnls else None,
         "median_trade_return_pct": _median(rets),
         "mean_trade_return_pct": _mean(rets),
@@ -316,6 +331,7 @@ def render(rep: dict) -> str:
         rows = [
             ("equity $", "equity", ""), ("return %", "return_pct", "%"),
             ("max drawdown %", "max_drawdown_pct", "%"), ("closed trades", "closed_trades", ""),
+            ("  of which stuck ($0)", "stuck_trades", ""),
             ("win rate", "win_rate", ""), ("median trade %", "median_trade_return_pct", "%"),
             ("mean trade %", "mean_trade_return_pct", "%"), ("profit factor", "profit_factor", ""),
             ("network fees $", "network_fees_usd", ""), ("failed txs", "failed_txs", ""),
