@@ -226,3 +226,21 @@ def test_a_blocked_exit_records_its_cause_once(cfg, good_pair, monkeypatch):
     eng.manage_positions()
     causes = [json.loads(r["detail"])["cause"] for r in j.query("SELECT detail FROM events WHERE kind='model_exit_cause'")]
     assert causes == ["no_route"]
+
+
+def test_an_emptied_pool_s_frozen_price_is_not_believed(cfg, good_pair):
+    """Live 10-27: three rugged positions kept DexScreener's last trade price (liquidity $0, no route out),
+    so the book showed ~$428 of value nobody could realise and their stops never fired."""
+    from dataclasses import replace as dc_replace
+    from tradingbot.execution.base import failed
+    jup = RuggedJupiter(sell=None)  # no route
+    eng, j, pos = _held_position(cfg, good_pair, jup)
+    frozen = dc_replace(good_pair, token_address="RUGMINT", price_usd=6e-5, liquidity_usd=0.0)
+    eng.dex = FakeDex(frozen)
+    assert eng.current_prices({"RUGMINT"}, {"RUGMINT": pos.qty}) == {"RUGMINT": 0.0}
+    eng.books[mb.NAME].executor.sell = lambda token, qty, price: failed(0.0, "no route")
+    eng.manage_positions()
+    assert j.query("SELECT COUNT(*) FROM events WHERE kind='exit_blocked'")[0][0] == 1  # the stop fired
+    # A pool that still has liquidity keeps its feed price.
+    eng.dex = FakeDex(dc_replace(frozen, liquidity_usd=50_000.0))
+    assert eng.current_prices({"RUGMINT"}, {"RUGMINT": pos.qty}) == {"RUGMINT": 6e-5}

@@ -43,6 +43,7 @@ DUST_QTY = 1e-12
 EQUITY_SNAPSHOT_S = 60
 EXIT_RETRY_S = 120  # a sell with no route is retried this often
 STUCK_AFTER_S = 1800  # ...and after this long the position is valued at zero (it cannot be sold)
+DEAD_LIQ_USD = 100.0  # a DexScreener pool with less liquidity than this is treated as emptied (rugged)
 QUOTE_PRICE_MAX = 10  # positions per monitor pass priced from a swap quote when no feed lists the token
 MODEL_POLL_S = 5  # how often queued model5 signals are bought
 MODEL_SIGNAL_MAX_AGE_S = 180  # a signal older than this is stale (the edge is in the first minutes)
@@ -216,16 +217,23 @@ class Engine:
         if self.jupiter is not None:
             prices = {m: p.usd for m, p in self.jupiter.prices(sorted(tokens)).items()}
         missing = tokens - prices.keys()
+        dead: set[str] = set()
         if missing:
-            prices.update({s.token_address: s.price_usd for s in self.dex.pairs(missing)})
+            for snap in self.dex.pairs(missing):
+                if snap.liquidity_usd is not None and snap.liquidity_usd < DEAD_LIQ_USD:
+                    dead.add(snap.token_address)  # an emptied pool's last trade price: nobody can sell at it
+                else:
+                    prices[snap.token_address] = snap.price_usd
         missing = tokens - prices.keys()
         if missing and self.jupiter is not None and hasattr(self.jupiter, "quote_price"):
             for mint in sorted(missing)[:QUOTE_PRICE_MAX]:  # brand-new (or rugged) tokens neither feed lists
                 if held and mint in held and hasattr(self.jupiter, "sell_price"):
                     p = self.jupiter.sell_price(mint, held[mint])
+                    if p is None and mint in dead:
+                        p = 0.0  # no route out of an emptied pool: worth nothing (fires the stop)
                 else:
                     p = self.jupiter.quote_price(mint)
-                if p:
+                if p or (p == 0.0 and mint in dead):
                     prices[mint] = p
         self._last_prices.update(prices)
         return prices
