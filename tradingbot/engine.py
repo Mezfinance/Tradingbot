@@ -206,7 +206,8 @@ class Engine:
         self._stop.set()
 
     # --- prices ---------------------------------------------------------------
-    def current_prices(self, tokens: set[str]) -> dict[str, float]:
+    def current_prices(self, tokens: set[str], held: dict[str, float] | None = None) -> dict[str, float]:
+        """`held` (token -> quantity) prices tokens neither feed lists from a quote to sell that quantity."""
         prices: dict[str, float] = {}
         if not tokens:
             return prices
@@ -217,8 +218,11 @@ class Engine:
             prices.update({s.token_address: s.price_usd for s in self.dex.pairs(missing)})
         missing = tokens - prices.keys()
         if missing and self.jupiter is not None and hasattr(self.jupiter, "quote_price"):
-            for mint in sorted(missing)[:QUOTE_PRICE_MAX]:  # brand-new tokens neither feed lists yet
-                p = self.jupiter.quote_price(mint)
+            for mint in sorted(missing)[:QUOTE_PRICE_MAX]:  # brand-new (or rugged) tokens neither feed lists
+                if held and mint in held and hasattr(self.jupiter, "sell_price"):
+                    p = self.jupiter.sell_price(mint, held[mint])
+                else:
+                    p = self.jupiter.quote_price(mint)
                 if p:
                     prices[mint] = p
         self._last_prices.update(prices)
@@ -229,7 +233,10 @@ class Engine:
         # The real book is handled first so simulated latency on baselines never delays it.
         positions = sorted(self.journal.open_positions(strategy=None),
                            key=lambda p: BOOK_PRIORITY.get(p.strategy, 2))
-        prices = self.current_prices({p.token_address for p in positions})
+        held: dict[str, float] = {}
+        for p in positions:
+            held[p.token_address] = max(held.get(p.token_address, 0.0), p.qty)
+        prices = self.current_prices(set(held), held)
         now = time.time()
         self.journal.set_state("heartbeat", repr(now))
         for pos in positions:
@@ -243,7 +250,19 @@ class Engine:
             if blocked and now < blocked["next"]:
                 continue  # no route out last time: retry every EXIT_RETRY_S, not every pass
             before = (pos.tp_hits, pos.stop_price)
-            for qty, reason in risk.plan_exits(pos, price, now, book.exit_cfg or self.cfg):
+            exit_cfg = book.exit_cfg or self.cfg
+            exits = risk.plan_exits(pos, price, now, exit_cfg)
+            if any(r.startswith("take_profit") for _, r in exits):
+                # A feed price can be stale or bogus (a rugged pool once showed 21,000x entry); take profit
+                # only if a quote to sell the position clears the target too.
+                confirmed = self._confirm_sell_price(pos)
+                if confirmed is not None and confirmed < price:
+                    pos.tp_hits, pos.stop_price = before
+                    log.info("[%s] %s take-profit not confirmed: feed %.10g, sell quote %.10g",
+                             book.name, pos.symbol, price, confirmed)
+                    price = confirmed
+                    exits = risk.plan_exits(pos, price, now, exit_cfg)
+            for qty, reason in exits:
                 if not self._sell(book, pos, qty, price, reason):
                     # Roll the ladder back so the missed target is retried next pass.
                     pos.tp_hits, pos.stop_price = before
@@ -251,6 +270,15 @@ class Engine:
             self.journal.save_position(pos)
         self.snapshot_equity(prices)
         return prices
+
+    def _confirm_sell_price(self, pos: Position) -> float | None:
+        if self.jupiter is None or not hasattr(self.jupiter, "sell_price"):
+            return None
+        try:
+            return self.jupiter.sell_price(pos.token_address, pos.qty)
+        except Exception:  # noqa: BLE001 (a failed check falls back to the feed price, as before)
+            log.warning("sell-quote check failed for %s", pos.symbol, exc_info=True)
+            return None
 
     def snapshot_equity(self, prices: dict[str, float], force: bool = False) -> None:
         if not force and time.time() - self._last_snapshot < EQUITY_SNAPSHOT_S:

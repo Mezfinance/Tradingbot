@@ -109,7 +109,7 @@ def test_a_position_with_no_route_out_backs_off_and_is_valued_at_zero(cfg, good_
     crash = {good_pair.token_address: good_pair.price_usd * 0.3}  # through the -50% stop
     clock = [pos.opened_at + 60]
     monkeypatch.setattr(eng_mod.time, "time", lambda: clock[0])
-    eng.current_prices = lambda tokens: crash
+    eng.current_prices = lambda tokens, held=None: crash
     for _ in range(6):  # a minute of 10-second monitor passes
         eng.manage_positions()
         clock[0] += 10
@@ -129,3 +129,54 @@ def test_a_position_with_no_route_out_backs_off_and_is_valued_at_zero(cfg, good_
     assert m5["mean_trade_return_pct"] == -100.0 and m5["exit_reasons"] == {"stuck": 1}
     text = render(rep)
     assert "EXIT BLOCKED" in text and "of which stuck" in text
+
+
+class RuggedJupiter:
+    """No feed lists the token; a $20 buy quote on the drained pool implies a huge price, selling returns ~0."""
+
+    def __init__(self, sell=1e-9):
+        self.sell = sell
+        self.sell_checks = 0
+
+    def prices(self, mints):
+        return {}
+
+    def quote_price(self, mint, usd=20.0):
+        return 0.5227
+
+    def sell_price(self, mint, qty):
+        self.sell_checks += 1
+        return self.sell
+
+
+def _held_position(cfg, good_pair, jupiter):
+    j = Journal(":memory:")
+    paper = PaperExecutor(cfg)
+    eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                 jupiter=jupiter, model_executor=paper)
+    book = eng.books[mb.NAME]
+    fill = paper.buy("RUGMINT", 100.0, 2.5e-5)
+    pos = eng._open_position(book, "RUGMINT", "**", fill, 2.5e-5, None)
+    return eng, j, pos
+
+
+def test_a_token_no_feed_lists_is_priced_by_selling_it_not_by_a_buy_quote(cfg, good_pair):
+    eng, j, pos = _held_position(cfg, good_pair, RuggedJupiter())
+    eng.manage_positions()
+    [(reason,)] = j.query("SELECT reason FROM fills WHERE side='sell'")
+    assert reason == "stop_loss"  # was take_profit_1 at the buy-implied 0.5227 (21,000x entry)
+
+
+def test_a_take_profit_needs_a_sell_quote_that_clears_the_target(cfg, good_pair):
+    jup = RuggedJupiter()
+    eng, j, pos = _held_position(cfg, good_pair, jup)
+    eng.current_prices = lambda tokens, held=None: {"RUGMINT": 0.5227}  # bogus feed price
+    eng.manage_positions()
+    assert jup.sell_checks == 1
+    assert [r for (r,) in j.query("SELECT reason FROM fills WHERE side='sell'")] == ["stop_loss"]
+    # A real pump: the sell quote agrees, so the take-profit goes through.
+    jup2 = RuggedJupiter(sell=2.5e-5 * 2.2)
+    eng2, j2, _ = _held_position(cfg, good_pair, jup2)
+    eng2.current_prices = lambda tokens, held=None: {"RUGMINT": 2.5e-5 * 2.3}
+    eng2.manage_positions()
+    assert [r for (r,) in j2.query("SELECT reason FROM fills WHERE side='sell'")] == ["take_profit_1"]

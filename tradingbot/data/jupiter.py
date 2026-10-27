@@ -138,6 +138,16 @@ class Jupiter:
             return None
         return usd / (q.out_raw / 10**dec)
 
+    def sell_price(self, mint: str, qty: float) -> float | None:
+        """USD per token from a quote to sell `qty` back to USDC: what a holder could actually get.
+        A buy quote on a drained pool implies a huge price while selling returns almost nothing."""
+        dec = self.decimals(mint)
+        raw = int(qty * 10**dec) if dec is not None else 0
+        q = self.quote(mint, USDC_MINT, raw) if raw > 0 else None
+        if q is None:
+            return None
+        return (q.out_raw / 10**USDC_DECIMALS) / qty
+
     def sol_price(self) -> float | None:
         if self._sol_price and time.time() - self._sol_price[1] < SOL_PRICE_TTL_S:
             return self._sol_price[0]
