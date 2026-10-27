@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -17,6 +18,8 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_DECIMALS = 6
 PRICE_BATCH = 50
 SOL_PRICE_TTL_S = 300
+HELIUS_RPC = "https://mainnet.helius-rpc.com/"
+PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
 MIN_REQUEST_INTERVAL_S = 0.5  # keeps the shared free tier comfortably under its rate limit
 RETRIES_ON_429 = 3
 
@@ -109,9 +112,31 @@ class Jupiter:
         return out
 
     def decimals(self, mint: str) -> int | None:
+        """From the price API, else on-chain: a token minutes old is often routable before /price lists it."""
         if mint not in self._decimals:
             self.prices([mint])
+        if mint not in self._decimals:
+            dec = self._decimals_onchain(mint)
+            if dec is not None:
+                self._decimals[mint] = dec
         return self._decimals.get(mint)
+
+    def _decimals_onchain(self, mint: str) -> int | None:
+        key = os.environ.get("HELIUS_API_KEY")
+        url = os.environ.get("SOLANA_RPC_URL") or (f"{HELIUS_RPC}?api-key={key}" if key else PUBLIC_RPC)
+        try:
+            resp = self.http.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [mint]})
+            return int(resp.json()["result"]["value"]["decimals"])
+        except (httpx.HTTPError, ValueError, KeyError, TypeError):
+            return None
+
+    def quote_price(self, mint: str, usd: float = 20.0) -> float | None:
+        """USD price implied by a small buy quote, for tokens the price API does not list yet."""
+        dec = self.decimals(mint)
+        q = self.quote(USDC_MINT, mint, int(usd * 10**USDC_DECIMALS)) if dec is not None else None
+        if q is None or q.out_raw <= 0:
+            return None
+        return usd / (q.out_raw / 10**dec)
 
     def sol_price(self) -> float | None:
         if self._sol_price and time.time() - self._sol_price[1] < SOL_PRICE_TTL_S:

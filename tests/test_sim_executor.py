@@ -96,3 +96,27 @@ def test_jupiter_client_parses_quote_and_round_trip():
     assert quote.route == ["Raydium"]
     loss, impact = jup.round_trip("TOK", 5.0)
     assert loss == pytest.approx(20.0)
+
+
+def test_token_too_new_for_the_price_api_gets_decimals_onchain_and_a_quote_price(monkeypatch):
+    monkeypatch.delenv("HELIUS_API_KEY", raising=False)
+    monkeypatch.delenv("SOLANA_RPC_URL", raising=False)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        if request.url.path == "/price/v3":
+            return httpx.Response(200, json={})  # not listed yet
+        if request.method == "POST":  # getTokenSupply on the public RPC
+            return httpx.Response(200, json={"result": {"value": {"decimals": 6, "amount": "1"}}})
+        if request.url.path == "/swap/v1/quote":
+            out = int(request.url.params["amount"]) * 1000  # 1 USDC -> 1000 tokens
+            return httpx.Response(200, json={"inAmount": request.url.params["amount"], "outAmount": str(out),
+                                             "otherAmountThreshold": str(out), "priceImpactPct": "0.001",
+                                             "routePlan": []})
+        return httpx.Response(404)
+
+    jup = Jupiter(http=httpx.Client(transport=httpx.MockTransport(handler), base_url="https://x"))
+    assert jup.decimals("NEWTOKEN") == 6
+    assert jup.quote_price("NEWTOKEN") == pytest.approx(0.001)  # $20 bought 20,000 tokens
+    assert calls.count("/") == 1  # decimals read on-chain once, then cached

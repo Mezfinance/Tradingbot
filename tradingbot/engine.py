@@ -40,6 +40,7 @@ REANALYSE_AFTER_S = 6 * 3600
 RECHECK_REJECTED_S = 30 * 60
 DUST_QTY = 1e-12
 EQUITY_SNAPSHOT_S = 60
+QUOTE_PRICE_MAX = 10  # positions per monitor pass priced from a swap quote when no feed lists the token
 MODEL_POLL_S = 5  # how often queued model5 signals are bought
 MODEL_SIGNAL_MAX_AGE_S = 180  # a signal older than this is stale (the edge is in the first minutes)
 
@@ -211,6 +212,12 @@ class Engine:
         missing = tokens - prices.keys()
         if missing:
             prices.update({s.token_address: s.price_usd for s in self.dex.pairs(missing)})
+        missing = tokens - prices.keys()
+        if missing and self.jupiter is not None and hasattr(self.jupiter, "quote_price"):
+            for mint in sorted(missing)[:QUOTE_PRICE_MAX]:  # brand-new tokens neither feed lists yet
+                p = self.jupiter.quote_price(mint)
+                if p:
+                    prices[mint] = p
         self._last_prices.update(prices)
         return prices
 
@@ -513,11 +520,12 @@ class Engine:
         trigger = sig["price"]
         if self.jupiter is not None:
             live = self.jupiter.prices([sig["mint"]]).get(sig["mint"])
-            if live is None:
+            live_usd = live.usd if live is not None else self.jupiter.quote_price(sig["mint"])  # too new to list
+            if live_usd is None:
                 return "no live price"
-            if (live.usd / sig["price"] - 1) * 100 > c.model_book_max_drift_pct:
-                return f"price ran {(live.usd / sig['price'] - 1) * 100:+.0f}% since the snapshot"
-            trigger = live.usd
+            if (live_usd / sig["price"] - 1) * 100 > c.model_book_max_drift_pct:
+                return f"price ran {(live_usd / sig['price'] - 1) * 100:+.0f}% since the snapshot"
+            trigger = live_usd
             rt = self.jupiter.round_trip(sig["mint"], usd)
             if rt is None:
                 return "no swap route"
