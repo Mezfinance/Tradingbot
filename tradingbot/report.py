@@ -78,17 +78,18 @@ def _exit_blocked(j: Journal, name: str, pos) -> str | None:
     return f"since {since} UTC ({(time.time() - b[0]) / 3600:.1f}h): {b[1]}"
 
 
-def strategy_stats(j: Journal, name: str, start_cash: float) -> dict:
+def strategy_stats(j: Journal, name: str, start_cash: float, since: float = 0.0) -> dict:
+    """Equity, return and drawdown are for the whole book; trade statistics cover positions opened from `since`."""
     eq_rows = j.query("SELECT equity FROM equity WHERE strategy=? ORDER BY ts", (name,))
     series = [r["equity"] for r in eq_rows]
     cash_raw = j.get_state(f"cash:{name}")
     cash = float(cash_raw) if cash_raw is not None else start_cash
-    open_pos = j.open_positions(name)
-    equity_now = series[-1] if series else cash + sum(p.qty * p.entry_price for p in open_pos)
+    open_pos = [p for p in j.open_positions(name) if (p.opened_at or 0) >= since]
+    equity_now = series[-1] if series else cash + sum(p.qty * p.entry_price for p in j.open_positions(name))
 
     closed = j.query(
-        "SELECT realized_usd, cost_usd, exit_reason FROM positions WHERE strategy=? AND closed_at IS NOT NULL",
-        (name,),
+        "SELECT realized_usd, cost_usd, exit_reason FROM positions WHERE strategy=? AND closed_at IS NOT NULL "
+        "AND opened_at >= ?", (name, since),
     )
     # A position nobody can sell (no route for STUCK_AFTER_S) counts as a finished trade worth what it
     # already returned: leaving it out would keep every rug out of the win rate and average trade.
@@ -104,24 +105,24 @@ def strategy_stats(j: Journal, name: str, start_cash: float) -> dict:
 
     fees = j.query(
         """SELECT COALESCE(SUM(f.fee_usd), 0) AS s FROM fills f JOIN positions p ON p.id=f.position_id
-           WHERE p.strategy=?""", (name,))[0]["s"]
+           WHERE p.strategy=? AND p.opened_at >= ?""", (name, since))[0]["s"]
     # A "failed" sell with no route sent nothing (older versions logged one every monitor pass): not a tx.
     failed = j.query(
         "SELECT COUNT(*) AS n, COALESCE(SUM(usd), 0) AS s FROM events WHERE kind='tx_failed' AND strategy=? "
-        "AND NOT (usd = 0 AND (detail LIKE '%no route%' OR detail LIKE '%route vanished%'))", (name,))[0]
+        "AND ts >= ? AND NOT (usd = 0 AND (detail LIKE '%no route%' OR detail LIKE '%route vanished%'))", (name, since))[0]
     api = j.query("SELECT COALESCE(SUM(usd), 0) AS s FROM costs WHERE strategy=?", (name,))[0]["s"]
 
     slip = {}
     for side in ("buy", "sell"):
         rows = j.query(
             """SELECT f.price, f.trigger_price FROM fills f JOIN positions p ON p.id=f.position_id
-               WHERE p.strategy=? AND f.side=? AND f.trigger_price > 0""", (name, side))
+               WHERE p.strategy=? AND f.side=? AND f.trigger_price > 0 AND p.opened_at >= ?""", (name, side, since))
         # Positive = worse than the trigger price (paid more on a buy, got less on a sell).
         sign = 1 if side == "buy" else -1
         slip[side] = _median([sign * (r["price"] / r["trigger_price"] - 1) * 100 for r in rows])
 
     skips = Counter(_reason_key(r["detail"]) for r in j.query(
-        "SELECT detail FROM events WHERE kind='entry_skipped' AND strategy=?", (name,)))
+        "SELECT detail FROM events WHERE kind='entry_skipped' AND strategy=? AND ts >= ?", (name, since)))
 
     trading_pnl = equity_now - start_cash
     return {
@@ -418,38 +419,60 @@ def render(rep: dict) -> str:
 
 # --- model5-only report (the default `report` since 2026-10-28; `report --all` is the full one) -------------
 def build_model(j: Journal, cfg: Config) -> dict:
-    """The model5 paper book: trading stats, rugs, skips and the model it trades with."""
+    """The model5 paper book: trades made under the current settings (`model_book.mark_regime`), a summary of
+    trades made under earlier settings, rugs, skips and the model it trades with. Equity is the whole book."""
     from tradingbot import model_book as mb
     from tradingbot.engine import STUCK_AFTER_S
-    stats = strategy_stats(j, mb.NAME, cfg.model_book_cash_usd)
+    since = mb.regime_since(j)
+    stats = strategy_stats(j, mb.NAME, cfg.model_book_cash_usd, since)
     # Exit slippage without total-loss fills (a rugged pool's sale is a loss, not slippage).
     rows = j.query("""SELECT f.price, f.trigger_price FROM fills f JOIN positions p ON p.id=f.position_id
-                      WHERE p.strategy=? AND f.side='sell' AND f.trigger_price > 0""", (mb.NAME,))
+                      WHERE p.strategy=? AND f.side='sell' AND f.trigger_price > 0 AND p.opened_at >= ?""",
+                   (mb.NAME, since))
     stats["median_exit_slippage_excl_rugs_pct"] = _median(
         [-(r["price"] / r["trigger_price"] - 1) * 100 for r in rows if r["price"] > 0.05 * r["trigger_price"]])
+    now = time.time()
     open_pos = j.open_positions(mb.NAME)
     stuck = {p.id for p in open_pos
-             if (b := _blocked(j, mb.NAME, p)) is not None and time.time() - b[0] >= STUCK_AFTER_S}
-    for p, row in zip(open_pos, stats["open_positions"]):
-        row["hours"] = round((time.time() - (p.opened_at or time.time())) / 3600, 1)
-    signals = j.query("SELECT COUNT(*) AS n FROM events WHERE strategy=? AND kind IN ('model_buy', 'entry_skipped')",
-                      (mb.NAME,))[0]["n"]
+             if (b := _blocked(j, mb.NAME, p)) is not None and now - b[0] >= STUCK_AFTER_S}
+    open_rows = [{"symbol": p.symbol, "cost_usd": round(p.cost_usd, 2), "earlier": (p.opened_at or 0) < since,
+                  "hours": round((now - (p.opened_at or now)) / 3600, 1), "exit_blocked": _exit_blocked(j, mb.NAME, p)}
+                 for p in open_pos]
+    # Earlier settings, one line: finished trades (incl. stuck) opened before `since`.
+    rets = [(r["realized_usd"] or 0) / r["cost_usd"] - 1 for r in j.query(
+        "SELECT id, realized_usd, cost_usd, closed_at FROM positions WHERE strategy=? AND opened_at < ? AND cost_usd > 0",
+        (mb.NAME, since)) if r["closed_at"] is not None or r["id"] in stuck]
+    earlier = {"trades": len(rets), "mean_trade_pct": _mean([x * 100 for x in rets]),
+               "rugs": sum(x <= mb.RUG_RETURN for x in rets), "pnl_usd": sum(rets) * cfg.model_book_usd}
+    signals = j.query("SELECT COUNT(*) AS n FROM events WHERE strategy=? AND kind IN ('model_buy', 'entry_skipped') "
+                      "AND ts >= ?", (mb.NAME, since))[0]["n"]
     path = mb.model_path(cfg)
     model = json.loads(path.read_text()) if path.exists() else None
-    return {"book": stats, "signals": signals,
-            "buys": j.query("SELECT COUNT(*) AS n FROM positions WHERE strategy=?", (mb.NAME,))[0]["n"],
-            "rugs": mb.rug_summary(j, stuck),
+    return {"book": stats, "since": since, "settings": mb.regime(cfg), "signals": signals,
+            "buys": j.query("SELECT COUNT(*) AS n FROM positions WHERE strategy=? AND opened_at >= ?",
+                            (mb.NAME, since))[0]["n"],
+            "open": open_rows, "earlier": earlier, "rugs": mb.rug_summary(j, stuck, since),
             "model": {"threshold": model["threshold"], **model.get("meta", {})} if model else None,
             "downtime": downtime(j), "last_backup": json.loads(j.get_state("last_backup") or "null")}
 
 
 def render_model(rep: dict) -> str:
-    s, r, m = rep["book"], rep["rugs"], rep["model"]
-    lines = ["MODEL5 PAPER BOOK (5-minute pump model, 10-minute hold since 10-28; simulated fills on real Jupiter quotes)",
-             "  backtest expectation (74 trades): +17%/trade, median +16%, 65% wins, 90% range -1%..+35%", ""]
+    s, r, m, st = rep["book"], rep["rugs"], rep["model"], rep["settings"]
+    since = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(rep["since"])) if rep["since"] else "the start"
+    lines = ["MODEL5 PAPER BOOK (5-minute pump model; simulated fills on real Jupiter quotes)",
+             f"  current settings since {since}: hold {st['hold_min']:g} min, take profit +{st['tp_pct']:g}%, "
+             f"stop -{st['sl_pct']:g}%, top {st['top_pct']:g}% of pools, min liquidity ${st['min_liq_usd']:,.0f}",
+             "  backtest expectation (74 trades, 10-min hold): +17%/trade, median +16%, 65% wins, 90% range -1%..+35%", "",
+             "WHOLE BOOK (all settings)"]
+    for label, v, suffix in (("equity $", s["equity"], ""), ("return %", s["return_pct"], "%"),
+                             ("max drawdown %", s["max_drawdown_pct"], "%")):
+        lines.append(f"  {label:<34}{_fmt(v, suffix):>14}")
+    e = rep["earlier"]
+    if e["trades"]:
+        lines.append(f"  earlier settings: {e['trades']} finished trades, mean {_fmt(e['mean_trade_pct'], '%')}, "
+                     f"{e['rugs']} rugged, about ${e['pnl_usd']:+,.0f}")
+    lines += ["", f"TRADES UNDER CURRENT SETTINGS (opened since {since})"]
     rows = [
-        ("equity $", s["equity"], ""), ("return %", s["return_pct"], "%"),
-        ("max drawdown %", s["max_drawdown_pct"], "%"),
         ("signals / buys", f"{rep['signals']} / {rep['buys']}", ""),
         ("closed trades", s["closed_trades"], ""), ("  of which stuck ($0)", s["stuck_trades"], ""),
         ("win rate", s["win_rate"], ""), ("median trade %", s["median_trade_return_pct"], "%"),
@@ -463,10 +486,11 @@ def render_model(rep: dict) -> str:
     if not s["enough_trades"]:
         lines.append(f"  only {s['closed_trades']} finished trades; need {MIN_TRADES_FOR_CONCLUSION}+ before drawing conclusions")
     lines += ["", f"EXITS: {s['exit_reasons'] or '-'}", f"SKIPPED SIGNALS: {s['top_skip_reasons'] or '-'}", "", "OPEN POSITIONS"]
-    for p in s["open_positions"] or []:
+    for p in rep["open"]:
         blocked = f"  EXIT BLOCKED {p['exit_blocked']} (valued at $0 after 30 min)" if p.get("exit_blocked") else ""
-        lines.append(f"  {p['symbol']:<16} cost ${p['cost_usd']:<8} {p['hours']}h{blocked}")
-    if not s["open_positions"]:
+        tag = " (earlier settings)" if p["earlier"] else ""
+        lines.append(f"  {p['symbol']:<16} cost ${p['cost_usd']:<8} {p['hours']}h{tag}{blocked}")
+    if not rep["open"]:
         lines.append("  none")
     lines += ["", "RUGS (trade lost >=80%, incl. stuck positions)",
               f"  live: {r['rugs']} of {r['finished_trades']} finished trades = {_fmt(r['rug_rate_pct'], '%', 1)}"

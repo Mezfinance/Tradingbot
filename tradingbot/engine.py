@@ -84,6 +84,7 @@ class Engine:
             book.exit_cfg = mb.exit_config(cfg)
             self.books[mb.NAME] = book
             self.model_book = mb.ModelBook(cfg)
+            mb.mark_regime(journal, cfg)  # report splits trades by the settings they were made under
         self._rng = random.Random(cfg.shadow_seed)
         self.lock = threading.RLock()  # guards book cash and position state
         self.tracker = Tracker(journal, dex, jupiter)

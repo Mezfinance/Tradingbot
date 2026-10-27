@@ -274,3 +274,22 @@ def test_short_hold_exits_after_ten_minutes_and_old_pools_are_skipped(cfg, good_
     book = eng.books[mb.NAME]
     assert eng._model_skip_reason(book, dict(sig, created_ts=real_time.time() - 6 * 60)) is None
     assert eng._model_skip_reason(book, dict(sig, created_ts=real_time.time() - 11 * 60)) == "pool too old for the short hold"
+
+
+def test_report_separates_trades_made_under_earlier_settings(cfg, good_pair, monkeypatch):
+    """10-28: the report mixed 24h-hold trades into the 10-minute test."""
+    from dataclasses import replace as dc_replace
+    from tradingbot.report import build_model, render_model
+    eng, j, pos = _held_position(cfg, good_pair, RuggedJupiter())  # opened under the current settings
+    since = mb.regime_since(j)
+    assert since > 0
+    j.execute("UPDATE positions SET opened_at=? WHERE id=?", (since - 3600, pos.id))  # pretend it was earlier
+    pos.opened_at = since - 3600
+    eng.manage_positions()  # sold through the stop for ~0
+    rep = build_model(j, cfg)
+    assert rep["book"]["closed_trades"] == 0 and rep["earlier"]["trades"] == 1 and rep["earlier"]["rugs"] == 1
+    assert rep["rugs"]["finished_trades"] == 0
+    assert "earlier settings: 1 finished trades" in render_model(rep)
+    # A settings change starts a new period; the same settings keep the old start.
+    assert mb.mark_regime(j, cfg, now=since + 10) == since
+    assert mb.mark_regime(j, dc_replace(cfg, model_book_hold_min=8.0), now=since + 20) == since + 20
