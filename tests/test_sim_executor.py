@@ -57,7 +57,9 @@ def test_price_moving_past_slippage_reverts_and_costs_fee(sim):
 
 
 def test_high_impact_entry_is_declined_for_free(sim):
-    assert sim([q(1_000_000, 970_000, impact=9.0)]).buy("T", 50, 1) is None
+    ex = sim([q(1_000_000, 970_000, impact=9.0)])
+    assert ex.buy("T", 50, 1) is None
+    assert ex.last_note == "price impact 9.00%"  # the engine logs this as the skip reason
 
 
 def test_exit_ignores_impact_cap(sim):

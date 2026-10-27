@@ -90,6 +90,7 @@ class Config:
     model_book_max_open: int = 120
     model_book_daily_loss_pct: float = 15.0  # of the book's equity; halts its entries for the UTC day
     model_book_max_drift_pct: float = 25.0  # skip if the live price ran this far above the snapshot
+    model_book_max_impact_pct: float = 5.0  # its buys are up to 2% of a pool, so 2-4% impact is normal
     model_book_tp_pct: float = 100.0
     model_book_sl_pct: float = 50.0
     model_book_hold_h: float = 24.0

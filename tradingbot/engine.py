@@ -442,7 +442,9 @@ class Engine:
             return False
         fill = book.executor.buy(snap.token_address, usd, fresh.price_usd)
         if fill is None:
-            self.journal.log_event("entry_skipped", snap.token_address, "executor declined", strategy=book.name)
+            why = getattr(book.executor, "last_note", "") or ""
+            self.journal.log_event("entry_skipped", snap.token_address,
+                                   f"executor declined: {why}" if why else "executor declined", strategy=book.name)
             return False
         if not fill.ok:
             self._charge_failed(book, snap.token_address, fill)
@@ -523,7 +525,7 @@ class Engine:
                 return f"round-trip loss {rt[0]:.1f}% (honeypot/tax/thin pool)"
         fill = book.executor.buy(sig["mint"], usd, trigger)
         if fill is None:
-            return "executor declined"
+            return f"executor declined: {getattr(book.executor, 'last_note', '') or 'no reason given'}"
         if not fill.ok:
             self._charge_failed(book, sig["mint"], fill)
             return "transaction failed"

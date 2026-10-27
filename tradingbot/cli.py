@@ -47,7 +47,10 @@ def build_engine(cfg: Config, with_analyst: bool = True):
         triage = Triage(cfg, analyst.client)
     from tradingbot.data.geckoterminal import GeckoTerminal
 
-    model_executor = SimExecutor(cfg, jupiter) if cfg.model_book else None  # model5 is always simulated
+    from dataclasses import replace
+    # model5 is always simulated, with its own impact cap (the Claude book's 3% suits older, deeper pools).
+    model_executor = (SimExecutor(replace(cfg, max_price_impact_pct=cfg.model_book_max_impact_pct), jupiter)
+                      if cfg.model_book else None)
     return Engine(cfg, DexScreener(), RugCheck(), analyst, executor, Journal(cfg.db_path), jupiter,
                   shadow_executors=shadow_executors, canary_executor=canary, gecko=GeckoTerminal(),
                   triage=triage, model_executor=model_executor)
@@ -218,6 +221,7 @@ def main(argv: list[str] | None = None) -> None:
             key = r["detail"].split(" (")[0].split(" since")[0]
             key = "price ran since the snapshot" if key.startswith("price ran") else key
             key = "round-trip loss too high" if key.startswith("round-trip loss") else key
+            key = "executor declined: price impact too high" if "price impact" in key else key
             skips[key] = skips.get(key, 0) + 1
         print(json.dumps({"model": {k: meta[k] for k in ("threshold", "meta")} if meta else "not trained yet",
                           "buys": j.query("SELECT COUNT(*) AS n FROM events WHERE strategy=? AND kind='model_buy'",

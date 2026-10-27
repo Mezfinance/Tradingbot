@@ -66,14 +66,18 @@ class SimExecutor:
         return (landed.out_raw + first.min_out_raw) // 2
 
     def buy(self, token: str, usd: float, ref_price: float) -> Fill | None:
+        """None = declined before sending (reason in `last_note`); a Fill with ok=False = reverted."""
         decimals = self.jup.decimals(token)
         if decimals is None:
+            self.last_note = "token decimals unknown"
             return None
         fee = self.tx_fee_usd() + self._sol_usd(self.cfg.ata_rent_sol)
         swap_usd = usd - fee
         if swap_usd <= 0:
+            self.last_note = "size below fees"
             return None
         out_raw, note = self._execute(USDC_MINT, token, int(swap_usd * 10**USDC_DECIMALS), cap_impact=True)
+        self.last_note = note
         if out_raw is None:
             # Pre-flight rejections cost nothing; a reverted transaction costs its fee.
             return failed(self.tx_fee_usd(), note) if "reverted" in note else None
