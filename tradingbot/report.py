@@ -414,3 +414,78 @@ def render(rep: dict) -> str:
                      f"{dt['outages_with_open_positions']} with positions unmanaged")
     lines += ["", f"FUNNEL: {rep['funnel']}"]
     return "\n".join(lines)
+
+
+# --- model5-only report (the default `report` since 2026-10-28; `report --all` is the full one) -------------
+def build_model(j: Journal, cfg: Config) -> dict:
+    """The model5 paper book: trading stats, rugs, skips and the model it trades with."""
+    from tradingbot import model_book as mb
+    from tradingbot.engine import STUCK_AFTER_S
+    stats = strategy_stats(j, mb.NAME, cfg.model_book_cash_usd)
+    # Exit slippage without total-loss fills (a rugged pool's sale is a loss, not slippage).
+    rows = j.query("""SELECT f.price, f.trigger_price FROM fills f JOIN positions p ON p.id=f.position_id
+                      WHERE p.strategy=? AND f.side='sell' AND f.trigger_price > 0""", (mb.NAME,))
+    stats["median_exit_slippage_excl_rugs_pct"] = _median(
+        [-(r["price"] / r["trigger_price"] - 1) * 100 for r in rows if r["price"] > 0.05 * r["trigger_price"]])
+    open_pos = j.open_positions(mb.NAME)
+    stuck = {p.id for p in open_pos
+             if (b := _blocked(j, mb.NAME, p)) is not None and time.time() - b[0] >= STUCK_AFTER_S}
+    for p, row in zip(open_pos, stats["open_positions"]):
+        row["hours"] = round((time.time() - (p.opened_at or time.time())) / 3600, 1)
+    signals = j.query("SELECT COUNT(*) AS n FROM events WHERE strategy=? AND kind IN ('model_buy', 'entry_skipped')",
+                      (mb.NAME,))[0]["n"]
+    path = mb.model_path(cfg)
+    model = json.loads(path.read_text()) if path.exists() else None
+    return {"book": stats, "signals": signals,
+            "buys": j.query("SELECT COUNT(*) AS n FROM positions WHERE strategy=?", (mb.NAME,))[0]["n"],
+            "rugs": mb.rug_summary(j, stuck),
+            "model": {"threshold": model["threshold"], **model.get("meta", {})} if model else None,
+            "downtime": downtime(j), "last_backup": json.loads(j.get_state("last_backup") or "null")}
+
+
+def render_model(rep: dict) -> str:
+    s, r, m = rep["book"], rep["rugs"], rep["model"]
+    lines = ["MODEL5 PAPER BOOK (5-minute pump model; simulated fills on real Jupiter quotes)", ""]
+    rows = [
+        ("equity $", s["equity"], ""), ("return %", s["return_pct"], "%"),
+        ("max drawdown %", s["max_drawdown_pct"], "%"),
+        ("signals / buys", f"{rep['signals']} / {rep['buys']}", ""),
+        ("closed trades", s["closed_trades"], ""), ("  of which stuck ($0)", s["stuck_trades"], ""),
+        ("win rate", s["win_rate"], ""), ("median trade %", s["median_trade_return_pct"], "%"),
+        ("mean trade %", s["mean_trade_return_pct"], "%"), ("profit factor", s["profit_factor"], ""),
+        ("network fees $", s["network_fees_usd"], ""), ("failed txs", s["failed_txs"], ""),
+        ("entry slippage % (med)", s["median_entry_slippage_pct"], "%"),
+        ("exit slippage % (med, excl. rugs)", s["median_exit_slippage_excl_rugs_pct"], "%"),
+    ]
+    for label, v, suffix in rows:
+        lines.append(f"  {label:<34}{_fmt(v, suffix):>14}")
+    if not s["enough_trades"]:
+        lines.append(f"  only {s['closed_trades']} finished trades; need {MIN_TRADES_FOR_CONCLUSION}+ before drawing conclusions")
+    lines += ["", f"EXITS: {s['exit_reasons'] or '-'}", f"SKIPPED SIGNALS: {s['top_skip_reasons'] or '-'}", "", "OPEN POSITIONS"]
+    for p in s["open_positions"] or []:
+        blocked = f"  EXIT BLOCKED {p['exit_blocked']} (valued at $0 after 30 min)" if p.get("exit_blocked") else ""
+        lines.append(f"  {p['symbol']:<16} cost ${p['cost_usd']:<8} {p['hours']}h{blocked}")
+    if not s["open_positions"]:
+        lines.append("  none")
+    lines += ["", "RUGS (trade lost >=80%, incl. stuck positions)",
+              f"  live: {r['rugs']} of {r['finished_trades']} finished trades = {_fmt(r['rug_rate_pct'], '%', 1)}"
+              f"   (research with rug-aware labels: ~28% of top-2% picks)",
+              f"  causes of losing exits: {r['losing_exit_causes'] or '-'}"]
+    for label, key in (("rugs", "entry_audit_rugs"), ("others", "entry_audit_others")):
+        a = r[key]
+        lines.append(f"  entry audit, {label:<6} (n={a['n_with_audit']}): {a['median']}  "
+                     f"Jupiter 'suspicious': {_fmt(a['flagged_suspicious_pct'], '%', 1)}")
+    lines += ["", "MODEL"]
+    if m:
+        trained = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(m["trained_ts"])) if m.get("trained_ts") else "?"
+        lines.append(f"  trained {trained} on {m.get('rows')} pools ({m.get('days')} days); pump rate "
+                     f"{_fmt((m.get('pump_rate') or 0) * 100, '%', 1)}; cut-off {m['threshold']:.3f} (top {m.get('top_pct')}%)")
+        lines.append(f"  in-sample top picks: pump rate {_fmt((m.get('top_pump_rate_in_sample') or 0) * 100, '%', 1)}, "
+                     f"mean trade {_fmt((m.get('top_trade_ret_in_sample') or 0) * 100, '%', 1)} (optimistic: in-sample)")
+    else:
+        lines.append("  not trained yet")
+    dt, bk = rep["downtime"], rep.get("last_backup")
+    lines += ["", f"DOWNTIME: {dt['outages']} outage(s), {dt['hours_offline']:.1f}h offline, "
+                  f"{dt['outages_with_open_positions']} with positions unmanaged",
+              f"LAST BACKUP: {bk['date']} -> {bk['uploaded'] or 'volume only'}" if bk else "LAST BACKUP: none yet"]
+    return "\n".join(lines)

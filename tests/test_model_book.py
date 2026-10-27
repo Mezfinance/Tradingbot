@@ -244,3 +244,17 @@ def test_an_emptied_pool_s_frozen_price_is_not_believed(cfg, good_pair):
     # A pool that still has liquidity keeps its feed price.
     eng.dex = FakeDex(dc_replace(frozen, liquidity_usd=50_000.0))
     assert eng.current_prices({"RUGMINT"}, {"RUGMINT": pos.qty}) == {"RUGMINT": 6e-5}
+
+
+def test_the_report_shows_only_the_model5_book_with_its_rugs(cfg, good_pair):
+    from tradingbot.report import build_model, render_model
+    eng, j, pos = _held_position(cfg, good_pair, RuggedJupiter())
+    eng.extras = FakeExtras(liquidity=40_000.0)
+    eng._log_model_audit(eng.books[mb.NAME], {"mint": "RUGMINT", "score": 1.2, "liq": 30_000.0})
+    eng.extras.liquidity = 1_000.0
+    eng.manage_positions()  # a rug: sold through the stop for ~0
+    rep = build_model(j, cfg)
+    assert rep["book"]["strategy"] == mb.NAME and rep["rugs"]["rugs"] == 1
+    text = render_model(rep)
+    assert "MODEL5 PAPER BOOK" in text and "liquidity_pulled" in text and "1 of 1 finished trades" in text
+    assert "filters_only" not in text and "Claude API" not in text and "not trained yet" in text

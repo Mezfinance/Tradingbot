@@ -68,6 +68,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
+    parser.add_argument("--all", action="store_true", help="report: every book, not just model5")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
     parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
@@ -96,8 +97,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "report":
         from tradingbot import report
         from tradingbot.journal import Journal
-        rep = report.build(Journal(cfg.db_path), cfg)
-        print(json.dumps(rep, indent=2, default=str) if args.json else report.render(rep))
+        j = Journal(cfg.db_path)
+        if args.all:  # every book, Claude's selection, learning, triage (Claude trading is off since 10-27)
+            rep = report.build(j, cfg)
+            print(json.dumps(rep, indent=2, default=str) if args.json else report.render(rep))
+        else:
+            rep = report.build_model(j, cfg)
+            print(json.dumps(rep, indent=2, default=str) if args.json else report.render_model(rep))
         return
 
     if args.command == "health":
