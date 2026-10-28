@@ -12,6 +12,8 @@ from datetime import datetime
 
 import httpx
 
+from tradingbot.data import jupiter
+
 log = logging.getLogger(__name__)
 
 UA = {"User-Agent": "Mozilla/5.0"}
@@ -40,7 +42,8 @@ class Paced:
 class Extras:
     def __init__(self, client: httpx.Client | None = None, pace_s: float = 0.4):
         self.http = client or httpx.Client(timeout=15, headers=UA, follow_redirects=True)
-        self.pace = {h: Paced(pace_s) for h in ("jup", "dex", "misc")}
+        self.pace = {h: Paced(pace_s) for h in ("dex", "misc")}
+        self.pace["jup"] = jupiter.GATE  # Jupiter's limit is per key/IP: share the trading client's pace
         self.pace["rug"] = Paced(2.0)  # RugCheck rate-limits hard; fresh tokens may also not be indexed yet
 
     def _get(self, host: str, url: str, **kw):
@@ -61,11 +64,13 @@ class Extras:
 
     # --- per token -----------------------------------------------------------------
     def jupiter_token(self, mint: str) -> dict | None:
-        data = self._json("jup", "https://lite-api.jup.ag/tokens/v2/search", params={"query": mint})
+        data = self._json("jup", f"{jupiter.base_url()}/tokens/v2/search", params={"query": mint},
+                          headers=jupiter.headers())
         return next((t for t in data or [] if t.get("id") == mint), None)
 
     def jupiter_trending(self, interval: str = "1h", limit: int = 100) -> list[str]:
-        data = self._json("jup", f"https://lite-api.jup.ag/tokens/v2/toptrending/{interval}", params={"limit": limit})
+        data = self._json("jup", f"{jupiter.base_url()}/tokens/v2/toptrending/{interval}", params={"limit": limit},
+                          headers=jupiter.headers())
         return [t["id"] for t in data or [] if t.get("id")]
 
     def rugcheck(self, mint: str) -> dict | None:

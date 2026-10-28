@@ -3,7 +3,13 @@ import time
 import pytest
 
 from tradingbot.config import Config
+from tradingbot.data import jupiter
 from tradingbot.models import PairSnapshot, SafetyReport
+
+
+@pytest.fixture(autouse=True)
+def _no_jupiter_pace(monkeypatch):
+    monkeypatch.setattr(jupiter.GATE, "interval_s", 0.0)
 
 
 @pytest.fixture

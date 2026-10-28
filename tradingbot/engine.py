@@ -25,7 +25,7 @@ from tradingbot import factors, risk, shadows
 from tradingbot.analyst import Analyst
 from tradingbot.config import Config
 from tradingbot.data.dexscreener import DexScreener
-from tradingbot.data.jupiter import Jupiter
+from tradingbot.data.jupiter import RATE_LIMITED, Jupiter
 from tradingbot.data.rugcheck import RugCheck
 from tradingbot.execution.base import Executor, Fill
 from tradingbot.journal import Journal
@@ -233,7 +233,8 @@ class Engine:
             for mint in sorted(missing)[:QUOTE_PRICE_MAX]:  # brand-new (or rugged) tokens neither feed lists
                 if held and mint in held and hasattr(self.jupiter, "sell_price"):
                     p = self.jupiter.sell_price(mint, held[mint])
-                    if p is None and mint in dead:
+                    limited = getattr(self.jupiter, "last_failure", lambda: "")() == RATE_LIMITED
+                    if p is None and mint in dead and not limited:
                         p = 0.0  # no route out of an emptied pool: worth nothing (fires the stop)
                 else:
                     p = self.jupiter.quote_price(mint)
@@ -582,7 +583,7 @@ class Engine:
             live = self.jupiter.prices([sig["mint"]]).get(sig["mint"])
             live_usd = live.usd if live is not None else self.jupiter.quote_price(sig["mint"])  # too new to list
             if live_usd is None:
-                return "no live price"
+                return self._jup_failure("no live price")
             if live_usd > NO_LIQUIDITY_MULT * sig["price"]:
                 # A buy quote on an empty or drained pool implies an absurd price (10-28: 268,000x and 122,000,000x
                 # the snapshot): there is nothing real to buy, which is not the price running up.
@@ -592,7 +593,7 @@ class Engine:
             trigger = live_usd
             rt = self.jupiter.round_trip(sig["mint"], usd)
             if rt is None:
-                return "no swap route"
+                return self._jup_failure("no swap route")
             if rt[0] > c.max_round_trip_loss_pct:
                 return f"round-trip loss {rt[0]:.1f}% (honeypot/tax/thin pool)"
         fill = book.executor.buy(sig["mint"], usd, trigger)
@@ -607,6 +608,10 @@ class Engine:
                                strategy=book.name)
         self._log_model_audit(book, sig)
         return None
+
+    def _jup_failure(self, default: str) -> str:
+        """Skip reason for a failed Jupiter lookup: a refused request is not a missing route."""
+        return RATE_LIMITED if getattr(self.jupiter, "last_failure", lambda: "")() == RATE_LIMITED else default
 
     def _log_model_audit(self, book: Book, sig: dict) -> None:
         """Holder audit at the moment of buying (model_entry_audit), for the live rug analysis."""
@@ -643,6 +648,9 @@ class Engine:
 
     def _sell(self, book: Book, pos: Position, qty: float, price: float, reason: str) -> bool:
         fill = book.executor.sell(pos.token_address, min(qty, pos.qty), price)
+        if fill is not None and not fill.ok and RATE_LIMITED in (fill.note or ""):
+            log.info("[%s] sell %s (%s) postponed: %s", book.name, pos.symbol, reason, fill.note)
+            return False  # Jupiter refused the quote: says nothing about the route, retry next pass
         if fill is not None and not fill.ok and fill.usd == 0:
             self._exit_blocked(book, pos, reason, fill.note)  # nothing was sent: no route out
             return False

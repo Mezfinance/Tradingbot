@@ -249,6 +249,27 @@ def test_an_emptied_pool_s_frozen_price_is_not_believed(cfg, good_pair):
     assert eng.current_prices({"RUGMINT"}, {"RUGMINT": pos.qty}) == {"RUGMINT": 6e-5}
 
 
+def test_a_rate_limited_exit_is_retried_not_marked_blocked(cfg, good_pair):
+    """A 429 from Jupiter used to look like 'no route': the exit was marked blocked and an emptied pool
+    priced at 0. Now a refused quote only postpones the sell to the next monitor pass."""
+    from dataclasses import replace as dc_replace
+    from tradingbot.data.jupiter import RATE_LIMITED
+    from tradingbot.execution.base import failed
+
+    class LimitedJupiter(RuggedJupiter):
+        def last_failure(self):
+            return RATE_LIMITED
+
+    eng, j, pos = _held_position(cfg, good_pair, LimitedJupiter(sell=None))
+    eng.dex = FakeDex(dc_replace(good_pair, token_address="RUGMINT", price_usd=6e-5, liquidity_usd=0.0))
+    assert eng.current_prices({"RUGMINT"}, {"RUGMINT": pos.qty}) == {}  # unknown, not worth $0
+    eng.current_prices = lambda tokens, held=None: {"RUGMINT": 1e-5}  # below the stop
+    eng.books[mb.NAME].executor.sell = lambda token, qty, price: failed(0.0, RATE_LIMITED)
+    eng.manage_positions()
+    assert pos.id not in eng._blocked
+    assert j.query("SELECT COUNT(*) FROM events WHERE kind IN ('exit_blocked', 'tx_failed')")[0][0] == 0
+
+
 def test_the_report_shows_only_the_model5_book_with_its_rugs(cfg, good_pair):
     from tradingbot.report import build_model, render_model
     eng, j, pos = _held_position(cfg, good_pair, RuggedJupiter())

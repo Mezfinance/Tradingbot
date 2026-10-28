@@ -16,7 +16,7 @@ import logging
 import time
 
 from tradingbot.config import Config
-from tradingbot.data.jupiter import USDC_DECIMALS, USDC_MINT, Jupiter, Quote
+from tradingbot.data.jupiter import RATE_LIMITED, USDC_DECIMALS, USDC_MINT, Jupiter, Quote
 from tradingbot.execution.base import Fill, failed
 
 log = logging.getLogger(__name__)
@@ -45,17 +45,22 @@ class SimExecutor:
         """
         first = self.jup.quote(in_mint, out_mint, in_raw)
         if first is None:
-            return None, "no route"
+            return None, self._why_none("no route")
         if cap_impact and first.price_impact_pct > self.cfg.max_price_impact_pct:
             return None, f"price impact {first.price_impact_pct:.2f}%"
         if self.latency_s > 0:
             self.sleep(self.latency_s)
         landed = self.jup.quote(in_mint, out_mint, in_raw)
         if landed is None:
-            return None, "route vanished"
+            return None, self._why_none("route vanished")
         if landed.out_raw < first.min_out_raw:
             return None, "slippage exceeded (reverted)"
         return self._fill_amount(first, landed), "ok"
+
+    def _why_none(self, default: str) -> str:
+        """A refused (429/5xx) quote says nothing about the route: report it as rate-limited."""
+        why = getattr(self.jup, "last_failure", lambda: default)()
+        return why if why == RATE_LIMITED else default
 
     def _fill_amount(self, first: Quote, landed: Quote) -> int:
         mode = self.cfg.sim_fill_mode

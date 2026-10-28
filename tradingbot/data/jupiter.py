@@ -1,4 +1,8 @@
-"""Jupiter public endpoints: swap quotes, USD prices and token decimals. No key required."""
+"""Jupiter endpoints: swap quotes, USD prices and token decimals.
+
+With JUPITER_API_KEY set, calls go to the paid api.jup.ag (header x-api-key), else to the free lite-api.
+Every Jupiter call in the process (trading client and enrichment) shares one pace, `GATE`.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +16,8 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-BASE = "https://lite-api.jup.ag"
+LITE_BASE = "https://lite-api.jup.ag"
+PAID_BASE = "https://api.jup.ag"
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 SOL_MINT = "So11111111111111111111111111111111111111112"
 USDC_DECIMALS = 6
@@ -20,8 +25,59 @@ PRICE_BATCH = 50
 SOL_PRICE_TTL_S = 300
 HELIUS_RPC = "https://mainnet.helius-rpc.com/"
 PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
-MIN_REQUEST_INTERVAL_S = 0.5  # keeps the shared free tier comfortably under its rate limit
+FREE_INTERVAL_S = 2.0  # free tier: 5 requests per 10 s per IP, shared by quote, price and tokens
+PAID_RPS = 8.0  # paid plan: 10/s and 25M requests a month; 8/s flat out for 31 days = 21.4M
 RETRIES_ON_429 = 3
+RATE_LIMITED = "Jupiter rate-limited"
+STATS_LOG_S = 3600
+
+
+def api_key() -> str | None:
+    return os.environ.get("JUPITER_API_KEY") or None
+
+
+def base_url() -> str:
+    return PAID_BASE if api_key() else LITE_BASE
+
+
+def headers() -> dict:
+    key = api_key()
+    return {"x-api-key": key} if key else {}
+
+
+class Gate:
+    """One request pace for the whole process, plus counters (calls, 429s) for the budget."""
+
+    def __init__(self, interval_s: float | None = None):
+        if interval_s is None:
+            rps = float(os.environ.get("JUPITER_RPS") or PAID_RPS)
+            interval_s = 1.0 / rps if api_key() else FREE_INTERVAL_S
+        self.interval_s = interval_s
+        self._lock = threading.Lock()
+        self._last = 0.0
+        self.calls = 0
+        self.limited = 0
+        self.started = self._logged = time.time()
+
+    def wait(self) -> None:
+        with self._lock:
+            delay = self._last + self.interval_s - time.monotonic()
+            if delay > 0:
+                time.sleep(delay)
+            self._last = time.monotonic()
+            self.calls += 1
+            if time.time() - self._logged >= STATS_LOG_S:
+                self._logged = time.time()
+                log.info("jupiter usage: %s", self.stats())
+
+    def stats(self) -> dict:
+        hours = max((time.time() - self.started) / 3600, 1e-9)
+        return {"calls": self.calls, "rate_limited": self.limited, "per_hour": round(self.calls / hours),
+                "month_projection": round(self.calls / hours * 24 * 31), "interval_s": self.interval_s,
+                "paid": bool(api_key())}
+
+
+GATE = Gate()
 
 
 @dataclass
@@ -44,29 +100,32 @@ class TokenPrice:
 
 
 class Jupiter:
-    def __init__(self, slippage_bps: int = 300, http: httpx.Client | None = None):
-        self.http = http or httpx.Client(base_url=BASE, timeout=15)
+    def __init__(self, slippage_bps: int = 300, http: httpx.Client | None = None, gate: Gate | None = None):
+        self.http = http or httpx.Client(base_url=base_url(), headers=headers(), timeout=15)
         self.slippage_bps = slippage_bps
+        self.gate = gate or GATE
         self._decimals: dict[str, int] = {USDC_MINT: USDC_DECIMALS, SOL_MINT: 9}
         self._sol_price: tuple[float, float] | None = None  # (price, fetched_at)
-        self._pace = threading.Lock()
-        self._last_request = 0.0
+        self._local = threading.local()  # per thread: why the last quote failed
+
+    def last_failure(self) -> str:
+        """Why this thread's last quote returned None: RATE_LIMITED or 'no route'."""
+        return getattr(self._local, "failure", "no route")
 
     def _get(self, path: str, params: dict) -> httpx.Response:
-        """GET with global pacing (both bot threads share this client) and back-off on 429 and 5xx."""
+        """GET through the shared gate, with back-off on 429 and 5xx."""
         for attempt in range(RETRIES_ON_429 + 1):
-            with self._pace:
-                wait = self._last_request + MIN_REQUEST_INTERVAL_S - time.monotonic()
-                if wait > 0:
-                    time.sleep(wait)
-                self._last_request = time.monotonic()
+            self.gate.wait()
             resp = self.http.get(path, params=params)
+            if resp.status_code == 429:
+                self.gate.limited += 1
             if not (resp.status_code == 429 or resp.status_code >= 500) or attempt == RETRIES_ON_429:
                 return resp
             time.sleep(2 ** attempt)
         return resp
 
     def quote(self, in_mint: str, out_mint: str, in_raw: int) -> Quote | None:
+        self._local.failure = "no route"
         if in_raw <= 0:
             return None
         try:
@@ -76,6 +135,11 @@ class Jupiter:
             })
         except httpx.HTTPError as exc:
             log.warning("quote request failed: %s", exc)
+            self._local.failure = RATE_LIMITED if isinstance(exc, httpx.TimeoutException) else "no route"
+            return None
+        if resp.status_code == 429 or resp.status_code >= 500:
+            self._local.failure = RATE_LIMITED  # refused or unavailable: says nothing about the route
+            log.info("quote %s->%s refused: HTTP %s", in_mint[:6], out_mint[:6], resp.status_code)
             return None
         if resp.status_code != 200:
             log.info("no quote %s->%s: %s", in_mint[:6], out_mint[:6], resp.text[:200])
