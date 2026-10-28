@@ -259,7 +259,9 @@ def test_the_report_shows_only_the_model5_book_with_its_rugs(cfg, good_pair):
     rep = build_model(j, cfg)
     [m5, fast] = rep["books"]
     assert m5["name"] == mb.NAME and m5["rugs"]["rugs"] == 1 and fast["name"] == mb.FAST and fast["buys"] == 0
+    assert m5["started"] and fast["started"]  # both books had equity snapshots from the running engine
     text = render_model(rep)
+    assert "running since (UTC)" in text and "running for" in text
     assert "MODEL PAPER BOOKS" in text and "model5_10m" in text and "liquidity_pulled" in text and "1 (100%)" in text
     assert "filters_only" not in text and "Claude API" not in text and "not trained yet" in text
 

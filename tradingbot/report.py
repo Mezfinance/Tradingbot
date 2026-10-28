@@ -432,7 +432,13 @@ def _model_book_report(j: Journal, cfg: Config, name: str) -> dict:
              if (b := _blocked(j, name, p)) is not None and now - b[0] >= STUCK_AFTER_S}
     for p, row in zip(open_pos, stats["open_positions"]):
         row["hours"] = round((now - (p.opened_at or now)) / 3600, 1)
-    return {"name": name, "hold_min": mb.hold_min(cfg, name), "book": stats,
+    # When the book started: its first equity snapshot (taken every minute while the engine runs), trade or signal.
+    firsts = [j.query(q, (name,))[0]["t"] for q in (
+        "SELECT MIN(ts) AS t FROM equity WHERE strategy=?",
+        "SELECT MIN(opened_at) AS t FROM positions WHERE strategy=?",
+        "SELECT MIN(ts) AS t FROM events WHERE strategy=?")]
+    started = min((t for t in firsts if t), default=None)
+    return {"name": name, "hold_min": mb.hold_min(cfg, name), "book": stats, "started": started,
             "signals": j.query("SELECT COUNT(*) AS n FROM events WHERE strategy=? AND kind IN ('model_buy', "
                                "'entry_skipped')", (name,))[0]["n"],
             "buys": j.query("SELECT COUNT(*) AS n FROM positions WHERE strategy=?", (name,))[0]["n"],
@@ -450,6 +456,13 @@ def build_model(j: Journal, cfg: Config) -> dict:
             "downtime": downtime(j), "last_backup": json.loads(j.get_state("last_backup") or "null")}
 
 
+def _running_for(started: float | None) -> str:
+    if not started:
+        return "-"
+    h = (time.time() - started) / 3600
+    return f"{h:.1f} h" if h < 48 else f"{h / 24:.1f} days"
+
+
 EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the live books
     "model5": "24h hold: -26%/trade, 62% rugged (rug-aware labels, 377 picks)",
     "model5_10m": "10-min hold: +17%/trade, median +16%, 65% wins, 90% range -1%..+35% (74 picks)",
@@ -463,6 +476,8 @@ def render_model(rep: dict) -> str:
     for b in books:
         lines.append(f"  {b['name']:<11} backtest: {EXPECTED.get(b['name'], '-')}")
     rows = [("hold", lambda b: f"{b['hold_min']:g} min"),
+            ("running since (UTC)", lambda b: time.strftime("%m-%d %H:%M", time.gmtime(b["started"])) if b["started"] else "not yet"),
+            ("running for", lambda b: _running_for(b["started"])),
             ("equity $", lambda b: _fmt(b["book"]["equity"])), ("return %", lambda b: _fmt(b["book"]["return_pct"], "%")),
             ("max drawdown %", lambda b: _fmt(b["book"]["max_drawdown_pct"], "%")),
             ("signals / buys", lambda b: f"{b['signals']} / {b['buys']}"),
