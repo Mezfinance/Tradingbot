@@ -39,7 +39,9 @@ log = logging.getLogger(__name__)
 
 NAME = "model5"  # 24h hold
 FAST = "model5_10m"  # 10-minute hold, same signals, own cash and ledger
-BOOKS = (NAME, FAST)
+CLIMB = "model5_climb"  # FAST's rules + out after 3 min unless the price climbed 5%
+BOOKS = (NAME, FAST, CLIMB)
+SHORT = (FAST, CLIMB)  # the short-hold books
 AGE_MIN = 5
 FEATURES = sorted(set(wa._static_features({"name": "x", "dex": "x", "created_ts": 0}))
                   | set(wa._snap_features({})) | {"log_price_vs_first"})
@@ -69,13 +71,24 @@ def is_handmade(dex: str, mint: str) -> bool:
 def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
     """Pool-age exit for model5_10m's hand-made pools: sell by created + `model_book_handmade_exit_age_min`."""
     age = cfg.model_book_handmade_exit_age_min
-    if name != FAST or age <= 0 or not sig.get("created_ts") or not is_handmade(sig.get("dex") or "", sig["mint"]):
+    if name not in SHORT or age <= 0 or not sig.get("created_ts") or not is_handmade(sig.get("dex") or "", sig["mint"]):
         return None
     return sig["created_ts"] + age * 60
 
 
+def active_books(cfg: Config) -> list[str]:
+    return [NAME] + ([FAST] if cfg.model_book_fast else []) + ([CLIMB] if cfg.model_book_climb else [])
+
+
+def climb_check(cfg: Config, name: str, bought_ts: float, market_price: float) -> tuple[float, float] | None:
+    """model5_climb only: (check time, price the position must have reached by then)."""
+    if name != CLIMB or not market_price:
+        return None
+    return bought_ts + cfg.model_book_climb_after_min * 60, market_price * (1 + cfg.model_book_climb_min_gain_pct / 100)
+
+
 def hold_min(cfg: Config, name: str = NAME) -> float:
-    return cfg.model_book_fast_hold_min if name == FAST else cfg.model_book_hold_min
+    return cfg.model_book_fast_hold_min if name in SHORT else cfg.model_book_hold_min
 
 
 def exit_config(cfg: Config, name: str = NAME) -> Config:
@@ -238,7 +251,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
 
     return {"finished_trades": len(trades), "rugs": len(rugs),
             "rug_rate_pct": round(100 * len(rugs) / len(trades), 1) if trades else None,
-            "research_rug_rate_pct": 16.0 if name == FAST else 76.0,  # 10-28 backtests: 10-min hold vs 24h
+            "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0}.get(name, 76.0),  # 10-28 backtests: 10-min hold vs 24h
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 

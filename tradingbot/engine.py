@@ -82,7 +82,7 @@ class Engine:
         self.model_book = None
         if model_executor is not None and cfg.model_book:
             from tradingbot import model_book as mb
-            for name in (mb.BOOKS if cfg.model_book_fast else (mb.NAME,)):  # same signals, separate cash and ledgers
+            for name in mb.active_books(cfg):  # same signals, separate cash and ledgers
                 ex = model_executor if name == mb.NAME else copy.copy(model_executor)
                 book = self._open_book(name, ex, cfg.model_book_cash_usd, cfg.model_book_usd)
                 book.exit_cfg = mb.exit_config(cfg, name)
@@ -96,6 +96,7 @@ class Engine:
         self._last_prices: dict[str, float] = {}
         self._blocked: dict[int, dict] = {}  # position id -> exit blocked (no route): since, next try, note
         self._deadlines = self._load_deadlines()  # position id -> sell by this time (pool-age exit)
+        self._climbs = self._load_climbs()  # position id -> [check time, price to reach, best price seen]
         self._last_snapshot = 0.0
         self._stop = threading.Event()
         self.restart_reason: str | None = None
@@ -270,6 +271,8 @@ class Engine:
             exits = risk.plan_exits(pos, price, now, exit_cfg)
             if not exits and now >= self._deadlines.get(pos.id, float("inf")):
                 exits = [(pos.qty, "pool_age_exit")]  # hand-made pool: out before its creator usually pulls it
+            if not exits and self._climb_failed(pos.id, price, now):
+                exits = [(pos.qty, "no_climb")]  # flat after the first minutes: pulled pools mostly look like this
             if any(r.startswith("take_profit") for _, r in exits):
                 # A feed price can be stale or bogus (a rugged pool once showed 21,000x entry); take profit
                 # only if a quote to sell the position clears the target too.
@@ -563,7 +566,7 @@ class Engine:
         if time.time() - sig["ts"] > MODEL_SIGNAL_MAX_AGE_S:
             return "signal too old"
         from tradingbot import model_book as mb
-        if (book.name == mb.FAST and sig.get("created_ts")
+        if (book.name in mb.SHORT and sig.get("created_ts")
                 and (time.time() - sig["created_ts"]) / 60 > c.model_book_max_entry_age_min):
             return "pool too old for the short hold"
         open_ = self.journal.open_positions(book.name)
@@ -613,6 +616,12 @@ class Engine:
             self._deadlines[pos.id] = deadline
             self.journal.log_event("model_exit_deadline", sig["mint"],
                                    json.dumps({"position_id": pos.id, "deadline": deadline}), strategy=book.name)
+        check = mb.climb_check(self.cfg, book.name, pos.opened_at, trigger)
+        if check is not None:
+            self._climbs[pos.id] = [check[0], check[1], 0.0]
+            self.journal.log_event("model_climb_check", sig["mint"],
+                                   json.dumps({"position_id": pos.id, "at": check[0], "price": check[1]}),
+                                   strategy=book.name)
         self.journal.log_event("model_buy", sig["mint"], f"score {sig['score']:.3f} liq ${sig['liq']:,.0f}",
                                strategy=book.name)
         self._log_model_audit(book, sig)
@@ -627,6 +636,29 @@ class Engine:
             if d["position_id"] in open_ids:
                 out[d["position_id"]] = d["deadline"]
         return out
+
+    def _load_climbs(self) -> dict[int, list]:
+        """Pending climb checks of open positions. The best price seen restarts at 0 after a restart."""
+        open_ids = {p.id for p in self.journal.open_positions(strategy=None)}
+        out = {}
+        for r in self.journal.query("SELECT detail FROM events WHERE kind='model_climb_check'"):
+            d = json.loads(r["detail"])
+            if d["position_id"] in open_ids:
+                out[d["position_id"]] = [d["at"], d["price"], 0.0]
+        return out
+
+    def _climb_failed(self, pos_id: int, price: float, now: float) -> bool:
+        """True once the check time passes without the price having reached its target; a pass ends the check."""
+        c = self._climbs.get(pos_id)
+        if c is None:
+            return False
+        c[2] = max(c[2], price)
+        if now < c[0]:
+            return False
+        if c[2] >= c[1]:
+            del self._climbs[pos_id]
+            return False
+        return True
 
     def _jup_failure(self, default: str) -> str:
         """Skip reason for a failed Jupiter lookup: a refused request is not a missing route."""

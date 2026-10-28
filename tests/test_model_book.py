@@ -74,7 +74,9 @@ def test_engine_buys_signals_with_the_books_own_exits(cfg, good_pair, tmp_path):
     eng.model_book.consider(pool, 5, snap(1.0, buyers=300, liq=4_000.0))  # below the liquidity floor
     eng.model_book.consider(pool, 5, snap(1.0, buyers=300, liq=6_000.0))  # 2% of $6k = $120, capped at $100
     eng.model_book.consider(pool, 5, snap(1.0, buyers=300, liq=6_000.0))  # same token again: skipped
-    assert eng.buy_model_signals() == 2  # one buy per book: same signal, separate ledgers
+    assert eng.buy_model_signals() == 3  # one buy per book: same signal, separate ledgers
+    [climb] = j.open_positions(mb.CLIMB)
+    assert eng.books[mb.CLIMB].exit_cfg.max_hold_hours * 60 == 10 and climb.id in eng._climbs
     [pos] = j.open_positions(mb.NAME)
     [fast] = j.open_positions(mb.FAST)
     assert fast.token_address == pos.token_address and eng.books[mb.FAST].cash < cfg.model_book_cash_usd
@@ -279,12 +281,13 @@ def test_the_report_shows_only_the_model5_book_with_its_rugs(cfg, good_pair):
     eng.extras.liquidity = 1_000.0
     eng.manage_positions()  # a rug: sold through the stop for ~0
     rep = build_model(j, cfg)
-    [m5, fast] = rep["books"]
+    [m5, fast, climb] = rep["books"]
     assert m5["name"] == mb.NAME and m5["rugs"]["rugs"] == 1 and fast["name"] == mb.FAST and fast["buys"] == 0
     assert m5["started"] and fast["started"]  # both books had equity snapshots from the running engine
     text = render_model(rep)
     assert "running since (UTC)" in text and "running for" in text
     assert "MODEL PAPER BOOKS" in text and "model5_10m" in text and "liquidity_pulled" in text and "1 (100%)" in text
+    assert climb["name"] == mb.CLIMB and "model5_climb" in text and "out at 3 min unless +5%" in text
     assert "filters_only" not in text and "Claude API" not in text and "not trained yet" in text
 
 
@@ -359,3 +362,36 @@ def test_the_pool_age_exit_sells_and_survives_a_restart(cfg, good_pair):
     eng.manage_positions()
     assert j.open_positions(mb.FAST) == []
     assert [r for (r,) in j.query("SELECT reason FROM fills WHERE side='sell'")] == ["pool_age_exit"]
+
+
+def test_the_climb_book_sells_positions_that_have_not_climbed(cfg, good_pair):
+    j = Journal(":memory:")
+    make = lambda: Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg),
+                          j, model_executor=PaperExecutor(cfg))
+    eng = make()
+    assert mb.active_books(cfg) == [mb.NAME, mb.FAST, mb.CLIMB] and mb.CLIMB in eng.books
+    assert mb.climb_check(cfg, mb.FAST, 0.0, 1.0) is None
+    sig = lambda mint: {"mint": mint, "dex": "pumpswap", "created_ts": time.time() - 6 * 60, "name": mint,
+                        "price": 1e-5, "liq": 30_000.0, "score": 1.0}
+    book = eng.books[mb.CLIMB]
+    assert eng._buy_model(book, sig("FLAT")) is None and eng._buy_model(book, sig("UP")) is None
+    flat, up = sorted(j.open_positions(mb.CLIMB), key=lambda p: p.token_address)
+    assert eng._climbs[up.id][1] == 1e-5 * 1.05  # +5% over the market price at the buy, not over the fill
+    prices = {"FLAT": 1.02e-5, "UP": 1.06e-5}
+    eng.current_prices = lambda tokens, held=None: {t: prices[t] for t in tokens}
+    eng.manage_positions()  # before the 3-minute check: both held
+    assert {p.token_address for p in j.open_positions(mb.CLIMB)} == {"FLAT", "UP"}
+    eng = make()  # restart: checks come back from the journal
+    assert set(eng._climbs) == {flat.id, up.id}
+    eng.current_prices = lambda tokens, held=None: {t: prices[t] for t in tokens}
+    for c in eng._climbs.values():
+        c[2] = 1.02e-5 if c is eng._climbs[flat.id] else 1.06e-5
+        c[0] = time.time() - 1  # check is due
+    prices["UP"] = 1.01e-5  # it climbed earlier, so a later dip doesn't fail it
+    eng.manage_positions()
+    assert [p.token_address for p in j.open_positions(mb.CLIMB)] == ["UP"]
+    assert [r for (r,) in j.query("SELECT reason FROM fills WHERE side='sell'")] == ["no_climb"]
+    assert up.id not in eng._climbs  # passed: no more checks
+    cfg.model_book_climb = False
+    assert mb.CLIMB not in make().books
+    cfg.model_book_climb = True

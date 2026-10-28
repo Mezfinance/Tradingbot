@@ -448,7 +448,7 @@ def _model_book_report(j: Journal, cfg: Config, name: str) -> dict:
 def build_model(j: Journal, cfg: Config) -> dict:
     """The model paper books (same signals, separate cash and ledgers), and the model they trade with."""
     from tradingbot import model_book as mb
-    names = list(mb.BOOKS) if cfg.model_book_fast else [mb.NAME]
+    names = mb.active_books(cfg)
     path = mb.model_path(cfg)
     model = json.loads(path.read_text()) if path.exists() else None
     return {"books": [_model_book_report(j, cfg, n) for n in names],
@@ -465,7 +465,10 @@ def _running_for(started: float | None) -> str:
 
 EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the live books
     "model5": "24h hold: -26%/trade, 62% rugged (rug-aware labels, 377 picks)",
-    "model5_10m": "10-min hold: +17%/trade, median +16%, 65% wins, 90% range -1%..+35% (74 picks)",
+    "model5_10m": "10-min hold: +17%/trade on 74 picks (10-14..10-24); out of sample (10-21..10-26) +1.7%, "
+                  "90% range -8%..+10%",
+    "model5_climb": "as model5_10m, out at 3 min unless +5%: +2.5%/trade, 7% rugged (vs 20%), 90% range "
+                    "-5%..+10% (95 picks, 10-21..10-26)",
 }
 
 
@@ -474,7 +477,7 @@ def render_model(rep: dict) -> str:
     lines = ["MODEL PAPER BOOKS (5-minute pump model; same signals, separate $ and ledgers; simulated fills on real "
              "Jupiter quotes)", "  exits: +100% take profit, -50% stop, out after the hold time"]
     for b in books:
-        lines.append(f"  {b['name']:<11} backtest: {EXPECTED.get(b['name'], '-')}")
+        lines.append(f"  {b['name']:<12} backtest: {EXPECTED.get(b['name'], '-')}")
     rows = [("hold", lambda b: f"{b['hold_min']:g} min"),
             ("running since (UTC)", lambda b: time.strftime("%m-%d %H:%M", time.gmtime(b["started"])) if b["started"] else "not yet"),
             ("running for", lambda b: _running_for(b["started"])),

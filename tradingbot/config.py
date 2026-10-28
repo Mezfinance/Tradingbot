@@ -104,6 +104,12 @@ class Config:
     # model5_10m sells hand-made pumpswap pools (mint not ending in 'pump': their creator holds the LP and can
     # pull it) by this pool age, whatever the hold says; 0 = off. 15 min was the best cut-off on the 10-26 backup.
     model_book_handmade_exit_age_min: float = 15.0
+    # model5_climb: the 10-minute book's rules, plus an early exit for positions that aren't climbing: sell
+    # `model_book_climb_after_min` after the buy unless the price has been >= `model_book_climb_min_gain_pct` above
+    # the buy's market price. Pulled pools mostly sit flat first (10-28 backtest: rugs 20% -> 7% of picks).
+    model_book_climb: bool = True
+    model_book_climb_after_min: float = 3.0
+    model_book_climb_min_gain_pct: float = 5.0
     model_train_days: float = 4.0
 
     # --- Claude analyst -------------------------------------------------
