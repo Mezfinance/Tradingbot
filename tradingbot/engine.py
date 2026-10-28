@@ -11,6 +11,7 @@ The "claude" book is the real strategy; other books are baselines (see shadows.p
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import queue
@@ -80,11 +81,12 @@ class Engine:
         self.model_book = None
         if model_executor is not None and cfg.model_book:
             from tradingbot import model_book as mb
-            book = self._open_book(mb.NAME, model_executor, cfg.model_book_cash_usd, cfg.model_book_usd)
-            book.exit_cfg = mb.exit_config(cfg)
-            self.books[mb.NAME] = book
+            for name in (mb.BOOKS if cfg.model_book_fast else (mb.NAME,)):  # same signals, separate cash and ledgers
+                ex = model_executor if name == mb.NAME else copy.copy(model_executor)
+                book = self._open_book(name, ex, cfg.model_book_cash_usd, cfg.model_book_usd)
+                book.exit_cfg = mb.exit_config(cfg, name)
+                self.books[name] = book
             self.model_book = mb.ModelBook(cfg)
-            mb.mark_regime(journal, cfg)  # report splits trades by the settings they were made under
         self._rng = random.Random(cfg.shadow_seed)
         self.lock = threading.RLock()  # guards book cash and position state
         self.tracker = Tracker(journal, dex, jupiter)
@@ -537,22 +539,27 @@ class Engine:
                 sig = self.model_book.signals.get_nowait()
             except queue.Empty:
                 break
-            book = self.books[mb.NAME]
-            reason = self._model_skip_reason(book, sig)
-            if reason is None:
-                reason = self._buy_model(book, sig)
-            if reason:
-                self.journal.log_event("entry_skipped", sig["mint"], reason, strategy=book.name)
-                log.info("[%s] skip %s: %s", book.name, sig["name"][:24], reason)
-            else:
-                bought += 1
+            for name in mb.BOOKS:
+                book = self.books.get(name)
+                if book is None:
+                    continue
+                reason = self._model_skip_reason(book, sig)
+                if reason is None:
+                    reason = self._buy_model(book, sig)
+                if reason:
+                    self.journal.log_event("entry_skipped", sig["mint"], reason, strategy=book.name)
+                    log.info("[%s] skip %s: %s", book.name, sig["name"][:24], reason)
+                else:
+                    bought += 1
         return bought
 
     def _model_skip_reason(self, book: Book, sig: dict) -> str | None:
         c = self.cfg
         if time.time() - sig["ts"] > MODEL_SIGNAL_MAX_AGE_S:
             return "signal too old"
-        if sig.get("created_ts") and (time.time() - sig["created_ts"]) / 60 > c.model_book_max_entry_age_min:
+        from tradingbot import model_book as mb
+        if (book.name == mb.FAST and sig.get("created_ts")
+                and (time.time() - sig["created_ts"]) / 60 > c.model_book_max_entry_age_min):
             return "pool too old for the short hold"
         open_ = self.journal.open_positions(book.name)
         if any(p.token_address == sig["mint"] for p in open_):
@@ -610,7 +617,7 @@ class Engine:
     def _log_exit_cause(self, book: Book, pos: Position, blocked: bool) -> None:
         """Why a model5 trade lost (model_exit_cause): no route, liquidity pulled, dumped or an ordinary stop."""
         from tradingbot import model_book as mb
-        if book.name != mb.NAME or not pos.cost_usd:
+        if book.name not in mb.BOOKS or not pos.cost_usd:
             return
         if self.journal.query("SELECT 1 FROM events WHERE strategy=? AND kind='model_exit_cause' AND token=? "
                               "AND ts >= ?", (book.name, pos.token_address, pos.opened_at or 0)):

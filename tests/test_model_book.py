@@ -73,8 +73,11 @@ def test_engine_buys_signals_with_the_books_own_exits(cfg, good_pair, tmp_path):
     eng.model_book.consider(pool, 5, snap(1.0, buyers=300, liq=4_000.0))  # below the liquidity floor
     eng.model_book.consider(pool, 5, snap(1.0, buyers=300, liq=6_000.0))  # 2% of $6k = $120, capped at $100
     eng.model_book.consider(pool, 5, snap(1.0, buyers=300, liq=6_000.0))  # same token again: skipped
-    assert eng.buy_model_signals() == 1
+    assert eng.buy_model_signals() == 2  # one buy per book: same signal, separate ledgers
     [pos] = j.open_positions(mb.NAME)
+    [fast] = j.open_positions(mb.FAST)
+    assert fast.token_address == pos.token_address and eng.books[mb.FAST].cash < cfg.model_book_cash_usd
+    assert eng.books[mb.NAME].exit_cfg.max_hold_hours == 24 and eng.books[mb.FAST].exit_cfg.max_hold_hours * 60 == 10
     assert 95 <= pos.cost_usd <= 101 and pos.stop_price == pos.entry_price * 0.5
     assert j.query("SELECT detail FROM events WHERE kind='entry_skipped' AND strategy=?", (mb.NAME,))[0][0] == "already held"
     # +100% sells everything at once (the Claude book's ladder would sell only part at +50%).
@@ -254,9 +257,10 @@ def test_the_report_shows_only_the_model5_book_with_its_rugs(cfg, good_pair):
     eng.extras.liquidity = 1_000.0
     eng.manage_positions()  # a rug: sold through the stop for ~0
     rep = build_model(j, cfg)
-    assert rep["book"]["strategy"] == mb.NAME and rep["rugs"]["rugs"] == 1
+    [m5, fast] = rep["books"]
+    assert m5["name"] == mb.NAME and m5["rugs"]["rugs"] == 1 and fast["name"] == mb.FAST and fast["buys"] == 0
     text = render_model(rep)
-    assert "MODEL5 PAPER BOOK" in text and "liquidity_pulled" in text and "1 of 1 finished trades" in text
+    assert "MODEL PAPER BOOKS" in text and "model5_10m" in text and "liquidity_pulled" in text and "1 (100%)" in text
     assert "filters_only" not in text and "Claude API" not in text and "not trained yet" in text
 
 
@@ -264,32 +268,15 @@ def test_short_hold_exits_after_ten_minutes_and_old_pools_are_skipped(cfg, good_
     """10-28: model5 holds 10 minutes (most rugs come after the 15-minute mark) and only buys pools young
     enough for the tested window."""
     import time as real_time
-    book_cfg = mb.exit_config(cfg)
-    assert book_cfg.max_hold_hours * 60 == 10
+    book_cfg = mb.exit_config(cfg, mb.FAST)
+    assert book_cfg.max_hold_hours * 60 == 10 and mb.exit_config(cfg).max_hold_hours == 24
     eng, j, pos = _held_position(cfg, good_pair, None)
     eng.current_prices = lambda tokens, held=None: {"RUGMINT": pos.entry_price * 1.2}
     assert risk.plan_exits(pos, pos.entry_price * 1.2, pos.opened_at + 9 * 60, book_cfg) == []
     assert risk.plan_exits(pos, pos.entry_price * 1.2, pos.opened_at + 10 * 60 + 1, book_cfg)[0][1] == "time_stop"
     sig = {"mint": "NEW", "name": "N / SOL", "score": 1.0, "price": 1.0, "liq": 9000.0, "ts": real_time.time()}
-    book = eng.books[mb.NAME]
-    assert eng._model_skip_reason(book, dict(sig, created_ts=real_time.time() - 6 * 60)) is None
-    assert eng._model_skip_reason(book, dict(sig, created_ts=real_time.time() - 11 * 60)) == "pool too old for the short hold"
+    fast = eng.books[mb.FAST]
+    assert eng._model_skip_reason(fast, dict(sig, created_ts=real_time.time() - 6 * 60)) is None
+    assert eng._model_skip_reason(fast, dict(sig, created_ts=real_time.time() - 11 * 60)) == "pool too old for the short hold"
+    assert eng._model_skip_reason(eng.books[mb.NAME], dict(sig, created_ts=real_time.time() - 11 * 60)) is None
 
-
-def test_report_separates_trades_made_under_earlier_settings(cfg, good_pair, monkeypatch):
-    """10-28: the report mixed 24h-hold trades into the 10-minute test."""
-    from dataclasses import replace as dc_replace
-    from tradingbot.report import build_model, render_model
-    eng, j, pos = _held_position(cfg, good_pair, RuggedJupiter())  # opened under the current settings
-    since = mb.regime_since(j)
-    assert since > 0
-    j.execute("UPDATE positions SET opened_at=? WHERE id=?", (since - 3600, pos.id))  # pretend it was earlier
-    pos.opened_at = since - 3600
-    eng.manage_positions()  # sold through the stop for ~0
-    rep = build_model(j, cfg)
-    assert rep["book"]["closed_trades"] == 0 and rep["earlier"]["trades"] == 1 and rep["earlier"]["rugs"] == 1
-    assert rep["rugs"]["finished_trades"] == 0
-    assert "earlier settings: 1 finished trades" in render_model(rep)
-    # A settings change starts a new period; the same settings keep the old start.
-    assert mb.mark_regime(j, cfg, now=since + 10) == since
-    assert mb.mark_regime(j, dc_replace(cfg, model_book_hold_min=8.0), now=since + 20) == since + 20

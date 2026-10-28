@@ -93,10 +93,14 @@ class Config:
     model_book_max_impact_pct: float = 5.0  # its buys are up to 2% of a pool, so 2-4% impact is normal
     model_book_tp_pct: float = 100.0
     model_book_sl_pct: float = 50.0
-    # 10-minute hold (10-28 backtest on 1-min candles: picks held 10 min +17%/trade, held 24h -26%; most rugs
-    # come after the 15-minute mark). Live paper test; not yet proven.
-    model_book_hold_min: float = 10.0
-    model_book_max_entry_age_min: float = 10.0  # skip pools older than this at the buy (the tested window)
+    # Two paper books trade the same signals with separate cash and ledgers (10-28):
+    #   model5     - the original exits: out after `model_book_hold_min` (24h)
+    #   model5_10m - out after `model_book_fast_hold_min` (10 min; 10-28 backtest on 1-min candles: picks held
+    #                10 min +17%/trade, held 24h -26%, as most rugs come after the 15-minute mark). Not yet proven.
+    model_book_hold_min: float = 1440.0
+    model_book_fast: bool = True
+    model_book_fast_hold_min: float = 10.0
+    model_book_max_entry_age_min: float = 10.0  # model5_10m skips pools older than this (the tested window)
     model_train_days: float = 4.0
 
     # --- Claude analyst -------------------------------------------------

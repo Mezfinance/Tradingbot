@@ -37,7 +37,9 @@ from tradingbot.watch_features import load_snaps
 
 log = logging.getLogger(__name__)
 
-NAME = "model5"
+NAME = "model5"  # 24h hold
+FAST = "model5_10m"  # 10-minute hold, same signals, own cash and ledger
+BOOKS = (NAME, FAST)
 AGE_MIN = 5
 FEATURES = sorted(set(wa._static_features({"name": "x", "dex": "x", "created_ts": 0}))
                   | set(wa._snap_features({})) | {"log_price_vs_first"})
@@ -58,10 +60,14 @@ def features(pool: dict, snap: dict) -> dict:
     return out
 
 
-def exit_config(cfg: Config) -> Config:
-    """This book's exits: one take-profit at +100%, a -50% stop, out after `model_book_hold_min` minutes."""
+def hold_min(cfg: Config, name: str = NAME) -> float:
+    return cfg.model_book_fast_hold_min if name == FAST else cfg.model_book_hold_min
+
+
+def exit_config(cfg: Config, name: str = NAME) -> Config:
+    """A model book's exits: one take-profit at +100%, a -50% stop, out after its hold time."""
     return replace(cfg, stop_loss_pct=cfg.model_book_sl_pct, take_profit_pcts=(cfg.model_book_tp_pct,),
-                   take_profit_fractions=(1.0,), max_hold_hours=cfg.model_book_hold_min / 60)
+                   take_profit_fractions=(1.0,), max_hold_hours=hold_min(cfg, name) / 60)
 
 
 class Model:
@@ -148,37 +154,6 @@ def train_and_save(store, cfg: Config) -> Path | None:
     return path
 
 
-# --- settings history -----------------------------------------------------------------------
-def regime(cfg: Config) -> dict:
-    """The settings that define how this book trades; a change starts a new period in the report."""
-    return {"hold_min": cfg.model_book_hold_min, "tp_pct": cfg.model_book_tp_pct, "sl_pct": cfg.model_book_sl_pct,
-            "top_pct": cfg.model_book_top_pct, "min_liq_usd": cfg.model_book_min_liq_usd}
-
-
-def mark_regime(journal, cfg: Config, now: float | None = None) -> float:
-    """Store the current settings; if they differ from the stored ones, the current period starts now.
-    Returns when the current settings took effect."""
-    cur = json.dumps(regime(cfg), sort_keys=True)
-    stored = journal.get_state(f"regime:{NAME}")
-    if stored != cur:
-        start = now if now is not None else time.time()
-        if stored is None:
-            # First run of this bookkeeping (10-28): the short hold began before it. Its first time-stop exit
-            # marks it; positions opened up to one hold earlier were already sold under the short hold.
-            first = journal.query("SELECT MIN(f.ts) AS t FROM fills f JOIN positions p ON p.id = f.position_id "
-                                  "WHERE p.strategy=? AND f.side='sell' AND f.reason='time_stop'", (NAME,))[0]["t"]
-            if first:
-                start = min(start, first - cfg.model_book_hold_min * 60)
-        journal.set_state(f"regime:{NAME}", cur)
-        journal.set_state(f"regime_since:{NAME}", repr(start))
-    return float(journal.get_state(f"regime_since:{NAME}"))
-
-
-def regime_since(journal) -> float:
-    v = journal.get_state(f"regime_since:{NAME}")
-    return float(v) if v else 0.0
-
-
 # --- rug logging -------------------------------------------------------------------------------
 # The research found ~11.5% of top-2% picks rug (the -50% stop gaps to <=0.26x) and that holder data
 # fetched at 15 minutes added nothing. These record, for the book's own trades, the holder audit at the
@@ -218,20 +193,18 @@ def exit_cause(extras, mint: str, entry_liq: float | None, ret: float, blocked: 
             "holders_now": now.get("holders"), "top_holders_pct_now": now.get("top_holders_pct")}
 
 
-def rug_summary(journal, stuck: set[int] | None = None, since: float = 0.0) -> dict:
-    """Live rug rate and causes for the book's finished trades (opened from `since`), and entry audits of
-    rugs vs the rest."""
+def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dict:
+    """Live rug rate and causes for a model book's finished trades, and entry audits of rugs vs the rest."""
     stuck = stuck or set()
     audits = {r["token"]: json.loads(r["detail"]) for r in journal.query(
-        "SELECT token, detail FROM events WHERE strategy=? AND kind='model_entry_audit' ORDER BY ts", (NAME,))}
+        "SELECT token, detail FROM events WHERE strategy=? AND kind='model_entry_audit' ORDER BY ts", (name,))}
     causes: dict[str, int] = {}
-    for r in journal.query("SELECT detail FROM events WHERE strategy=? AND kind='model_exit_cause' AND ts >= ?",
-                           (NAME, since)):
+    for r in journal.query("SELECT detail FROM events WHERE strategy=? AND kind='model_exit_cause'", (name,)):
         c = json.loads(r["detail"]).get("cause", "?")
         causes[c] = causes.get(c, 0) + 1
     trades = []
-    for p in journal.query("SELECT id, token, cost_usd, realized_usd, closed_at FROM positions "
-                           "WHERE strategy=? AND opened_at >= ?", (NAME, since)):
+    for p in journal.query("SELECT id, token, cost_usd, realized_usd, closed_at FROM positions WHERE strategy=?",
+                           (name,)):
         if p["closed_at"] is None and p["id"] not in stuck:
             continue
         ret = (p["realized_usd"] or 0) / p["cost_usd"] - 1 if p["cost_usd"] else 0.0
@@ -251,7 +224,7 @@ def rug_summary(journal, stuck: set[int] | None = None, since: float = 0.0) -> d
 
     return {"finished_trades": len(trades), "rugs": len(rugs),
             "rug_rate_pct": round(100 * len(rugs) / len(trades), 1) if trades else None,
-            "research_rug_rate_pct": 16.0,  # 10-min hold backtest (10-28): 16-18% of picks
+            "research_rug_rate_pct": 16.0 if name == FAST else 76.0,  # 10-28 backtests: 10-min hold vs 24h
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 

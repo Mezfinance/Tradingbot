@@ -225,24 +225,26 @@ def main(argv: list[str] | None = None) -> None:
         meta = json.loads(path.read_text()) if path.exists() else None
         j = Journal(cfg.db_path)
         from tradingbot.engine import STUCK_AFTER_S
-        stuck = {p.id for p in j.open_positions(model_book.NAME)
-                 if (b := report._blocked(j, model_book.NAME, p)) and time.time() - b[0] >= STUCK_AFTER_S}
-        skips: dict[str, int] = {}
-        for r in j.query("SELECT detail FROM events WHERE strategy=? AND kind='entry_skipped'", (model_book.NAME,)):
-            key = r["detail"].split(" (")[0].split(" since")[0]
-            key = "price ran since the snapshot" if key.startswith("price ran") else key
-            key = "round-trip loss too high" if key.startswith("round-trip loss") else key
-            key = "executor declined: price impact too high" if "price impact" in key else key
-            skips[key] = skips.get(key, 0) + 1
+
+        def book_status(name: str) -> dict:
+            stuck = {p.id for p in j.open_positions(name)
+                     if (b := report._blocked(j, name, p)) and time.time() - b[0] >= STUCK_AFTER_S}
+            skips: dict[str, int] = {}
+            for r in j.query("SELECT detail FROM events WHERE strategy=? AND kind='entry_skipped'", (name,)):
+                key = r["detail"].split(" (")[0].split(" since")[0]
+                key = "price ran since the snapshot" if key.startswith("price ran") else key
+                key = "round-trip loss too high" if key.startswith("round-trip loss") else key
+                key = "executor declined: price impact too high" if "price impact" in key else key
+                skips[key] = skips.get(key, 0) + 1
+            return {"hold_min": model_book.hold_min(cfg, name),
+                    "buys": j.query("SELECT COUNT(*) AS n FROM events WHERE strategy=? AND kind='model_buy'",
+                                    (name,))[0]["n"],
+                    "open": [{"symbol": p.symbol, "cost_usd": round(p.cost_usd, 2),
+                              "hours": round((time.time() - (p.opened_at or time.time())) / 3600, 1),
+                              "exit_blocked": report._exit_blocked(j, name, p)} for p in j.open_positions(name)],
+                    "skip_reasons": skips, "rugs": model_book.rug_summary(j, stuck, name)}
         print(json.dumps({"model": {k: meta[k] for k in ("threshold", "meta")} if meta else "not trained yet",
-                          "buys": j.query("SELECT COUNT(*) AS n FROM events WHERE strategy=? AND kind='model_buy'",
-                                          (model_book.NAME,))[0]["n"],
-                          "open": [{"symbol": p.symbol, "cost_usd": round(p.cost_usd, 2),
-                                    "hours": round((time.time() - (p.opened_at or time.time())) / 3600, 1),
-                                    "exit_blocked": report._exit_blocked(j, model_book.NAME, p)}
-                                   for p in j.open_positions(model_book.NAME)],
-                          "skip_reasons": skips,
-                          "rugs": model_book.rug_summary(j, stuck)}, indent=2, default=str))
+                          **{name: book_status(name) for name in model_book.BOOKS}}, indent=2, default=str))
         return
 
     if args.command == "watch-report-now":
