@@ -395,3 +395,19 @@ def test_the_climb_book_sells_positions_that_have_not_climbed(cfg, good_pair):
     cfg.model_book_climb = False
     assert mb.CLIMB not in make().books
     cfg.model_book_climb = True
+
+
+def test_a_switched_off_book_is_left_alone(cfg, good_pair):
+    eng, j, pos = _held_position(cfg, good_pair, RuggedJupiter())  # an open model5 position
+    cfg.model_book_slow = False
+    try:
+        eng2 = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                      jupiter=RuggedJupiter(), model_executor=PaperExecutor(cfg))
+        assert mb.NAME not in eng2.books and mb.active_books(cfg) == [mb.FAST, mb.CLIMB]
+        seen = []
+        eng2.current_prices = lambda tokens, held=None: seen.append(set(tokens)) or {}
+        eng2.manage_positions()
+        assert seen == [set()]  # no price lookups (or sell quotes) for the switched-off book
+        assert [p.id for p in j.open_positions(mb.NAME)] == [pos.id]  # left in the journal as it was
+    finally:
+        cfg.model_book_slow = True

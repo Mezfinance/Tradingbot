@@ -98,6 +98,7 @@ class Config:
     #   model5_10m - out after `model_book_fast_hold_min` (10 min; 10-28 backtest on 1-min candles: picks held
     #                10 min +17%/trade, held 24h -26%, as most rugs come after the 15-minute mark). Not yet proven.
     model_book_hold_min: float = 1440.0
+    model_book_slow: bool = True  # the 24h `model5` book (off on Fly since 10-28: 61% rugged, no use to the test)
     model_book_fast: bool = True
     model_book_fast_hold_min: float = 10.0
     model_book_max_entry_age_min: float = 10.0  # model5_10m skips pools older than this (the tested window)

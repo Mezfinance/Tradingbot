@@ -77,7 +77,8 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
 
 
 def active_books(cfg: Config) -> list[str]:
-    return [NAME] + ([FAST] if cfg.model_book_fast else []) + ([CLIMB] if cfg.model_book_climb else [])
+    return ([NAME] if cfg.model_book_slow else []) + ([FAST] if cfg.model_book_fast else []) \
+        + ([CLIMB] if cfg.model_book_climb else [])
 
 
 def climb_check(cfg: Config, name: str, bought_ts: float, market_price: float) -> tuple[float, float] | None:

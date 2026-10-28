@@ -248,7 +248,8 @@ class Engine:
     # --- positions ----------------------------------------------------------
     def manage_positions(self) -> dict[str, float]:
         # The real book is handled first so simulated latency on baselines never delays it.
-        positions = sorted(self.journal.open_positions(strategy=None),
+        # Only books that are running: a switched-off book's positions stay in the journal as they are.
+        positions = sorted((p for p in self.journal.open_positions(strategy=None) if p.strategy in self.books),
                            key=lambda p: BOOK_PRIORITY.get(p.strategy, 2))
         held: dict[str, float] = {}
         for p in positions:
