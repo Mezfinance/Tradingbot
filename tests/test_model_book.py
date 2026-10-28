@@ -1,5 +1,6 @@
 import json
 import random
+import time
 from types import SimpleNamespace
 
 from tradingbot import model_book as mb
@@ -323,3 +324,38 @@ def test_an_absurd_live_price_is_reported_as_no_liquidity_not_a_price_run(cfg, g
     assert eng._buy_model(eng.books[mb.FAST], sig).startswith("no real liquidity (live price 270,000x")
     eng.jupiter = EmptyPoolJupiter(1.3e-5)  # +30%: a genuine run-up
     assert eng._buy_model(eng.books[mb.FAST], sig) == "price ran +30% since the snapshot"
+
+
+def test_hand_made_pumpswap_pools_get_a_pool_age_exit_in_the_10_minute_book(cfg, good_pair):
+    sig = {"mint": "Scam111", "dex": "pumpswap", "created_ts": 1000.0, "name": "SCAM / SOL",
+           "price": 2.5e-5, "liq": 30_000.0, "score": 1.0}
+    assert mb.is_handmade("pumpswap", "Scam111") and not mb.is_handmade("pumpswap", "Abcpump")
+    assert not mb.is_handmade("meteora-damm-v2", "Scam111")
+    assert mb.exit_deadline(cfg, mb.FAST, sig) == 1000.0 + 15 * 60
+    assert mb.exit_deadline(cfg, mb.NAME, sig) is None  # the 24h book keeps its own rules
+    assert mb.exit_deadline(cfg, mb.FAST, {**sig, "mint": "Abcpump"}) is None  # pump.fun graduation
+    cfg.model_book_handmade_exit_age_min = 0
+    assert mb.exit_deadline(cfg, mb.FAST, sig) is None
+    cfg.model_book_handmade_exit_age_min = 15
+
+
+def test_the_pool_age_exit_sells_and_survives_a_restart(cfg, good_pair):
+    j = Journal(":memory:")
+    paper = PaperExecutor(cfg)
+    make = lambda: Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg),
+                          j, model_executor=paper)
+    eng = make()
+    created = time.time() - 14 * 60  # pool is 14 min old: deadline in 1 min
+    sig = {"mint": "Scam111", "dex": "pumpswap", "created_ts": created, "name": "SCAM / SOL",
+           "price": 2.5e-5, "liq": 30_000.0, "score": 1.0}
+    assert eng._buy_model(eng.books[mb.FAST], sig) is None
+    [pos] = j.open_positions(mb.FAST)
+    eng = make()  # restart: the deadline comes back from the journal
+    assert eng._deadlines == {pos.id: created + 15 * 60}
+    eng.current_prices = lambda tokens, held=None: {"Scam111": 2.6e-5}
+    eng.manage_positions()
+    assert [p.id for p in j.open_positions(mb.FAST)] == [pos.id]  # 14 min old, inside the 10-min hold: still held
+    eng._deadlines[pos.id] = time.time() - 1
+    eng.manage_positions()
+    assert j.open_positions(mb.FAST) == []
+    assert [r for (r,) in j.query("SELECT reason FROM fills WHERE side='sell'")] == ["pool_age_exit"]

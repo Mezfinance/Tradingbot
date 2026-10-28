@@ -101,6 +101,9 @@ class Config:
     model_book_fast: bool = True
     model_book_fast_hold_min: float = 10.0
     model_book_max_entry_age_min: float = 10.0  # model5_10m skips pools older than this (the tested window)
+    # model5_10m sells hand-made pumpswap pools (mint not ending in 'pump': their creator holds the LP and can
+    # pull it) by this pool age, whatever the hold says; 0 = off. 15 min was the best cut-off on the 10-26 backup.
+    model_book_handmade_exit_age_min: float = 15.0
     model_train_days: float = 4.0
 
     # --- Claude analyst -------------------------------------------------

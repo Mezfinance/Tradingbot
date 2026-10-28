@@ -95,6 +95,7 @@ class Engine:
         self._cooldown: dict[str, float] = journal.load_cooldowns()  # token -> time it may be re-screened
         self._last_prices: dict[str, float] = {}
         self._blocked: dict[int, dict] = {}  # position id -> exit blocked (no route): since, next try, note
+        self._deadlines = self._load_deadlines()  # position id -> sell by this time (pool-age exit)
         self._last_snapshot = 0.0
         self._stop = threading.Event()
         self.restart_reason: str | None = None
@@ -267,6 +268,8 @@ class Engine:
             before = (pos.tp_hits, pos.stop_price)
             exit_cfg = book.exit_cfg or self.cfg
             exits = risk.plan_exits(pos, price, now, exit_cfg)
+            if not exits and now >= self._deadlines.get(pos.id, float("inf")):
+                exits = [(pos.qty, "pool_age_exit")]  # hand-made pool: out before its creator usually pulls it
             if any(r.startswith("take_profit") for _, r in exits):
                 # A feed price can be stale or bogus (a rugged pool once showed 21,000x entry); take profit
                 # only if a quote to sell the position clears the target too.
@@ -603,11 +606,27 @@ class Engine:
             self._charge_failed(book, sig["mint"], fill)
             return "transaction failed"
         symbol = (sig["name"].split(" / ")[0] or sig["mint"][:6])[:16]
-        self._open_position(book, sig["mint"], symbol, fill, trigger, None)
+        pos = self._open_position(book, sig["mint"], symbol, fill, trigger, None)
+        from tradingbot import model_book as mb
+        deadline = mb.exit_deadline(self.cfg, book.name, sig)
+        if deadline is not None:
+            self._deadlines[pos.id] = deadline
+            self.journal.log_event("model_exit_deadline", sig["mint"],
+                                   json.dumps({"position_id": pos.id, "deadline": deadline}), strategy=book.name)
         self.journal.log_event("model_buy", sig["mint"], f"score {sig['score']:.3f} liq ${sig['liq']:,.0f}",
                                strategy=book.name)
         self._log_model_audit(book, sig)
         return None
+
+    def _load_deadlines(self) -> dict[int, float]:
+        """Pool-age exits of open positions, so they survive a restart."""
+        open_ids = {p.id for p in self.journal.open_positions(strategy=None)}
+        out = {}
+        for r in self.journal.query("SELECT detail FROM events WHERE kind='model_exit_deadline'"):
+            d = json.loads(r["detail"])
+            if d["position_id"] in open_ids:
+                out[d["position_id"]] = d["deadline"]
+        return out
 
     def _jup_failure(self, default: str) -> str:
         """Skip reason for a failed Jupiter lookup: a refused request is not a missing route."""

@@ -60,6 +60,20 @@ def features(pool: dict, snap: dict) -> dict:
     return out
 
 
+def is_handmade(dex: str, mint: str) -> bool:
+    """A pumpswap pool of a mint pump.fun didn't create: made by hand, its creator holds the LP and can pull it.
+    On the 10-26 backup 87% of these were pulled within 24h (27% by a pool age of 17 min)."""
+    return dex == "pumpswap" and not mint.endswith("pump")
+
+
+def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
+    """Pool-age exit for model5_10m's hand-made pools: sell by created + `model_book_handmade_exit_age_min`."""
+    age = cfg.model_book_handmade_exit_age_min
+    if name != FAST or age <= 0 or not sig.get("created_ts") or not is_handmade(sig.get("dex") or "", sig["mint"]):
+        return None
+    return sig["created_ts"] + age * 60
+
+
 def hold_min(cfg: Config, name: str = NAME) -> float:
     return cfg.model_book_fast_hold_min if name == FAST else cfg.model_book_hold_min
 
@@ -270,7 +284,7 @@ class ModelBook:
         try:
             self.signals.put_nowait({"pool": pool["pool"], "mint": pool["mint"], "name": pool.get("name") or "",
                                      "score": score, "price": wa._f(snap["price"]), "liq": liq, "ts": time.time(),
-                                     "created_ts": pool.get("created_ts")})
+                                     "created_ts": pool.get("created_ts"), "dex": pool.get("dex") or ""})
         except queue.Full:
             return None
         return score
