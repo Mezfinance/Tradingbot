@@ -282,3 +282,23 @@ def test_short_hold_exits_after_ten_minutes_and_old_pools_are_skipped(cfg, good_
     assert eng._model_skip_reason(fast, dict(sig, created_ts=real_time.time() - 11 * 60)) == "pool too old for the short hold"
     assert eng._model_skip_reason(eng.books[mb.NAME], dict(sig, created_ts=real_time.time() - 11 * 60)) is None
 
+
+
+def test_an_absurd_live_price_is_reported_as_no_liquidity_not_a_price_run(cfg, good_pair):
+    """10-28: buy quotes on empty pools implied 268,000x and 122,000,000x the snapshot and were logged as
+    'price ran +26860426%'."""
+    import time as real_time
+
+    class EmptyPoolJupiter(RuggedJupiter):
+        def __init__(self, implied):
+            super().__init__()
+            self.implied = implied
+
+        def quote_price(self, mint, usd=20.0):
+            return self.implied
+
+    sig = {"mint": "NEW", "name": "N / SOL", "score": 1.0, "price": 1e-5, "liq": 9000.0, "ts": real_time.time()}
+    eng, j, _ = _held_position(cfg, good_pair, EmptyPoolJupiter(2.7))  # 270,000x the snapshot
+    assert eng._buy_model(eng.books[mb.FAST], sig).startswith("no real liquidity (live price 270,000x")
+    eng.jupiter = EmptyPoolJupiter(1.3e-5)  # +30%: a genuine run-up
+    assert eng._buy_model(eng.books[mb.FAST], sig) == "price ran +30% since the snapshot"

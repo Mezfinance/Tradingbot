@@ -44,6 +44,7 @@ DUST_QTY = 1e-12
 EQUITY_SNAPSHOT_S = 60
 EXIT_RETRY_S = 120  # a sell with no route is retried this often
 STUCK_AFTER_S = 1800  # ...and after this long the position is valued at zero (it cannot be sold)
+NO_LIQUIDITY_MULT = 10.0  # model entry: a live price this many times the snapshot means an empty pool
 DEAD_LIQ_USD = 100.0  # a DexScreener pool with less liquidity than this is treated as emptied (rugged)
 QUOTE_PRICE_MAX = 10  # positions per monitor pass priced from a swap quote when no feed lists the token
 MODEL_POLL_S = 5  # how often queued model5 signals are bought
@@ -582,6 +583,10 @@ class Engine:
             live_usd = live.usd if live is not None else self.jupiter.quote_price(sig["mint"])  # too new to list
             if live_usd is None:
                 return "no live price"
+            if live_usd > NO_LIQUIDITY_MULT * sig["price"]:
+                # A buy quote on an empty or drained pool implies an absurd price (10-28: 268,000x and 122,000,000x
+                # the snapshot): there is nothing real to buy, which is not the price running up.
+                return f"no real liquidity (live price {live_usd / sig['price']:,.0f}x the snapshot)"
             if (live_usd / sig["price"] - 1) * 100 > c.model_book_max_drift_pct:
                 return f"price ran {(live_usd / sig['price'] - 1) * 100:+.0f}% since the snapshot"
             trigger = live_usd
