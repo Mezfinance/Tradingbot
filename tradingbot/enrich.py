@@ -58,6 +58,7 @@ MINT_KINDS = ("helius", "x", "dev", "narrative", "sentiment")
 # Lookups rationed by a free-data score, with a random control slice (see `select`).
 RANKED = {"helius": ("helius_budget", "helius_daily_credits", 30.0), "x": ("x_budget", "x_daily_budget_usd", 0.015)}
 NEEDS_SNAP5 = PAID_OR_HEAVY + ("operator",)
+CREATORS_PER_STEP = 500  # pumpswap pools whose creator is read per pass (100 per call), newest first
 OPERATOR_PULL_CHECKS = 5  # earlier pools of the same creator whose withdrawal time is looked up per lookup
 OPERATOR_RECHECK_S = 1800  # an earlier pool found un-pulled is checked again after this long
 OPERATOR_WORST_CREDITS = 10 + 10 + 10 * OPERATOR_PULL_CHECKS
@@ -215,6 +216,10 @@ class Enricher:
                     done[key] = fn(now)
                 except Exception as exc:  # noqa: BLE001 (a market-wide source must never stop the rest)
                     log.warning("enrich %s failed: %s: %s", key, type(exc).__name__, exc)
+        try:
+            done["creators"] = self.poll_creators(now)
+        except Exception as exc:  # noqa: BLE001 (the rug catcher's creators must never stop the rest)
+            log.warning("enrich creators failed: %s: %s", type(exc).__name__, exc)
         done["tasks"] = self.run_tasks(now)
         return done
 
@@ -230,6 +235,22 @@ class Enricher:
                          for rank, mint in enumerate(self.gecko.trending_ranked(duration), 1)]
         self.store.executemany("INSERT INTO watch_lists(ts, list, rank, mint, amount) VALUES(?,?,?,?,?)", rows)
         return len(rows)
+
+    def poll_creators(self, now: float) -> int:
+        """Creator of every pumpswap pool not yet recorded (new pools within a pass of discovery, then the
+        backlog). One batched account read per 100 pools; counted against the operator budget on Helius."""
+        rows = self.store.query(
+            "SELECT pool FROM watch_pools p WHERE dex='pumpswap' "
+            "AND NOT EXISTS (SELECT 1 FROM watch_creators c WHERE c.pool=p.pool) ORDER BY created_ts DESC LIMIT ?",
+            (CREATORS_PER_STEP,))
+        if not rows:
+            return 0
+        before = self.helius.credits_used
+        found = self.helius.pool_creators([r["pool"] for r in rows])
+        self.operator_budget.add(self.helius.credits_used - before)
+        self.store.executemany("INSERT OR REPLACE INTO watch_creators(pool, creator, ts) VALUES(?,?,?)",
+                               [(p, c, now) for p, c in found.items()])
+        return len(found)
 
     def poll_market(self, now: float) -> int:
         counts = [0, 0]
@@ -795,6 +816,7 @@ class Enricher:
                 "COUNT(*) AS n FROM watch_enrich WHERE ts > ? AND kind='operator' AND data != '{}' GROUP BY what",
                 (day_ago,))},
             "pulls_found": q("SELECT COUNT(*) AS n FROM watch_pulls WHERE pull_ts IS NOT NULL")[0]["n"],
+            "creators_known": q("SELECT COUNT(*) AS n FROM watch_creators WHERE creator IS NOT NULL")[0]["n"],
             "pumpfun_blocked": time.monotonic() < getattr(self.pump, "blocked_until", 0.0),
             "keys": {"helius": self.helius.enabled, "x": self.x.enabled, "anthropic": self.llm_client is not None},
         }

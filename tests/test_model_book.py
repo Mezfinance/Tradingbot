@@ -411,3 +411,27 @@ def test_a_switched_off_book_is_left_alone(cfg, good_pair):
         assert [p.id for p in j.open_positions(mb.NAME)] == [pos.id]  # left in the journal as it was
     finally:
         cfg.model_book_slow = True
+
+
+def test_rug_predictions_are_logged_before_trading_and_reported_by_verdict(cfg, good_pair):
+    from tradingbot.report import build_model, render_model
+    j = Journal(":memory:")
+    eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                 model_executor=PaperExecutor(cfg))
+    sig = lambda mint, verdict: {"pool": "P" + mint, "mint": mint, "dex": "pumpswap", "created_ts": time.time() - 360,
+                                 "name": mint, "price": 2.5e-5, "liq": 30_000.0, "score": 1.0, "ts": time.time(),
+                                 "rug_check": {"verdict": verdict}}
+    eng.model_book.signals.put(sig("NEWW", "new wallet"))
+    eng.model_book.signals.put(sig("REPT", "repeat operator"))
+    assert eng.buy_model_signals() == 6  # two signals x three books (24h, 10-min, climb)
+    preds = j.query("SELECT token, detail FROM events WHERE kind='rug_prediction' ORDER BY id")
+    assert [p["token"] for p in preds] == ["NEWW", "REPT"]  # once per signal, not once per book
+    eng.current_prices = lambda tokens, held=None: {t: (1e-9 if t == "NEWW" else 3.0e-5) for t in tokens}
+    j.execute("UPDATE positions SET opened_at = opened_at - 660")  # bought 11 min ago: past the 10-min hold
+    j.execute("UPDATE events SET ts = ts - 660 WHERE kind='rug_prediction'")  # and so were the signals
+    eng.manage_positions()
+    summary = mb.rug_catcher_summary(j, [mb.FAST])[mb.FAST]
+    assert summary["new wallet"]["trades"] == 1 and summary["new wallet"]["rugged"] == 1
+    assert summary["repeat operator"]["rugged"] == 0 and summary["repeat operator"]["pnl_usd"] > 0
+    text = render_model(build_model(j, cfg))
+    assert "RUG CATCHER" in text and "new wallet" in text and "repeat operator" in text

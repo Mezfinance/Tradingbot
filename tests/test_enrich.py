@@ -409,3 +409,24 @@ def test_operator_lookup_records_the_creator_and_how_fast_it_pulled_before():
     assert e.status()["pulls_found"] == 1
     # a fee withdrawal is not a liquidity pull
     assert find_withdraw([_optx(1, "Y", ["Program log: Instruction: WithdrawFees"], "P", (5.0, 4.9))], "P") is None
+
+
+def test_creators_of_pumpswap_pools_are_recorded_and_judge_new_wallets():
+    from tradingbot.model_book import operator_verdict
+    st = WatchStore(":memory:")
+    for p, created in (("OLD", T0 - 3600), ("NEW", T0), ("SOLO", T0), ("CURVE", T0)):
+        st.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts) VALUES(?,?,?,?,?,?)",
+                   (p, p + "Mint", "pump-fun" if p == "CURVE" else "pumpswap", p, created, created))
+    e = make_enricher(st)
+    asked = []
+    e.helius.pool_creators = lambda pools: asked.extend(pools) or {"OLD": "OP", "NEW": "OP", "SOLO": "FRESH"}
+    assert e.poll_creators(T0 + 60) == 3
+    assert sorted(asked) == ["NEW", "OLD", "SOLO"]  # only pumpswap pools
+    assert e.poll_creators(T0 + 80) == 0  # nothing left to read
+    pool = lambda p: dict(st.query("SELECT * FROM watch_pools WHERE pool=?", (p,))[0])
+    assert operator_verdict(st, pool("NEW")) == {"verdict": "repeat operator", "creator": "OP", "prior_pools": 1}
+    assert operator_verdict(st, pool("OLD"))["verdict"] == "new wallet"  # its later pool doesn't count
+    assert operator_verdict(st, pool("SOLO"))["verdict"] == "new wallet"
+    assert operator_verdict(st, pool("CURVE")) == {"verdict": "unknown", "reason": "creator not read yet"}
+    assert operator_verdict(None, pool("NEW")) == {"verdict": "unknown"}
+    assert e.status()["creators_known"] == 3

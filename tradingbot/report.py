@@ -452,6 +452,7 @@ def build_model(j: Journal, cfg: Config) -> dict:
     path = mb.model_path(cfg)
     model = json.loads(path.read_text()) if path.exists() else None
     return {"books": [_model_book_report(j, cfg, n) for n in names],
+            "rug_catcher": mb.rug_catcher_summary(j, [n for n in names if n in mb.SHORT]),
             "model": {"threshold": model["threshold"], **model.get("meta", {})} if model else None,
             "downtime": downtime(j), "last_backup": json.loads(j.get_state("last_backup") or "null")}
 
@@ -513,6 +514,16 @@ def render_model(rep: dict) -> str:
             if a["n_with_audit"]:
                 lines.append(f"  entry audit, {label:<6} (n={a['n_with_audit']}): {a['median']}  "
                              f"Jupiter 'suspicious': {_fmt(a['flagged_suspicious_pct'], '%', 1)}")
+    rc = rep.get("rug_catcher") or {}
+    if any(rc.values()):
+        lines += ["", "RUG CATCHER (blind test: verdict logged before each signal was traded; trading unchanged)",
+                  "  backtest 10-16..10-26: new-wallet pools 32% pulled during the hold (-26%/trade), "
+                  "repeat operators 17% (-2.5%)"]
+        for book, groups in rc.items():
+            for verdict, g in sorted(groups.items()):
+                lines.append(f"  {book:<13} {verdict:<16} signals {g['signals']:>4}  trades {g['trades']:>4}  "
+                             f"P&L ${g['pnl_usd']:>9,.2f}  per trade {_fmt(g['per_trade_usd'], '', 2):>7}  "
+                             f"rugged {_fmt(g['rug_rate_pct'], '%', 0)}")
     lines += ["", "MODEL"]
     if m:
         trained = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(m["trained_ts"])) if m.get("trained_ts") else "?"

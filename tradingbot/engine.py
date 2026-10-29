@@ -170,6 +170,7 @@ class Engine:
             watcher = Watcher.from_config(self.cfg)
             if self.model_book is not None:
                 watcher.on_snapshot = self.model_book.consider
+                self.model_book.store = watcher.store
                 threading.Thread(target=self._loop, name="model", daemon=True,
                                  args=(MODEL_POLL_S, self.buy_model_signals)).start()
             threading.Thread(target=self._loop, name="watcher", daemon=True,
@@ -548,6 +549,9 @@ class Engine:
                 sig = self.model_book.signals.get_nowait()
             except queue.Empty:
                 break
+            if sig.get("rug_check"):  # blind test: the prediction is recorded before any trade or outcome
+                self.journal.log_event("rug_prediction", sig["mint"],
+                                       json.dumps({"pool": sig.get("pool"), **sig["rug_check"]}), strategy="model")
             for name in mb.BOOKS:
                 book = self.books.get(name)
                 if book is None:

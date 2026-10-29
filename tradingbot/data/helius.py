@@ -14,6 +14,7 @@ Credits are counted with Helius's published prices (full history: 10 per 100 tra
 
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
@@ -23,6 +24,10 @@ import httpx
 log = logging.getLogger(__name__)
 
 RPC_URL = "https://mainnet.helius-rpc.com/"
+PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
+PUMPSWAP_PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+POOL_CREATOR_OFFSET = 11  # pumpswap Pool account: 8-byte discriminator, bump (1), index (2), then creator (32)
+B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 # Jito's public tip accounts: SOL sent here buys a place at the front of the block.
 JITO_TIP_ACCOUNTS = {
     "96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5", "HFqU5x63VTqvQss8hp11i4wVV8bD44PvwucfZ2bU7gRe",
@@ -74,6 +79,31 @@ class Helius:
                                    "maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}],
                         max(HISTORY_CREDITS_PER_100, HISTORY_CREDITS_PER_100 * limit // 100))
         return (res or {}).get("data") or []
+
+    def pool_creators(self, pools: list[str]) -> dict[str, str | None]:
+        """Creator wallet of each pumpswap pool, read from the pool account (100 per call; 1 credit each on
+        Helius, the public RPC without a key). None = not a pumpswap pool; pools whose read failed are left out."""
+        out: dict[str, str | None] = {}
+        for i in range(0, len(pools), 100):
+            chunk = pools[i:i + 100]
+            params = [chunk, {"encoding": "base64", "dataSlice": {"offset": POOL_CREATOR_OFFSET, "length": 32}}]
+            res = self._rpc("getMultipleAccounts", params, RPC_CREDITS) if self.enabled else self._public(
+                "getMultipleAccounts", params)
+            values = (res or {}).get("value")
+            if values is None:
+                continue
+            for pool, acct in zip(chunk, values):
+                ok = acct and acct.get("owner") == PUMPSWAP_PROGRAM
+                out[pool] = b58encode(base64.b64decode(acct["data"][0])) if ok else None
+        return out
+
+    def _public(self, method: str, params: list):
+        try:
+            body = self.http.post(PUBLIC_RPC, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).json()
+        except (httpx.HTTPError, ValueError) as exc:
+            log.warning("public rpc %s failed: %s", method, exc)
+            return None
+        return body.get("result")
 
     def recent(self, address: str, limit: int = 50) -> list[dict]:
         """Newest-first full transactions touching `address`."""
@@ -203,3 +233,12 @@ def find_withdraw(txs: list[dict], pool: str) -> dict | None:
         hits.append({"ts": tx.get("blockTime"), "by": keys[0] if keys else None,
                      "sol_out": round(pre - post, 4) if pre is not None and post is not None else None})
     return min(hits, key=lambda h: h["ts"] or 0) if hits else None
+
+
+def b58encode(raw: bytes) -> str:
+    n = int.from_bytes(raw, "big")
+    out = ""
+    while n:
+        n, r = divmod(n, 58)
+        out = B58[r] + out
+    return "1" * (len(raw) - len(raw.lstrip(b"\0"))) + out

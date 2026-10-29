@@ -257,6 +257,52 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 
 
+def operator_verdict(store, pool: dict) -> dict:
+    """Rug catcher (blind test): who created this pumpswap pool and whether that wallet launched a pool before
+    (10-28 backtest: pools of brand-new wallets were pulled during the hold 32% of the time, -26%/trade; repeat
+    operators 17%, -2.5%). Only pools recorded before this one count."""
+    if store is None:
+        return {"verdict": "unknown"}
+    row = store.query("SELECT creator FROM watch_creators WHERE pool=?", (pool["pool"],))
+    if not row or not row[0]["creator"]:
+        return {"verdict": "unknown", "reason": "not a pumpswap pool" if row else "creator not read yet"}
+    creator = row[0]["creator"]
+    prior = store.query(
+        "SELECT COUNT(*) AS n FROM watch_creators c JOIN watch_pools p ON p.pool = c.pool "
+        "WHERE c.creator=? AND c.pool != ? AND p.created_ts < ?",
+        (creator, pool["pool"], (pool.get("created_ts") or time.time()) - 30))[0]["n"]
+    return {"verdict": "repeat operator" if prior else "new wallet", "creator": creator, "prior_pools": prior}
+
+
+def rug_catcher_summary(journal, books=SHORT, now: float | None = None) -> dict:
+    """Outcome of the books' trades grouped by the verdict logged before each signal was traded.
+    A position still open 40+ minutes after its buy counts as rugged (the short books hold 10-15 minutes)."""
+    now = now or time.time()
+    preds = journal.query("SELECT ts, token, detail FROM events WHERE kind='rug_prediction' ORDER BY ts")
+    out = {}
+    for name in books:
+        groups: dict[str, dict] = {}
+        for p in preds:
+            verdict = json.loads(p["detail"]).get("verdict", "unknown")
+            g = groups.setdefault(verdict, {"signals": 0, "trades": 0, "pnl_usd": 0.0, "rugged": 0})
+            g["signals"] += 1
+            pos = journal.query("SELECT realized_usd, cost_usd, closed_at, opened_at FROM positions WHERE strategy=? "
+                                "AND token=? AND opened_at BETWEEN ? AND ?", (name, p["token"], p["ts"] - 60, p["ts"] + 600))
+            for r in pos:
+                if r["closed_at"] is None and now - r["opened_at"] < 2400:
+                    continue  # still being held normally
+                pnl = (r["realized_usd"] - r["cost_usd"]) if r["closed_at"] is not None else -r["cost_usd"]
+                g["trades"] += 1
+                g["pnl_usd"] += pnl
+                g["rugged"] += pnl <= -0.8 * r["cost_usd"]
+        for g in groups.values():
+            g["pnl_usd"] = round(g["pnl_usd"], 2)
+            g["per_trade_usd"] = round(g["pnl_usd"] / g["trades"], 2) if g["trades"] else None
+            g["rug_rate_pct"] = round(100 * g["rugged"] / g["trades"], 1) if g["trades"] else None
+        out[name] = groups
+    return out
+
+
 class ModelBook:
     """Scores 5-minute snapshots and queues the top ones for the engine's `model` thread to buy."""
 
@@ -266,6 +312,7 @@ class ModelBook:
         self._mtime = 0.0
         self._checked = 0.0
         self.signals: queue.Queue = queue.Queue(maxsize=500)
+        self.store = None  # the watcher's store, for the rug catcher's creator lookup (set by the engine)
         self.reload(force=True)
 
     def reload(self, force: bool = False) -> None:
@@ -298,7 +345,8 @@ class ModelBook:
         try:
             self.signals.put_nowait({"pool": pool["pool"], "mint": pool["mint"], "name": pool.get("name") or "",
                                      "score": score, "price": wa._f(snap["price"]), "liq": liq, "ts": time.time(),
-                                     "created_ts": pool.get("created_ts"), "dex": pool.get("dex") or ""})
+                                     "created_ts": pool.get("created_ts"), "dex": pool.get("dex") or "",
+                                     "rug_check": operator_verdict(self.store, pool)})
         except queue.Full:
             return None
         return score
