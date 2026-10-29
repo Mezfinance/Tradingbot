@@ -429,4 +429,6 @@ def test_creators_of_pumpswap_pools_are_recorded_and_judge_new_wallets():
     assert operator_verdict(st, pool("SOLO"))["verdict"] == "new wallet"
     assert operator_verdict(st, pool("CURVE")) == {"verdict": "unknown", "reason": "creator not read yet"}
     assert operator_verdict(None, pool("NEW")) == {"verdict": "unknown"}
+    grad = {"pool": "GRADPOOL", "mint": "Abcpump", "dex": "pumpswap", "created_ts": T0}
+    assert operator_verdict(st, grad) == {"verdict": "graduation"}  # each migration pool has a fresh creator
     assert e.status()["creators_known"] == 3

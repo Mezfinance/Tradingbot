@@ -571,6 +571,9 @@ class Engine:
         if time.time() - sig["ts"] > MODEL_SIGNAL_MAX_AGE_S:
             return "signal too old"
         from tradingbot import model_book as mb
+        skip = mb.verdict_skip(book.name, sig)
+        if skip:
+            return skip
         if (book.name in mb.SHORT and sig.get("created_ts")
                 and (time.time() - sig["created_ts"]) / 60 > c.model_book_max_entry_age_min):
             return "pool too old for the short hold"

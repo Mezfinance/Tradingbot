@@ -40,8 +40,10 @@ log = logging.getLogger(__name__)
 NAME = "model5"  # 24h hold
 FAST = "model5_10m"  # 10-minute hold, same signals, own cash and ledger
 CLIMB = "model5_climb"  # FAST's rules + out after 3 min unless the price climbed 5%
-BOOKS = (NAME, FAST, CLIMB)
-SHORT = (FAST, CLIMB)  # the short-hold books
+OPS = "model5_ops"  # 12-minute hold, only pools the rug catcher calls `repeat operator`, no pool-age exit
+BOOKS = (NAME, FAST, CLIMB, OPS)
+SHORT = (FAST, CLIMB, OPS)  # the short-hold books (entry-age guard, rug catcher report)
+AGE_EXIT = (FAST, CLIMB)  # books with the pool-age exit for hand-made pools
 AGE_MIN = 5
 FEATURES = sorted(set(wa._static_features({"name": "x", "dex": "x", "created_ts": 0}))
                   | set(wa._snap_features({})) | {"log_price_vs_first"})
@@ -69,16 +71,27 @@ def is_handmade(dex: str, mint: str) -> bool:
 
 
 def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
-    """Pool-age exit for model5_10m's hand-made pools: sell by created + `model_book_handmade_exit_age_min`."""
+    """Pool-age exit for the 10-min and climb books' hand-made pools: sell by created +
+    `model_book_handmade_exit_age_min`."""
     age = cfg.model_book_handmade_exit_age_min
-    if name not in SHORT or age <= 0 or not sig.get("created_ts") or not is_handmade(sig.get("dex") or "", sig["mint"]):
+    if name not in AGE_EXIT or age <= 0 or not sig.get("created_ts") or not is_handmade(sig.get("dex") or "", sig["mint"]):
         return None
     return sig["created_ts"] + age * 60
 
 
 def active_books(cfg: Config) -> list[str]:
     return ([NAME] if cfg.model_book_slow else []) + ([FAST] if cfg.model_book_fast else []) \
-        + ([CLIMB] if cfg.model_book_climb else [])
+        + ([CLIMB] if cfg.model_book_climb else []) + ([OPS] if cfg.model_book_ops else [])
+
+
+def verdict_skip(name: str, sig: dict) -> str | None:
+    """model5_ops trades only pools whose creator launched a pool before (10-28 backtest on 95 picks with 1-min
+    candles: the 63 repeat-operator pools +6.8%/trade at a 10-min hold, +9.0% at 12, vs -4.1% for all picks;
+    new wallets -30%, graduations -13% on 9)."""
+    if name != OPS:
+        return None
+    verdict = (sig.get("rug_check") or {}).get("verdict", "unknown")
+    return None if verdict == "repeat operator" else f"rug catcher: {verdict}"
 
 
 def climb_check(cfg: Config, name: str, bought_ts: float, market_price: float) -> tuple[float, float] | None:
@@ -89,6 +102,8 @@ def climb_check(cfg: Config, name: str, bought_ts: float, market_price: float) -
 
 
 def hold_min(cfg: Config, name: str = NAME) -> float:
+    if name == OPS:
+        return cfg.model_book_ops_hold_min
     return cfg.model_book_fast_hold_min if name in SHORT else cfg.model_book_hold_min
 
 
@@ -252,7 +267,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
 
     return {"finished_trades": len(trades), "rugs": len(rugs),
             "rug_rate_pct": round(100 * len(rugs) / len(trades), 1) if trades else None,
-            "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0}.get(name, 76.0),  # 10-28 backtests: 10-min hold vs 24h
+            "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0, OPS: 14.0}.get(name, 76.0),  # 10-28 backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 
@@ -261,6 +276,8 @@ def operator_verdict(store, pool: dict) -> dict:
     """Rug catcher (blind test): who created this pumpswap pool and whether that wallet launched a pool before
     (10-28 backtest: pools of brand-new wallets were pulled during the hold 32% of the time, -26%/trade; repeat
     operators 17%, -2.5%). Only pools recorded before this one count."""
+    if pool.get("dex") == "pumpswap" and (pool.get("mint") or "").endswith("pump"):
+        return {"verdict": "graduation"}  # pump.fun's migration makes each of these pools from a fresh wallet
     if store is None:
         return {"verdict": "unknown"}
     row = store.query("SELECT creator FROM watch_creators WHERE pool=?", (pool["pool"],))

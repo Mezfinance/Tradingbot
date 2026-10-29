@@ -115,6 +115,11 @@ class Config:
     model_book_climb: bool = True
     model_book_climb_after_min: float = 3.0
     model_book_climb_min_gain_pct: float = 5.0
+    # model5_ops: trades only signals the rug catcher calls `repeat operator` (creator launched a pool before),
+    # holds `model_book_ops_hold_min`, no pool-age exit (it sold the repeat operators' pools during the climb:
+    # 10-28 backtest +6.8% -> +3.6%/trade at 10 min). Backtest +9.0%/trade at 12 min, 90% CI -1..+20, n=63.
+    model_book_ops: bool = True
+    model_book_ops_hold_min: float = 12.0
     model_train_days: float = 4.0
 
     # --- Claude analyst -------------------------------------------------
