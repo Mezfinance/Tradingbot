@@ -171,6 +171,9 @@ class Engine:
             if self.model_book is not None:
                 watcher.on_snapshot = self.model_book.consider
                 self.model_book.store = watcher.store
+                import httpx
+                from tradingbot.data.helius import Helius
+                self.model_book.helius = Helius(client=httpx.Client(timeout=5))  # runs on the watcher thread
                 threading.Thread(target=self._loop, name="model", daemon=True,
                                  args=(MODEL_POLL_S, self.buy_model_signals)).start()
             threading.Thread(target=self._loop, name="watcher", daemon=True,

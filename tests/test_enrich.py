@@ -427,8 +427,16 @@ def test_creators_of_pumpswap_pools_are_recorded_and_judge_new_wallets():
     assert operator_verdict(st, pool("NEW")) == {"verdict": "repeat operator", "creator": "OP", "prior_pools": 1}
     assert operator_verdict(st, pool("OLD"))["verdict"] == "new wallet"  # its later pool doesn't count
     assert operator_verdict(st, pool("SOLO"))["verdict"] == "new wallet"
-    assert operator_verdict(st, pool("CURVE")) == {"verdict": "unknown", "reason": "creator not read yet"}
+    assert operator_verdict(st, pool("CURVE")) == {"verdict": "unknown", "reason": "not a pumpswap pool (pump-fun)"}
     assert operator_verdict(None, pool("NEW")) == {"verdict": "unknown"}
+    reads = []
+    reader = SimpleNamespace(pool_creators=lambda pools: reads.extend(pools) or {p: "OP" for p in pools})
+    st.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts) VALUES(?,?,?,?,?,?)",
+               ("LATE", "LateMint", "pumpswap", "LATE", T0 + 600, T0 + 600))
+    assert operator_verdict(st, pool("LATE"), reader)["verdict"] == "repeat operator"  # read on the spot
+    assert reads == ["LATE"] and operator_verdict(st, pool("LATE"), reader)["prior_pools"] == 2 and reads == ["LATE"]
+    assert operator_verdict(st, {"pool": "M", "mint": "x", "dex": "meteora-damm-v2"}, reader) == {
+        "verdict": "unknown", "reason": "not a pumpswap pool (meteora-damm-v2)"}
     grad = {"pool": "GRADPOOL", "mint": "Abcpump", "dex": "pumpswap", "created_ts": T0}
     assert operator_verdict(st, grad) == {"verdict": "graduation"}  # each migration pool has a fresh creator
-    assert e.status()["creators_known"] == 3
+    assert e.status()["creators_known"] == 4  # incl. LATE, read on the spot

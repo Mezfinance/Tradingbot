@@ -274,7 +274,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 
 
-def operator_verdict(store, pool: dict) -> dict:
+def operator_verdict(store, pool: dict, helius=None) -> dict:
     """Rug catcher (blind test): who created this pumpswap pool and whether that wallet launched a pool before
     (10-28 backtest: pools of brand-new wallets were pulled during the hold 32% of the time, -26%/trade; repeat
     operators 17%, -2.5%). Only pools recorded before this one count."""
@@ -282,10 +282,25 @@ def operator_verdict(store, pool: dict) -> dict:
         return {"verdict": "graduation"}  # pump.fun's migration makes each of these pools from a fresh wallet
     if store is None:
         return {"verdict": "unknown"}
+    if pool.get("dex") and pool["dex"] != "pumpswap":
+        return {"verdict": "unknown", "reason": f"not a pumpswap pool ({pool['dex']})"}
     row = store.query("SELECT creator FROM watch_creators WHERE pool=?", (pool["pool"],))
-    if not row or not row[0]["creator"]:
+    creator = row[0]["creator"] if row else None
+    if not row and helius is not None:
+        # The enricher reads creators between slow tasks, often after the 5-minute signal (10-29: every live
+        # verdict came back unknown), so a signal reads its own pool's creator: one account read.
+        try:
+            found = helius.pool_creators([pool["pool"]])
+        except Exception as exc:  # noqa: BLE001 (the verdict must never stop a signal)
+            log.warning("rug catcher creator read failed: %s", exc)
+            found = {}
+        if pool["pool"] in found:
+            creator = found[pool["pool"]]
+            store.execute("INSERT OR REPLACE INTO watch_creators(pool, creator, ts) VALUES(?,?,?)",
+                          (pool["pool"], creator, time.time()))
+            row = [{"creator": creator}]
+    if not creator:
         return {"verdict": "unknown", "reason": "not a pumpswap pool" if row else "creator not read yet"}
-    creator = row[0]["creator"]
     prior = store.query(
         "SELECT COUNT(*) AS n FROM watch_creators c JOIN watch_pools p ON p.pool = c.pool "
         "WHERE c.creator=? AND c.pool != ? AND p.created_ts < ?",
@@ -302,7 +317,10 @@ def rug_catcher_summary(journal, books=SHORT, now: float | None = None) -> dict:
     for name in books:
         groups: dict[str, dict] = {}
         for p in preds:
-            verdict = json.loads(p["detail"]).get("verdict", "unknown")
+            d = json.loads(p["detail"])
+            verdict = d.get("verdict", "unknown")
+            if verdict == "unknown" and d.get("reason"):
+                verdict = "unknown: " + ("not read" if d["reason"].startswith("creator") else "other dex")
             g = groups.setdefault(verdict, {"signals": 0, "trades": 0, "pnl_usd": 0.0, "rugged": 0})
             g["signals"] += 1
             pos = journal.query("SELECT realized_usd, cost_usd, closed_at, opened_at FROM positions WHERE strategy=? "
@@ -332,6 +350,7 @@ class ModelBook:
         self._checked = 0.0
         self.signals: queue.Queue = queue.Queue(maxsize=500)
         self.store = None  # the watcher's store, for the rug catcher's creator lookup (set by the engine)
+        self.helius = None  # reads a signal's pool creator when the enricher hasn't yet (set by the engine)
         self.reload(force=True)
 
     def reload(self, force: bool = False) -> None:
@@ -365,7 +384,7 @@ class ModelBook:
             self.signals.put_nowait({"pool": pool["pool"], "mint": pool["mint"], "name": pool.get("name") or "",
                                      "score": score, "price": wa._f(snap["price"]), "liq": liq, "ts": time.time(),
                                      "created_ts": pool.get("created_ts"), "dex": pool.get("dex") or "",
-                                     "rug_check": operator_verdict(self.store, pool)})
+                                     "rug_check": operator_verdict(self.store, pool, self.helius)})
         except queue.Full:
             return None
         return score

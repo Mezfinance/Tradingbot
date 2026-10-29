@@ -524,7 +524,7 @@ def render_model(rep: dict) -> str:
                   "repeat operators 17% (-2.5%)"]
         for book, groups in rc.items():
             for verdict, g in sorted(groups.items()):
-                lines.append(f"  {book:<13} {verdict:<16} signals {g['signals']:>4}  trades {g['trades']:>4}  "
+                lines.append(f"  {book:<13} {verdict:<20} signals {g['signals']:>4}  trades {g['trades']:>4}  "
                              f"P&L ${g['pnl_usd']:>9,.2f}  per trade {_fmt(g['per_trade_usd'], '', 2):>7}  "
                              f"rugged {_fmt(g['rug_rate_pct'], '%', 0)}")
     lines += ["", "MODEL"]
