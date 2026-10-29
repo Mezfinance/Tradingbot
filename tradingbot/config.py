@@ -47,7 +47,11 @@ class Config:
     enrich_control_share: float = 0.2  # share of the Helius/X budget spent on random eligible tokens (control)
     enrich_rank_window_h: float = 6.0  # recent eligible tokens the rank threshold is set from
     enrich_rank_min_history: int = 30  # below this many scored tokens, every eligible token is looked up
-    helius_daily_credits: int = 30_000  # ~0.9M/month: fits Helius free (1M); raise on a paid plan
+    # Helius credits: 30k/day in total (~0.9M/month). Since 10-29 two thirds go to the rug catcher's operator
+    # lookups (every pool with >= operator_min_liq_usd at 5 min), a third to the early-buyer enrichment.
+    helius_daily_credits: int = 10_000
+    operator_daily_credits: int = 20_000
+    operator_min_liq_usd: float = 5000.0
     enrich_wallets_per_token: int = 8  # early buyers whose wallet age/funder is looked up
     x_daily_budget_usd: float = 3.0
     x_cost_per_post: float = 0.005  # X pay-per-use estimate; adjust to your bill

@@ -105,6 +105,9 @@ CREATE INDEX IF NOT EXISTS watch_macro_key ON watch_macro(key, ts);
 CREATE TABLE IF NOT EXISTS watch_xfeed (ts REAL NOT NULL, account TEXT, post_ts REAL, text TEXT);
 -- wallet origins (Helius), cached across tokens
 CREATE TABLE IF NOT EXISTS watch_wallets (wallet TEXT PRIMARY KEY, first_ts REAL, funder TEXT, checked_ts REAL);
+-- liquidity withdrawals found on-chain (Helius): pull_ts NULL = none found when checked
+CREATE TABLE IF NOT EXISTS watch_pulls (pool TEXT PRIMARY KEY, checked_ts REAL NOT NULL, pull_ts REAL, by TEXT,
+                                        sol_out REAL);
 """
 
 

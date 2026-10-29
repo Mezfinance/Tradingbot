@@ -35,7 +35,7 @@ from tradingbot.config import Config
 from tradingbot.data.dexscreener import DexScreener
 from tradingbot.data.extras import MEMECOIN_INDEX, Extras
 from tradingbot.data.geckoterminal import GeckoTerminal
-from tradingbot.data.helius import Helius, trades
+from tradingbot.data.helius import Helius, find_withdraw, pool_creation, trades
 from tradingbot.data.pumpfun import PumpFun, compact_coin, compact_creator, compact_user
 from tradingbot.data.telegram import fetch_channel
 from tradingbot.data.xapi import XClient, cashtag_query, handle, mint_query, post_id
@@ -50,13 +50,17 @@ WINDOWS = {  # kind -> (earliest age, latest age) in minutes; outside the window
     "pumpfun5": (5, 25), "pumpfun15": (15, 45), "orders": (15, 120), "narrative": (15, 360),
     "image": (15, 360), "helius": (7, 60), "x": (15, 90), "jupiter": (15, 120), "rugcheck": (15, 120),
     "jupquote": (15, 120), "links": (15, 240), "crosschain": (15, 240), "dev": (7, 120), "sentiment": (20, 180),
-    "candles15": (15, 25),
+    "candles15": (15, 25), "operator": (5, 10),
 }
 PAID_OR_HEAVY = ("helius", "x", "jupquote", "rugcheck", "links", "crosschain", "dev", "sentiment", "candles15")
 # Paid lookups that describe the token rather than the pool: a graduation pool reuses its launch pool's row.
 MINT_KINDS = ("helius", "x", "dev", "narrative", "sentiment")
 # Lookups rationed by a free-data score, with a random control slice (see `select`).
 RANKED = {"helius": ("helius_budget", "helius_daily_credits", 30.0), "x": ("x_budget", "x_daily_budget_usd", 0.015)}
+NEEDS_SNAP5 = PAID_OR_HEAVY + ("operator",)
+OPERATOR_PULL_CHECKS = 5  # earlier pools of the same creator whose withdrawal time is looked up per lookup
+OPERATOR_RECHECK_S = 1800  # an earlier pool found un-pulled is checked again after this long
+OPERATOR_WORST_CREDITS = 10 + 10 + 10 * OPERATOR_PULL_CHECKS
 LAUNCH_MINT_SUFFIXES = ("pump", "bonk")  # pump.fun and letsbonk mints keep their suffix after graduating
 NARRATIVE_SCHEMA = {
     "type": "object",
@@ -176,6 +180,7 @@ class Enricher:
         self.helius_budget = Budget(store, "helius_credits", cfg.helius_daily_credits)
         self.x_budget = Budget(store, "x_usd", cfg.x_daily_budget_usd)
         self.narrative_budget = Budget(store, "narrative_usd", cfg.narrative_daily_usd)
+        self.operator_budget = Budget(store, "operator_credits", cfg.operator_daily_credits)
         self._rank_cache: dict = {}
         self._last = {"lists": 0.0, "market": 0.0, "tg": 0.0, "macro": 0.0, "biz": 0.0, "xfeed": 0.0}
 
@@ -300,7 +305,7 @@ class Enricher:
                AND NOT EXISTS (SELECT 1 FROM watch_enrich e WHERE e.pool=p.pool AND e.kind=?)
                AND (? = 0 OR s.data IS NOT NULL)
                ORDER BY p.created_ts DESC LIMIT ?""",
-            (now - lo * 60, now - hi * 60, kind, int(kind in PAID_OR_HEAVY), limit))
+            (now - lo * 60, now - hi * 60, kind, int(kind in NEEDS_SNAP5), limit))
         return [dict(r) for r in rows]
 
     def _save(self, pool: str, kind: str, data: dict | None, now: float) -> None:
@@ -390,7 +395,8 @@ class Enricher:
 
     def run_tasks(self, now: float) -> int:
         budget = TASK_LIMIT_PER_STEP
-        for kind, fn in (("pumpfun5", self.task_pumpfun), ("pumpfun15", self.task_pumpfun),
+        for kind, fn in (("operator", self.task_operator),  # first: the rug catcher needs it by our buy
+                         ("pumpfun5", self.task_pumpfun), ("pumpfun15", self.task_pumpfun),
                          ("dev", self.task_dev), ("helius", self.task_helius), ("orders", self.task_orders),
                          ("jupiter", self.task_jupiter), ("rugcheck", self.task_rugcheck),
                          ("jupquote", self.task_jupquote), ("x", self.task_x), ("narrative", self.task_narrative),
@@ -524,6 +530,68 @@ class Enricher:
         self.helius_budget.add(self.helius.credits_used - before)
         return {"trades": tr, "supply": supply, "holders": holders, "pool_accounts": sorted(pool_accounts),
                 "creator": pf.get("creator"), "wallets": wallets, "n_txs": len(txs), "sol_balances": sol}
+
+    def task_operator(self, pool: dict, kind: str, now: float) -> dict | None:
+        """Rug catcher: who created the pool, that wallet's age and funder, and its earlier pools in this
+        database with the exact time each was pulled (when it was). Only facts known now are stored."""
+        if not self.helius.enabled:
+            return {"skipped": "no HELIUS_API_KEY"}
+        snap = json.loads(pool["snap5"]) if pool.get("snap5") else {}
+        if (snap.get("liq") or 0) < self.cfg.operator_min_liq_usd:
+            return {"skipped": "below liquidity"}
+        if not self.operator_budget.allows(OPERATOR_WORST_CREDITS):
+            return None
+        before = self.helius.credits_used
+        try:
+            first = self.helius.history(pool["pool"], 1)
+            data = pool_creation(first[0], pool["pool"]) if first else {"creator": None}
+            creator = data.get("creator")
+            if creator:
+                data.update(self._wallet_origin(creator, now))
+                data.update(self._operator_record(pool, creator, data.get("funder"), now))
+        finally:
+            self.operator_budget.add(self.helius.credits_used - before)
+        return data
+
+    def _wallet_origin(self, wallet: str, now: float) -> dict:
+        cached = self.store.query("SELECT first_ts, funder FROM watch_wallets WHERE wallet=?", (wallet,))
+        if cached:
+            origin = {"first_ts": cached[0]["first_ts"], "funder": cached[0]["funder"]}
+        else:
+            origin = self.helius.wallet_origin(wallet) or {}
+            self.store.execute("INSERT OR REPLACE INTO watch_wallets(wallet, first_ts, funder, checked_ts) "
+                               "VALUES(?,?,?,?)", (wallet, origin.get("first_ts"), origin.get("funder"), now))
+        return {"wallet_first_ts": origin.get("first_ts"), "funder": origin.get("funder")}
+
+    def _operator_record(self, pool: dict, creator: str, funder: str | None, now: float) -> dict:
+        """Earlier pools created by the same wallet (or funded by the same funder), each with its pull time."""
+        rows = self.store.query(
+            """SELECT e.pool, p.created_ts, json_extract(e.data, '$.creator') AS creator FROM watch_enrich e
+               JOIN watch_pools p ON p.pool = e.pool
+               WHERE e.kind='operator' AND e.pool != ? AND p.created_ts < ?
+               AND (json_extract(e.data, '$.creator') = ? OR (? IS NOT NULL AND json_extract(e.data, '$.funder') = ?))
+               ORDER BY p.created_ts DESC""", (pool["pool"], pool["created_ts"], creator, funder, funder))
+        prior = [r for r in rows if r["creator"] == creator]
+        for r in prior[:OPERATOR_PULL_CHECKS]:
+            seen = self.store.query("SELECT checked_ts, pull_ts FROM watch_pulls WHERE pool=?", (r["pool"],))
+            if seen and (seen[0]["pull_ts"] is not None or now - seen[0]["checked_ts"] < OPERATOR_RECHECK_S):
+                continue
+            hit = find_withdraw(self.helius.recent(r["pool"], 50), r["pool"]) or {}
+            self.store.execute("INSERT OR REPLACE INTO watch_pulls(pool, checked_ts, pull_ts, by, sol_out) "
+                               "VALUES(?,?,?,?,?)", (r["pool"], now, hit.get("ts"), hit.get("by"), hit.get("sol_out")))
+        marks = ",".join("?" * len(prior)) or "NULL"
+        pulls = {r["pool"]: r for r in self.store.query(
+            f"SELECT pool, checked_ts, pull_ts FROM watch_pulls WHERE pool IN ({marks})", [r["pool"] for r in prior])}
+        history = []  # [created_ts, pull_ts or None, checked_ts or None] per earlier pool, newest first
+        for r in prior:
+            pr = pulls.get(r["pool"])
+            history.append([r["created_ts"], pr["pull_ts"] if pr else None, pr["checked_ts"] if pr else None])
+        ages = [(p - c) / 60 for c, p, _ in history if p]
+        return {"prior_pools": len(prior), "prior_pulled": len(ages),
+                "pull_age_min": round(min(ages), 1) if ages else None,
+                "pull_age_median": round(float(np.median(ages)), 1) if ages else None,
+                "funder_prior_pools": sum(1 for r in rows if r["creator"] != creator),
+                "history": history[:20]}
 
     def task_dev(self, pool: dict, kind: str, now: float) -> dict | None:
         """The developer's pump.fun profile, their best earlier coin, and (Helius) their wallet's origin."""
@@ -719,7 +787,14 @@ class Enricher:
             "market_rows": q("SELECT COUNT(*) AS n FROM watch_market")[0]["n"],
             "wallets_cached": q("SELECT COUNT(*) AS n FROM watch_wallets")[0]["n"],
             "spend_today": {b.name: round(b.spent(), 4) for b in (self.helius_budget, self.x_budget,
-                                                                   self.narrative_budget)},
+                                                                   self.narrative_budget, self.operator_budget)},
+            "operator_24h": {r["what"]: r["n"] for r in q(
+                "SELECT CASE WHEN json_extract(data, '$.skipped') IS NOT NULL THEN json_extract(data, '$.skipped') "
+                "WHEN json_extract(data, '$.creator') IS NULL THEN 'no creator found' "
+                "WHEN json_extract(data, '$.prior_pools') > 0 THEN 'known operator' ELSE 'new operator' END AS what, "
+                "COUNT(*) AS n FROM watch_enrich WHERE ts > ? AND kind='operator' AND data != '{}' GROUP BY what",
+                (day_ago,))},
+            "pulls_found": q("SELECT COUNT(*) AS n FROM watch_pulls WHERE pull_ts IS NOT NULL")[0]["n"],
             "pumpfun_blocked": time.monotonic() < getattr(self.pump, "blocked_until", 0.0),
             "keys": {"helius": self.helius.enabled, "x": self.x.enabled, "anthropic": self.llm_client is not None},
         }

@@ -5,6 +5,8 @@
                      whether the developer sold
   holder concentration  getTokenLargestAccounts + owners (pool/curve accounts excluded later)
   wallet origin      the wallet's own first transaction -> wallet age and who funded it
+  pool operator      a pool's first transaction (who created it, SOL seeded) and its latest ones (a
+                     liquidity withdrawal: when the operator pulled it)
 
 Credits are counted with Helius's published prices (full history: 10 per 100 transactions,
 10 minimum; standard RPC: 1) so the caller can enforce a daily budget.
@@ -14,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 
 import httpx
 
@@ -29,6 +32,10 @@ JITO_TIP_ACCOUNTS = {
 }
 HISTORY_CREDITS_PER_100 = 10
 RPC_CREDITS = 1
+SOL_MINT = "So11111111111111111111111111111111111111112"
+# Program log lines of a liquidity withdrawal (pumpswap `Withdraw`, Meteora/Raydium remove-liquidity variants).
+WITHDRAW_RE = re.compile(r"Instruction: (Withdraw|RemoveLiquidity|RemoveAllLiquidity|RemoveBalanceLiquidity|"
+                         r"remove_liquidity|withdraw)\b")
 
 
 class Helius:
@@ -64,6 +71,14 @@ class Helius:
         """Oldest-first full transactions touching `address`."""
         res = self._rpc("getTransactionsForAddress",
                         [address, {"transactionDetails": "full", "sortOrder": "asc", "limit": limit,
+                                   "maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}],
+                        max(HISTORY_CREDITS_PER_100, HISTORY_CREDITS_PER_100 * limit // 100))
+        return (res or {}).get("data") or []
+
+    def recent(self, address: str, limit: int = 50) -> list[dict]:
+        """Newest-first full transactions touching `address`."""
+        res = self._rpc("getTransactionsForAddress",
+                        [address, {"transactionDetails": "full", "sortOrder": "desc", "limit": limit,
                                    "maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}],
                         max(HISTORY_CREDITS_PER_100, HISTORY_CREDITS_PER_100 * limit // 100))
         return (res or {}).get("data") or []
@@ -149,3 +164,42 @@ def trades(txs: list[dict], mint: str) -> list[list]:
             if abs(delta) > 0:
                 out.append([tx.get("blockTime"), tx.get("slot"), owner, delta, payer, meta.get("fee") or 0, max(tip, 0)])
     return out
+
+
+def instructions(tx: dict) -> list[str]:
+    """Instruction names from the program logs, in order, without repeats."""
+    out = []
+    for line in (tx.get("meta") or {}).get("logMessages") or []:
+        if "Instruction: " in line:
+            name = line.split("Instruction: ", 1)[1].strip()
+            if name not in out:
+                out.append(name)
+    return out
+
+
+def _pool_sol(tx: dict, pool: str, side: str) -> float | None:
+    for b in (tx.get("meta") or {}).get(side) or []:
+        if b.get("owner") == pool and b.get("mint") == SOL_MINT:
+            return float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+    return None
+
+
+def pool_creation(tx: dict, pool: str) -> dict:
+    """From a pool's first transaction: who created it (fee payer), when, and the SOL it was seeded with."""
+    keys = _keys(tx)
+    return {"creator": keys[0] if keys else None, "create_ts": tx.get("blockTime"),
+            "seed_sol": _pool_sol(tx, pool, "postTokenBalances"), "create_ix": instructions(tx)[:6]}
+
+
+def find_withdraw(txs: list[dict], pool: str) -> dict | None:
+    """The earliest successful liquidity withdrawal among `txs`: {"ts", "by", "sol_out"}; None if none."""
+    hits = []
+    for tx in txs:
+        meta = tx.get("meta") or {}
+        if meta.get("err") or not any(WITHDRAW_RE.search(line) for line in meta.get("logMessages") or []):
+            continue
+        pre, post = _pool_sol(tx, pool, "preTokenBalances"), _pool_sol(tx, pool, "postTokenBalances")
+        keys = _keys(tx)
+        hits.append({"ts": tx.get("blockTime"), "by": keys[0] if keys else None,
+                     "sol_out": round(pre - post, 4) if pre is not None and post is not None else None})
+    return min(hits, key=lambda h: h["ts"] or 0) if hits else None

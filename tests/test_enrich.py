@@ -356,3 +356,56 @@ def test_status_shows_how_paid_lookups_were_chosen():
         e.run_tasks(T0 + 20 * 60)
     sel = e.status()["paid_selection_24h"]["helius"]
     assert sel == {"all": 1, "copied": 1, "not active enough": 1}
+
+
+def _optx(ts, payer, logs, pool=None, sol=(None, None)):
+    bal = lambda amt: [{"owner": pool, "mint": "So11111111111111111111111111111111111111112",
+                        "uiTokenAmount": {"uiAmount": amt}}] if amt is not None else []
+    return {"blockTime": ts, "transaction": {"message": {"accountKeys": [{"pubkey": payer}]}},
+            "meta": {"err": None, "logMessages": logs, "preTokenBalances": bal(sol[0]),
+                     "postTokenBalances": bal(sol[1])}}
+
+
+class OperatorHelius(FakeHelius):
+    """NEW was created by OP; OP's earlier pool OLD1 was pulled 10 minutes after launch, OLD2 not (yet)."""
+
+    def history(self, address, limit=100):
+        self.credits_used += 10
+        if address == "NEW":
+            return [_optx(T0, "OP", ["Program log: Instruction: CreatePool"], "NEW", (None, 85.0))]
+        return super().history(address, limit)
+
+    def recent(self, address, limit=50):
+        self.credits_used += 10
+        if address == "OLD1":
+            return [_optx(T0 - 3000 + 30, "X", ["Program log: Instruction: Buy"]),
+                    _optx(T0 - 3000, "OP", ["Program log: Instruction: Withdraw", "Program log: Instruction: Burn"],
+                          "OLD1", (110.0, 0.0))]
+        return [_optx(T0 - 100, "Y", ["Program log: Instruction: Sell", "Program log: Instruction: WithdrawFees"])]
+
+
+def test_operator_lookup_records_the_creator_and_how_fast_it_pulled_before():
+    from tradingbot.data.helius import find_withdraw
+    st = store_with([("NEW", "NewMint", "pumpswap", 50), ("LOW", "LowMint", "pumpswap", 50)])
+    st.execute("UPDATE watch_snaps SET data=? WHERE pool='NEW'", (json.dumps({"buyers_m5": 50, "liq": 30000}),))
+    st.execute("UPDATE watch_snaps SET data=? WHERE pool='LOW'", (json.dumps({"buyers_m5": 50, "liq": 900}),))
+    for p, created in (("OLD1", T0 - 3600), ("OLD2", T0 - 1800)):
+        st.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts) VALUES(?,?,?,?,?,?)",
+                   (p, p + "Mint", "pumpswap", "SCAM / SOL", created, created))
+        st.execute("INSERT INTO watch_enrich(pool, kind, ts, data) VALUES(?,?,?,?)",
+                   (p, "operator", created + 330, json.dumps({"creator": "OP", "funder": "F"})))
+    e = make_enricher(st)
+    e.helius = OperatorHelius()
+    e.operator_budget.allows = lambda cost, now=None: True
+    e.run_tasks(T0 + 6 * 60)
+    got = {r["pool"]: json.loads(r["data"]) for r in st.query("SELECT * FROM watch_enrich WHERE kind='operator'")}
+    assert got["LOW"] == {"skipped": "below liquidity"}
+    new = got["NEW"]
+    assert new["creator"] == "OP" and new["seed_sol"] == 85.0 and new["create_ts"] == T0
+    assert new["wallet_first_ts"] == T0 - 60 and new["funder"] == "CEX"
+    assert new["prior_pools"] == 2 and new["prior_pulled"] == 1 and new["pull_age_min"] == 10.0
+    assert new["history"][1][:2] == [T0 - 3600, T0 - 3000] and new["history"][0][1] is None
+    assert tuple(st.query("SELECT by, sol_out FROM watch_pulls WHERE pool='OLD1'")[0]) == ("OP", 110.0)
+    assert e.status()["pulls_found"] == 1
+    # a fee withdrawal is not a liquidity pull
+    assert find_withdraw([_optx(1, "Y", ["Program log: Instruction: WithdrawFees"], "P", (5.0, 4.9))], "P") is None
