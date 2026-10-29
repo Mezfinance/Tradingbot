@@ -40,9 +40,11 @@ log = logging.getLogger(__name__)
 NAME = "model5"  # 24h hold
 FAST = "model5_10m"  # 10-minute hold, same signals, own cash and ledger
 CLIMB = "model5_climb"  # FAST's rules + out after 3 min unless the price climbed 5%
-OPS = "model5_ops"  # 12-minute hold, only pools the rug catcher calls `repeat operator`, no pool-age exit
-BOOKS = (NAME, FAST, CLIMB, OPS)
-SHORT = (FAST, CLIMB, OPS)  # the short-hold books (entry-age guard, rug catcher report)
+# Only pools the rug catcher calls `repeat operator`, no pool-age exit; the name carries the hold in minutes
+OPS9, OPS10 = "model5_ops9", "model5_ops10"
+OPS_HOLD_MIN = {OPS9: 9.0, OPS10: 10.0}
+BOOKS = (NAME, FAST, CLIMB, OPS9, OPS10)
+SHORT = (FAST, CLIMB, OPS9, OPS10)  # the short-hold books (entry-age guard, rug catcher report)
 AGE_EXIT = (FAST, CLIMB)  # books with the pool-age exit for hand-made pools
 AGE_MIN = 5
 FEATURES = sorted(set(wa._static_features({"name": "x", "dex": "x", "created_ts": 0}))
@@ -81,14 +83,14 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
 
 def active_books(cfg: Config) -> list[str]:
     return ([NAME] if cfg.model_book_slow else []) + ([FAST] if cfg.model_book_fast else []) \
-        + ([CLIMB] if cfg.model_book_climb else []) + ([OPS] if cfg.model_book_ops else [])
+        + ([CLIMB] if cfg.model_book_climb else []) + ([OPS9, OPS10] if cfg.model_book_ops else [])
 
 
 def verdict_skip(name: str, sig: dict) -> str | None:
-    """model5_ops trades only pools whose creator launched a pool before (10-28 backtest on 95 picks with 1-min
-    candles: the 63 repeat-operator pools +6.8%/trade at a 10-min hold, +9.0% at 12, vs -4.1% for all picks;
-    new wallets -30%, graduations -13% on 9)."""
-    if name != OPS:
+    """The ops books trade only pools whose creator launched a pool before (10-28 backtest with exact on-chain pull
+    times: the 60 repeat-operator picks +8.1%/trade at a 9-min hold, +7.6% at 10, +3.6% at 12, vs +0.6% for all
+    86 picks at 10)."""
+    if name not in OPS_HOLD_MIN:
         return None
     verdict = (sig.get("rug_check") or {}).get("verdict", "unknown")
     return None if verdict == "repeat operator" else f"rug catcher: {verdict}"
@@ -102,8 +104,8 @@ def climb_check(cfg: Config, name: str, bought_ts: float, market_price: float) -
 
 
 def hold_min(cfg: Config, name: str = NAME) -> float:
-    if name == OPS:
-        return cfg.model_book_ops_hold_min
+    if name in OPS_HOLD_MIN:
+        return OPS_HOLD_MIN[name]
     return cfg.model_book_fast_hold_min if name in SHORT else cfg.model_book_hold_min
 
 
@@ -267,7 +269,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
 
     return {"finished_trades": len(trades), "rugs": len(rugs),
             "rug_rate_pct": round(100 * len(rugs) / len(trades), 1) if trades else None,
-            "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0, OPS: 14.0}.get(name, 76.0),  # 10-28 backtests
+            "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0, OPS9: 13.0, OPS10: 15.0}.get(name, 76.0),  # 10-28 backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 

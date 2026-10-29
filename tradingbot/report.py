@@ -470,8 +470,9 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
                   "90% range -8%..+10%",
     "model5_climb": "as model5_10m, out at 3 min unless +5%: +2.5%/trade, 7% rugged (vs 20%), 90% range "
                     "-5%..+10% (95 picks, 10-21..10-26)",
-    "model5_ops": "repeat-operator pools only, 12-min hold, no pool-age exit: +9.0%/trade, 14% rugged, 90% range "
-                  "-1%..+20% (63 of 95 picks, 10-21..10-26; filter chosen after looking)",
+    "model5_ops9": "repeat-operator pools only, 9-min hold, no pool-age exit: +8.1%/trade, 13% rugged, 90% range "
+                   "-2%..+18% (60 picks, 10-21..10-26, exact on-chain pulls; chosen after looking)",
+    "model5_ops10": "as model5_ops9 with a 10-min hold: +7.6%/trade, 15% rugged, 90% range -4%..+18%",
 }
 
 

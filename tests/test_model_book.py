@@ -281,14 +281,14 @@ def test_the_report_shows_only_the_model5_book_with_its_rugs(cfg, good_pair):
     eng.extras.liquidity = 1_000.0
     eng.manage_positions()  # a rug: sold through the stop for ~0
     rep = build_model(j, cfg)
-    [m5, fast, climb, ops] = rep["books"]
+    [m5, fast, climb, ops9, ops10] = rep["books"]
     assert m5["name"] == mb.NAME and m5["rugs"]["rugs"] == 1 and fast["name"] == mb.FAST and fast["buys"] == 0
     assert m5["started"] and fast["started"]  # both books had equity snapshots from the running engine
     text = render_model(rep)
     assert "running since (UTC)" in text and "running for" in text
     assert "MODEL PAPER BOOKS" in text and "model5_10m" in text and "liquidity_pulled" in text and "1 (100%)" in text
     assert climb["name"] == mb.CLIMB and "model5_climb" in text and "out at 3 min unless +5%" in text
-    assert ops["name"] == mb.OPS and "repeat-operator pools only" in text
+    assert (ops9["name"], ops10["name"]) == (mb.OPS9, mb.OPS10) and "repeat-operator pools only" in text
     assert "filters_only" not in text and "Claude API" not in text and "not trained yet" in text
 
 
@@ -370,7 +370,7 @@ def test_the_climb_book_sells_positions_that_have_not_climbed(cfg, good_pair):
     make = lambda: Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg),
                           j, model_executor=PaperExecutor(cfg))
     eng = make()
-    assert mb.active_books(cfg) == [mb.NAME, mb.FAST, mb.CLIMB, mb.OPS] and mb.CLIMB in eng.books
+    assert mb.active_books(cfg) == [mb.NAME, mb.FAST, mb.CLIMB, mb.OPS9, mb.OPS10] and mb.CLIMB in eng.books
     assert mb.climb_check(cfg, mb.FAST, 0.0, 1.0) is None
     sig = lambda mint: {"mint": mint, "dex": "pumpswap", "created_ts": time.time() - 6 * 60, "name": mint,
                         "price": 1e-5, "liq": 30_000.0, "score": 1.0}
@@ -404,7 +404,7 @@ def test_a_switched_off_book_is_left_alone(cfg, good_pair):
     try:
         eng2 = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
                       jupiter=RuggedJupiter(), model_executor=PaperExecutor(cfg))
-        assert mb.NAME not in eng2.books and mb.active_books(cfg) == [mb.FAST, mb.CLIMB, mb.OPS]
+        assert mb.NAME not in eng2.books and mb.active_books(cfg) == [mb.FAST, mb.CLIMB, mb.OPS9, mb.OPS10]
         seen = []
         eng2.current_prices = lambda tokens, held=None: seen.append(set(tokens)) or {}
         eng2.manage_positions()
@@ -424,10 +424,11 @@ def test_rug_predictions_are_logged_before_trading_and_reported_by_verdict(cfg, 
                                  "rug_check": {"verdict": verdict}}
     eng.model_book.signals.put(sig("NEWW", "new wallet"))
     eng.model_book.signals.put(sig("REPT", "repeat operator"))
-    assert eng.buy_model_signals() == 7  # two signals x four books, but model5_ops skips the new wallet
-    skips = j.query("SELECT token, detail FROM events WHERE kind='entry_skipped' AND strategy=?", (mb.OPS,))
-    assert [(r["token"], r["detail"]) for r in skips] == [("NEWW", "rug catcher: new wallet")]
-    assert [p.token_address for p in j.open_positions(mb.OPS)] == ["REPT"]
+    assert eng.buy_model_signals() == 8  # two signals x five books, but the two ops books skip the new wallet
+    for ops in (mb.OPS9, mb.OPS10):
+        skips = j.query("SELECT token, detail FROM events WHERE kind='entry_skipped' AND strategy=?", (ops,))
+        assert [(r["token"], r["detail"]) for r in skips] == [("NEWW", "rug catcher: new wallet")]
+        assert [p.token_address for p in j.open_positions(ops)] == ["REPT"]
     preds = j.query("SELECT token, detail FROM events WHERE kind='rug_prediction' ORDER BY id")
     assert [p["token"] for p in preds] == ["NEWW", "REPT"]  # once per signal, not once per book
     eng.current_prices = lambda tokens, held=None: {t: (1e-9 if t == "NEWW" else 3.0e-5) for t in tokens}
@@ -441,13 +442,15 @@ def test_rug_predictions_are_logged_before_trading_and_reported_by_verdict(cfg, 
     assert "RUG CATCHER" in text and "new wallet" in text and "repeat operator" in text
 
 
-def test_the_operator_book_holds_12_minutes_without_the_pool_age_exit(cfg):
+def test_the_operator_books_hold_9_and_10_minutes_without_the_pool_age_exit(cfg):
     sig = {"mint": "HandMadeMint", "dex": "pumpswap", "created_ts": 1000.0}
-    assert mb.hold_min(cfg, mb.OPS) == 12 and mb.exit_config(cfg, mb.OPS).max_hold_hours * 60 == 12
-    assert mb.exit_deadline(cfg, mb.OPS, sig) is None and mb.exit_deadline(cfg, mb.FAST, sig) == 1000.0 + 15 * 60
-    assert mb.climb_check(cfg, mb.OPS, 0.0, 1.0) is None
+    for ops, minutes in ((mb.OPS9, 9), (mb.OPS10, 10)):
+        assert mb.hold_min(cfg, ops) == minutes and round(mb.exit_config(cfg, ops).max_hold_hours * 60, 6) == minutes
+        assert mb.exit_deadline(cfg, ops, sig) is None and mb.climb_check(cfg, ops, 0.0, 1.0) is None
+        assert mb.verdict_skip(ops, {"rug_check": {"verdict": "new wallet"}}) == "rug catcher: new wallet"
+    assert mb.exit_deadline(cfg, mb.FAST, sig) == 1000.0 + 15 * 60
     for verdict, skip in (("repeat operator", None), ("new wallet", "rug catcher: new wallet"),
                           ("graduation", "rug catcher: graduation"), ("unknown", "rug catcher: unknown")):
-        assert mb.verdict_skip(mb.OPS, {"rug_check": {"verdict": verdict}}) == skip
+        assert mb.verdict_skip(mb.OPS10, {"rug_check": {"verdict": verdict}}) == skip
         assert mb.verdict_skip(mb.FAST, {"rug_check": {"verdict": verdict}}) is None
-    assert mb.verdict_skip(mb.OPS, {}) == "rug catcher: unknown"
+    assert mb.verdict_skip(mb.OPS10, {}) == "rug catcher: unknown"
