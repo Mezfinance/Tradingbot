@@ -213,8 +213,12 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "watch-model-train":
         from tradingbot import model_book
         from tradingbot.watcher import WatchStore, watch_db_path
-        out = model_book.train_and_save(WatchStore(watch_db_path(cfg)), cfg)
+        store = WatchStore(watch_db_path(cfg))
+        out = model_book.train_and_save(store, cfg)
         print(f"model written to {out}" if out else "not enough finished data to train yet")
+        if cfg.early_book:
+            out = model_book.train_early_and_save(store, cfg)
+            print(f"early model written to {out}" if out else "early model: not enough data to train yet")
         return
 
     if args.command == "model-status":

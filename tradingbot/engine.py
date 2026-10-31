@@ -170,6 +170,7 @@ class Engine:
             watcher = Watcher.from_config(self.cfg)
             if self.model_book is not None:
                 watcher.on_snapshot = self.model_book.consider
+                watcher.on_discover = self.model_book.consider_first
                 self.model_book.store = watcher.store
                 import httpx
                 from tradingbot.data.helius import Helius
@@ -557,8 +558,8 @@ class Engine:
                                        json.dumps({"pool": sig.get("pool"), **sig["rug_check"]}), strategy="model")
             for name in mb.BOOKS:
                 book = self.books.get(name)
-                if book is None:
-                    continue
+                if book is None or (name in mb.EARLY_BOOKS) != (sig.get("kind") == "early"):
+                    continue  # early signals go to the early books only, model5 signals to the others
                 reason = self._model_skip_reason(book, sig)
                 if reason is None:
                     reason = self._buy_model(book, sig)
@@ -577,6 +578,9 @@ class Engine:
         skip = mb.verdict_skip(book.name, sig)
         if skip:
             return skip
+        if book.name in mb.EARLY_EXIT_MIN and sig.get("created_ts") and \
+                time.time() > sig["created_ts"] + (mb.EARLY_EXIT_MIN[book.name] - 0.5) * 60:
+            return f"pool too old to sell by minute {mb.EARLY_EXIT_MIN[book.name]:g}"
         if (book.name in mb.SHORT and sig.get("created_ts")
                 and (time.time() - sig["created_ts"]) / 60 > c.model_book_max_entry_age_min):
             return "pool too old for the short hold"

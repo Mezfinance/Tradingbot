@@ -119,6 +119,12 @@ class Config:
     # pool before), hold 9 / 10 minutes, no pool-age exit. 10-28 backtest with exact on-chain pull times (60 picks):
     # +8.1% / +7.6% per trade (90% CI about -3..+18), 13% / 15% rugged; 12 min +3.6%, 15 min -9.3%.
     model_book_ops: bool = True
+    # Early books (10-31) early5/early6/early7: hand-made pumpswap pools scored at first sight (~pool minute 2) by
+    # their own model (`model/early.json`, top `early_top_pct` of recent scores), sold by pool minute 5/6/7.
+    # 10-28 backup walk-forward, exact on-chain pulls (51 trades): +8.8 / +9.9 / +9.0%/trade, 90% CI about -2..+20;
+    # minute 8 -1.8%. Designed after looking at the data, so the live run is the test. Off unless switched on.
+    early_book: bool = False
+    early_top_pct: float = 5.0
     model_train_days: float = 4.0
 
     # --- Claude analyst -------------------------------------------------

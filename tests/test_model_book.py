@@ -454,3 +454,83 @@ def test_the_operator_books_hold_9_and_10_minutes_without_the_pool_age_exit(cfg)
         assert mb.verdict_skip(mb.OPS10, {"rug_check": {"verdict": verdict}}) == skip
         assert mb.verdict_skip(mb.FAST, {"rug_check": {"verdict": verdict}}) is None
     assert mb.verdict_skip(mb.OPS10, {}) == "rug catcher: unknown"
+
+
+def early_store(n=800, seed=3):
+    """Hand-made pools first seen at minute 2; busy ones mostly rise by the 5-minute snapshot, quiet ones fade."""
+    rng = random.Random(seed)
+    store = WatchStore(":memory:")
+    for i in range(n):
+        created = T0 + i * 600
+        busy = rng.random() < 0.3
+        up = rng.random() < (0.7 if busy else 0.05)
+        first = snap(1.0, buyers=rng.randint(60, 120) if busy else rng.randint(2, 15), liq=20_000.0)
+        store.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts, first) VALUES(?,?,?,?,?,?,?)",
+                      (f"P{i}", f"M{i}", "pumpswap", f"P{i} / SOL", created, created + 120, json.dumps(first)))
+        store.execute("INSERT INTO watch_snaps(pool, age_min, ts, data) VALUES(?,?,?,?)",
+                      (f"P{i}", 5, created + 360, json.dumps(snap(1.4 if up else 0.9, liq=20_000.0))))
+    return store
+
+
+def test_early_model_trains_on_hand_made_pools_and_queues_first_sight_signals(tmp_path):
+    cfg = Config(db_path=str(tmp_path / "bot.db"), early_book=True)
+    store = early_store()
+    rows = mb.early_training_rows(store, now=T0 + 800 * 600 + 3600, days=30)
+    assert len(rows) == 800 and 0.1 < sum(r["up"] for r in rows) / len(rows) < 0.4
+    store.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts, first) VALUES(?,?,?,?,?,?,?)",
+                  ("G", "Gpump", "pumpswap", "G / SOL", T0, T0 + 120, json.dumps(snap(1.0))))
+    assert len(mb.early_training_rows(store, now=T0 + 800 * 600 + 3600, days=30)) == 800  # graduations left out
+    assert mb.train_early_and_save(store, cfg) == mb.early_model_path(cfg)  # last 4 days of the data's own clock
+    model = mb.Model.from_json(json.loads(mb.early_model_path(cfg).read_text()))
+    assert model.meta["top_pump_rate_in_sample"] > model.meta["pump_rate"] and model.meta["top_pct"] == 5.0
+    book = mb.ModelBook(cfg)
+    now = time.time()
+    pool = lambda mint, seen_after=120: {"pool": "X" + mint, "mint": mint, "dex": "pumpswap", "name": "X / SOL",
+                                         "created_ts": now - seen_after, "seen_ts": now}
+    busy, quiet = snap(1.0, buyers=300, liq=20_000.0), snap(1.0, buyers=3, liq=20_000.0)
+    assert book.consider_first(pool("HAND"), quiet) is None  # below the cut-off
+    assert book.consider_first(pool("HANDpump"), busy) is None  # pump.fun graduation: not hand-made
+    assert book.consider_first(pool("HAND", seen_after=300), busy) is None  # first seen too late to trade
+    assert book.consider_first(pool("HAND"), snap(1.0, buyers=300, liq=1000.0)) is None  # too thin
+    assert book.consider_first(pool("HAND"), busy) is not None
+    sig = book.signals.get_nowait()
+    assert sig["kind"] == "early" and sig["mint"] == "HAND" and sig["created_ts"] == now - 120
+
+
+def test_early_signals_go_to_the_early_books_with_pool_minute_deadlines(cfg, good_pair):
+    cfg.early_book = True
+    try:
+        j = Journal(":memory:")
+        eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                     model_executor=PaperExecutor(cfg))
+        assert mb.active_books(cfg)[-3:] == [mb.EARLY5, mb.EARLY6, mb.EARLY7]
+        assert [mb.hold_min(cfg, b) for b in mb.EARLY_BOOKS] == [5, 6, 7]
+        created = time.time() - 120
+        early = {"pool": "PE", "mint": "EARLY", "dex": "pumpswap", "created_ts": created, "name": "E",
+                 "price": 2.5e-5, "liq": 30_000.0, "score": 1.0, "ts": time.time(), "kind": "early"}
+        late = dict(early, mint="LATE", created_ts=time.time() - 290)  # 4.8 min old: too late for early5
+        model5 = dict(early, mint="M5", kind=None)
+        for s in (early, late, model5):
+            eng.model_book.signals.put(s)
+        eng.buy_model_signals()
+        for book, minutes in zip(mb.EARLY_BOOKS, (5, 6, 7)):
+            held = {p.token_address: p for p in j.open_positions(book)}
+            assert "EARLY" in held and "M5" not in held  # model5 signals never reach the early books
+            assert eng._deadlines[held["EARLY"].id] == created + minutes * 60  # sold by the pool minute
+            assert ("LATE" in held) == (minutes > 5)
+        assert all(p.token_address != "EARLY" for p in j.open_positions(mb.FAST))  # and early signals not the rest
+        skip = j.query("SELECT detail FROM events WHERE kind='entry_skipped' AND strategy=? AND token='LATE'", (mb.EARLY5,))
+        assert skip[0][0] == "pool too old to sell by minute 5"
+    finally:
+        cfg.early_book = False
+
+
+def test_watcher_hands_newly_seen_pools_to_the_early_listener():
+    from tests.test_watcher import FakeGecko, make, pool
+    g = FakeGecko({1: [pool("A", "MA")]})
+    w, _ = make(g)
+    seen = []
+    w.on_discover = lambda p, first: seen.append((p["pool"], p["mint"], p["seen_ts"], "price" in first))
+    w.discover(T0)
+    w.discover(T0 + 30)  # already known: not handed over again
+    assert seen == [("A", "MA", T0, True)]

@@ -268,6 +268,7 @@ class Watcher:
         self.s3_factory = s3_factory
         self.report_in_subprocess = report_in_subprocess
         self.on_snapshot = None  # callable(pool_row, age_min, snapshot) for each new snapshot (model5)
+        self.on_discover = None  # callable(pool_row, first_snapshot) for each newly recorded pool (early books)
         self._seen: dict[str, bool] = {}  # every new pool seen recently -> is a launchpad pool (before sampling)
         self.seen_counts = [0, 0]  # new pools, of which launchpad, since the market row was last written
 
@@ -316,6 +317,13 @@ class Watcher:
             self.store.executemany(
                 "INSERT OR IGNORE INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts, first) "
                 "VALUES(?,?,?,?,?,?,?)", rows)
+            if self.on_discover is not None:
+                for addr, mint, dex, name, created, seen, first in rows:
+                    try:
+                        self.on_discover({"pool": addr, "mint": mint, "dex": dex, "name": name, "created_ts": created,
+                                          "seen_ts": seen}, json.loads(first))
+                    except Exception as exc:  # noqa: BLE001 (a listener must never stop discovery)
+                        log.warning("on_discover failed for %s: %s", addr, exc)
             added += len(rows)
             if known:  # caught up with what we already have
                 break

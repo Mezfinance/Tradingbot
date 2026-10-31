@@ -43,7 +43,13 @@ CLIMB = "model5_climb"  # FAST's rules + out after 3 min unless the price climbe
 # Only pools the rug catcher calls `repeat operator`, no pool-age exit; the name carries the hold in minutes
 OPS9, OPS10 = "model5_ops9", "model5_ops10"
 OPS_HOLD_MIN = {OPS9: 9.0, OPS10: 10.0}
-BOOKS = (NAME, FAST, CLIMB, OPS9, OPS10)
+# Early books (10-31): one hand-made-pool model scored at first sight (~pool minute 2), sold by pool minute 5/6/7
+EARLY5, EARLY6, EARLY7 = "early5", "early6", "early7"
+EARLY_EXIT_MIN = {EARLY5: 5.0, EARLY6: 6.0, EARLY7: 7.0}
+EARLY_BOOKS = tuple(EARLY_EXIT_MIN)
+EARLY_MAX_SEEN_MIN = 4.0  # first sight later than this leaves no time to trade (and was left out of training)
+EARLY_GAIN = 0.10  # label: the 5-minute snapshot price >= first-sight price x 1.10 after costs, pool intact
+BOOKS = (NAME, FAST, CLIMB, OPS9, OPS10) + EARLY_BOOKS
 SHORT = (FAST, CLIMB, OPS9, OPS10)  # the short-hold books (entry-age guard, rug catcher report)
 AGE_EXIT = (FAST, CLIMB)  # books with the pool-age exit for hand-made pools
 AGE_MIN = 5
@@ -54,6 +60,10 @@ RELOAD_CHECK_S = 300
 
 def model_path(cfg: Config) -> Path:
     return Path(cfg.db_path).resolve().parent / "model" / f"{NAME}.json"
+
+
+def early_model_path(cfg: Config) -> Path:
+    return Path(cfg.db_path).resolve().parent / "model" / "early.json"
 
 
 def features(pool: dict, snap: dict) -> dict:
@@ -73,8 +83,10 @@ def is_handmade(dex: str, mint: str) -> bool:
 
 
 def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
-    """Pool-age exit for the 10-min and climb books' hand-made pools: sell by created +
-    `model_book_handmade_exit_age_min`."""
+    """Pool-age exit: the early books sell every position by their pool minute; the 10-min and climb books sell
+    hand-made pools by created + `model_book_handmade_exit_age_min`."""
+    if name in EARLY_EXIT_MIN:
+        return sig["created_ts"] + EARLY_EXIT_MIN[name] * 60 if sig.get("created_ts") else None
     age = cfg.model_book_handmade_exit_age_min
     if name not in AGE_EXIT or age <= 0 or not sig.get("created_ts") or not is_handmade(sig.get("dex") or "", sig["mint"]):
         return None
@@ -83,7 +95,8 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
 
 def active_books(cfg: Config) -> list[str]:
     return ([NAME] if cfg.model_book_slow else []) + ([FAST] if cfg.model_book_fast else []) \
-        + ([CLIMB] if cfg.model_book_climb else []) + ([OPS9, OPS10] if cfg.model_book_ops else [])
+        + ([CLIMB] if cfg.model_book_climb else []) + ([OPS9, OPS10] if cfg.model_book_ops else []) \
+        + (list(EARLY_BOOKS) if cfg.early_book else [])
 
 
 def verdict_skip(name: str, sig: dict) -> str | None:
@@ -106,6 +119,8 @@ def climb_check(cfg: Config, name: str, bought_ts: float, market_price: float) -
 def hold_min(cfg: Config, name: str = NAME) -> float:
     if name in OPS_HOLD_MIN:
         return OPS_HOLD_MIN[name]
+    if name in EARLY_EXIT_MIN:  # from the buy; the pool-minute deadline normally sells first
+        return EARLY_EXIT_MIN[name]
     return cfg.model_book_fast_hold_min if name in SHORT else cfg.model_book_hold_min
 
 
@@ -207,6 +222,77 @@ RUG_RETURN = -0.80  # a trade that lost >=80%: the stop did not protect it
 LIQ_PULLED_SHARE = 0.25  # liquidity now below 25% of entry liquidity = pulled, not dumped into
 
 
+def early_features(pool: dict, first: dict, seen_ts: float) -> dict:
+    """The early model's inputs: what GeckoTerminal showed when the watcher first saw the pool."""
+    out = wa._static_features(pool)
+    out.update(wa._snap_features(first))
+    out["seen_age_min"] = (seen_ts - pool["created_ts"]) / 60
+    return out
+
+
+def early_training_rows(store, now: float | None = None, days: float = 4) -> list[dict]:
+    """Hand-made pumpswap pools first seen within EARLY_MAX_SEEN_MIN, labelled by their 5-minute snapshot
+    (~pool minute 6): `up` = price >= first-sight x (1 + EARLY_GAIN) after the 6% round trip, pool not emptied."""
+    now = now if now is not None else wa.data_now(store)
+    rows = []
+    for p in store.query(
+            "SELECT w.pool, w.mint, w.dex, w.name, w.created_ts, w.seen_ts, w.first, s.data AS snap5 FROM watch_pools w "
+            "JOIN watch_snaps s ON s.pool = w.pool AND s.age_min = 5 WHERE w.dex = 'pumpswap' AND w.created_ts >= ? "
+            "AND w.first IS NOT NULL AND s.data IS NOT NULL AND s.data != '{}' ORDER BY w.created_ts",
+            (now - days * wa.DAY_S,)):
+        if not is_handmade(p["dex"], p["mint"]) or not p["created_ts"] or not p["seen_ts"]:
+            continue
+        if not 0 <= p["seen_ts"] - p["created_ts"] <= EARLY_MAX_SEEN_MIN * 60:
+            continue
+        first, s5 = json.loads(p["first"]), json.loads(p["snap5"])
+        pf, lf, p5, l5 = (wa._f(first.get("price")), wa._f(first.get("liq")) or 0.0, wa._f(s5.get("price")),
+                          wa._f(s5.get("liq")) or 0.0)
+        if not pf or not p5:
+            continue
+        pulled = lf > 0 and l5 < wa.RUG_LIQ_SHARE * lf
+        ret = -1.0 if pulled else min(p5 / pf - 1 - wa.ROUND_TRIP_COST, 3.0)  # cap: unit glitches print 500x
+        row = {"pool": p["pool"], "created_ts": p["created_ts"], "up": float(ret >= EARLY_GAIN), "ret": ret}
+        row.update({k: v for k, v in early_features(dict(p), first, p["seen_ts"]).items() if v is not None})
+        rows.append(row)
+    return rows
+
+
+def train_early(store, cfg: Config, now: float | None = None) -> Model | None:
+    rows = early_training_rows(store, now, cfg.model_train_days)
+    if len(rows) < wa.MIN_ROWS or not any(r["up"] for r in rows):
+        log.warning("early model: not enough rows to train (%d)", len(rows))
+        return None
+    names = sorted({k for r in rows for k in r} - {"pool", "created_ts", "up", "ret"})
+    x, med = wa._matrix(rows, names)
+    y = np.array([r["up"] for r in rows])
+    mu, sd = x.mean(0), x.std(0) + 1e-9
+    w, b = wa.logistic((x - mu) / sd, y)
+    scores = ((x - mu) / sd) @ w + b
+    recent = scores[[r["created_ts"] >= rows[-1]["created_ts"] - 2 * wa.DAY_S for r in rows]]
+    threshold = float(np.quantile(recent, 1 - cfg.early_top_pct / 100))
+    top = scores >= threshold
+    meta = {"trained_ts": time.time(), "rows": len(rows), "pump_rate": float(y.mean()),
+            "top_pump_rate_in_sample": float(y[top].mean()) if top.any() else None,
+            "top_trade_ret_in_sample": float(np.mean([r["ret"] for r, t in zip(rows, top) if t])) if top.any() else None,
+            "days": cfg.model_train_days, "top_pct": cfg.early_top_pct}
+    return Model(names, mu.tolist(), sd.tolist(), {n: float(med[n]) for n in names}, w.tolist(), float(b),
+                 threshold, meta)
+
+
+def train_early_and_save(store, cfg: Config) -> Path | None:
+    model = train_early(store, cfg)
+    if model is None:
+        return None
+    path = early_model_path(cfg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(model.to_json()))
+    os.replace(tmp, path)
+    log.info("early model trained on %d rows (up rate %.1f%%), cut-off %.3f", model.meta["rows"],
+             model.meta["pump_rate"] * 100, model.threshold)
+    return path
+
+
 def entry_audit(extras, mint: str) -> dict:
     """Jupiter's holder audit right now (free, one call)."""
     t = extras.jupiter_token(mint) if extras is not None else None
@@ -269,7 +355,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
 
     return {"finished_trades": len(trades), "rugs": len(rugs),
             "rug_rate_pct": round(100 * len(rugs) / len(trades), 1) if trades else None,
-            "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0, OPS9: 13.0, OPS10: 15.0}.get(name, 76.0),  # 10-28 backtests
+            "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0, OPS9: 13.0, OPS10: 15.0, EARLY5: 10.0, EARLY6: 12.0, EARLY7: 14.0}.get(name, 76.0),  # 10-28 backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 
@@ -346,26 +432,51 @@ class ModelBook:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.model: Model | None = None
-        self._mtime = 0.0
+        self._mtimes = {"model": 0.0, "early": 0.0}
         self._checked = 0.0
         self.signals: queue.Queue = queue.Queue(maxsize=500)
         self.store = None  # the watcher's store, for the rug catcher's creator lookup (set by the engine)
         self.helius = None  # reads a signal's pool creator when the enricher hasn't yet (set by the engine)
+        self.early: Model | None = None
         self.reload(force=True)
 
     def reload(self, force: bool = False) -> None:
         if not force and time.time() - self._checked < RELOAD_CHECK_S:
             return
         self._checked = time.time()
-        path = model_path(self.cfg)
+        for path, attr, label in ((model_path(self.cfg), "model", "model5"),
+                                  (early_model_path(self.cfg), "early", "early model")):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime != self._mtimes[attr]:
+                m = Model.from_json(json.loads(path.read_text()))
+                setattr(self, attr, m)
+                self._mtimes[attr] = mtime
+                log.info("%s loaded (%s rows, cut-off %.3f)", label, m.meta.get("rows"), m.threshold)
+
+    def consider_first(self, pool: dict, first: dict) -> float | None:
+        """Called by the watcher when it first sees a pool (`pool` has created_ts and seen_ts). Hand-made pools
+        that score in the early model's top `early_top_pct` are queued for the early books."""
+        if not self.cfg.early_book or not first or not is_handmade(pool.get("dex") or "", pool.get("mint") or ""):
+            return None
+        self.reload()
+        if self.early is None or not pool.get("created_ts") or not pool.get("seen_ts"):
+            return None
+        if not 0 <= pool["seen_ts"] - pool["created_ts"] <= EARLY_MAX_SEEN_MIN * 60:
+            return None
+        score = self.early.score(early_features(pool, first, pool["seen_ts"]))
+        liq = wa._f(first.get("liq")) or 0.0
+        if score < self.early.threshold or liq < self.cfg.model_book_min_liq_usd or not wa._f(first.get("price")):
+            return None
         try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return
-        if mtime != self._mtime:
-            self.model = Model.from_json(json.loads(path.read_text()))
-            self._mtime = mtime
-            log.info("model5 loaded (%s rows, cut-off %.3f)", self.model.meta.get("rows"), self.model.threshold)
+            self.signals.put_nowait({"pool": pool["pool"], "mint": pool["mint"], "name": pool.get("name") or "",
+                                     "score": score, "price": wa._f(first["price"]), "liq": liq, "ts": time.time(),
+                                     "created_ts": pool["created_ts"], "dex": pool.get("dex") or "", "kind": "early"})
+        except queue.Full:
+            return None
+        return score
 
     def consider(self, pool: dict, age: int, snap: dict) -> float | None:
         """Called by the watcher for each new snapshot. Returns the score when the pool is queued."""
