@@ -125,6 +125,10 @@ class Config:
     # minute 8 -1.8%. Designed after looking at the data, so the live run is the test. Off unless switched on.
     early_book: bool = False
     early_top_pct: float = 5.0
+    # early5r/early6r/early7r: the same model and exits, but buy the top `early_top_pct` of the past day's eligible
+    # pools (rolling cut-off) instead of the fixed one set at training. Walk-forward on the 10-28 backup (snapshot
+    # yardstick): -4.9%/trade, 90% CI -16..+6, vs -6.5% fixed and -4.1% for every eligible pool. Off unless switched on.
+    early_rolling: bool = False
     model_train_days: float = 4.0
 
     # --- Claude analyst -------------------------------------------------

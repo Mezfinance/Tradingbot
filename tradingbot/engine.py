@@ -561,6 +561,8 @@ class Engine:
                 book = self.books.get(name)
                 if book is None or (name in mb.EARLY_BOOKS) != (sig.get("kind") == "early"):
                     continue  # early signals go to the early books only, model5 signals to the others
+                if name in mb.EARLY_BOOKS and not mb.early_wants(name, sig):
+                    continue  # a fixed-only signal for a rolling book, or the other way round
                 reason = self._model_skip_reason(book, sig)
                 if reason is None:
                     reason = self._buy_model(book, sig)

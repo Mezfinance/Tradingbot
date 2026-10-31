@@ -477,6 +477,10 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
               "-2.9%/trade, 25% emptied, 90% range -11%..+6% (the +8.8% seen on the 60 with 1-min candles was biased)",
     "early6": "as early5, out by pool minute 6 (all picks ~-3%/trade; candle subset +9.9%, biased)",
     "early7": "as early5, out by pool minute 7 (all picks ~-3%/trade; candle subset +9.0%, biased)",
+    "early5r": "as early5 but top 5% of the past day's eligible pools (rolling cut-off). Walk-forward at ~minute 6: "
+               "-4.9%/trade, 26% emptied, 90% range -16%..+6% (fixed -6.5%, every eligible pool -4.1%)",
+    "early6r": "as early5r, out by pool minute 6",
+    "early7r": "as early5r, out by pool minute 7",
 }
 
 

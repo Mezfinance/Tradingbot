@@ -45,7 +45,11 @@ OPS9, OPS10 = "model5_ops9", "model5_ops10"
 OPS_HOLD_MIN = {OPS9: 9.0, OPS10: 10.0}
 # Early books (10-31): one hand-made-pool model scored at first sight (~pool minute 2), sold by pool minute 5/6/7
 EARLY5, EARLY6, EARLY7 = "early5", "early6", "early7"
-EARLY_EXIT_MIN = {EARLY5: 5.0, EARLY6: 6.0, EARLY7: 7.0}
+# Rolling twins (10-31): same model and exits, but buy the top `early_top_pct` of the past day's eligible pools
+EARLY5R, EARLY6R, EARLY7R = "early5r", "early6r", "early7r"
+EARLY_FIXED = (EARLY5, EARLY6, EARLY7)
+EARLY_ROLLING = (EARLY5R, EARLY6R, EARLY7R)
+EARLY_EXIT_MIN = {EARLY5: 5.0, EARLY6: 6.0, EARLY7: 7.0, EARLY5R: 5.0, EARLY6R: 6.0, EARLY7R: 7.0}
 EARLY_BOOKS = tuple(EARLY_EXIT_MIN)
 EARLY_MAX_SEEN_MIN = 4.0  # first sight later than this leaves no time to trade (and was left out of training)
 EARLY_GAIN = 0.10  # label: the 5-minute snapshot price >= first-sight price x 1.10 after costs, pool intact
@@ -96,7 +100,12 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
 def active_books(cfg: Config) -> list[str]:
     return ([NAME] if cfg.model_book_slow else []) + ([FAST] if cfg.model_book_fast else []) \
         + ([CLIMB] if cfg.model_book_climb else []) + ([OPS9, OPS10] if cfg.model_book_ops else []) \
-        + (list(EARLY_BOOKS) if cfg.early_book else [])
+        + (list(EARLY_FIXED) if cfg.early_book else []) + (list(EARLY_ROLLING) if cfg.early_rolling else [])
+
+
+def early_wants(name: str, sig: dict) -> bool:
+    """Which early books take an early signal: the fixed books its fixed cut-off pass, the rolling ones its rolling."""
+    return bool(sig.get("rolling")) if name in EARLY_ROLLING else bool(sig.get("fixed"))
 
 
 def verdict_skip(name: str, sig: dict) -> str | None:
@@ -471,7 +480,8 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
 
     return {"finished_trades": len(trades), "rugs": len(rugs),
             "rug_rate_pct": round(100 * len(rugs) / len(trades), 1) if trades else None,
-            "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0, OPS9: 13.0, OPS10: 15.0, EARLY5: 10.0, EARLY6: 12.0, EARLY7: 14.0}.get(name, 76.0),  # 10-28 backtests
+            "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0, OPS9: 13.0, OPS10: 15.0, EARLY5: 25.0, EARLY6: 25.0, EARLY7: 25.0,
+                                      EARLY5R: 26.0, EARLY6R: 26.0, EARLY7R: 26.0}.get(name, 76.0),  # 10-28 backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 
@@ -554,6 +564,7 @@ class ModelBook:
         self.store = None  # the watcher's store, for the rug catcher's creator lookup (set by the engine)
         self.helius = None  # reads a signal's pool creator when the enricher hasn't yet (set by the engine)
         self.early: Model | None = None
+        self._history: list[tuple[float, float]] | None = None  # (seen_ts, score) of eligible pools, past day
         self.reload(force=True)
 
     def reload(self, force: bool = False) -> None:
@@ -570,29 +581,53 @@ class ModelBook:
                 m = Model.from_json(json.loads(path.read_text()))
                 setattr(self, attr, m)
                 self._mtimes[attr] = mtime
+                if attr == "early":
+                    self._history = None  # a new model scores differently: rebuild the rolling window
                 log.info("%s loaded (%s rows, cut-off %.3f)", label, m.meta.get("rows"), m.threshold)
 
     def consider_first(self, pool: dict, first: dict) -> float | None:
         """Called by the watcher when it first sees a pool (`pool` has created_ts and seen_ts). Hand-made pools
-        that score in the early model's top `early_top_pct` are queued for the early books."""
-        if not self.cfg.early_book or not first or not is_handmade(pool.get("dex") or "", pool.get("mint") or ""):
+        at or above the early model's fixed cut-off (fixed books) or in the top `early_top_pct` of the past day's
+        eligible pools (rolling books) are queued."""
+        if not (self.cfg.early_book or self.cfg.early_rolling) or not first or \
+                not is_handmade(pool.get("dex") or "", pool.get("mint") or ""):
             return None
         self.reload()
         if self.early is None or not pool.get("created_ts") or not pool.get("seen_ts"):
             return None
         if not 0 <= pool["seen_ts"] - pool["created_ts"] <= EARLY_MAX_SEEN_MIN * 60:
             return None
-        score = self.early.score(early_features(pool, first, pool["seen_ts"]))
         liq = wa._f(first.get("liq")) or 0.0
-        if score < self.early.threshold or liq < self.cfg.model_book_min_liq_usd or not wa._f(first.get("price")):
+        if liq < self.cfg.model_book_min_liq_usd or not wa._f(first.get("price")):
+            return None
+        score = self.early.score(early_features(pool, first, pool["seen_ts"]))
+        fixed = self.cfg.early_book and score >= self.early.threshold
+        rolling = False
+        if self.cfg.early_rolling:
+            history = self._rolling_history(pool["seen_ts"])
+            cut = rolling_cut_off(history, pool["seen_ts"], self.cfg.early_top_pct)
+            rolling = cut is not None and score >= cut
+            history.append((pool["seen_ts"], score))
+        if not (fixed or rolling):
             return None
         try:
             self.signals.put_nowait({"pool": pool["pool"], "mint": pool["mint"], "name": pool.get("name") or "",
                                      "score": score, "price": wa._f(first["price"]), "liq": liq, "ts": time.time(),
-                                     "created_ts": pool["created_ts"], "dex": pool.get("dex") or "", "kind": "early"})
+                                     "created_ts": pool["created_ts"], "dex": pool.get("dex") or "", "kind": "early",
+                                     "fixed": fixed, "rolling": rolling})
         except queue.Full:
             return None
         return score
+
+    def _rolling_history(self, now: float) -> list[tuple[float, float]]:
+        """The past day's eligible scores; rebuilt from the watcher's store at start-up and after a retrain."""
+        if self._history is None:
+            self._history = []
+            if self.store is not None and self.early is not None:
+                self._history = [(c["seen_ts"], c["score"]) for c in
+                                 early_candidates(self.store, self.cfg, self.early, now - ROLLING_WINDOW_S, now)]
+        self._history = [h for h in self._history if h[0] >= now - ROLLING_WINDOW_S]
+        return self._history
 
     def consider(self, pool: dict, age: int, snap: dict) -> float | None:
         """Called by the watcher for each new snapshot. Returns the score when the pool is queued."""

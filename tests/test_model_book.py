@@ -504,16 +504,16 @@ def test_early_signals_go_to_the_early_books_with_pool_minute_deadlines(cfg, goo
         eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
                      model_executor=PaperExecutor(cfg))
         assert mb.active_books(cfg)[-3:] == [mb.EARLY5, mb.EARLY6, mb.EARLY7]
-        assert [mb.hold_min(cfg, b) for b in mb.EARLY_BOOKS] == [5, 6, 7]
+        assert [mb.hold_min(cfg, b) for b in mb.EARLY_FIXED] == [5, 6, 7]
         created = time.time() - 120
         early = {"pool": "PE", "mint": "EARLY", "dex": "pumpswap", "created_ts": created, "name": "E",
-                 "price": 2.5e-5, "liq": 30_000.0, "score": 1.0, "ts": time.time(), "kind": "early"}
+                 "price": 2.5e-5, "liq": 30_000.0, "score": 1.0, "ts": time.time(), "kind": "early", "fixed": True}
         late = dict(early, mint="LATE", created_ts=time.time() - 290)  # 4.8 min old: too late for early5
         model5 = dict(early, mint="M5", kind=None)
         for s in (early, late, model5):
             eng.model_book.signals.put(s)
         eng.buy_model_signals()
-        for book, minutes in zip(mb.EARLY_BOOKS, (5, 6, 7)):
+        for book, minutes in zip(mb.EARLY_FIXED, (5, 6, 7)):
             held = {p.token_address: p for p in j.open_positions(book)}
             assert "EARLY" in held and "M5" not in held  # model5 signals never reach the early books
             assert eng._deadlines[held["EARLY"].id] == created + minutes * 60  # sold by the pool minute
@@ -566,3 +566,58 @@ def test_early_backtest_compares_the_fixed_and_rolling_cut_offs(tmp_path):
     assert out["fixed"]["mean_pct"] > out["all_eligible"]["mean_pct"]  # busy pools rise in this data
     assert len(out["rolling"]["trades"][0]) == 4
     assert mb.rolling_cut_off([(now - 10, 1.0)] * 10, now, 5.0) is None  # too little history
+
+
+
+def test_rolling_books_take_only_signals_in_the_top_of_the_past_day(cfg, good_pair, tmp_path):
+    cfg.db_path = str(tmp_path / "bot.db")
+    cfg.early_book = cfg.early_rolling = True
+    try:
+        store = early_store()
+        cfg.model_train_days = 30
+        mb.train_early_and_save(store, cfg)
+        book = mb.ModelBook(cfg)
+        now = time.time()
+        book.store = store
+        book._history = [(now - 3600 + i, -1.0 + i / 100) for i in range(100)]  # past day's scores -1.0 .. -0.01
+        pool = lambda mint: {"pool": "X" + mint, "mint": mint, "dex": "pumpswap", "name": "X / SOL",
+                             "created_ts": now - 120, "seen_ts": now}
+        busy, middling = snap(1.0, buyers=300, liq=20_000.0), snap(1.0, buyers=12, liq=20_000.0)
+        score_mid = book.early.score(mb.early_features(pool("MID"), middling, now))
+        assert book.consider_first(pool("BUSY"), busy) is not None
+        sig = book.signals.get_nowait()
+        assert sig["fixed"] and sig["rolling"]  # clears both cut-offs
+        if -0.05 < score_mid < book.early.threshold:  # beats the past day's top 5% but not the fixed cut-off
+            assert book.consider_first(pool("MID"), middling) is not None and not book.signals.get_nowait()["fixed"]
+        assert len(book._history) >= 101  # every eligible pool joins the window, picked or not
+        j = Journal(":memory:")
+        eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                     model_executor=PaperExecutor(cfg))
+        assert mb.active_books(cfg)[-6:] == list(mb.EARLY_FIXED + mb.EARLY_ROLLING)
+        base = {"dex": "pumpswap", "created_ts": time.time() - 120, "name": "E", "price": 2.5e-5, "liq": 30_000.0,
+                "score": 1.0, "ts": time.time(), "kind": "early"}
+        eng.model_book.signals.put(dict(base, pool="P1", mint="ROLL", fixed=False, rolling=True))
+        eng.model_book.signals.put(dict(base, pool="P2", mint="FIXD", fixed=True, rolling=False))
+        eng.buy_model_signals()
+        for b in mb.EARLY_ROLLING:
+            assert {p.token_address for p in j.open_positions(b)} == {"ROLL"}
+        for b in mb.EARLY_FIXED:
+            assert {p.token_address for p in j.open_positions(b)} == {"FIXD"}
+        assert mb.rolling_cut_off([(now - 10, s) for s in range(10)], now, 5.0) is None  # under 50 scores: no cut-off
+    finally:
+        cfg.early_book = cfg.early_rolling = False
+
+
+def test_the_rolling_window_is_rebuilt_from_the_store_and_after_a_retrain(tmp_path):
+    cfg = Config(db_path=str(tmp_path / "bot.db"), early_book=True, early_rolling=True, model_train_days=30)
+    store = early_store()
+    mb.train_early_and_save(store, cfg)
+    book = mb.ModelBook(cfg)
+    book.store = store
+    last = T0 + 800 * 600
+    history = book._rolling_history(last)
+    assert 100 < len(history) <= 144  # one pool every 10 minutes over the past day (liquidity permitting)
+    book._mtimes["early"] = 0.0  # as if the nightly training wrote a new file
+    book._checked = 0.0
+    book.reload()
+    assert book._history is None
