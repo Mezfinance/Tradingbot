@@ -10,7 +10,11 @@ primary_region = "iad"
   TB_MODE = "paper"
   TB_DB_PATH = "/data/tradingbot.db"
   TB_HEALTH_PORT = "8080"
-  TB_MODEL_BOOK_SLOW = "0"  # 24h model5 book off (10-28: -10%, 61% rugged); the short-hold books keep running
+  TB_MODEL_BOOK_SLOW = "0"  # 24h model5 book off (10-28: -10%, 61% rugged)
+  # All model5 books off (10-31: 10m -13%, climb -6%, ops9/ops10 -8%; rugs 16-30% of picks)
+  TB_MODEL_BOOK_FAST = "0"
+  TB_MODEL_BOOK_CLIMB = "0"
+  TB_MODEL_BOOK_OPS = "0"
   TB_CLAUDE_TRADING = "0"  # no Opus buy/pass analysis, triage or learning: 0 Claude buys in two weeks
 
 # The journal. Daily snapshots are kept for 14 days; the volume grows itself if it fills.
