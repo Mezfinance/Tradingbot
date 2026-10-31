@@ -553,3 +553,16 @@ def test_early_status_shows_the_funnel_and_scores_against_the_cut_off(tmp_path):
     assert out["pools_seen"] == 4 and out["hand_made"] == 3 and out["hand_made_seen_within_4_min"] == 2
     assert out["with_enough_liquidity"] == 1 and out["scores"]["at_or_above_cut_off"] == 1
     assert out["model"]["top_pct"] == 5.0 and out["books"][mb.EARLY6]["buys"] == 1
+
+
+def test_early_backtest_compares_the_fixed_and_rolling_cut_offs(tmp_path):
+    cfg = Config(db_path=str(tmp_path / "bot.db"), early_book=True)
+    store = early_store(n=1200)  # one pool every 10 min: 144 in the last day, 144 in the day before
+    mb.train_early_and_save(store, cfg)
+    now = T0 + 1200 * 600
+    out = mb.early_backtest(store, cfg, hours=24, now=now)
+    assert out["eligible_pools"] == 144 and out["all_eligible"]["with_outcome"] == 144
+    assert 0 < out["fixed"]["picks"] < 40 and 0 < out["rolling"]["picks"] < 40
+    assert out["fixed"]["mean_pct"] > out["all_eligible"]["mean_pct"]  # busy pools rise in this data
+    assert len(out["rolling"]["trades"][0]) == 4
+    assert mb.rolling_cut_off([(now - 10, 1.0)] * 10, now, 5.0) is None  # too little history

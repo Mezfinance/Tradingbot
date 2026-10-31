@@ -337,6 +337,78 @@ def early_status(store, cfg: Config, hours: float = 8, now: float | None = None,
     return out
 
 
+ROLLING_WINDOW_S = 24 * 3600  # the rolling cut-off ranks a pool against the eligible pools of the past day
+ROLLING_MIN_SCORES = 50  # fewer eligible pools than this in the window: no rolling cut-off yet
+
+
+def early_candidates(store, cfg: Config, model: Model, since: float, until: float) -> list[dict]:
+    """Hand-made pools first seen in [since, until) within EARLY_MAX_SEEN_MIN, with enough liquidity, scored by
+    `model`, oldest first; with their 5-minute snapshot outcome when it exists (as the model was trained)."""
+    out = []
+    for p in store.query(
+            "SELECT w.pool, w.mint, w.dex, w.name, w.created_ts, w.seen_ts, w.first, s.data AS snap5 FROM watch_pools w "
+            "LEFT JOIN watch_snaps s ON s.pool = w.pool AND s.age_min = 5 WHERE w.seen_ts >= ? AND w.seen_ts < ? "
+            "AND w.dex = 'pumpswap' AND w.first IS NOT NULL ORDER BY w.seen_ts", (since, until)):
+        if not is_handmade(p["dex"], p["mint"]) or not p["created_ts"]:
+            continue
+        if not 0 <= p["seen_ts"] - p["created_ts"] <= EARLY_MAX_SEEN_MIN * 60:
+            continue
+        first = json.loads(p["first"])
+        pf, lf = wa._f(first.get("price")), wa._f(first.get("liq")) or 0.0
+        if not pf or lf < cfg.model_book_min_liq_usd:
+            continue
+        ret = None
+        s5 = json.loads(p["snap5"]) if p["snap5"] and p["snap5"] != "{}" else None
+        if s5 and wa._f(s5.get("price")):
+            pulled = (wa._f(s5.get("liq")) or 0.0) < wa.RUG_LIQ_SHARE * lf
+            ret = -1.0 if pulled else min(wa._f(s5["price"]) / pf - 1 - wa.ROUND_TRIP_COST, 3.0)
+        out.append({"pool": p["pool"], "name": (p["name"] or "").split(" / ")[0], "seen_ts": p["seen_ts"],
+                    "score": model.score(early_features(dict(p), first, p["seen_ts"])), "ret": ret})
+    return out
+
+
+def rolling_cut_off(history: list[tuple[float, float]], ts: float, top_pct: float) -> float | None:
+    """The (100 - top_pct) percentile of eligible scores seen in the ROLLING_WINDOW_S before `ts`."""
+    window = [s for t, s in history if ts - ROLLING_WINDOW_S <= t < ts]
+    return float(np.percentile(window, 100 - top_pct)) if len(window) >= ROLLING_MIN_SCORES else None
+
+
+def early_backtest(store, cfg: Config, hours: float = 8, now: float | None = None) -> dict:
+    """How the last `hours` of eligible pools would have done under the fixed cut-off (the model's, set at training)
+    and a rolling one (top `early_top_pct` of the previous day's eligible pools), scored on each pool's 5-minute
+    snapshot (~pool minute 6; emptied pool = -100%; 6% round trip)."""
+    now = now or time.time()
+    path = early_model_path(cfg)
+    if not path.exists():
+        return {"error": "no early model yet"}
+    model = Model.from_json(json.loads(path.read_text()))
+    cands = early_candidates(store, cfg, model, now - hours * 3600 - ROLLING_WINDOW_S, now)
+    history = [(c["seen_ts"], c["score"]) for c in cands]
+    window = [c for c in cands if c["seen_ts"] >= now - hours * 3600]
+
+    def summary(picks):
+        done = [c["ret"] for c in picks if c["ret"] is not None]
+        a = np.array(done)
+        return {"picks": len(picks), "with_outcome": len(done),
+                "mean_pct": round(float(a.mean()) * 100, 1) if done else None,
+                "median_pct": round(float(np.median(a)) * 100, 1) if done else None,
+                "win_pct": round(float((a > 0).mean()) * 100) if done else None,
+                "emptied_pct": round(float((a <= -0.99).mean()) * 100) if done else None,
+                "trades": [[time.strftime("%H:%M", time.gmtime(c["seen_ts"])), c["name"][:14], round(c["score"], 2),
+                            None if c["ret"] is None else round(c["ret"] * 100, 1)] for c in picks]}
+    fixed = [c for c in window if c["score"] >= model.threshold]
+    rolling = []
+    for c in window:
+        cut = rolling_cut_off(history, c["seen_ts"], cfg.early_top_pct)
+        if cut is not None and c["score"] >= cut:
+            rolling.append(c)
+    everything = summary(window)
+    everything.pop("trades")
+    return {"hours": hours, "eligible_pools": len(window), "fixed_cut_off": round(model.threshold, 3),
+            "all_eligible": everything, "fixed": summary(fixed), "rolling": summary(rolling),
+            "note": "outcome = 5-minute snapshot (~pool minute 6) vs first-sight price, 6% round trip; emptied = -100%"}
+
+
 def entry_audit(extras, mint: str) -> dict:
     """Jupiter's holder audit right now (free, one call)."""
     t = extras.jupiter_token(mint) if extras is not None else None

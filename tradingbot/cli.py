@@ -64,7 +64,8 @@ def main(argv: list[str] | None = None) -> None:
                                             "settings-rollback", "code-versions", "code-diff", "code-rollback",
                                             "propose", "proposals", "watch-status", "watch-report",
                                             "watch-export", "watch-links", "watch-report-now",
-                                            "watch-model-train", "model-status", "early-status"])
+                                            "watch-model-train", "model-status", "early-status",
+                                            "early-backtest"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -82,7 +83,7 @@ def main(argv: list[str] | None = None) -> None:
                         help="watch-report: only tokens whose Helius lookup ignored the free score (control slice)")
     parser.add_argument("--paid-value", action="store_true",
                         help="watch-report: is Helius / X data worth paying for (control slice, 15-min features)")
-    parser.add_argument("--hours", type=float, default=8.0, help="early-status: look back this many hours")
+    parser.add_argument("--hours", type=float, default=8.0, help="early-status / early-backtest: look back this many hours")
     parser.add_argument("--idea", help="propose: what to build")
     parser.add_argument("--problem", default="", help="propose: what it should fix or improve")
     parser.add_argument("--priority", type=int, default=1, help="propose: 1 (first) to 5 (last)")
@@ -228,6 +229,12 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore, watch_db_path
         print(json.dumps(model_book.early_status(WatchStore(watch_db_path(cfg)), cfg, args.hours,
                                                  journal=Journal(cfg.db_path)), indent=2))
+        return
+
+    if args.command == "early-backtest":
+        from tradingbot import model_book
+        from tradingbot.watcher import WatchStore, watch_db_path
+        print(json.dumps(model_book.early_backtest(WatchStore(watch_db_path(cfg)), cfg, args.hours), indent=2))
         return
 
     if args.command == "model-status":
