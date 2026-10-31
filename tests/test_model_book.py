@@ -534,3 +534,22 @@ def test_watcher_hands_newly_seen_pools_to_the_early_listener():
     w.discover(T0)
     w.discover(T0 + 30)  # already known: not handed over again
     assert seen == [("A", "MA", T0, True)]
+
+
+def test_early_status_shows_the_funnel_and_scores_against_the_cut_off(tmp_path):
+    cfg = Config(db_path=str(tmp_path / "bot.db"), early_book=True)
+    store = early_store()
+    mb.train_early_and_save(store, cfg)
+    now = T0 + 800 * 600 + 10 * 86400  # after the training pools (the test clock is in 2027)
+    for i, (mint, seen_after, liq, buyers) in enumerate((("HAND1", 120, 20_000.0, 300), ("HAND2", 600, 20_000.0, 300),
+                                                          ("HAND3", 120, 1_000.0, 300), ("Gpump", 120, 20_000.0, 300))):
+        store.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts, first) VALUES(?,?,?,?,?,?,?)",
+                      (f"L{i}", mint, "pumpswap", "L / SOL", now - seen_after - 60, now - 60,
+                       json.dumps(snap(1.0, buyers=buyers, liq=liq))))
+    j = Journal(":memory:")
+    j.log_event("model_buy", "HAND1", "score 1", strategy=mb.EARLY6)
+    j.execute("UPDATE events SET ts = ?", (now - 60,))
+    out = mb.early_status(store, cfg, hours=1, now=now, journal=j)
+    assert out["pools_seen"] == 4 and out["hand_made"] == 3 and out["hand_made_seen_within_4_min"] == 2
+    assert out["with_enough_liquidity"] == 1 and out["scores"]["at_or_above_cut_off"] == 1
+    assert out["model"]["top_pct"] == 5.0 and out["books"][mb.EARLY6]["buys"] == 1

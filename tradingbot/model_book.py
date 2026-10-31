@@ -293,6 +293,50 @@ def train_early_and_save(store, cfg: Config) -> Path | None:
     return path
 
 
+def early_status(store, cfg: Config, hours: float = 8, now: float | None = None, journal=None) -> dict:
+    """What the early books' funnel looked like over the last `hours`: pools seen, hand-made ones, how soon after
+    creation the watcher saw them, liquidity, and how their first-sight scores compare with the model's cut-off."""
+    now = now or time.time()
+    path = early_model_path(cfg)
+    model = Model.from_json(json.loads(path.read_text())) if path.exists() else None
+    pct = lambda xs, q: round(float(np.percentile(xs, q)), 3) if xs else None
+    seen_all, handmade, ages, early, liq_ok, scores = 0, 0, [], 0, 0, []
+    for p in store.query("SELECT pool, mint, dex, name, created_ts, seen_ts, first FROM watch_pools WHERE seen_ts >= ?",
+                         (now - hours * 3600,)):
+        seen_all += 1
+        if not is_handmade(p["dex"] or "", p["mint"] or "") or not p["created_ts"] or not p["seen_ts"]:
+            continue
+        handmade += 1
+        age = (p["seen_ts"] - p["created_ts"]) / 60
+        ages.append(age)
+        if not 0 <= age <= EARLY_MAX_SEEN_MIN or not p["first"]:
+            continue
+        early += 1
+        first = json.loads(p["first"])
+        if (wa._f(first.get("liq")) or 0.0) < cfg.model_book_min_liq_usd or not wa._f(first.get("price")):
+            continue
+        liq_ok += 1
+        if model is not None:
+            scores.append(model.score(early_features(dict(p), first, p["seen_ts"])))
+    out = {"hours": hours, "pools_seen": seen_all, "hand_made": handmade,
+           "hand_made_seen_age_min": {"p10": pct(ages, 10), "median": pct(ages, 50), "p90": pct(ages, 90)},
+           f"hand_made_seen_within_{EARLY_MAX_SEEN_MIN:g}_min": early, "with_enough_liquidity": liq_ok,
+           "model": None if model is None else {"trained_rows": model.meta.get("rows"), "cut_off": round(model.threshold, 3),
+                                                "top_pct": model.meta.get("top_pct")}}
+    if model is not None:
+        out["scores"] = {"p50": pct(scores, 50), "p90": pct(scores, 90), "p95": pct(scores, 95), "max": pct(scores, 100),
+                         "at_or_above_cut_off": sum(s >= model.threshold for s in scores),
+                         f"cut_off_for_top_{cfg.early_top_pct:g}pct_of_these": pct(scores, 100 - cfg.early_top_pct)}
+    if journal is not None:
+        since = now - hours * 3600
+        out["books"] = {b: {"buys": journal.query("SELECT COUNT(*) FROM events WHERE kind='model_buy' AND strategy=? "
+                                                 "AND ts >= ?", (b, since))[0][0],
+                            "skips": [tuple(r) for r in journal.query(
+                                "SELECT detail, COUNT(*) FROM events WHERE kind='entry_skipped' AND strategy=? AND ts >= ? "
+                                "GROUP BY detail", (b, since))]} for b in EARLY_BOOKS}
+    return out
+
+
 def entry_audit(extras, mint: str) -> dict:
     """Jupiter's holder audit right now (free, one call)."""
     t = extras.jupiter_token(mint) if extras is not None else None
