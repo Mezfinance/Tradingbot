@@ -473,10 +473,10 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
     "model5_ops9": "repeat-operator pools only, 9-min hold, no pool-age exit: +8.1%/trade, 13% rugged, 90% range "
                    "-2%..+18% (60 picks, 10-21..10-26, exact on-chain pulls; chosen after looking)",
     "model5_ops10": "as model5_ops9 with a 10-min hold: +7.6%/trade, 15% rugged, 90% range -4%..+18%",
-    "early5": "hand-made pools at first sight (~minute 2), out by pool minute 5: +8.8%/trade, 10% rugged, 90% range "
-              "-2%..+19% (51 trades, 10-22..10-27, exact on-chain pulls; chosen after looking)",
-    "early6": "as early5, out by pool minute 6: +9.9%/trade, 12% rugged, 90% range -2%..+20%",
-    "early7": "as early5, out by pool minute 7: +9.0%/trade, 14% rugged, 90% range -3%..+21%",
+    "early5": "hand-made pools at first sight (~minute 2), out by pool minute 5. All 134 backtest picks at ~minute 6: "
+              "-2.9%/trade, 25% emptied, 90% range -11%..+6% (the +8.8% seen on the 60 with 1-min candles was biased)",
+    "early6": "as early5, out by pool minute 6 (all picks ~-3%/trade; candle subset +9.9%, biased)",
+    "early7": "as early5, out by pool minute 7 (all picks ~-3%/trade; candle subset +9.0%, biased)",
 }
 
 
