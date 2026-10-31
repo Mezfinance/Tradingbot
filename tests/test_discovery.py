@@ -115,6 +115,30 @@ def test_gecko_gate_serves_higher_priority_first_and_backs_off_on_429():
     assert gate.interval == gt.MIN_INTERVAL_S
 
 
+def test_gecko_gate_serves_a_low_priority_call_once_it_has_waited_long_enough():
+    """10-31: the watcher's snapshots never stop queueing, and strict priority starved the engine's trending
+    discovery forever (the scan loop stalled; the watchdog restarted the bot every 30 minutes)."""
+    import threading
+    import time
+    from tradingbot.data import geckoterminal as gt
+    gate = gt._Gate(max_wait_s=0.3)
+    gate.interval = 0.05
+    stop, served = threading.Event(), {}
+
+    def snapshots():  # a higher-priority call is always waiting
+        while not stop.is_set():
+            threading.Thread(target=gate.acquire, args=(gt.P_SNAPSHOT, 0.01), daemon=True).start()
+            time.sleep(0.02)
+    threading.Thread(target=snapshots, daemon=True).start()
+    time.sleep(0.1)
+    t0 = time.monotonic()
+    extra = threading.Thread(target=lambda: (gate.acquire(gt.P_EXTRA, 0.01), served.setdefault("at", time.monotonic())))
+    extra.start()
+    extra.join(3)
+    stop.set()
+    assert "at" in served and served["at"] - t0 < 1.5  # aged past 0.3 s, then served ahead of fresh snapshots
+
+
 def test_trending_discovery_is_reused_for_ten_minutes():
     calls = []
 

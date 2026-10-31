@@ -195,7 +195,8 @@ class Engine:
             self._stop.set()
 
     def _scan_cycle(self) -> None:
-        self.scan_and_enter()
+        if self.analyst is not None or any(n in self.books for n in shadows.KNOWN):
+            self.scan_and_enter()  # nothing uses the screened candidates when Claude and the baselines are off
         self.backups.run_if_due()
         self.journal.set_state("scan_heartbeat", repr(time.time()))
 

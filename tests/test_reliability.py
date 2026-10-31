@@ -125,3 +125,22 @@ def test_tracker_samples_on_its_own_thread_not_after_claude(cfg, good_pair, safe
     monkeypatch.setattr(eng, "scan_and_enter", lambda: None)
     eng._scan_cycle()
     assert polled == []
+
+
+def test_scan_cycle_skips_screening_when_nothing_uses_it_but_still_beats(good_pair, safe, monkeypatch):
+    """10-31: with Claude and the baselines off, screening only waited on GeckoTerminal; the stalled scan loop
+    made the watchdog restart the bot every 30 minutes."""
+    from tradingbot.config import Config
+    from tradingbot.engine import Engine
+    from tradingbot.execution.paper import PaperExecutor
+    from tests.test_analyst_engine import FakeDex
+    screened = []
+    for shadows_spec, want in (("", []), ("filters_only", [1])):
+        j = Journal(":memory:")
+        eng = Engine(Config(db_path=":memory:", shadows=shadows_spec), FakeDex(good_pair),
+                     SimpleNamespace(report=lambda m: safe), None, PaperExecutor(Config()), j,
+                     shadow_executors={n: PaperExecutor(Config()) for n in shadows_spec.split(",") if n})
+        screened.clear()
+        monkeypatch.setattr(eng, "scan_and_enter", lambda: screened.append(1))
+        eng._scan_cycle()
+        assert screened == want and j.get_state("scan_heartbeat")

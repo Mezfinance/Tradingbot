@@ -17,6 +17,7 @@ primary_region = "iad"
   TB_MODEL_BOOK_OPS = "0"
   TB_EARLY_BOOK = "1"  # early5/early6/early7: hand-made pools at first sight, out by pool minute 5/6/7 (10-31)
   TB_CLAUDE_TRADING = "0"  # no Opus buy/pass analysis, triage or learning: 0 Claude buys in two weeks
+  TB_SHADOWS = ""  # filters_only/random baselines off: with Claude off they only cost GeckoTerminal/Jupiter calls
 
 # The journal. Daily snapshots are kept for 14 days; the volume grows itself if it fills.
 [mounts]

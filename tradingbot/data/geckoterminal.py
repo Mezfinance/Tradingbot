@@ -8,7 +8,6 @@ market data still comes from DexScreener so every candidate is measured the same
 
 from __future__ import annotations
 
-import heapq
 import logging
 import threading
 import time
@@ -38,35 +37,44 @@ DISCOVER_TTL_S = 600  # the engine's trending discovery is reused this long
 # Lower goes first: snapshots feed the 5-minute model; candles make its training labels exact; token info
 # only feeds 15-minute-and-later factors; trending lists, discovery and 1-minute candles are extras.
 P_SNAPSHOT, P_CANDLES, P_INFO, P_EXTRA = 0, 1, 2, 3
+# A call that has waited this long goes next whatever its priority: with the watcher's queue never empty,
+# strict priority starved extras for good (10-31: the engine's trending discovery never returned, so its scan
+# loop stalled and the watchdog restarted the bot every 30 minutes; 1-minute candles stopped on 10-27).
+MAX_WAIT_S = 120.0
 
 
 class _Gate:
-    def __init__(self):
+    def __init__(self, max_wait_s: float = MAX_WAIT_S):
         self.cv = threading.Condition()
-        self.waiting: list[tuple[int, int]] = []
+        self.waiting: list[tuple[int, int, float]] = []  # (priority, seq, enqueued at)
         self.seq = 0
         self.next_free = 0.0
         self.interval = MIN_INTERVAL_S
+        self.max_wait_s = max_wait_s
+
+    def _next(self) -> tuple[int, int, float]:
+        now = time.monotonic()
+        return min(self.waiting, key=lambda t: (-1 if now - t[2] >= self.max_wait_s else t[0], t[1]))
 
     def acquire(self, priority: int, min_interval: float) -> None:
         if min_interval <= 0:  # tests
             return
         with self.cv:
             self.seq += 1
-            ticket = (priority, self.seq)
-            heapq.heappush(self.waiting, ticket)
+            ticket = (priority, self.seq, time.monotonic())
+            self.waiting.append(ticket)
             self.cv.notify_all()
             while True:
-                if self.waiting[0] == ticket:
+                if self._next() == ticket:
                     wait = self.next_free - time.monotonic()
                     if wait <= 0:
-                        heapq.heappop(self.waiting)
+                        self.waiting.remove(ticket)
                         self.next_free = time.monotonic() + max(min_interval, self.interval)
                         self.cv.notify_all()
                         return
                     self.cv.wait(wait)
                 else:
-                    self.cv.wait()
+                    self.cv.wait(1.0)  # re-check: a waiting ticket may have aged past max_wait_s
 
     def throttled(self) -> None:
         with self.cv:
