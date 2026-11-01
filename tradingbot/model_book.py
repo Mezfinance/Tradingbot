@@ -637,6 +637,11 @@ class ModelBook:
                                      "fixed": fixed, "rolling": rolling})
         except queue.Full:
             return None
+        if self.store is not None:  # the enricher records this pool's launch data whatever the random sample
+            try:
+                self.store.set_state(f"early_signal:{pool['pool']}", repr(time.time()))
+            except Exception:  # noqa: BLE001 (research bookkeeping must never stop a signal)
+                log.warning("could not mark early signal %s", pool["pool"], exc_info=True)
         return score
 
     def _rolling_history(self, now: float) -> list[tuple[float, float]]:

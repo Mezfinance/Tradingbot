@@ -59,8 +59,8 @@ MINT_KINDS = ("helius", "x", "dev", "narrative", "sentiment")
 RANKED = {"helius": ("helius_budget", "helius_daily_credits", 30.0), "x": ("x_budget", "x_daily_budget_usd", 0.015)}
 NEEDS_SNAP5 = PAID_OR_HEAVY + ("operator",)
 CREATORS_PER_STEP = 500  # pumpswap pools whose creator is read per pass (100 per call), newest first
-LAUNCH_WINDOW_S = 180  # seconds after creation kept per sampled pool
-LAUNCH_READY_S = 240  # fetch once the window is over (and indexed)
+LAUNCH_WINDOW_S = 300  # seconds after creation kept per sampled pool (covers first sight, up to minute 4)
+LAUNCH_READY_S = 360  # fetch once the window is over (and indexed)
 LAUNCH_MAX_AGE_S = 6 * 3600  # give up on pools older than this
 LAUNCH_PER_STEP = 5  # Helius lookups per pass
 OPERATOR_PULL_CHECKS = 5  # earlier pools of the same creator whose withdrawal time is looked up per lookup
@@ -246,9 +246,9 @@ class Enricher:
         return len(rows)
 
     def poll_launch(self, now: float) -> int:
-        """First 3 minutes of on-chain trading for a stable random `launch_sample_pct` of hand-made pumpswap
-        pools (kind `launch`), so a model that buys in the first seconds can be backtested. Others get a
-        skipped row. Returns the number of Helius lookups made."""
+        """First 5 minutes of on-chain trading for a stable random `launch_sample_pct` of hand-made pumpswap
+        pools, plus every early-book signal (kind `launch`, `selection` sample / early signal), so buying in
+        the first seconds can be backtested. Others get a skipped row. Returns the number of Helius lookups made."""
         if self.cfg.launch_sample_pct <= 0:
             return 0
         rows = self.store.query(
@@ -258,9 +258,11 @@ class Enricher:
         fetched = 0
         for r in rows:
             pool, mint = r["pool"], r["mint"] or ""
+            signal = self.store.get_state(f"early_signal:{pool}") is not None
+            in_sample = sampled(f"launch:{pool}", self.cfg.launch_sample_pct)
             if mint.endswith("pump"):
                 self._save(pool, "launch", {"skipped": "not hand-made"}, now)
-            elif not sampled(f"launch:{pool}", self.cfg.launch_sample_pct):
+            elif not (in_sample or signal):
                 self._save(pool, "launch", {"skipped": "not sampled"}, now)
             elif not self.helius.enabled:
                 self._save(pool, "launch", {"skipped": "no helius key"}, now)
@@ -271,7 +273,9 @@ class Enricher:
                 txs = self.helius.history(pool, 100)
                 self.launch_budget.add(self.helius.credits_used - before)
                 fetched += 1
-                self._save(pool, "launch", launch_record(txs, pool, mint, LAUNCH_WINDOW_S), now)
+                rec = launch_record(txs, pool, mint, LAUNCH_WINDOW_S)
+                rec["selection"] = "sample" if in_sample else "early signal"  # only 'sample' is unbiased
+                self._save(pool, "launch", rec, now)
         return fetched
 
     def poll_creators(self, now: float) -> int:
