@@ -507,7 +507,8 @@ def test_early_signals_go_to_the_early_books_with_pool_minute_deadlines(cfg, goo
         assert [mb.hold_min(cfg, b) for b in mb.EARLY_FIXED] == [5, 6, 7]
         created = time.time() - 120
         early = {"pool": "PE", "mint": "EARLY", "dex": "pumpswap", "created_ts": created, "name": "E",
-                 "price": 2.5e-5, "liq": 30_000.0, "score": 1.0, "ts": time.time(), "kind": "early", "fixed": True}
+                 "price": 2.5e-5, "liq": 30_000.0, "score": 1.0, "ts": time.time(), "kind": "early", "fixed": True,
+                 "seen_ts": created + 70}
         late = dict(early, mint="LATE", created_ts=time.time() - 290)  # 4.8 min old: too late for early5
         model5 = dict(early, mint="M5", kind=None)
         for s in (early, late, model5):
@@ -521,6 +522,9 @@ def test_early_signals_go_to_the_early_books_with_pool_minute_deadlines(cfg, goo
         assert all(p.token_address != "EARLY" for p in j.open_positions(mb.FAST))  # and early signals not the rest
         skip = j.query("SELECT detail FROM events WHERE kind='entry_skipped' AND strategy=? AND token='LATE'", (mb.EARLY5,))
         assert skip[0][0] == "pool too old to sell by minute 5"
+        timing = mb.early_timing(j, 0)  # every book bought in parallel and logged its stage times
+        assert set(timing) == set(mb.EARLY_FIXED) and timing[mb.EARLY6]["buys"] == 2
+        assert timing[mb.EARLY5]["created->seen"] == 70.0 and timing[mb.EARLY5]["created->filled"] >= 120
     finally:
         cfg.early_book = False
 

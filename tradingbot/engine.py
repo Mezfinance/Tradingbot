@@ -47,7 +47,7 @@ STUCK_AFTER_S = 1800  # ...and after this long the position is valued at zero (i
 NO_LIQUIDITY_MULT = 10.0  # model entry: a live price this many times the snapshot means an empty pool
 DEAD_LIQ_USD = 100.0  # a DexScreener pool with less liquidity than this is treated as emptied (rugged)
 QUOTE_PRICE_MAX = 10  # positions per monitor pass priced from a swap quote when no feed lists the token
-MODEL_POLL_S = 5  # how often queued model5 signals are bought
+MODEL_POLL_S = 0.5  # how often queued model signals are picked up (early books lose ~6-8 pts per minute of delay)
 MODEL_SIGNAL_MAX_AGE_S = 180  # a signal older than this is stale (the edge is in the first minutes)
 
 Survivor = tuple[PairSnapshot, FactorResult, SafetyReport | None]
@@ -97,6 +97,7 @@ class Engine:
         self._blocked: dict[int, dict] = {}  # position id -> exit blocked (no route): since, next try, note
         self._deadlines = self._load_deadlines()  # position id -> sell by this time (pool-age exit)
         self._climbs = self._load_climbs()  # position id -> [check time, price to reach, best price seen]
+        self._model_pool = None  # threads that let every book buy a signal at the same time
         self._last_snapshot = 0.0
         self._stop = threading.Event()
         self.restart_reason: str | None = None
@@ -557,21 +558,37 @@ class Engine:
             if sig.get("rug_check"):  # blind test: the prediction is recorded before any trade or outcome
                 self.journal.log_event("rug_prediction", sig["mint"],
                                        json.dumps({"pool": sig.get("pool"), **sig["rug_check"]}), strategy="model")
+            sig.setdefault("picked_ts", time.time())
+            targets = []
             for name in mb.BOOKS:
                 book = self.books.get(name)
                 if book is None or (name in mb.EARLY_BOOKS) != (sig.get("kind") == "early"):
                     continue  # early signals go to the early books only, model5 signals to the others
                 if name in mb.EARLY_BOOKS and not mb.early_wants(name, sig):
                     continue  # a fixed-only signal for a rolling book, or the other way round
-                reason = self._model_skip_reason(book, sig)
-                if reason is None:
-                    reason = self._buy_model(book, sig)
-                if reason:
-                    self.journal.log_event("entry_skipped", sig["mint"], reason, strategy=book.name)
-                    log.info("[%s] skip %s: %s", book.name, sig["name"][:24], reason)
-                else:
-                    bought += 1
+                targets.append(book)
+            if len(targets) > 1:  # all books buy at once: one after another cost each later book ~3.5 s
+                if self._model_pool is None:
+                    from concurrent.futures import ThreadPoolExecutor
+                    self._model_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="model-buy")
+                bought += sum(self._model_pool.map(lambda b: self._try_model(b, sig), targets))
+            else:
+                bought += sum(self._try_model(b, sig) for b in targets)
         return bought
+
+    def _try_model(self, book: Book, sig: dict) -> bool:
+        try:
+            reason = self._model_skip_reason(book, sig)
+            if reason is None:
+                reason = self._buy_model(book, sig)
+        except Exception as exc:  # noqa: BLE001 (one book's failure must not stop the others)
+            log.exception("[%s] model buy failed", book.name)
+            reason = f"error: {type(exc).__name__}"
+        if reason:
+            self.journal.log_event("entry_skipped", sig["mint"], reason, strategy=book.name)
+            log.info("[%s] skip %s: %s", book.name, sig["name"][:24], reason)
+            return False
+        return True
 
     def _model_skip_reason(self, book: Book, sig: dict) -> str | None:
         c = self.cfg
@@ -599,6 +616,7 @@ class Engine:
 
     def _buy_model(self, book: Book, sig: dict) -> str | None:
         c = self.cfg
+        started = time.time()
         usd = min(c.model_book_usd, c.model_book_liq_share * sig["liq"], book.cash)
         if usd < 5:
             return "size too small (cash or liquidity)"
@@ -642,6 +660,12 @@ class Engine:
                                    strategy=book.name)
         self.journal.log_event("model_buy", sig["mint"], f"score {sig['score']:.3f} liq ${sig['liq']:,.0f}",
                                strategy=book.name)
+        if sig.get("kind") == "early":  # where the seconds between the pool's creation and our fill go
+            self.journal.log_event("early_timing", sig["mint"], json.dumps(
+                {k: round(v, 2) for k, v in (("created", sig.get("created_ts")), ("seen", sig.get("seen_ts")),
+                                             ("found", sig.get("ts")), ("picked", sig.get("picked_ts")),
+                                             ("started", started), ("filled", pos.opened_at)) if v}),
+                strategy=book.name)
         self._log_model_audit(book, sig)
         return None
 

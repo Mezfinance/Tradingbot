@@ -343,6 +343,25 @@ def early_status(store, cfg: Config, hours: float = 8, now: float | None = None,
                             "skips": [tuple(r) for r in journal.query(
                                 "SELECT detail, COUNT(*) FROM events WHERE kind='entry_skipped' AND strategy=? AND ts >= ? "
                                 "GROUP BY detail", (b, since))]} for b in EARLY_BOOKS}
+        out["timing_s"] = early_timing(journal, since)
+    return out
+
+
+def early_timing(journal, since: float) -> dict:
+    """Median seconds per stage of the early books' buys (events `early_timing`): GeckoTerminal listing the pool
+    (created -> seen = the watcher's step start), the new-pools call and scoring (seen -> found), the queue
+    (found -> picked), the book's own checks (picked -> started) and quotes plus the simulated landing
+    (started -> filled)."""
+    stages = (("created", "seen"), ("seen", "found"), ("found", "picked"), ("picked", "started"),
+              ("started", "filled"), ("created", "filled"))
+    out = {}
+    for b in EARLY_BOOKS:
+        rows = [json.loads(r[0]) for r in journal.query(
+            "SELECT detail FROM events WHERE kind='early_timing' AND strategy=? AND ts >= ?", (b, since))]
+        if rows:
+            out[b] = {"buys": len(rows), **{f"{a}->{z}": round(float(np.median([r[z] - r[a] for r in rows
+                                                                                 if a in r and z in r])), 1)
+                                           for a, z in stages if any(a in r and z in r for r in rows)}}
     return out
 
 
@@ -613,7 +632,8 @@ class ModelBook:
         try:
             self.signals.put_nowait({"pool": pool["pool"], "mint": pool["mint"], "name": pool.get("name") or "",
                                      "score": score, "price": wa._f(first["price"]), "liq": liq, "ts": time.time(),
-                                     "created_ts": pool["created_ts"], "dex": pool.get("dex") or "", "kind": "early",
+                                     "created_ts": pool["created_ts"], "seen_ts": pool["seen_ts"],
+                                     "dex": pool.get("dex") or "", "kind": "early",
                                      "fixed": fixed, "rolling": rolling})
         except queue.Full:
             return None
