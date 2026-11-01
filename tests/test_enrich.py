@@ -440,3 +440,38 @@ def test_creators_of_pumpswap_pools_are_recorded_and_judge_new_wallets():
     grad = {"pool": "GRADPOOL", "mint": "Abcpump", "dex": "pumpswap", "created_ts": T0}
     assert operator_verdict(st, grad) == {"verdict": "graduation"}  # each migration pool has a fresh creator
     assert e.status()["creators_known"] == 4  # incl. LATE, read on the spot
+
+
+def test_launch_data_records_the_first_minutes_of_a_sample_of_hand_made_pools():
+    from tradingbot.data.helius import SOL_MINT, launch_record
+    from tradingbot.watcher import sampled
+    st = WatchStore(":memory:")
+    hand = [f"HAND{i}" for i in range(40)]
+    for p in hand + ["GRAD"]:
+        st.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts) VALUES(?,?,?,?,?,?)",
+                   (p, "GradMintpump" if p == "GRAD" else p + "Mint", "pumpswap", p, T0, T0 + 60))
+    e = make_enricher(st)
+    e.cfg.launch_sample_pct = 25.0
+
+    def vault(t, slot, payer, base, sol, err=None):  # pool's (pre, post) token and SOL balances
+        m = {"err": err, "preTokenBalances": [], "postTokenBalances": []}
+        for mint, (a, b) in ((None, base), (SOL_MINT, sol)):
+            m["preTokenBalances"].append({"mint": mint, "owner": "P", "uiTokenAmount": {"uiAmount": a}})
+            m["postTokenBalances"].append({"mint": mint, "owner": "P", "uiTokenAmount": {"uiAmount": b}})
+        return {"blockTime": t, "slot": slot, "meta": m, "transaction": {"message": {"accountKeys": [{"pubkey": payer}]}}}
+
+    asked = []
+    e.helius.history = lambda pool, limit=100: asked.append(pool) or []
+    assert e.poll_launch(T0 + 300) == min(5, sum(sampled(f"launch:{p}", 25.0) for p in hand))
+    assert "GRAD" not in asked and all(sampled(f"launch:{p}", 25.0) for p in asked)
+    assert e._get("GRAD", "launch") == {"skipped": "not hand-made"}
+    assert 1 <= len(asked) <= 5 and e.poll_launch(T0 + 300) >= 1  # the rest of the sample next pass
+    rec = launch_record([vault(T0, 1, "OP", (0, 1000), (0, 50)),
+                         vault(T0 + 20, 2, "BUYER", (1000, 900), (50, 56)),
+                         vault(T0 + 30, 3, "X", (900, 900), (56, 56), err="failed"),
+                         vault(T0 + 400, 4, "LATE", (900, 800), (56, 60))], "P", None, 180)
+    for r in rec["txs"]:
+        r[0] = int(r[0])
+    assert rec["creator"] == "OP" and rec["seed_sol"] == 50 and rec["failed"] == 1 and rec["complete"]
+    assert rec["txs"] == [[0, 1, "OP", 1000, 50, 1000, 50], [20, 2, "BUYER", -100, 6, 900, 56]]
+    assert e.status()["launch_24h"]["not hand-made"] == 1

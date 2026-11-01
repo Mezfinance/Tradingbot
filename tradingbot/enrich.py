@@ -35,11 +35,11 @@ from tradingbot.config import Config
 from tradingbot.data.dexscreener import DexScreener
 from tradingbot.data.extras import MEMECOIN_INDEX, Extras
 from tradingbot.data.geckoterminal import GeckoTerminal
-from tradingbot.data.helius import Helius, find_withdraw, pool_creation, trades
+from tradingbot.data.helius import HISTORY_CREDITS_PER_100, Helius, find_withdraw, launch_record, pool_creation, trades
 from tradingbot.data.pumpfun import PumpFun, compact_coin, compact_creator, compact_user
 from tradingbot.data.telegram import fetch_channel
 from tradingbot.data.xapi import XClient, cashtag_query, handle, mint_query, post_id
-from tradingbot.watcher import LAUNCHPAD_DEXES, WatchStore
+from tradingbot.watcher import LAUNCHPAD_DEXES, WatchStore, sampled
 
 log = logging.getLogger(__name__)
 
@@ -59,6 +59,10 @@ MINT_KINDS = ("helius", "x", "dev", "narrative", "sentiment")
 RANKED = {"helius": ("helius_budget", "helius_daily_credits", 30.0), "x": ("x_budget", "x_daily_budget_usd", 0.015)}
 NEEDS_SNAP5 = PAID_OR_HEAVY + ("operator",)
 CREATORS_PER_STEP = 500  # pumpswap pools whose creator is read per pass (100 per call), newest first
+LAUNCH_WINDOW_S = 180  # seconds after creation kept per sampled pool
+LAUNCH_READY_S = 240  # fetch once the window is over (and indexed)
+LAUNCH_MAX_AGE_S = 6 * 3600  # give up on pools older than this
+LAUNCH_PER_STEP = 5  # Helius lookups per pass
 OPERATOR_PULL_CHECKS = 5  # earlier pools of the same creator whose withdrawal time is looked up per lookup
 OPERATOR_RECHECK_S = 1800  # an earlier pool found un-pulled is checked again after this long
 OPERATOR_WORST_CREDITS = 10 + 10 + 10 * OPERATOR_PULL_CHECKS
@@ -182,6 +186,7 @@ class Enricher:
         self.x_budget = Budget(store, "x_usd", cfg.x_daily_budget_usd)
         self.narrative_budget = Budget(store, "narrative_usd", cfg.narrative_daily_usd)
         self.operator_budget = Budget(store, "operator_credits", cfg.operator_daily_credits)
+        self.launch_budget = Budget(store, "launch_credits", cfg.launch_daily_credits)
         self._rank_cache: dict = {}
         self._last = {"lists": 0.0, "market": 0.0, "tg": 0.0, "macro": 0.0, "biz": 0.0, "xfeed": 0.0}
 
@@ -220,6 +225,10 @@ class Enricher:
             done["creators"] = self.poll_creators(now)
         except Exception as exc:  # noqa: BLE001 (the rug catcher's creators must never stop the rest)
             log.warning("enrich creators failed: %s: %s", type(exc).__name__, exc)
+        try:
+            done["launch"] = self.poll_launch(now)
+        except Exception as exc:  # noqa: BLE001 (research data must never stop the rest)
+            log.warning("enrich launch failed: %s: %s", type(exc).__name__, exc)
         done["tasks"] = self.run_tasks(now)
         return done
 
@@ -235,6 +244,35 @@ class Enricher:
                          for rank, mint in enumerate(self.gecko.trending_ranked(duration), 1)]
         self.store.executemany("INSERT INTO watch_lists(ts, list, rank, mint, amount) VALUES(?,?,?,?,?)", rows)
         return len(rows)
+
+    def poll_launch(self, now: float) -> int:
+        """First 3 minutes of on-chain trading for a stable random `launch_sample_pct` of hand-made pumpswap
+        pools (kind `launch`), so a model that buys in the first seconds can be backtested. Others get a
+        skipped row. Returns the number of Helius lookups made."""
+        if self.cfg.launch_sample_pct <= 0:
+            return 0
+        rows = self.store.query(
+            """SELECT pool, mint FROM watch_pools p WHERE dex='pumpswap' AND created_ts BETWEEN ? AND ?
+               AND NOT EXISTS (SELECT 1 FROM watch_enrich e WHERE e.pool=p.pool AND e.kind='launch')
+               ORDER BY created_ts DESC LIMIT 300""", (now - LAUNCH_MAX_AGE_S, now - LAUNCH_READY_S))
+        fetched = 0
+        for r in rows:
+            pool, mint = r["pool"], r["mint"] or ""
+            if mint.endswith("pump"):
+                self._save(pool, "launch", {"skipped": "not hand-made"}, now)
+            elif not sampled(f"launch:{pool}", self.cfg.launch_sample_pct):
+                self._save(pool, "launch", {"skipped": "not sampled"}, now)
+            elif not self.helius.enabled:
+                self._save(pool, "launch", {"skipped": "no helius key"}, now)
+            elif fetched >= LAUNCH_PER_STEP or not self.launch_budget.allows(HISTORY_CREDITS_PER_100):
+                continue  # left for the next pass; skips below still get marked
+            else:
+                before = self.helius.credits_used
+                txs = self.helius.history(pool, 100)
+                self.launch_budget.add(self.helius.credits_used - before)
+                fetched += 1
+                self._save(pool, "launch", launch_record(txs, pool, mint, LAUNCH_WINDOW_S), now)
+        return fetched
 
     def poll_creators(self, now: float) -> int:
         """Creator of every pumpswap pool not yet recorded (new pools within a pass of discovery, then the
@@ -808,7 +846,12 @@ class Enricher:
             "market_rows": q("SELECT COUNT(*) AS n FROM watch_market")[0]["n"],
             "wallets_cached": q("SELECT COUNT(*) AS n FROM watch_wallets")[0]["n"],
             "spend_today": {b.name: round(b.spent(), 4) for b in (self.helius_budget, self.x_budget,
-                                                                   self.narrative_budget, self.operator_budget)},
+                                                                   self.narrative_budget, self.operator_budget,
+                                                                   self.launch_budget)},
+            "launch_24h": {r["what"]: r["n"] for r in q(
+                "SELECT COALESCE(json_extract(data, '$.skipped'), json_extract(data, '$.error'), "
+                "CASE WHEN json_extract(data, '$.complete') THEN 'recorded' ELSE 'recorded (over 100 txs)' END) "
+                "AS what, COUNT(*) AS n FROM watch_enrich WHERE ts > ? AND kind='launch' GROUP BY what", (day_ago,))},
             "operator_24h": {r["what"]: r["n"] for r in q(
                 "SELECT CASE WHEN json_extract(data, '$.skipped') IS NOT NULL THEN json_extract(data, '$.skipped') "
                 "WHEN json_extract(data, '$.creator') IS NULL THEN 'no creator found' "

@@ -221,6 +221,41 @@ def pool_creation(tx: dict, pool: str) -> dict:
             "seed_sol": _pool_sol(tx, pool, "postTokenBalances"), "create_ix": instructions(tx)[:6]}
 
 
+def _vault(tx: dict, pool: str, mint: str, side: str) -> float:
+    for b in (tx.get("meta") or {}).get(side) or []:
+        if b.get("owner") == pool and b.get("mint") == mint:
+            return float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+    return 0.0
+
+
+def launch_record(txs: list[dict], pool: str, base_mint: str, window_s: float = 180) -> dict:
+    """A pool's first `window_s` seconds from its oldest-first transactions: one row per successful tx,
+    [seconds after creation, slot, fee payer, pool's token change, pool's SOL change, tokens after, SOL after].
+    Positive token change with negative SOL change = someone sold to the pool; the reverse = a buy."""
+    if not txs:
+        return {"error": "no transactions"}
+    t0 = txs[0].get("blockTime") or 0
+    rows, failed, complete = [], 0, len(txs) < 100
+    for tx in txs:
+        bt = tx.get("blockTime") or 0
+        if bt > t0 + window_s:
+            complete = True
+            break
+        if (tx.get("meta") or {}).get("err") is not None:
+            failed += 1
+            continue
+        b0, b1 = _vault(tx, pool, base_mint, "preTokenBalances"), _vault(tx, pool, base_mint, "postTokenBalances")
+        q0, q1 = _vault(tx, pool, SOL_MINT, "preTokenBalances"), _vault(tx, pool, SOL_MINT, "postTokenBalances")
+        keys = _keys(tx)
+        rows.append([bt - t0, tx.get("slot"), keys[0] if keys else None, round(b1 - b0, 6), round(q1 - q0, 9),
+                     round(b1, 6), round(q1, 9)])
+    seed = next((r for r in rows if r[4] > 0 and r[6] == r[4]), None)  # the tx that funded the empty SOL vault
+    creator = seed[2] if seed else (_keys(txs[0]) or [None])[0]
+    return {"create_ts": t0, "creator": creator, "seed_sol": seed[6] if seed else None, "window_s": window_s,
+            "txs": rows,
+            "failed": failed, "complete": complete, "fetched": len(txs)}
+
+
 def find_withdraw(txs: list[dict], pool: str) -> dict | None:
     """The earliest successful liquidity withdrawal among `txs`: {"ts", "by", "sol_out"}; None if none."""
     hits = []

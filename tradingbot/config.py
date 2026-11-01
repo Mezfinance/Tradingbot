@@ -52,6 +52,10 @@ class Config:
     helius_daily_credits: int = 10_000
     operator_daily_credits: int = 20_000
     operator_min_liq_usd: float = 5000.0
+    # Launch data (research): a stable random share of hand-made pumpswap pools gets its first 3 minutes of
+    # transactions from Helius (~10 credits each), to test whether buying in the first seconds would pay.
+    launch_sample_pct: float = 25.0
+    launch_daily_credits: int = 3000
     enrich_wallets_per_token: int = 8  # early buyers whose wallet age/funder is looked up
     x_daily_budget_usd: float = 3.0
     x_cost_per_post: float = 0.005  # X pay-per-use estimate; adjust to your bill
