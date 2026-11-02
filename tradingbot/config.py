@@ -64,6 +64,9 @@ class Config:
     launch_live_daily_credits: int = 20_000
     launch_live_decide_delay_s: float = 4.0  # after the websocket notification (~1 s after creation)
     launch_train_days: float = 14.0
+    # Paper books launch4_2 / launch4_5 on the scorer's top 2% / top 5% picks (needs launch_live and model_book):
+    # bought through Jupiter with the model books' simulated executor, sold at pool minute 6, no stop/take-profit.
+    launch_book: bool = False
     enrich_wallets_per_token: int = 8  # early buyers whose wallet age/funder is looked up
     x_daily_budget_usd: float = 3.0
     x_cost_per_post: float = 0.005  # X pay-per-use estimate; adjust to your bill

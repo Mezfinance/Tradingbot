@@ -1,4 +1,7 @@
-"""Second-4 launch scorer, shadow mode (never trades).
+"""Second-4 launch scorer. It records every hand-made pool's prediction and pool-level outcome, and sends its
+top-2% / top-5% picks to the launch4_2 / launch4_5 paper books (engine model-book path: Jupiter quotes, simulated
+landing latency and reverts, sold at pool minute 6). Jupiter routes these pools ~0.1-2.4 s after creation
+(measured 11-02 on 6 live pools, mostly via "Pump.fun Amm").
 
 The timing backtest (`launch_analysis.timing`) found that a model on a hand-made pumpswap pool's first 4 seconds
 of on-chain trading picks winners (top 2% / 5%, filled at seconds 4-7, out at pool minute ~6). This runs that
@@ -130,9 +133,11 @@ def live_features(rec: dict, create_ts: float, prior_pools: int) -> dict:
 # --- live scorer ----------------------------------------------------------------------------------
 
 class LaunchLive:
-    def __init__(self, cfg: Config, store, helius: Helius | None = None, clock=time.time, workers: int = 4):
+    def __init__(self, cfg: Config, store, helius: Helius | None = None, clock=time.time, workers: int = 4,
+                 signals=None):
         from tradingbot.enrich import Budget
         self.cfg, self.store, self.clock = cfg, store, clock
+        self.signals = signals  # the engine's model-signal queue: top-2% / top-5% picks go to the launch books
         self.helius = helius or Helius()
         self.budget = Budget(store, "launch_live", cfg.launch_live_daily_credits)
         store.execute(SCHEMA)
@@ -373,6 +378,16 @@ class LaunchLive:
             self._update(pool, status="skipped", reason="not liquid at second 4", **cols)
             return
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
+        if self.signals is not None and (cols["top2"] or cols["top5"]):
+            px = la.chain_price(rows, DECIDE_S)  # SOL per whole token (vault UI amounts)
+            if sol_usd and px:
+                self.signals.put_nowait({
+                    "pool": pool, "mint": r["token_mint"], "name": "", "score": score, "price": px * sol_usd,
+                    "liq": 2 * sol4 * sol_usd, "ts": now, "decided_ts": now, "created_ts": create,
+                    "dex": "pumpswap", "kind": "launch", "top2": bool(cols["top2"]), "top5": bool(cols["top5"])})
+                self._count("signals sent to the launch books")
+            else:
+                self._count("pick not sent: no SOL price")
         with self.lock:
             self.lp_pool[r["lp_mint"]] = pool
         self._schedule(max(now, create + FILL_S + 0.5), "fill", pool)
@@ -512,7 +527,7 @@ def parity(store, rows) -> dict:
             "median_max_diff": round(float(np.median(diffs)), 4), "worst_max_diff": round(float(max(diffs)), 4)}
 
 
-def status(store, cfg: Config, hours: float = 24, now: float | None = None) -> dict:
+def status(store, cfg: Config, hours: float = 24, now: float | None = None, journal=None) -> dict:
     now = now if now is not None else time.time()
     store.execute(SCHEMA)
     rows = store.query("SELECT * FROM watch_launch_live WHERE notified_ts >= ?", (now - hours * 3600,))
@@ -532,6 +547,8 @@ def status(store, cfg: Config, hours: float = 24, now: float | None = None) -> d
                        "fill_after_creation": _median([r["fill_ts"] - r["create_ts"] for r in decided if r["fill_ts"]])}
     scored = [r for r in rows if r["score"] is not None and r["liquid"]]
     out["scored_liquid"] = len(scored)
+    out["note"] = ("outcomes below are pool-level (vault price at second ~6 vs minute 6, 6% cost); the books' own "
+                   "Jupiter-simulated trades are in `report`")
     out["picks"] = {"top 2%": sum(r["top2"] or 0 for r in scored), "top 5%": sum(r["top5"] or 0 for r in scored)}
     rng = np.random.default_rng(0)
     done = [r for r in rows if r["status"] == "done"]
@@ -540,6 +557,12 @@ def status(store, cfg: Config, hours: float = 24, now: float | None = None) -> d
         "top 2%": _group([r for r in done if r["top2"]], rng),
         "top 5%": _group([r for r in done if r["top5"]], rng)}
     out["feature parity with the backtest"] = parity(store, scored)
+    if journal is not None:  # the launch books' own buys: where the seconds from creation to the fill go
+        from tradingbot import model_book as mb
+        out["book_timing_s"] = mb.early_timing(journal, now - hours * 3600, tuple(mb.LAUNCH_CUT), mb.LAUNCH_STAGES)
+        out["book_skips"] = {b: dict(collections.Counter(r["detail"] for r in journal.query(
+            "SELECT detail FROM events WHERE kind='entry_skipped' AND strategy=? AND ts >= ?",
+            (b, now - hours * 3600))).most_common(8)) for b in mb.LAUNCH_CUT}
     try:
         meta = json.loads(model_path(cfg).read_text()).get("meta", {})
         out["model"] = {k: meta.get(k) for k in ("trained_ts", "rows", "win_rate", "cut2", "cut5",

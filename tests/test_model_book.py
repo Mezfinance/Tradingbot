@@ -625,3 +625,31 @@ def test_the_rolling_window_is_rebuilt_from_the_store_and_after_a_retrain(tmp_pa
     book._checked = 0.0
     book.reload()
     assert book._history is None
+
+
+def test_launch_signals_go_to_the_matching_launch_book_with_a_minute_6_deadline(cfg, good_pair):
+    cfg.launch_book, cfg.launch_live = True, True
+    try:
+        j = Journal(":memory:")
+        eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                     model_executor=PaperExecutor(cfg))
+        assert mb.active_books(cfg)[-2:] == [mb.LAUNCH2, mb.LAUNCH5]
+        ec = mb.exit_config(cfg, mb.LAUNCH5)
+        assert ec.stop_loss_pct >= 99 and ec.take_profit_pcts[0] >= 1000  # held to minute 6, as backtested
+        created = time.time() - 6
+        top5 = {"pool": "PL", "mint": "L5", "dex": "pumpswap", "created_ts": created, "name": "", "price": 2.5e-5,
+                "liq": 30_000.0, "score": 1.0, "ts": time.time(), "decided_ts": time.time(), "kind": "launch",
+                "top2": False, "top5": True}
+        top2 = dict(top5, mint="L2", top2=True)
+        for s in (top5, top2, dict(top5, mint="M5", kind=None)):
+            eng.model_book.signals.put(s)
+        eng.buy_model_signals()
+        h2 = {p.token_address: p for p in j.open_positions(mb.LAUNCH2)}
+        h5 = {p.token_address: p for p in j.open_positions(mb.LAUNCH5)}
+        assert set(h2) == {"L2"} and set(h5) == {"L2", "L5"}  # model5 signals never reach the launch books
+        assert eng._deadlines[h5["L5"].id] == created + 360
+        assert all(p.token_address not in ("L2", "L5") for p in j.open_positions(mb.FAST))
+        timing = mb.early_timing(j, 0, tuple(mb.LAUNCH_CUT), mb.LAUNCH_STAGES)
+        assert timing[mb.LAUNCH5]["buys"] == 2 and "created->decided" in timing[mb.LAUNCH5]
+    finally:
+        cfg.launch_book, cfg.launch_live = False, False

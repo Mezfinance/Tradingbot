@@ -239,8 +239,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "launch-status":
         from tradingbot import launch_live
         from tradingbot.watcher import WatchStore, watch_db_path
-        print(json.dumps(launch_live.status(WatchStore(watch_db_path(cfg)), cfg, args.hours or 24), indent=2,
-                         default=str))
+        from tradingbot.journal import Journal
+        print(json.dumps(launch_live.status(WatchStore(watch_db_path(cfg)), cfg, args.hours or 24,
+                                            journal=Journal(cfg.db_path)), indent=2, default=str))
         return
 
     if args.command == "early-status":

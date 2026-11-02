@@ -51,9 +51,15 @@ EARLY_FIXED = (EARLY5, EARLY6, EARLY7)
 EARLY_ROLLING = (EARLY5R, EARLY6R, EARLY7R)
 EARLY_EXIT_MIN = {EARLY5: 5.0, EARLY6: 6.0, EARLY7: 7.0, EARLY5R: 5.0, EARLY6R: 6.0, EARLY7R: 7.0}
 EARLY_BOOKS = tuple(EARLY_EXIT_MIN)
+# Launch books (11-02): picks of the second-4 launch scorer (launch_live), top 2% / top 5%, bought through Jupiter
+# (it routes hand-made pools within ~0.1-2.4 s of creation) and sold at pool minute 6.
+LAUNCH2, LAUNCH5 = "launch4_2", "launch4_5"
+LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5"}
+LAUNCH_EXIT_MIN = {LAUNCH2: 6.0, LAUNCH5: 6.0}
+POOL_MINUTE_EXIT = {**EARLY_EXIT_MIN, **LAUNCH_EXIT_MIN}  # books that sell every position by a pool minute
 EARLY_MAX_SEEN_MIN = 4.0  # first sight later than this leaves no time to trade (and was left out of training)
 EARLY_GAIN = 0.10  # label: the 5-minute snapshot price >= first-sight price x 1.10 after costs, pool intact
-BOOKS = (NAME, FAST, CLIMB, OPS9, OPS10) + EARLY_BOOKS
+BOOKS = (NAME, FAST, CLIMB, OPS9, OPS10) + EARLY_BOOKS + tuple(LAUNCH_CUT)
 SHORT = (FAST, CLIMB, OPS9, OPS10)  # the short-hold books (entry-age guard, rug catcher report)
 AGE_EXIT = (FAST, CLIMB)  # books with the pool-age exit for hand-made pools
 AGE_MIN = 5
@@ -89,8 +95,8 @@ def is_handmade(dex: str, mint: str) -> bool:
 def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
     """Pool-age exit: the early books sell every position by their pool minute; the 10-min and climb books sell
     hand-made pools by created + `model_book_handmade_exit_age_min`."""
-    if name in EARLY_EXIT_MIN:
-        return sig["created_ts"] + EARLY_EXIT_MIN[name] * 60 if sig.get("created_ts") else None
+    if name in POOL_MINUTE_EXIT:
+        return sig["created_ts"] + POOL_MINUTE_EXIT[name] * 60 if sig.get("created_ts") else None
     age = cfg.model_book_handmade_exit_age_min
     if name not in AGE_EXIT or age <= 0 or not sig.get("created_ts") or not is_handmade(sig.get("dex") or "", sig["mint"]):
         return None
@@ -100,7 +106,8 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
 def active_books(cfg: Config) -> list[str]:
     return ([NAME] if cfg.model_book_slow else []) + ([FAST] if cfg.model_book_fast else []) \
         + ([CLIMB] if cfg.model_book_climb else []) + ([OPS9, OPS10] if cfg.model_book_ops else []) \
-        + (list(EARLY_FIXED) if cfg.early_book else []) + (list(EARLY_ROLLING) if cfg.early_rolling else [])
+        + (list(EARLY_FIXED) if cfg.early_book else []) + (list(EARLY_ROLLING) if cfg.early_rolling else []) \
+        + (list(LAUNCH_CUT) if cfg.launch_book and cfg.launch_live else [])
 
 
 def early_wants(name: str, sig: dict) -> bool:
@@ -125,7 +132,22 @@ def climb_check(cfg: Config, name: str, bought_ts: float, market_price: float) -
     return bought_ts + cfg.model_book_climb_after_min * 60, market_price * (1 + cfg.model_book_climb_min_gain_pct / 100)
 
 
+def signal_kind(name: str) -> str | None:
+    """Which signals a book takes: early (first sight), launch (second-4 scorer) or model5 (None)."""
+    return "early" if name in EARLY_BOOKS else "launch" if name in LAUNCH_CUT else None
+
+
+def wants(name: str, sig: dict) -> bool:
+    if name in EARLY_BOOKS:
+        return early_wants(name, sig)
+    if name in LAUNCH_CUT:
+        return bool(sig.get(LAUNCH_CUT[name]))
+    return True
+
+
 def hold_min(cfg: Config, name: str = NAME) -> float:
+    if name in LAUNCH_EXIT_MIN:  # from the buy (~pool second 6); the pool-minute deadline normally sells first
+        return LAUNCH_EXIT_MIN[name]
     if name in OPS_HOLD_MIN:
         return OPS_HOLD_MIN[name]
     if name in EARLY_EXIT_MIN:  # from the buy; the pool-minute deadline normally sells first
@@ -134,7 +156,11 @@ def hold_min(cfg: Config, name: str = NAME) -> float:
 
 
 def exit_config(cfg: Config, name: str = NAME) -> Config:
-    """A model book's exits: one take-profit at +100%, a -50% stop, out after its hold time."""
+    """A model book's exits: one take-profit at +100%, a -50% stop, out after its hold time. The launch books
+    hold to pool minute 6 with no stop or take-profit, as in their backtest."""
+    if name in LAUNCH_CUT:
+        return replace(cfg, stop_loss_pct=99.0, take_profit_pcts=(10_000.0,), take_profit_fractions=(1.0,),
+                       max_hold_hours=hold_min(cfg, name) / 60)
     return replace(cfg, stop_loss_pct=cfg.model_book_sl_pct, take_profit_pcts=(cfg.model_book_tp_pct,),
                    take_profit_fractions=(1.0,), max_hold_hours=hold_min(cfg, name) / 60)
 
@@ -347,15 +373,19 @@ def early_status(store, cfg: Config, hours: float = 8, now: float | None = None,
     return out
 
 
-def early_timing(journal, since: float) -> dict:
+LAUNCH_STAGES = (("created", "decided"), ("decided", "picked"), ("picked", "started"), ("started", "filled"),
+                 ("created", "filled"))
+
+
+def early_timing(journal, since: float, books=EARLY_BOOKS, stages=None) -> dict:
     """Median seconds per stage of the early books' buys (events `early_timing`): GeckoTerminal listing the pool
     (created -> seen = the watcher's step start), the new-pools call and scoring (seen -> found), the queue
     (found -> picked), the book's own checks (picked -> started) and quotes plus the simulated landing
     (started -> filled)."""
-    stages = (("created", "seen"), ("seen", "found"), ("found", "picked"), ("picked", "started"),
-              ("started", "filled"), ("created", "filled"))
+    stages = stages or (("created", "seen"), ("seen", "found"), ("found", "picked"), ("picked", "started"),
+                        ("started", "filled"), ("created", "filled"))
     out = {}
-    for b in EARLY_BOOKS:
+    for b in books:
         rows = [json.loads(r[0]) for r in journal.query(
             "SELECT detail FROM events WHERE kind='early_timing' AND strategy=? AND ts >= ?", (b, since))]
         if rows:

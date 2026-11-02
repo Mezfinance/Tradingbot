@@ -70,7 +70,10 @@ def setup(tmp_path, monkeypatch):
                                                for j in range(8)]
     monkeypatch.setattr(ll, "launch_record", lambda txs, pool, mint, window_s=60, exhausted=None: {
         "create_ts": create, "creator": "OP", "seed_sol": 50, "txs": busy})
-    live = ll.LaunchLive(cfg, st, hel, clock=clock, workers=0)
+    import queue
+    st.execute("CREATE TABLE IF NOT EXISTS watch_market(ts REAL, sol_usd REAL)")
+    st.execute("INSERT INTO watch_market(ts, sol_usd) VALUES(?, ?)", (clock.t - 60, 200.0))
+    live = ll.LaunchLive(cfg, st, hel, clock=clock, workers=0, signals=queue.Queue())
     return cfg, st, hel, clock, live, p, create
 
 
@@ -101,6 +104,12 @@ def test_hand_made_pool_scored_filled_and_exited(setup):
     r = live._row(HAND_POOL)
     assert r["status"] == "scored" and r["liquid"] == 1 and r["score"] is not None and r["top5"] == 1
     assert r["create_ts"] == create and r["indexed_s"] == 8 and hel.history_calls == 1
+    sig = live.signals.get_nowait()  # the pick goes to the launch books at once
+    px = la.chain_price(json.loads(r["feat"]) and [[0, 1, "OP", 1000, 50, 1000, 50]] +
+                        [[1 + j, 2 + j, f"W{j}", -1, 0.5, 1000 - j, 50 + 0.5 * j] for j in range(8)], 4)
+    assert sig["kind"] == "launch" and sig["top5"] and sig["mint"] == p["token_mint"]
+    assert sig["price"] == pytest.approx(px * 200) and sig["liq"] == pytest.approx(2 * r["sol_at_decide"] * 200)
+    assert sig["created_ts"] == create
     clock.t = create + ll.FILL_S + 0.5
     live.step()
     r = live._row(HAND_POOL)

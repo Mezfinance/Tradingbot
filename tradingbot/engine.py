@@ -180,11 +180,12 @@ class Engine:
                                  args=(MODEL_POLL_S, self.buy_model_signals)).start()
             threading.Thread(target=self._loop, name="watcher", daemon=True,
                              args=(self.cfg.watch_poll_s, watcher.step)).start()
-            if self.cfg.launch_live:  # second-4 launch scorer, shadow mode: never trades
+            if self.cfg.launch_live:  # second-4 launch scorer; its picks feed the launch books
                 import httpx
                 from tradingbot.data.helius import Helius
                 from tradingbot.launch_live import LaunchLive
-                LaunchLive(self.cfg, watcher.store, Helius(client=httpx.Client(timeout=10))).start()
+                signals = self.model_book.signals if self.model_book is not None and self.cfg.launch_book else None
+                LaunchLive(self.cfg, watcher.store, Helius(client=httpx.Client(timeout=10)), signals=signals).start()
             if self.cfg.enrich:
                 from tradingbot.enrich import Enricher
                 enricher = Enricher.from_config(self.cfg, watcher.store, watcher)
@@ -567,10 +568,10 @@ class Engine:
             targets = []
             for name in mb.BOOKS:
                 book = self.books.get(name)
-                if book is None or (name in mb.EARLY_BOOKS) != (sig.get("kind") == "early"):
-                    continue  # early signals go to the early books only, model5 signals to the others
-                if name in mb.EARLY_BOOKS and not mb.early_wants(name, sig):
-                    continue  # a fixed-only signal for a rolling book, or the other way round
+                if book is None or mb.signal_kind(name) != sig.get("kind"):
+                    continue  # early signals to the early books, launch signals to the launch books, model5 to the rest
+                if not mb.wants(name, sig):
+                    continue  # e.g. a fixed-only signal for a rolling book, a top-5% pick for the top-2% book
                 targets.append(book)
             if len(targets) > 1:  # all books buy at once: one after another cost each later book ~3.5 s
                 if self._model_pool is None:
@@ -603,9 +604,9 @@ class Engine:
         skip = mb.verdict_skip(book.name, sig)
         if skip:
             return skip
-        if book.name in mb.EARLY_EXIT_MIN and sig.get("created_ts") and \
-                time.time() > sig["created_ts"] + (mb.EARLY_EXIT_MIN[book.name] - 0.5) * 60:
-            return f"pool too old to sell by minute {mb.EARLY_EXIT_MIN[book.name]:g}"
+        if book.name in mb.POOL_MINUTE_EXIT and sig.get("created_ts") and \
+                time.time() > sig["created_ts"] + (mb.POOL_MINUTE_EXIT[book.name] - 0.5) * 60:
+            return f"pool too old to sell by minute {mb.POOL_MINUTE_EXIT[book.name]:g}"
         if (book.name in mb.SHORT and sig.get("created_ts")
                 and (time.time() - sig["created_ts"]) / 60 > c.model_book_max_entry_age_min):
             return "pool too old for the short hold"
@@ -635,7 +636,8 @@ class Engine:
                 # A buy quote on an empty or drained pool implies an absurd price (10-28: 268,000x and 122,000,000x
                 # the snapshot): there is nothing real to buy, which is not the price running up.
                 return f"no real liquidity (live price {live_usd / sig['price']:,.0f}x the snapshot)"
-            if (live_usd / sig["price"] - 1) * 100 > c.model_book_max_drift_pct:
+            # Launch picks are bought whatever the move since second 4, as in their backtest (fill at second 6).
+            if sig.get("kind") != "launch" and (live_usd / sig["price"] - 1) * 100 > c.model_book_max_drift_pct:
                 return f"price ran {(live_usd / sig['price'] - 1) * 100:+.0f}% since the snapshot"
             trigger = live_usd
             rt = self.jupiter.round_trip(sig["mint"], usd)
@@ -665,10 +667,11 @@ class Engine:
                                    strategy=book.name)
         self.journal.log_event("model_buy", sig["mint"], f"score {sig['score']:.3f} liq ${sig['liq']:,.0f}",
                                strategy=book.name)
-        if sig.get("kind") == "early":  # where the seconds between the pool's creation and our fill go
+        if sig.get("kind") in ("early", "launch"):  # where the seconds between the pool's creation and our fill go
             self.journal.log_event("early_timing", sig["mint"], json.dumps(
                 {k: round(v, 2) for k, v in (("created", sig.get("created_ts")), ("seen", sig.get("seen_ts")),
-                                             ("found", sig.get("ts")), ("picked", sig.get("picked_ts")),
+                                             ("found", sig.get("ts")), ("decided", sig.get("decided_ts")),
+                                             ("picked", sig.get("picked_ts")),
                                              ("started", started), ("filled", pos.opened_at)) if v}),
                 strategy=book.name)
         self._log_model_audit(book, sig)
