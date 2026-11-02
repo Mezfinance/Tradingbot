@@ -142,6 +142,7 @@ def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
             static = wa._static_features({"name": r["name"], "dex": r["dex"], "created_ts": r["created_ts"]})
             row["liquid"], row["feat"] = {}, {}
             create = launch["create_ts"]
+            row.update(chain_create=create, gone=gone, pulled_before_seen=pulled_by(txs, seen))
             row["snap_min"] = (r["snap_ts"] - create) / 60 if r["snap_ts"] else None
             candles = sorted((json.loads(r["candles"]) or {}).get("candles") or [], key=lambda c: c[0]) \
                 if r["candles"] else []
@@ -168,6 +169,8 @@ def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
                                                                launch.get("seed_sol"))}
                 if "cx" in row:
                     row["cx"]["link"][x] = p_seen / p_x
+                if x == EXIT_CHECK_CELL[1]:
+                    row["link6"] = round(p_seen / p_x, 6)
         out.append(row)
     return out
 
@@ -255,6 +258,31 @@ def fetch_history_candles(store, pools: list[dict], gecko, progress=None) -> int
     return fetched
 
 
+def export_exit_rows(data: list[dict], test_from: str | None, no_name: bool, sample_n: int) -> dict:
+    """What the exit timing check needs, for checking elsewhere (GeckoTerminal's rate limit is shared with the
+    running bot on Fly): the decide-4/fill-6 picks and a random sample of the other liquid pools, each with its
+    times, the backtest's snapshot return, the chain link from second 6 to first sight and the emptied flags."""
+    got: dict = {}
+    timing(data, np.random.default_rng(0), test_from, no_name, collect=got)
+    d, f = EXIT_CHECK_CELL
+    cut_of = {}
+    for k in sorted(TIMING_TOP_PCT, reverse=True):
+        for r in got.get("by_cut", {}).get(k, []):
+            cut_of[r["pool"]] = k
+    rest = [r for r in got.get("base", []) if r["pool"] not in cut_of]
+    sample = [rest[i] for i in np.random.default_rng(1).permutation(len(rest))[:sample_n]]
+    seen_s = lambda r: r["seen_s"]
+    out = []
+    for r in [r for r in got.get("base", []) if r["pool"] in cut_of] + sample:
+        create = r["created_ts"]
+        out.append({"pool": r["pool"], "top": cut_of.get(r["pool"]), "created": create,
+                    "chain_create": r.get("chain_create"), "seen_s": round(seen_s(r), 1),
+                    "snap_min": round(r["snap_min"], 3) if r.get("snap_min") else None,
+                    "ret": round(r["ret"][f], 5), "link": r.get("link6"), "gone": r.get("gone"),
+                    "pulled_before_seen": r.get("pulled_before_seen"), "day": _day(r)})
+    return {"cell": f"decide {d}s, fill {f}s", "rows": out}
+
+
 def timing(data: list[dict], rng, test_from: str | None = None, no_name: bool = False,
            collect: dict | None = None) -> dict:
     """Live entries can't fill at the decision second. For each (decide at d, fill at f): walk-forward by day, a
@@ -297,7 +325,7 @@ def timing(data: list[dict], rng, test_from: str | None = None, no_name: bool = 
             res[f"top {k:g}%"] = _summary(picks[k], rng)
         res["by day"] = by_day
         if (d, f) == EXIT_CHECK_CELL and collect is not None:
-            collect.update(base=base_rows, picks=pick_rows[max(TIMING_TOP_PCT)])
+            collect.update(base=base_rows, picks=pick_rows[max(TIMING_TOP_PCT)], by_cut=pick_rows)
         if (d, f) == EXIT_CHECK_CELL:
             res["exit timing check"] = {"every liquid pool": exit_check(base_rows, f, rng),
                                         **{f"top {k:g}%": exit_check(pick_rows[k], f, rng) for k in TIMING_TOP_PCT}}

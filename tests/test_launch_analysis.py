@@ -167,3 +167,14 @@ def test_fetch_candles_gets_history_for_picks_and_a_sample():
     assert chk["top 5%"]["pools with candles"] == f"{n_picks} of {n_picks}"
     la.backtest(st, Config(), only_timing=True, fetch_candles=10, gecko=Gecko())
     assert len(asked) == n_picks + 10  # saved: a rerun fetches nothing new
+
+
+def test_export_exit_rows_lists_picks_and_a_sample():
+    st = WatchStore(":memory:")
+    _three_days(st)
+    out = la.export_exit_rows(la.rows(st, Config()), None, True, 10)
+    tops = [r for r in out["rows"] if r["top"]]
+    assert tops and len(out["rows"]) == len(tops) + 10
+    r = tops[0]
+    assert r["link"] > 0 and r["snap_min"] == pytest.approx(380 / 60, abs=0.01) and r["created"] and r["day"]
+    assert {r["top"] for r in tops} <= {2.0, 5.0}

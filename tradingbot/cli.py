@@ -93,6 +93,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--fetch-candles", type=int, default=0, metavar="N",
                         help="launch-backtest: fetch historical 1-minute candles for the decide-4/fill-6 picks plus N "
                              "random liquid pools (GeckoTerminal, saved for reruns) for the exit timing check")
+    parser.add_argument("--export-exit", type=int, default=0, metavar="N",
+                        help="launch-backtest: print the decide-4/fill-6 picks + N random liquid pools as JSON "
+                             "(times, snapshot return, chain link) for the exit timing check run elsewhere")
     parser.add_argument("--timing", action="store_true",
                         help="launch-backtest: only the decide-at-d / fill-at-f timing table (faster)")
     parser.add_argument("--max-pools", type=int, default=2000, help="launch-backfill: at most this many pools")
@@ -287,6 +290,10 @@ def main(argv: list[str] | None = None) -> None:
         picks = {r["pool"] for r in store.query("SELECT pool, mint FROM watch_pools WHERE dex='pumpswap'")
                  if r["mint"] in mints}
         since = time.time() - args.hours * 3600 if args.hours else 0.0
+        if args.export_exit:
+            print(json.dumps(launch_analysis.export_exit_rows(launch_analysis.rows(store, cfg, since), args.test_from,
+                                                              args.no_name, args.export_exit), separators=(",", ":")))
+            return
         print(json.dumps(launch_analysis.backtest(store, cfg, since, picks, test_from=args.test_from,
                                                   only_timing=args.timing, no_name=args.no_name,
                                                   fetch_candles=args.fetch_candles,
