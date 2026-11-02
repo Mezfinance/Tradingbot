@@ -527,6 +527,30 @@ def parity(store, rows) -> dict:
             "median_max_diff": round(float(np.median(diffs)), 4), "worst_max_diff": round(float(max(diffs)), 4)}
 
 
+def fill_gap(store, journal, book: str, since: float, rng) -> dict:
+    """A book's real (Jupiter-simulated) trades vs the scorer's ideal trade on the same pools: vault price at
+    second ~6.5 in, vault price at minute 6 out, flat 6% cost. The gap is what a real fill costs live."""
+    pairs = []
+    for p in journal.query("SELECT token, opened_at, closed_at, cost_usd, realized_usd FROM positions "
+                           "WHERE strategy=? AND opened_at >= ? AND closed_at IS NOT NULL", (book, since)):
+        r = store.query("SELECT create_ts, ret FROM watch_launch_live WHERE token_mint=? AND status='done' "
+                        "ORDER BY notified_ts DESC LIMIT 1", (p["token"],))
+        if not r or r[0]["ret"] is None or not p["cost_usd"]:
+            continue
+        pairs.append({"real": p["realized_usd"] / p["cost_usd"] - 1, "ideal": r[0]["ret"],
+                      "in_s": p["opened_at"] - r[0]["create_ts"], "out_s": p["closed_at"] - r[0]["create_ts"]})
+    if not pairs:
+        return {"trades": 0}
+    gaps = [x["real"] - x["ideal"] for x in pairs]
+    return {"trades": len(pairs),
+            "book (real fills)": _group([{"ret": x["real"]} for x in pairs], rng),
+            "scorer (ideal fills), same pools": _group([{"ret": x["ideal"]} for x in pairs], rng),
+            "gap per trade (real - ideal)": {"mean_pct": round(100 * float(np.mean(gaps)), 1),
+                                             "median_pct": round(100 * float(np.median(gaps)), 1)},
+            "filled at pool second (median)": _median([x["in_s"] for x in pairs]),
+            "sold at pool second (median)": _median([x["out_s"] for x in pairs])}
+
+
 def status(store, cfg: Config, hours: float = 24, now: float | None = None, journal=None) -> dict:
     now = now if now is not None else time.time()
     store.execute(SCHEMA)
@@ -563,6 +587,7 @@ def status(store, cfg: Config, hours: float = 24, now: float | None = None, jour
         out["book_skips"] = {b: dict(collections.Counter(r["detail"] for r in journal.query(
             "SELECT detail FROM events WHERE kind='entry_skipped' AND strategy=? AND ts >= ?",
             (b, now - hours * 3600))).most_common(8)) for b in mb.LAUNCH_CUT}
+        out["real vs ideal fills"] = {b: fill_gap(store, journal, b, now - hours * 3600, rng) for b in mb.LAUNCH_CUT}
     try:
         meta = json.loads(model_path(cfg).read_text()).get("meta", {})
         out["model"] = {k: meta.get(k) for k in ("trained_ts", "rows", "win_rate", "cut2", "cut5",

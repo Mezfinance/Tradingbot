@@ -128,3 +128,23 @@ def test_timing_without_name_features(monkeypatch):
     out = la.backtest(st, Config(), only_timing=True, no_name=True)["timing (walk-forward: decide at d, fill at f)"]
     assert seen and not any(n & set(la.LIVE_DROP) for n in seen)
     assert out["decide 4s, fill 6s"]["top 5%"]["n"] > 0
+
+
+def test_exit_timing_check_compares_the_snapshot_with_minute_6():
+    st = WatchStore(":memory:")
+    _three_days(st)
+    for r in st.query("SELECT pool, created_ts FROM watch_pools"):
+        c = r["created_ts"]
+        candles = [[c, 1, 1, 1, 1.0, 5], [c + 330, 1, 2, 1, 2.0, 5], [c + 370, 2, 3, 2, 3.0, 5]]
+        st.execute("INSERT INTO watch_enrich(pool, kind, ts, data) VALUES(?,?,?,?)",
+                   (r["pool"], "candles15", c + 900, json.dumps({"candles": candles})))
+    out = la.backtest(st, Config(), only_timing=True)["timing (walk-forward: decide at d, fill at f)"]
+    chk = out["decide 4s, fill 6s"]["exit timing check"]["every liquid pool"]
+    assert chk["snapshot taken at pool minute"]["median"] == pytest.approx(380 / 60, abs=0.01)
+    n = chk["candle price at pool minute 6"]["n"]
+    assert n > 0 and chk["pools with candles"] == f"{n} of {n}"
+    # candle price doubles by minute 6 and triples by the snapshot (both from c_seen = 1.0)
+    assert chk["candle price at the snapshot time"]["mean_pct"] > chk["candle price at pool minute 6"]["mean_pct"]
+    r = next(r for r in la.rows(st, Config()) if "cx" in r)
+    assert la.candle_ret(r, 6, "c6") == pytest.approx(min(2.0 * r["cx"]["link"][6] - 1 - la.COST, 3.0))
+    assert "exit timing check" not in out["decide 5s, fill 5s"]

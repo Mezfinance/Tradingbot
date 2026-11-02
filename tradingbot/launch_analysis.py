@@ -42,6 +42,17 @@ def chain_price(txs: list, t: float) -> float | None:
     return p
 
 
+def candle_price(candles: list, t: float) -> float | None:
+    """Close of the last 1-minute candle that started before t (GeckoTerminal lists only minutes with trades, so
+    a quiet stretch keeps the last price). The close lands within a minute of t either side."""
+    p = None
+    for c in candles:
+        if c[0] >= t:
+            break
+        p = c[4]
+    return p
+
+
 def pulled_by(txs: list, t: float) -> bool:
     peak = 0.0
     for r in txs:
@@ -101,9 +112,10 @@ def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
     out = []
     for r in store.query(
             """SELECT p.pool, p.mint, p.dex, p.name, p.created_ts, p.seen_ts, p.first, e.data AS launch,
-                      s.data AS snap5
+                      s.data AS snap5, s.ts AS snap_ts, c.data AS candles
                FROM watch_enrich e JOIN watch_pools p ON p.pool=e.pool
                LEFT JOIN watch_snaps s ON s.pool=p.pool AND s.age_min=5
+               LEFT JOIN watch_enrich c ON c.pool=p.pool AND c.kind='candles15'
                WHERE e.kind='launch' AND p.created_ts >= ? AND json_extract(e.data, '$.txs') IS NOT NULL""",
             (since,)):
         launch, first = json.loads(r["launch"]), json.loads(r["first"] or "{}")
@@ -128,6 +140,15 @@ def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
             prior = _prior_pools(store, launch.get("creator"), r["created_ts"])
             static = wa._static_features({"name": r["name"], "dex": r["dex"], "created_ts": r["created_ts"]})
             row["liquid"], row["feat"] = {}, {}
+            create = launch["create_ts"]
+            row["snap_min"] = (r["snap_ts"] - create) / 60 if r["snap_ts"] else None
+            candles = sorted((json.loads(r["candles"]) or {}).get("candles") or [], key=lambda c: c[0]) \
+                if r["candles"] else []
+            c_seen = candle_price(candles, r["seen_ts"])
+            if c_seen and p_seen:  # exit-timing check: the same trade sold at exactly pool minute 6
+                row["cx"] = {"c_seen": c_seen, "c6": candle_price(candles, create + 360),
+                             "c_snap": candle_price(candles, r["snap_ts"]), "gone": gone,
+                             "pulled_before_seen": pulled_by(txs, seen), "link": {}}
             for x in FEATURE_SECONDS:
                 if x >= seen:
                     continue
@@ -144,6 +165,8 @@ def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
                     and not pulled_by(txs, x)
                 row["feat"][x] = {**static, **launch_features(txs, x, launch.get("creator"), prior,
                                                                launch.get("seed_sol"))}
+                if "cx" in row:
+                    row["cx"]["link"][x] = p_seen / p_x
         out.append(row)
     return out
 
@@ -171,6 +194,43 @@ def _fit_score(train: list[dict], test: list[dict], feat_x: int, label_x: int, d
     return ((xs - mu) / sd) @ w + b, te
 
 
+EXIT_CHECK_CELL = (4, 6)  # the live rule: decide on second-4 features, fill at second 6
+
+
+def candle_ret(r: dict, x: int, at: str) -> float | None:
+    """The second-x trade sold at the 1-minute candle price `at` ('c6' = pool minute 6, 'c_snap' = when the
+    backtest's snapshot was taken), linked to the entry by the chain price; emptied pools stay -100%."""
+    cx = r.get("cx")
+    if not cx or x not in cx["link"] or not cx.get(at):
+        return None
+    if cx["pulled_before_seen"] or cx["gone"]:
+        return -1.0
+    return min(cx[at] / cx["c_seen"] * cx["link"][x] - 1 - COST, 3.0)
+
+
+def exit_check(rows: list[dict], f: int, rng) -> dict:
+    """Does the backtest's exit time matter? The snapshot exit vs 1-minute candle prices at the snapshot's own time
+    (same moment, other price source) and at exactly pool minute 6, on the pools that have candles; and the
+    snapshot exit of pools without candles (if it differs, the candle subset is not representative)."""
+    have = [r for r in rows if candle_ret(r, f, "c6") is not None and candle_ret(r, f, "c_snap") is not None]
+    rest = [r for r in rows if r not in have]
+    mins = [r["snap_min"] for r in rows if r.get("snap_min") is not None]
+    kept = [r for r in have if not (r["cx"]["gone"] or r["cx"]["pulled_before_seen"])]
+    return {
+        "snapshot taken at pool minute": {
+            "median": round(float(np.median(mins)), 2) if mins else None,
+            "p10": round(float(np.percentile(mins, 10)), 2) if mins else None,
+            "p90": round(float(np.percentile(mins, 90)), 2) if mins else None},
+        "pools with candles": f"{len(have)} of {len(rows)}",
+        "snapshot exit (backtest), pools with candles": _summary([r["ret"][f] for r in have], rng),
+        "snapshot exit (backtest), pools without candles": _summary([r["ret"][f] for r in rest], rng),
+        "candle price at the snapshot time": _summary([candle_ret(r, f, "c_snap") for r in have], rng),
+        "candle price at pool minute 6": _summary([candle_ret(r, f, "c6") for r in have], rng),
+        "not emptied: candle at snapshot time": _summary([candle_ret(r, f, "c_snap") for r in kept], rng),
+        "not emptied: candle at minute 6": _summary([candle_ret(r, f, "c6") for r in kept], rng),
+    }
+
+
 def timing(data: list[dict], rng, test_from: str | None = None, no_name: bool = False) -> dict:
     """Live entries can't fill at the decision second. For each (decide at d, fill at f): walk-forward by day, a
     model on features at second d (label: the second-f trade made money) picks the top 2% / 5% of the training
@@ -182,8 +242,9 @@ def timing(data: list[dict], rng, test_from: str | None = None, no_name: bool = 
                        and r["liquid"].get(d)], key=lambda r: r["created_ts"])
         days = sorted({_day(r) for r in pool})
         picks = {k: [] for k in TIMING_TOP_PCT}
+        pick_rows = {k: [] for k in TIMING_TOP_PCT}
         by_day = {}
-        base = []
+        base, base_rows = [], []
         for dd in days:
             if test_from and dd < test_from:
                 continue
@@ -196,17 +257,23 @@ def timing(data: list[dict], rng, test_from: str | None = None, no_name: bool = 
                 continue
             tr, te = fit
             base += [r["ret"][f] for r in test]
+            base_rows += test
             row = {"pools": len(test), "all_mean_pct": round(float(np.mean([r["ret"][f] for r in test])) * 100, 1)}
             for k in TIMING_TOP_PCT:
                 cut = float(np.quantile(tr, 1 - k / 100))
-                got = [r["ret"][f] for r, sc in zip(test, te) if sc >= cut - 1e-9]  # ties count
+                chosen = [r for r, sc in zip(test, te) if sc >= cut - 1e-9]  # ties count
+                got = [r["ret"][f] for r in chosen]
                 picks[k] += got
+                pick_rows[k] += chosen
                 row[f"top {k:g}%"] = {"n": len(got), "mean_pct": round(float(np.mean(got)) * 100, 1) if got else None}
             by_day[dd] = row
         res = {"pools": len(pool), "days_scored": len(by_day), "every liquid pool": _summary(base, rng)}
         for k in TIMING_TOP_PCT:
             res[f"top {k:g}%"] = _summary(picks[k], rng)
         res["by day"] = by_day
+        if (d, f) == EXIT_CHECK_CELL:
+            res["exit timing check"] = {"every liquid pool": exit_check(base_rows, f, rng),
+                                        **{f"top {k:g}%": exit_check(pick_rows[k], f, rng) for k in TIMING_TOP_PCT}}
         out[f"decide {d}s, fill {f}s"] = res
     return out
 

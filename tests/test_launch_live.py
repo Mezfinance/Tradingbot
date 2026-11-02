@@ -182,3 +182,25 @@ def test_empty_history_is_retried(setup):
     clock.t += ll.EMPTY_RETRY_S
     live.step()
     assert len(calls) == 2 and live._row(HAND_POOL)["status"] == "scored"
+
+
+def test_real_vs_ideal_fills_pairs_book_trades_with_the_scorer(setup):
+    from tradingbot.journal import Journal
+    from tradingbot.models import Position
+    cfg, st, hel, clock, live, p, create = setup
+    live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+    live.step()
+    clock.t += cfg.launch_live_decide_delay_s
+    live.step()
+    clock.t = create + ll.FILL_S + 0.5
+    live.step()
+    hel.accts[p["sol_vault"]] = ("tok", token_acct(75_000_000_000))
+    clock.t = create + ll.EXIT_S
+    live.step()  # ideal: 75/60 - 1 - 6% = +19%
+    j = Journal(":memory:")
+    pos = Position(None, p["token_mint"], "X", 1.0, 0.0, 100.0, 100.0, create + 7, 0.0, 1.0,
+                   realized_usd=110.0, closed_at=create + 361, exit_reason="pool_age_exit", strategy="launch4_5")
+    j.save_position(pos)
+    out = ll.status(st, cfg, 24, now=clock.t, journal=j)["real vs ideal fills"]["launch4_5"]
+    assert out["trades"] == 1 and out["filled at pool second (median)"] == 7
+    assert out["gap per trade (real - ideal)"]["mean_pct"] == pytest.approx(10 - 19, abs=0.1)
