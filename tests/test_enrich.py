@@ -461,11 +461,15 @@ def test_launch_data_records_the_first_minutes_of_a_sample_of_hand_made_pools():
         return {"blockTime": t, "slot": slot, "meta": m, "transaction": {"message": {"accountKeys": [{"pubkey": payer}]}}}
 
     asked = []
-    e.helius.history = lambda pool, limit=100: asked.append(pool) or []
+    e.helius.history_until = lambda pool, until, pages=4: asked.append(pool) or ([], True, True)
     assert e.poll_launch(T0 + 400) == min(5, sum(sampled(f"launch:{p}", 25.0) for p in hand))
     assert "GRAD" not in asked and all(sampled(f"launch:{p}", 25.0) for p in asked)
     assert e._get("GRAD", "launch") == {"skipped": "not hand-made"}
     assert 1 <= len(asked) <= 5 and e.poll_launch(T0 + 400) >= 1  # the rest of the sample next pass
+    assert e._get(asked[0], "launch") == {}  # an empty answer is retried, not recorded
+    for _ in range(10):
+        e.poll_launch(T0 + 400)
+    assert e._get(asked[0], "launch") == {"error": "no transactions", "tries": 3}
     rec = launch_record([vault(T0, 1, "OP", (0, 1000), (0, 50)),
                          vault(T0 + 20, 2, "BUYER", (1000, 900), (50, 56)),
                          vault(T0 + 30, 3, "X", (900, 900), (56, 56), err="failed"),
@@ -478,7 +482,28 @@ def test_launch_data_records_the_first_minutes_of_a_sample_of_hand_made_pools():
     outside = next(p for p in hand if not sampled(f"launch:{p}", 25.0))
     st.execute("DELETE FROM watch_enrich WHERE pool=?", (outside,))
     st.set_state(f"early_signal:{outside}", "1")  # an early-book signal is recorded whatever the sample
-    e.helius.history = lambda pool, limit=100: [vault(T0, 1, "OP", (0, 1000), (0, 50))]
+    e.helius.history_until = lambda pool, until, pages=4: ([vault(T0, 1, "OP", (0, 1000), (0, 50))], True, True)
     for _ in range(10):
         e.poll_launch(T0 + 400)
     assert e._get(outside, "launch")["selection"] == "early signal"
+
+
+def test_helius_history_pages_until_the_wanted_time():
+    from tradingbot.data.helius import Helius
+    pages = {None: ([{"blockTime": 10}, {"blockTime": 20}], "p2"), "p2": ([{"blockTime": 30}], "p3"),
+             "p3": ([{"blockTime": 99}], "p4")}
+    sent = []
+
+    class Http:
+        def post(self, url, params=None, json=None):
+            token = json["params"][1].get("paginationToken")
+            sent.append(token)
+            data, nxt = pages[token]
+            return SimpleNamespace(status_code=200, json=lambda: {"result": {"data": data, "paginationToken": nxt}})
+
+    h = Helius(api_key="k", client=Http())
+    txs, done, ok = h.history_until("POOL", until_ts=25)
+    assert [t["blockTime"] for t in txs] == [10, 20, 30] and done and ok and sent == [None, "p2"]
+    assert h.credits_used == 20
+    txs, done, ok = h.history_until("POOL", until_ts=1000, max_pages=2)
+    assert len(txs) == 3 and not done and ok  # stopped by the page cap before reaching the time

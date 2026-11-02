@@ -59,7 +59,10 @@ MINT_KINDS = ("helius", "x", "dev", "narrative", "sentiment")
 RANKED = {"helius": ("helius_budget", "helius_daily_credits", 30.0), "x": ("x_budget", "x_daily_budget_usd", 0.015)}
 NEEDS_SNAP5 = PAID_OR_HEAVY + ("operator",)
 CREATORS_PER_STEP = 500  # pumpswap pools whose creator is read per pass (100 per call), newest first
-LAUNCH_WINDOW_S = 300  # seconds after creation kept per sampled pool (covers first sight, up to minute 4)
+LAUNCH_WINDOW_S = 300  # at most this many seconds after creation are kept per pool
+LAUNCH_PAST_SEEN_S = 30  # ... and only until this long after first sight (the backtest needs the path up to it)
+LAUNCH_MAX_PAGES = 4  # Helius pages of 100 txs (10 credits each); busy pools trade every slot
+LAUNCH_MAX_TRIES = 3  # an empty or failed answer is retried on later passes before it is recorded
 LAUNCH_READY_S = 360  # fetch once the window is over (and indexed)
 LAUNCH_MAX_AGE_S = 6 * 3600  # give up on pools older than this
 LAUNCH_PER_STEP = 5  # Helius lookups per pass
@@ -252,7 +255,7 @@ class Enricher:
         if self.cfg.launch_sample_pct <= 0:
             return 0
         rows = self.store.query(
-            """SELECT pool, mint FROM watch_pools p WHERE dex='pumpswap' AND created_ts BETWEEN ? AND ?
+            """SELECT pool, mint, created_ts, seen_ts FROM watch_pools p WHERE dex='pumpswap' AND created_ts BETWEEN ? AND ?
                AND NOT EXISTS (SELECT 1 FROM watch_enrich e WHERE e.pool=p.pool AND e.kind='launch')
                ORDER BY created_ts DESC LIMIT 300""", (now - LAUNCH_MAX_AGE_S, now - LAUNCH_READY_S))
         fetched = 0
@@ -266,14 +269,24 @@ class Enricher:
                 self._save(pool, "launch", {"skipped": "not sampled"}, now)
             elif not self.helius.enabled:
                 self._save(pool, "launch", {"skipped": "no helius key"}, now)
-            elif fetched >= LAUNCH_PER_STEP or not self.launch_budget.allows(HISTORY_CREDITS_PER_100):
+            elif fetched >= LAUNCH_PER_STEP or \
+                    not self.launch_budget.allows(HISTORY_CREDITS_PER_100 * LAUNCH_MAX_PAGES):
                 continue  # left for the next pass; skips below still get marked
             else:
+                window = min(LAUNCH_WINDOW_S, max(0.0, r["seen_ts"] - r["created_ts"]) + LAUNCH_PAST_SEEN_S)
                 before = self.helius.credits_used
-                txs = self.helius.history(pool, 100)
+                txs, done, ok = self.helius.history_until(pool, r["created_ts"] + window + 60, LAUNCH_MAX_PAGES)
                 self.launch_budget.add(self.helius.credits_used - before)
                 fetched += 1
-                rec = launch_record(txs, pool, mint, LAUNCH_WINDOW_S)
+                if not txs or not ok:
+                    tries = int(self.store.get_state(f"launch_try:{pool}") or 0) + 1
+                    if tries < LAUNCH_MAX_TRIES:  # Helius errors and late indexing: try again next pass
+                        self.store.set_state(f"launch_try:{pool}", str(tries))
+                        continue
+                    if not txs:
+                        self._save(pool, "launch", {"error": "no transactions", "tries": tries}, now)
+                        continue
+                rec = launch_record(txs, pool, mint, window, exhausted=done)
                 rec["selection"] = "sample" if in_sample else "early signal"  # only 'sample' is unbiased
                 self._save(pool, "launch", rec, now)
         return fetched

@@ -72,6 +72,27 @@ class Helius:
             return None
         return body.get("result")
 
+    def history_until(self, address: str, until_ts: float, max_pages: int = 4) -> tuple[list[dict], bool, bool]:
+        """Oldest-first full transactions touching `address`, page by page (100 per page, 10 credits each) until one
+        is later than `until_ts`, the history ends or `max_pages` is reached. Returns (txs, reached the end or
+        until_ts, every call succeeded)."""
+        txs: list[dict] = []
+        token = None
+        for _ in range(max_pages):
+            opts = {"transactionDetails": "full", "sortOrder": "asc", "limit": 100,
+                    "maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}
+            if token:
+                opts["paginationToken"] = token
+            res = self._rpc("getTransactionsForAddress", [address, opts], HISTORY_CREDITS_PER_100)
+            if res is None:
+                return txs, False, False
+            page = res.get("data") or []
+            txs += page
+            token = res.get("paginationToken")
+            if not page or not token or (page[-1].get("blockTime") or 0) > until_ts:
+                return txs, True, True
+        return txs, False, True
+
     def history(self, address: str, limit: int = 100) -> list[dict]:
         """Oldest-first full transactions touching `address`."""
         res = self._rpc("getTransactionsForAddress",
@@ -228,14 +249,15 @@ def _vault(tx: dict, pool: str, mint: str, side: str) -> float:
     return 0.0
 
 
-def launch_record(txs: list[dict], pool: str, base_mint: str, window_s: float = 180) -> dict:
+def launch_record(txs: list[dict], pool: str, base_mint: str, window_s: float = 180,
+                  exhausted: bool | None = None) -> dict:
     """A pool's first `window_s` seconds from its oldest-first transactions: one row per successful tx,
     [seconds after creation, slot, fee payer, pool's token change, pool's SOL change, tokens after, SOL after].
     Positive token change with negative SOL change = someone sold to the pool; the reverse = a buy."""
     if not txs:
         return {"error": "no transactions"}
     t0 = txs[0].get("blockTime") or 0
-    rows, failed, complete = [], 0, len(txs) < 100
+    rows, failed, complete = [], 0, (len(txs) < 100 if exhausted is None else exhausted)
     for tx in txs:
         bt = tx.get("blockTime") or 0
         if bt > t0 + window_s:
