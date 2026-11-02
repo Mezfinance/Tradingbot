@@ -217,17 +217,19 @@ app in Sydney (Binance futures and Bybit refuse US addresses). It never places o
 fly apps create shortbook-paper                       # pick another name if taken, and change `app` in fly.shortbook.toml
 fly volumes create shortbook_data -r syd -s 1 -a shortbook-paper
 fly deploy -c fly.shortbook.toml
-fly ssh console -a shortbook-paper -C "python -m shortbook check"    # every venue should say ok
+fly machine list -a shortbook-paper                    # note the machine ID
+fly machine exec <machine-id> "python -m shortbook check" -a shortbook-paper   # every venue should say ok
 ```
 
-If a perp venue says FAILED from Sydney, move the app: set `primary_region` (e.g. `sin`, `nrt`, `hkg`) in
+`fly ssh console` can hang at "connecting" (WireGuard tunnel probe); `fly machine exec` doesn't need the tunnel
+(`fly wireguard websockets enable` usually fixes ssh). If a perp venue says FAILED from Sydney, move the app: set `primary_region` (e.g. `sin`, `nrt`, `hkg`) in
 `fly.shortbook.toml`, create the volume in that region, deploy again and re-run `check`.
 
 Day to day:
 
 ```sh
-fly ssh console -a shortbook-paper -C "python -m shortbook status"   # heartbeat, NAV, open shorts, pending listings
-fly ssh console -a shortbook-paper -C "python -m shortbook report"   # results by group vs the research, skip reasons
+fly machine exec <machine-id> "python -m shortbook status" -a shortbook-paper   # heartbeat, NAV, open shorts, pending listings
+fly machine exec <machine-id> "python -m shortbook report" -a shortbook-paper   # results by group vs the research, skip reasons
 fly logs -a shortbook-paper                                           # new markets, SHORT / COVER lines
 ```
 
