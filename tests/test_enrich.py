@@ -507,3 +507,29 @@ def test_helius_history_pages_until_the_wanted_time():
     assert h.credits_used == 20
     txs, done, ok = h.history_until("POOL", until_ts=1000, max_pages=2)
     assert len(txs) == 3 and not done and ok  # stopped by the page cap before reaching the time
+
+
+def test_launch_backfill_takes_a_capped_random_sample_of_older_hand_made_pools():
+    from tradingbot.data.helius import SOL_MINT
+    st = WatchStore(":memory:")
+    for i in range(30):
+        st.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts) VALUES(?,?,?,?,?,?)",
+                   (f"H{i}", f"H{i}Mint", "pumpswap", "H", T0 - 86400, T0 - 86400 + 60))
+    st.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts) VALUES(?,?,?,?,?,?)",
+               ("G", "Gpump", "pumpswap", "G", T0 - 86400, T0 - 86400 + 60))
+    e = make_enricher(st)
+    seed = {"blockTime": T0 - 86400, "slot": 1, "transaction": {"message": {"accountKeys": [{"pubkey": "OP"}]}},
+            "meta": {"err": None, "preTokenBalances": [], "postTokenBalances": [
+                {"mint": SOL_MINT, "owner": "X", "uiTokenAmount": {"uiAmount": 50}}]}}
+
+    def history_until(pool, until, pages=4):
+        e.helius.credits_used += 20
+        return [seed], True, True
+    e.helius.history_until = history_until
+    out = e.backfill_launch(T0 - 2 * 86400, T0, max_pools=100, max_credits=200)
+    assert out["candidates"] == 30 and out["saved"] == 9 and out["credits"] == 180  # stops before a lookup could pass the cap
+    saved = [r["pool"] for r in st.query("SELECT pool FROM watch_enrich WHERE kind='launch'")]
+    assert "G" not in saved and len(saved) == 9
+    assert e._get(saved[0], "launch")["backfill"] and e._get(saved[0], "launch")["selection"] == "sample"
+    again = e.backfill_launch(T0 - 2 * 86400, T0, max_pools=100, max_credits=200)
+    assert again["candidates"] == 21  # done pools are not fetched again

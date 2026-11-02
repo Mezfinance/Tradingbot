@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "propose", "proposals", "watch-status", "watch-report",
                                             "watch-export", "watch-links", "watch-report-now",
                                             "watch-model-train", "model-status", "early-status",
-                                            "early-backtest", "launch-backtest"])
+                                            "early-backtest", "launch-backtest", "launch-backfill"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -84,6 +84,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--paid-value", action="store_true",
                         help="watch-report: is Helius / X data worth paying for (control slice, 15-min features)")
     parser.add_argument("--hours", type=float, default=None, help="early-status / early-backtest (default 8) / launch-backtest (default all): look back this many hours")
+    parser.add_argument("--days", type=float, default=7.0, help="launch-backfill: pools created in the last N days")
+    parser.add_argument("--max-pools", type=int, default=2000, help="launch-backfill: at most this many pools")
+    parser.add_argument("--max-credits", type=int, default=60000, help="launch-backfill: Helius credit cap")
     parser.add_argument("--idea", help="propose: what to build")
     parser.add_argument("--problem", default="", help="propose: what it should fix or improve")
     parser.add_argument("--priority", type=int, default=1, help="propose: 1 (first) to 5 (last)")
@@ -235,6 +238,20 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot import model_book
         from tradingbot.watcher import WatchStore, watch_db_path
         print(json.dumps(model_book.early_backtest(WatchStore(watch_db_path(cfg)), cfg, args.hours or 8.0), indent=2))
+        return
+
+    if args.command == "launch-backfill":
+        import time
+        from tradingbot.enrich import Enricher
+        from tradingbot.watcher import WatchStore, watch_db_path
+        e = Enricher(cfg, WatchStore(watch_db_path(cfg)))
+        if not e.helius.enabled:
+            print("HELIUS_API_KEY is not set")
+            return
+        now = time.time()
+        out = e.backfill_launch(now - args.days * 86400, now - 3600, args.max_pools, args.max_credits,
+                                progress=lambda m: print(m, flush=True))
+        print(json.dumps(out, indent=2))
         return
 
     if args.command == "launch-backtest":

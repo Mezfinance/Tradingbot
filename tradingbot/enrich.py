@@ -273,23 +273,53 @@ class Enricher:
                     not self.launch_budget.allows(HISTORY_CREDITS_PER_100 * LAUNCH_MAX_PAGES):
                 continue  # left for the next pass; skips below still get marked
             else:
-                window = min(LAUNCH_WINDOW_S, max(0.0, r["seen_ts"] - r["created_ts"]) + LAUNCH_PAST_SEEN_S)
                 before = self.helius.credits_used
-                txs, done, ok = self.helius.history_until(pool, r["created_ts"] + window + 60, LAUNCH_MAX_PAGES)
+                self._fetch_launch(r, "sample" if in_sample else "early signal", now)  # only 'sample' is unbiased
                 self.launch_budget.add(self.helius.credits_used - before)
                 fetched += 1
-                if not txs or not ok:
-                    tries = int(self.store.get_state(f"launch_try:{pool}") or 0) + 1
-                    if tries < LAUNCH_MAX_TRIES:  # Helius errors and late indexing: try again next pass
-                        self.store.set_state(f"launch_try:{pool}", str(tries))
-                        continue
-                    if not txs:
-                        self._save(pool, "launch", {"error": "no transactions", "tries": tries}, now)
-                        continue
-                rec = launch_record(txs, pool, mint, window, exhausted=done)
-                rec["selection"] = "sample" if in_sample else "early signal"  # only 'sample' is unbiased
-                self._save(pool, "launch", rec, now)
         return fetched
+
+    def _fetch_launch(self, r, selection: str, now: float, retry: bool = True, extra: dict | None = None) -> bool:
+        """One pool's launch row from Helius (pages up to first sight + LAUNCH_PAST_SEEN_S). An empty or failed
+        answer is left for a later try (`retry`) up to LAUNCH_MAX_TRIES. Returns True when a row was saved."""
+        pool, mint = r["pool"], r["mint"] or ""
+        window = min(LAUNCH_WINDOW_S, max(0.0, r["seen_ts"] - r["created_ts"]) + LAUNCH_PAST_SEEN_S)
+        txs, done, ok = self.helius.history_until(pool, r["created_ts"] + window + 60, LAUNCH_MAX_PAGES)
+        if not txs or not ok:
+            tries = int(self.store.get_state(f"launch_try:{pool}") or 0) + 1
+            if retry and tries < LAUNCH_MAX_TRIES:  # Helius errors and late indexing: try again later
+                self.store.set_state(f"launch_try:{pool}", str(tries))
+                return False
+            if not txs:
+                self._save(pool, "launch", {"error": "no transactions", "tries": tries}, now)
+                return True
+        rec = launch_record(txs, pool, mint, window, exhausted=done)
+        rec["selection"] = selection
+        rec.update(extra or {})
+        self._save(pool, "launch", rec, now)
+        return True
+
+    def backfill_launch(self, since: float, until: float, max_pools: int, max_credits: int,
+                        progress=None) -> dict:
+        """One-off: launch rows for a random sample of older hand-made pumpswap pools (stable order by address
+        hash, so a stopped run resumes the same sample), up to `max_pools` or `max_credits` Helius credits.
+        Rows get `selection: sample` + `backfill: true`. Pools that already have a launch row with trades are
+        skipped. Not counted against the daily launch budget (it is a separate, capped spend)."""
+        rows = [dict(r) for r in self.store.query(
+            """SELECT p.pool, p.mint, p.created_ts, p.seen_ts FROM watch_pools p
+               WHERE p.dex='pumpswap' AND p.mint NOT LIKE '%pump' AND p.created_ts BETWEEN ? AND ?
+               AND NOT EXISTS (SELECT 1 FROM watch_enrich e WHERE e.pool=p.pool AND e.kind='launch'
+                               AND json_extract(e.data, '$.txs') IS NOT NULL)""", (since, until))]
+        rows.sort(key=lambda r: hashlib.sha1(f"launch:{r['pool']}".encode()).hexdigest())
+        start, saved = self.helius.credits_used, 0
+        for i, r in enumerate(rows[:max_pools]):
+            if self.helius.credits_used - start + HISTORY_CREDITS_PER_100 * LAUNCH_MAX_PAGES > max_credits:
+                break
+            if self._fetch_launch(r, "sample", time.time(), retry=False, extra={"backfill": True}):
+                saved += 1
+            if progress and (i + 1) % 100 == 0:
+                progress(f"{i + 1} pools, {saved} saved, {self.helius.credits_used - start} credits")
+        return {"candidates": len(rows), "saved": saved, "credits": self.helius.credits_used - start}
 
     def poll_creators(self, now: float) -> int:
         """Creator of every pumpswap pool not yet recorded (new pools within a pass of discovery, then the
