@@ -37,6 +37,10 @@ DISCOVER_TTL_S = 600  # the engine's trending discovery is reused this long
 # Lower goes first: snapshots feed the 5-minute model; candles make its training labels exact; token info
 # only feeds 15-minute-and-later factors; trending lists, discovery and 1-minute candles are extras.
 P_SNAPSHOT, P_CANDLES, P_INFO, P_EXTRA = 0, 1, 2, 3
+# The new-pools list goes ahead of everything, even calls that have waited past MAX_WAIT_S: the early books buy
+# off it, and every second of waiting costs them (11-02: a median 11 s between the watcher's step start and the
+# pool being scored). It is at most a few calls per watcher step, so nothing else is starved.
+P_DISCOVER = -2
 # A call that has waited this long goes next whatever its priority: with the watcher's queue never empty,
 # strict priority starved extras for good (10-31: the engine's trending discovery never returned, so its scan
 # loop stalled and the watchdog restarted the bot every 30 minutes; 1-minute candles stopped on 10-27).
@@ -54,7 +58,8 @@ class _Gate:
 
     def _next(self) -> tuple[int, int, float]:
         now = time.monotonic()
-        return min(self.waiting, key=lambda t: (-1 if now - t[2] >= self.max_wait_s else t[0], t[1]))
+        return min(self.waiting, key=lambda t: (t[0] if t[0] < 0 else -1 if now - t[2] >= self.max_wait_s else t[0],
+                                                t[1]))
 
     def acquire(self, priority: int, min_interval: float) -> None:
         if min_interval <= 0:  # tests
@@ -151,7 +156,7 @@ class GeckoTerminal:
 
     def new_pools(self, page: int = 1) -> list[dict]:
         """Newest pools first (bonding-curve launches and graduations), with base_token and dex ids."""
-        data = self._get(f"/networks/{self.network}/new_pools", {"page": page}, P_SNAPSHOT)
+        data = self._get(f"/networks/{self.network}/new_pools", {"page": page}, P_DISCOVER)
         return (data or {}).get("data") or []
 
     def pools(self, addresses: list[str]) -> dict[str, dict]:

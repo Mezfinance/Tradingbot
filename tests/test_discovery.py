@@ -139,6 +139,23 @@ def test_gecko_gate_serves_a_low_priority_call_once_it_has_waited_long_enough():
     assert "at" in served and served["at"] - t0 < 1.5  # aged past 0.3 s, then served ahead of fresh snapshots
 
 
+def test_gecko_gate_serves_the_new_pools_list_ahead_of_aged_calls():
+    import threading
+    import time
+    from tradingbot.data import geckoterminal as gt
+    gate = gt._Gate(max_wait_s=0.0)  # every waiting call counts as aged at once
+    gate.next_free = time.monotonic() + 0.2
+    order = []
+    threads = [threading.Thread(target=lambda p=p: (gate.acquire(p, 0.01), order.append(p)))
+               for p in (gt.P_EXTRA, gt.P_SNAPSHOT, gt.P_DISCOVER)]
+    for t in threads:
+        t.start()
+        time.sleep(0.02)
+    for t in threads:
+        t.join(5)
+    assert order[0] == gt.P_DISCOVER  # aged extras and snapshots still come after the new-pools list
+
+
 def test_trending_discovery_is_reused_for_ten_minutes():
     calls = []
 
