@@ -198,3 +198,40 @@ def test_step_survives_a_failing_job():
     book.step({})
     assert book.s.q("SELECT kind FROM events WHERE kind='loop_error'")
     assert book.s.get("heartbeat") == clock.t
+
+
+class CannedHttp:
+    """Answers by which params were sent: Bybit's error when startTime comes without endTime."""
+    def __init__(self, rows):
+        self.rows, self.calls = rows, []
+
+    def get(self, url, params=None):
+        self.calls.append(dict(params or {}))
+        if "startTime" in (params or {}) and "endTime" not in params:
+            return {"retCode": 10001, "retMsg": "params error"}
+        return {"retCode": 0, "result": {"list": self.rows}}
+
+
+def test_bybit_funding_sends_start_and_end_and_filters():
+    from shortbook.venues import BybitPerp
+    now = 1_800_000_000
+    rows = [{"fundingRateTimestamp": str((now - h * 3600) * 1000), "fundingRate": "0.0001"} for h in (2, 10, 30)]
+    h = CannedHttp(rows)
+    got = BybitPerp(h).funding(Contract("bybit", "XUSDT", "X", 1.0, None), now - 24 * 3600)
+    assert "endTime" in h.calls[0] and "startTime" in h.calls[0]
+    assert [t for t, _ in got] == [now - 10 * 3600, now - 2 * 3600]   # oldest first, 30 h ago dropped
+
+
+def test_bybit_funding_falls_back_to_latest_on_error():
+    from shortbook.venues import BybitPerp
+
+    class ErrThenOk(CannedHttp):
+        def get(self, url, params=None):
+            self.calls.append(dict(params or {}))
+            if "startTime" in (params or {}):
+                return {"retCode": 10001}
+            return {"retCode": 0, "result": {"list": self.rows}}
+    now = 1_800_000_000
+    h = ErrThenOk([{"fundingRateTimestamp": str((now - 3600) * 1000), "fundingRate": "-0.0002"}])
+    got = BybitPerp(h).funding(Contract("bybit", "XUSDT", "X", 1.0, None), now - 7200)
+    assert got == [(now - 3600, -0.0002)] and len(h.calls) == 2

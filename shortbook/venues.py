@@ -243,13 +243,22 @@ class BybitPerp:
                      _f(t.get("fundingRate")))
 
     def funding(self, c: Contract, since_ts: float) -> list[tuple[float, float]]:
-        d = self.h.get(f"{self.B}/funding/history", {"category": "linear", "symbol": c.symbol,
-                                                      "startTime": int(since_ts * 1000), "limit": 200})
+        """Bybit wants startTime and endTime together; without them it returns the latest 200 settlements.
+        Ask with both, and fall back to the latest 200 (filtered) if that answer is an error or empty."""
+        base = {"category": "linear", "symbol": c.symbol, "limit": 200}
+        rows = self._rows(self.h.get(f"{self.B}/funding/history",
+                                     {**base, "startTime": int(since_ts * 1000), "endTime": int(time.time() * 1000)}))
+        if not rows:
+            rows = self._rows(self.h.get(f"{self.B}/funding/history", base))
+        out = sorted((int(x["fundingRateTimestamp"]) / 1000, float(x["fundingRate"])) for x in rows)
+        return [(t, r) for t, r in out if t >= since_ts]
+
+    @staticmethod
+    def _rows(d) -> list:
         try:
-            rows = d["result"]["list"]
-        except (TypeError, KeyError):
+            return list(d["result"]["list"]) if d.get("retCode") == 0 else []
+        except (AttributeError, TypeError, KeyError):
             return []
-        return sorted((int(x["fundingRateTimestamp"]) / 1000, float(x["fundingRate"])) for x in rows)
 
     def limits(self, c: Contract) -> dict:
         d = self.h.get(f"{self.B}/risk-limit", {"category": "linear", "symbol": c.symbol})
