@@ -29,7 +29,11 @@ Binance's 'New Cryptocurrency Listing' notices (catalog 48) matched to 174 of 23
 - A events can't be shorted at the announcement: the token has no market until it lists.
 - Upbit Korea's notice API is blocked from the research sandbox (Cloudflare), so Upbit announcement timing is untested.
 
-Next: per-period stability of the venue-shortable sets; a live detector for new Upbit KRW / Coinbase / Binance listings; a paper short book with real perp prices, funding and position limits.
+### Half-year stability and fund model (2026-11-02, `s1_trades.py`, `s1_fund.py`, `s1_mc_half.py`)
+
+Shortable on Binance/Bybit/Gate at the listing hour, net of costs + funding: 239 trades, +14.3% (90% CI +11.8..+16.7), win 79%; every half-year positive (2024H2 +11.4, 2025H1 +17.8, 2025H2 +14.8, 2026H1 +10.5, 2026H2 +15.1). B Coinbase weakest (-3.9% in 2026H1). Stops hurt (+40% stop +12.9%, +15% stop +10.3%) and gap through. Fund model (10% NAV per trade, cap 2% of open interest, gross <= 100%, impact 0.10 x sqrt(size / 24h volume) per side): yearly profit paid out ~160% up to $1M, 98% at $5M, 57% at $10M, 6% at $100M; profit ceiling ~$6M/yr full edge, ~$1.8M/yr half edge. Co-founder guide: https://claude.ai/artifact/YXoW686wop64GhuJ7cKR1m
+
+Next: a live detector for new Upbit KRW / Coinbase / Binance listings; a paper short book with real perp prices, funding and position limits.
 
 ## Strategy 2+
 
