@@ -247,3 +247,15 @@ def test_websocket_failure_is_recorded_not_silent(setup, monkeypatch):
 def test_websockets_is_a_declared_dependency():
     from pathlib import Path
     assert '"websockets' in (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()
+
+
+def test_drift_shows_pick_rate_and_shifted_features(setup):
+    cfg, st, hel, clock, live, p, create = setup
+    live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+    live.step()
+    clock.t += cfg.launch_live_decide_delay_s
+    live.step()
+    d = ll.status(st, cfg, 24, now=clock.t)["live vs training (drift)"]
+    assert d["pools"] == 1 and d["share_above_cut5_pct"] == 100.0
+    assert set(d["training_score_quantiles"]) == {"10", "50", "90", "95", "98"}
+    assert d["most_shifted_features"] and {"feature", "z", "present_pct"} <= set(d["most_shifted_features"][0])

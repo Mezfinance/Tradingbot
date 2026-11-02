@@ -112,6 +112,7 @@ def train(store, cfg: Config, now: float | None = None):
     cut2, cut5 = float(np.quantile(scores, 1 - TOP2)), float(np.quantile(scores, 1 - TOP5))
     top = lambda c: scores >= c - 1e-9
     meta = {"trained_ts": time.time(), "rows": len(rs), "win_rate": float(y.mean()),
+            "score_quantiles": {str(q): float(np.quantile(scores, q / 100)) for q in (10, 50, 90, 95, 98)},
             "mean_ret_all": float(rets.mean()), "cut2": cut2, "cut5": cut5,
             "top2_in_sample": {"n": int(top(cut2).sum()), "mean_ret": float(rets[top(cut2)].mean())},
             "top5_in_sample": {"n": int(top(cut5).sum()), "mean_ret": float(rets[top(cut5)].mean())},
@@ -588,6 +589,40 @@ def liquidity(rows, hours: float) -> dict:
     return out
 
 
+def drift(rows, cfg: Config, top: int = 10) -> dict:
+    """Is the live scorer seeing what the model was trained on? Share of live liquid pools above each cut-off
+    (should be ~2% / ~5%), live score quantiles next to the training ones, and the features whose live mean is
+    furthest from the training mean, in training standard deviations (z), with how often each is present."""
+    try:
+        m = json.loads(model_path(cfg).read_text())
+    except (OSError, ValueError):
+        return {"model": None}
+    scored = [r for r in rows if r["score"] is not None and r["feat"]]
+    if not scored:
+        return {"pools": 0}
+    scores = np.array([r["score"] for r in scored])
+    meta = m.get("meta", {})
+    out = {"pools": len(scored),
+           "share_above_cut2_pct": round(100 * float(np.mean(scores >= meta.get("cut2", np.inf) - 1e-9)), 1),
+           "share_above_cut5_pct": round(100 * float(np.mean(scores >= meta.get("cut5", np.inf) - 1e-9)), 1),
+           "live_score_quantiles": {str(q): round(float(np.quantile(scores, q / 100)), 3) for q in (10, 50, 90, 95, 98)},
+           "training_score_quantiles": {k: round(v, 3) for k, v in (meta.get("score_quantiles") or {}).items()}}
+    feats = [json.loads(r["feat"]) for r in scored]
+    zs = []
+    for name, mu, sd in zip(m["names"], m["mu"], m["sd"]):
+        vals = [f[name] for f in feats if f.get(name) is not None]
+        if not vals:
+            zs.append((name, None, 0))
+            continue
+        zs.append((name, (float(np.mean(vals)) - mu) / sd, len(vals)))
+    missing = [n for n, z, k in zs if z is None]
+    ranked = sorted([x for x in zs if x[1] is not None], key=lambda x: -abs(x[1]))[:top]
+    out["most_shifted_features"] = [{"feature": n, "z": round(z, 2), "present_pct": round(100 * k / len(feats))}
+                                    for n, z, k in ranked]
+    out["features_never_present_live"] = missing
+    return out
+
+
 def status(store, cfg: Config, hours: float = 24, now: float | None = None, journal=None) -> dict:
     now = now if now is not None else time.time()
     ensure_schema(store)
@@ -619,6 +654,7 @@ def status(store, cfg: Config, hours: float = 24, now: float | None = None, jour
         "top 2%": _group([r for r in done if r["top2"]], rng),
         "top 5%": _group([r for r in done if r["top5"]], rng)}
     out["feature parity with the backtest"] = parity(store, scored)
+    out["live vs training (drift)"] = drift(scored, cfg)
     if journal is not None:  # the launch books' own buys: where the seconds from creation to the fill go
         from tradingbot import model_book as mb
         out["book_timing_s"] = mb.early_timing(journal, now - hours * 3600, tuple(mb.LAUNCH_CUT), mb.LAUNCH_STAGES)
