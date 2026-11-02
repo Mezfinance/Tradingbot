@@ -85,6 +85,10 @@ def main(argv: list[str] | None = None) -> None:
                         help="watch-report: is Helius / X data worth paying for (control slice, 15-min features)")
     parser.add_argument("--hours", type=float, default=None, help="early-status / early-backtest (default 8) / launch-backtest (default all): look back this many hours")
     parser.add_argument("--days", type=float, default=7.0, help="launch-backfill: pools created in the last N days")
+    parser.add_argument("--test-from", default=None,
+                        help="launch-backtest: score only days from this UTC date (YYYY-MM-DD); earlier days only train")
+    parser.add_argument("--timing", action="store_true",
+                        help="launch-backtest: only the decide-at-d / fill-at-f timing table (faster)")
     parser.add_argument("--max-pools", type=int, default=2000, help="launch-backfill: at most this many pools")
     parser.add_argument("--max-credits", type=int, default=60000, help="launch-backfill: Helius credit cap")
     parser.add_argument("--idea", help="propose: what to build")
@@ -265,7 +269,8 @@ def main(argv: list[str] | None = None) -> None:
         picks = {r["pool"] for r in store.query("SELECT pool, mint FROM watch_pools WHERE dex='pumpswap'")
                  if r["mint"] in mints}
         since = time.time() - args.hours * 3600 if args.hours else 0.0
-        print(json.dumps(launch_analysis.backtest(store, cfg, since, picks), indent=2))
+        print(json.dumps(launch_analysis.backtest(store, cfg, since, picks, test_from=args.test_from,
+                                                  only_timing=args.timing), indent=2))
         return
 
     if args.command == "model-status":

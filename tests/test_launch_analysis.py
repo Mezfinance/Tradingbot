@@ -75,3 +75,45 @@ def test_ranking_walks_forward_and_its_top_picks_beat_buying_everything():
     assert r10["top 10%"]["mean_pct"] > r10["every liquid pool (test days)"]["mean_pct"]
     fair = out["fair: liquid at second x"]["second 10"]
     assert fair["second x"]["n"] == 360 and "paired gain (second x - first sight)" in fair
+
+
+def _three_days(st):
+    import numpy as np
+    rng = np.random.default_rng(3)
+    for i in range(360):  # busy pools have more early buyers (seconds 1-8) and end higher
+        busy = rng.random() < 0.3
+        pool = f"P{i}"
+        created = T0 + (i // 120) * 86400 + (i % 120) * 10  # one hour a day: no hour-of-day noise
+        txs = [[0, 1, "OP", 1000, 50, 1000, 50]] + [[1 + j, 2 + j, f"W{j}", -1, 0.5, 1000 - j, 50 + 0.5 * j]
+                                                     for j in range(8 if busy else 1)]
+        st.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts, first) VALUES(?,?,?,?,?,?,?)",
+                   (pool, pool + "Mint", "pumpswap", "TOK", created, created + 60,
+                    json.dumps({"price": 1e-5, "liq": 20_000.0})))
+        st.execute("INSERT INTO watch_enrich(pool, kind, ts, data) VALUES(?,?,?,?)",
+                   (pool, "launch", created + 400, json.dumps({"create_ts": created, "txs": txs, "complete": True,
+                                                                "creator": "OP", "selection": "sample"})))
+        st.execute("INSERT INTO watch_snaps(pool, age_min, ts, data) VALUES(?,?,?,?)",
+                   (pool, 5, created + 380, json.dumps({"price": (1.6e-5 if busy else 0.8e-5), "liq": 20_000.0})))
+
+
+def test_timing_decides_on_early_features_and_fills_later():
+    import time as _t
+    st = WatchStore(":memory:")
+    _three_days(st)
+    out = la.backtest(st, Config(), only_timing=True)["timing (walk-forward: decide at d, fill at f)"]
+    assert set(out) == {f"decide {d}s, fill {f}s" for d, f in la.TIMING}
+    cell = out["decide 4s, fill 6s"]
+    assert cell["days_scored"] == 2 and len(cell["by day"]) == 2
+    assert cell["top 5%"]["n"] > 0 and cell["top 5%"]["mean_pct"] > cell["every liquid pool"]["mean_pct"]
+    day3 = _t.strftime("%Y-%m-%d", _t.gmtime(T0 + 2 * 86400))
+    later = la.backtest(st, Config(), only_timing=True, test_from=day3)["timing (walk-forward: decide at d, fill at f)"]
+    assert list(later["decide 5s, fill 7s"]["by day"]) == [day3]  # earlier days only train
+
+
+def test_fill_return_uses_the_chain_price_at_the_fill_second():
+    st = WatchStore(":memory:")
+    # chain price 0.5 until second 5, 1.0 from second 6 (buyers piling in); first sight at second 60, exit 1.2x
+    add(st, "X", [row(0, 100, 50), row(6, 100, 100)], 60, 1e-5, 1.2e-5)
+    r = la.rows(st, Config())[0]["ret"]
+    assert r[5] == pytest.approx(1.2 * 2.0 - 1 - 0.06) and r[6] == pytest.approx(1.2 - 1 - 0.06)
+    assert 4 in r and 7 in r

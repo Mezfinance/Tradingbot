@@ -22,6 +22,9 @@ from tradingbot.config import Config
 
 COST = 0.06
 ENTRY_SECONDS = (5, 10, 20, 30, 45, 60, 90)
+TIMING = ((4, 4), (4, 5), (4, 6), (4, 7), (5, 5), (5, 6), (5, 7))  # (decide on features at second d, fill at second f)
+TIMING_TOP_PCT = (2.0, 5.0)
+FEATURE_SECONDS = sorted(set(ENTRY_SECONDS) | {d for d, f in TIMING} | {f for d, f in TIMING})
 PULLED_SHARE = 0.10  # pool SOL below this share of its peak = pulled
 MAX_SEEN_S = 240
 
@@ -123,7 +126,7 @@ def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
             prior = _prior_pools(store, launch.get("creator"), r["created_ts"])
             static = wa._static_features({"name": r["name"], "dex": r["dex"], "created_ts": r["created_ts"]})
             row["liquid"], row["feat"] = {}, {}
-            for x in ENTRY_SECONDS:
+            for x in FEATURE_SECONDS:
                 if x >= seen:
                     continue
                 p_x = chain_price(txs, x)
@@ -146,6 +149,64 @@ def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
 RANK_SECONDS = (5, 10, 20, 30)
 RANK_TOP_PCT = (2.0, 5.0, 10.0)
 RANK_MIN_TRAIN = 100  # pools a day's model must be trained on before it is scored
+
+
+def _day(r) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(r["created_ts"]))
+
+
+def _fit_score(train: list[dict], test: list[dict], feat_x: int, label_x: int):
+    """Logistic on features at second feat_x, label: the trade filled at second label_x made money. Returns
+    (training scores, test scores) or None when the training labels are all one class."""
+    names = sorted({k for r in train for k in r["feat"][feat_x]})
+    xs, med = wa._matrix([r["feat"][feat_x] for r in train], names)
+    y = np.array([float(r["ret"][label_x] > 0) for r in train])
+    if y.min() == y.max():
+        return None
+    mu, sd = xs.mean(0), xs.std(0) + 1e-9
+    w, b = wa.logistic((xs - mu) / sd, y)
+    te = (wa._matrix([r["feat"][feat_x] for r in test], names, med)[0] - mu) / sd @ w + b
+    return ((xs - mu) / sd) @ w + b, te
+
+
+def timing(data: list[dict], rng, test_from: str | None = None) -> dict:
+    """Live entries can't fill at the decision second. For each (decide at d, fill at f): walk-forward by day, a
+    model on features at second d (label: the second-f trade made money) picks the top 2% / 5% of the training
+    scores; each pick earns its second-f return. Pools must be liquid and not pulled at d. Days before
+    `test_from` (YYYY-MM-DD) only train. Per-day results show whether a cell rests on one or two days."""
+    out = {}
+    for d, f in TIMING:
+        pool = sorted([r for r in data if r.get("sample") and d in r.get("feat", {}) and f in r.get("ret", {})
+                       and r["liquid"].get(d)], key=lambda r: r["created_ts"])
+        days = sorted({_day(r) for r in pool})
+        picks = {k: [] for k in TIMING_TOP_PCT}
+        by_day = {}
+        base = []
+        for dd in days:
+            if test_from and dd < test_from:
+                continue
+            train = [r for r in pool if _day(r) < dd]
+            test = [r for r in pool if _day(r) == dd]
+            if len(train) < RANK_MIN_TRAIN or not test:
+                continue
+            fit = _fit_score(train, test, d, f)
+            if fit is None:
+                continue
+            tr, te = fit
+            base += [r["ret"][f] for r in test]
+            row = {"pools": len(test), "all_mean_pct": round(float(np.mean([r["ret"][f] for r in test])) * 100, 1)}
+            for k in TIMING_TOP_PCT:
+                cut = float(np.quantile(tr, 1 - k / 100))
+                got = [r["ret"][f] for r, sc in zip(test, te) if sc >= cut - 1e-9]  # ties count
+                picks[k] += got
+                row[f"top {k:g}%"] = {"n": len(got), "mean_pct": round(float(np.mean(got)) * 100, 1) if got else None}
+            by_day[dd] = row
+        res = {"pools": len(pool), "days_scored": len(by_day), "every liquid pool": _summary(base, rng)}
+        for k in TIMING_TOP_PCT:
+            res[f"top {k:g}%"] = _summary(picks[k], rng)
+        res["by day"] = by_day
+        out[f"decide {d}s, fill {f}s"] = res
+    return out
 
 
 def rank(data: list[dict], rng) -> dict:
@@ -198,7 +259,8 @@ def _summary(vals, rng) -> dict:
             "median_pct": round(float(np.median(a)) * 100, 1), "rugged_pct": round(float(np.mean(a <= -0.99)) * 100)}
 
 
-def backtest(store, cfg: Config, since: float = 0.0, picks: set[str] | None = None) -> dict:
+def backtest(store, cfg: Config, since: float = 0.0, picks: set[str] | None = None,
+             test_from: str | None = None, only_timing: bool = False) -> dict:
     data = rows(store, cfg, since)
     out = {"pools": len(data), "dropped": {}}
     for r in data:
@@ -206,6 +268,9 @@ def backtest(store, cfg: Config, since: float = 0.0, picks: set[str] | None = No
             out["dropped"][r["drop"]] = out["dropped"].get(r["drop"], 0) + 1
     rng = np.random.default_rng(0)
     summary = lambda vals: _summary(vals, rng)
+    if only_timing:
+        out["timing (walk-forward: decide at d, fill at f)"] = timing(data, rng, test_from)
+        return out
 
     groups = {"all sampled hand-made": [r for r in data if "ret" in r and r["sample"]],
               "eligible (first-sight liquidity >= min)": [r for r in data if r.get("eligible") and r["sample"]]}
@@ -234,4 +299,5 @@ def backtest(store, cfg: Config, since: float = 0.0, picks: set[str] | None = No
                                    [r["ret"][x] - f for r, f in zip(rs, first)])}
     out["fair: liquid at second x"] = fair
     out["ranking (walk-forward, on-chain features at second x)"] = rank(data, rng)
+    out["timing (walk-forward: decide at d, fill at f)"] = timing(data, rng, test_from)
     return out
