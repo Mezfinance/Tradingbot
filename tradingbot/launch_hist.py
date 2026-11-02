@@ -24,12 +24,14 @@ import numpy as np
 from tradingbot import launch_analysis as la
 from tradingbot.config import Config
 from tradingbot.data import pumpswap as ps
-from tradingbot.data.helius import Helius, b58encode, launch_record
+from tradingbot.data.helius import Helius, _vault, b58encode, launch_record
 
 log = logging.getLogger(__name__)
 
 SPAN_S = 400  # history kept per pool: past the minute-6 exit
-MAX_PAGES = 6  # 600 txs; busier pools are marked incomplete
+MAX_PAGES = 6  # fallback paging (600 txs) when the blockTime filter isn't available
+HEAD_S, HEAD_PAGES = 30, 2  # the first seconds (features at 4, entry at 6) come from at most 2 pages
+RESERVE = 1 + 10 * HEAD_PAGES + 10 + 10 * MAX_PAGES  # worst-case credits for one pool
 SLOTS_PER_S = 2.5 * 1.15  # Solana's ~2.5 slots/s plus a margin, so the slot window covers the whole time window
 DECIDE_S, FILL_S, EXIT_S = 4, 6, 360
 
@@ -37,7 +39,7 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS watch_launch_hist(
     pool TEXT PRIMARY KEY, token_mint TEXT, lp_mint TEXT, create_ts REAL, status TEXT, data TEXT, ts REAL)"""
 
 
-def candidates(helius: Helius, days: float) -> list[dict] | None:
+def candidates(helius: Helius, days: float, progress=None, max_pages: int = 5000) -> list[dict] | None:
     """Hand-made SOL-pair pumpswap pools whose account changed in the last `days` days."""
     slot = helius.slot()
     if slot is None:
@@ -45,7 +47,8 @@ def candidates(helius: Helius, days: float) -> list[dict] | None:
     since = max(0, slot - int(days * 86400 * SLOTS_PER_S))
     accts = helius.program_accounts_changed(
         ps.PROGRAM, [{"dataSize": 301}, {"memcmp": {"offset": 211, "bytes": ps.NO_KEY}}],
-        {"offset": 43, "length": 96}, since)
+        {"offset": 43, "length": 96}, since, max_pages=max_pages,
+        progress=(lambda page, n: progress(f"listing page {page}", n, helius.credits_used)) if progress else None)
     if accts is None:
         return None
     out = []
@@ -65,10 +68,11 @@ def backfill(store, helius: Helius, days: float, max_credits: int, now: float | 
     store.execute(SCHEMA)
     stats: collections.Counter = collections.Counter()
     base = helius.credits_used  # the listing calls count toward the cap too
-    pools = candidates(helius, days)
+    pools = candidates(helius, days, progress, max_pages=max(1, max_credits // 3 // 10))  # listing <= 1/3 of the cap
     if pools is None:
         return {"error": "could not list pools (getSlot / getProgramAccountsV2 failed; needs HELIUS_API_KEY)"}
     stats["candidates"] = len(pools)
+    stats["listing pages"] = getattr(helius, "last_pages", None)
     done = {r[0] for r in store.query("SELECT pool FROM watch_launch_hist")}
     start, end = now - days * 86400, now - SPAN_S - 60
     save = lambda p, status, create=None, data=None: store.execute(
@@ -80,7 +84,7 @@ def backfill(store, helius: Helius, days: float, max_credits: int, now: float | 
         if p["pool"] in done:
             stats["already fetched"] += 1
             continue
-        if helius.credits_used - base + 10 * MAX_PAGES + 1 > max_credits:
+        if helius.credits_used - base + RESERVE > max_credits:
             stats["stopped: credit cap"] = len(pools) - i
             break
         t = helius.first_time(p["lp_mint"])
@@ -91,7 +95,7 @@ def backfill(store, helius: Helius, days: float, max_credits: int, now: float | 
             save(p, "outside window", t)
             stats["outside window"] += 1
             continue
-        txs, reached, ok = helius.history_from_start(p["pool"], SPAN_S, MAX_PAGES)
+        txs, reached, ok = helius.history_from_start(p["pool"], HEAD_S, HEAD_PAGES)
         if not ok:
             stats["history call failed (left for a rerun)"] += 1
             continue
@@ -104,6 +108,23 @@ def backfill(store, helius: Helius, days: float, max_credits: int, now: float | 
             save(p, "outside window", rec["create_ts"])
             stats["outside window"] += 1
             continue
+        last_t = (txs[-1].get("blockTime") or 0) - rec["create_ts"]
+        # a tx at or after minute 6 settles the state by then; a history that ended inside the head is complete
+        covered = last_t >= EXIT_S or (reached and last_t < HEAD_S)
+        if not covered:
+            # the pool's state at minute 6 = the balances after its last transaction by then (one call)
+            last = helius.last_before(p["pool"], rec["create_ts"] + EXIT_S)
+            if last is False:  # no blockTime filter: page through instead
+                stats["exit by paging (filter unavailable)"] += 1
+                txs, reached, ok = helius.history_from_start(p["pool"], SPAN_S, MAX_PAGES)
+                if not ok:
+                    stats["history call failed (left for a rerun)"] += 1
+                    continue
+                rec = launch_record(txs, p["pool"], p["token_mint"], window_s=SPAN_S, exhausted=reached)
+            elif last:
+                rec["exit"] = [(last.get("blockTime") or 0) - rec["create_ts"],
+                               _vault(last, p["pool"], p["token_mint"], "postTokenBalances"),
+                               _vault(last, p["pool"], ps.WSOL, "postTokenBalances")]
         save(p, "ok", rec["create_ts"], json.dumps(rec))
         stats["fetched"] += 1
     stats["credits_used"] = helius.credits_used - base
@@ -123,7 +144,8 @@ def rows(store, cfg: Config) -> tuple[list[dict], dict]:
         if not txs:
             dropped["no trades parsed"] += 1
             continue
-        if not rec.get("complete") and txs[-1][0] < EXIT_S:
+        exit_state = rec.get("exit")
+        if not exit_state and not rec.get("complete") and txs[-1][0] < EXIT_S:
             dropped["history pages ended before minute 6"] += 1
             continue
         upto4 = [t for t in txs if t[0] <= DECIDE_S]
@@ -133,10 +155,16 @@ def rows(store, cfg: Config) -> tuple[list[dict], dict]:
         sol4 = upto4[-1][6]
         sol_usd = la._sol_usd(store, create)
         liquid = (sol_usd is None or 2 * sol4 * sol_usd >= cfg.model_book_min_liq_usd) and not la.pulled_by(txs, DECIDE_S)
-        entry, exit_p = la.chain_price(txs, FILL_S), la.chain_price(txs, EXIT_S)
+        entry = la.chain_price(txs, FILL_S)
         path = [t for t in txs if t[0] <= EXIT_S]
-        peak = max(t[6] for t in path)
-        rugged = peak > 0 and path[-1][6] < la.PULLED_SHARE * peak
+        if exit_state:  # [seconds after creation, pool tokens, pool SOL] after the last tx by minute 6
+            _, tok6, sol6 = exit_state
+            exit_p = sol6 / tok6 if tok6 and sol6 else None
+            peak = max([t[6] for t in path] + [sol6])
+        else:
+            exit_p, sol6 = la.chain_price(txs, EXIT_S), path[-1][6]
+            peak = max(t[6] for t in path)
+        rugged = peak > 0 and sol6 < la.PULLED_SHARE * peak
         ret = -1.0 if rugged or not entry or not exit_p else min(exit_p / entry - 1 - la.COST, 3.0)
         feat = live_features(rec, create, la._prior_pools(store, rec.get("creator"), create))
         out.append({"pool": r["pool"], "created_ts": create, "listed": r["pool"] in listed, "liquid": liquid,

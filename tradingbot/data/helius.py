@@ -129,12 +129,17 @@ class Helius:
         return int(res) if res is not None else None
 
     def program_accounts_changed(self, program: str, filters: list, data_slice: dict, since_slot: int,
-                                 limit: int = 5000, max_pages: int = 200):
+                                 limit: int = 10000, max_pages: int = 5000, progress=None):
         """Helius getProgramAccountsV2: accounts of `program` matching `filters` that changed since
-        `since_slot`, page by page (10 credits per call, counted as such). Returns [(pubkey, bytes)] or None
-        when the first call failed."""
-        out, key = [], None
+        `since_slot`, page by page (10 credits per call, counted as such). Filters apply per page, so a page can
+        come back empty with a key to the next one: paging stops only when no key is returned. Returns
+        [(pubkey, bytes)] or None when the first call failed."""
+        out, key, seen_keys = [], None, set()
+        self.last_pages = 0
         for page in range(max_pages):
+            self.last_pages = page + 1
+            if progress and page % 25 == 0:
+                progress(page, len(out))
             opts = {"encoding": "base64", "filters": filters, "dataSlice": data_slice, "limit": limit,
                     "changedSinceSlot": since_slot}
             if key:
@@ -149,8 +154,9 @@ class Helius:
                 data = (a.get("account") or {}).get("data") or [""]
                 out.append((a["pubkey"], base64.b64decode(data[0] if isinstance(data, list) else data)))
             key = res.get("paginationKey") if isinstance(res, dict) else None
-            if not key or not accounts:
+            if not key or key in seen_keys:
                 break
+            seen_keys.add(key)
         return out
 
     def first_time(self, address: str) -> float | None:
@@ -180,6 +186,21 @@ class Helius:
             if not page or not token or (page[-1].get("blockTime") or 0) > (t0 or 0) + span_s:
                 return txs, True, True
         return txs, False, True
+
+    def last_before(self, address: str, ts: float, limit: int = 10) -> dict | None | bool:
+        """The newest successful transaction touching `address` at or before `ts` (one call, 10 credits), using
+        getTransactionsForAddress's blockTime filter. Returns the tx, None if there is none, False if the call
+        failed (e.g. the filter isn't supported)."""
+        res = self._rpc("getTransactionsForAddress",
+                        [address, {"transactionDetails": "full", "sortOrder": "desc", "limit": limit,
+                                   "maxSupportedTransactionVersion": TX_VERSION, "encoding": "jsonParsed",
+                                   "filters": {"blockTime": {"lte": int(ts)}}}], HISTORY_CREDITS_PER_100)
+        if res is None:
+            return False
+        for tx in res.get("data") or []:
+            if (tx.get("meta") or {}).get("err") is None and (tx.get("blockTime") or 0) <= ts:
+                return tx
+        return None
 
     def history(self, address: str, limit: int = 100) -> list[dict]:
         """Oldest-first full transactions touching `address`."""

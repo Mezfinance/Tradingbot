@@ -85,7 +85,7 @@ def test_backfill_keeps_pools_created_in_the_window():
 def test_backfill_stops_at_the_credit_cap():
     st = WatchStore(":memory:")
     pools = {f"P{i}": (NOW - 3600 - i, 1.0) for i in range(5)}
-    out = lh.backfill(st, make(pools), 3, 10 + 11 + (10 * lh.MAX_PAGES + 1), now=NOW)  # listing + 1 pool + worst case
+    out = lh.backfill(st, make(pools), 3, 10 + 11 + lh.RESERVE, now=NOW)  # listing + 1 pool + worst case
     assert out["fetched"] <= 2 and out["stopped: credit cap"] >= 3
 
 
@@ -110,3 +110,77 @@ def test_test_reports_listed_and_unlisted():
     assert out["liquid at second 4"] == 300 and out["every liquid pool"]["never listed"]["n"] == 300
     wf = out["walk-forward on these rows (train on earlier days, no names)"]
     assert "top 2%" in wf and "by day" in wf
+
+
+class HeadOnlyHelius(FakeHelius):
+    """Returns only the first seconds of history; the minute-6 state comes from last_before (or not)."""
+
+    def __init__(self, pools, filter_ok=True):
+        super().__init__(pools)
+        self.filter_ok, self.last_calls = filter_ok, 0
+
+    def history_from_start(self, address, span_s, max_pages=6):
+        self.history_calls += 1
+        self.credits_used += 10
+        t0, up = self.pools[address]
+        txs = pool_history(address, t0, up)
+        if span_s > lh.EXIT_S:
+            return txs, True, True
+        head = [x for x in txs if x["blockTime"] <= t0 + span_s]
+        return head + [txs[len(head)]], True, True  # like a real page: it ends with the first tx past the span
+
+    def last_before(self, address, ts):
+        self.last_calls += 1
+        self.credits_used += 10
+        if not self.filter_ok:
+            return False
+        t0, up = self.pools[address]
+        return [x for x in pool_history(address, t0, up) if x["blockTime"] <= ts][-1]
+
+
+def head_only(pools, filter_ok=True):
+    hel = HeadOnlyHelius(pools, filter_ok)
+    order = iter([pools[p][0] for p in pools])
+    hel.t_for = lambda lp: next(order)
+    return hel
+
+
+def test_minute_6_state_comes_from_one_filtered_call():
+    st = WatchStore(":memory:")
+    hel = head_only({"UP": (NOW - 3600, 2.0), "PULL": (NOW - 3700, 0.05)})
+    lh.backfill(st, hel, 3, 10_000, now=NOW)
+    assert hel.last_calls == 2 and hel.history_calls == 2  # one head page + one exit call per pool
+    rec = json.loads(st.query("SELECT data FROM watch_launch_hist WHERE pool='UP'")[0]["data"])
+    assert rec["exit"][0] == 300 and rec["exit"][2] == pytest.approx(51.5 * 2.0)
+    r = {x["pool"]: x for x in lh.rows(st, Config())[0]}
+    assert r["UP"]["ret"][6] == pytest.approx(2.0 - 1 - 0.06) and r["PULL"]["ret"][6] == -1.0
+
+
+def test_without_the_blocktime_filter_it_pages_instead():
+    st = WatchStore(":memory:")
+    hel = head_only({"UP": (NOW - 3600, 2.0)}, filter_ok=False)
+    out = lh.backfill(st, hel, 3, 10_000, now=NOW)
+    assert out["exit by paging (filter unavailable)"] == 1 and hel.history_calls == 2
+    r = lh.rows(st, Config())[0][0]
+    assert r["ret"][6] == pytest.approx(2.0 - 1 - 0.06)
+
+
+def test_program_accounts_pages_through_empty_pages():
+    import base64 as b64
+    from tradingbot.data.helius import Helius
+
+    class Http:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, url, params=None, json=None):
+            self.calls += 1
+            n = self.calls
+            accts = [] if n < 3 else [{"pubkey": f"P{n}", "account": {"data": [b64.b64encode(b"x").decode(), "base64"]}}]
+            key = f"k{n}" if n < 4 else None
+            body = {"jsonrpc": "2.0", "id": 1, "result": {"accounts": accts, "paginationKey": key}}
+            return type("R", (), {"status_code": 200, "json": lambda self: body})()
+    h = Helius(api_key="k", client=Http())
+    h.min_interval_s = 0
+    out = h.program_accounts_changed("prog", [], {"offset": 0, "length": 1}, 1)
+    assert [p for p, _ in out] == ["P3", "P4"] and h.last_pages == 4  # two empty pages did not stop it
