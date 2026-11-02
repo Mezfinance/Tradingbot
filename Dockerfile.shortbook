@@ -2,7 +2,8 @@
 # Separate Fly app from the memecoin bot: deploy with `fly deploy -c fly.shortbook.toml`.
 ARG BASE_IMAGE=python:3.12-slim
 FROM ${BASE_IMAGE}
-ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 SB_DB_PATH=/data/shortbook.db
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PIP_NO_CACHE_DIR=1 SB_DB_PATH=/data/shortbook.db \
+    PYTHONPATH=/app
 WORKDIR /app
 RUN pip install "httpx>=0.27"
 COPY shortbook ./shortbook
