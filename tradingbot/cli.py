@@ -66,7 +66,8 @@ def main(argv: list[str] | None = None) -> None:
                                             "propose", "proposals", "watch-status", "watch-report",
                                             "watch-export", "watch-links", "watch-report-now",
                                             "watch-model-train", "model-status", "early-status",
-                                            "early-backtest", "launch-backtest", "launch-backfill", "launch-status"])
+                                            "early-backtest", "launch-backtest", "launch-backfill", "launch-status",
+                                            "launch-hist-backfill", "launch-hist-test"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -241,6 +242,23 @@ def main(argv: list[str] | None = None) -> None:
             from tradingbot import launch_live
             out = launch_live.train_and_save(store, cfg)
             print(f"launch4 model written to {out}" if out else "launch4 model: not enough data to train yet")
+        return
+
+    if args.command == "launch-hist-backfill":
+        import httpx
+        from tradingbot import launch_hist
+        from tradingbot.data.helius import Helius
+        from tradingbot.watcher import WatchStore, watch_db_path
+        out = launch_hist.backfill(WatchStore(watch_db_path(cfg)), Helius(client=httpx.Client(timeout=60)), args.days,
+                                   args.max_credits, progress=lambda i, n, c: print(
+                                       f"pools {i}/{n}, credits {c}", file=sys.stderr, flush=True))
+        print(json.dumps(out, indent=2))
+        return
+
+    if args.command == "launch-hist-test":
+        from tradingbot import launch_hist
+        from tradingbot.watcher import WatchStore, watch_db_path
+        print(json.dumps(launch_hist.test(WatchStore(watch_db_path(cfg)), cfg), indent=2))
         return
 
     if args.command == "launch-status":

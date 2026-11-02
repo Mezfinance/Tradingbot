@@ -124,6 +124,63 @@ class Helius:
                 return txs, True, True
         return txs, False, True
 
+    def slot(self) -> int | None:
+        res = self._rpc("getSlot", [{"commitment": "confirmed"}], RPC_CREDITS)
+        return int(res) if res is not None else None
+
+    def program_accounts_changed(self, program: str, filters: list, data_slice: dict, since_slot: int,
+                                 limit: int = 5000, max_pages: int = 200):
+        """Helius getProgramAccountsV2: accounts of `program` matching `filters` that changed since
+        `since_slot`, page by page (10 credits per call, counted as such). Returns [(pubkey, bytes)] or None
+        when the first call failed."""
+        out, key = [], None
+        for page in range(max_pages):
+            opts = {"encoding": "base64", "filters": filters, "dataSlice": data_slice, "limit": limit,
+                    "changedSinceSlot": since_slot}
+            if key:
+                opts["paginationKey"] = key
+            res = self._rpc("getProgramAccountsV2", [program, opts], HISTORY_CREDITS_PER_100)
+            if res is None:
+                return out if page else None
+            accounts = res.get("accounts") if isinstance(res, dict) else res
+            if accounts is None and isinstance(res, dict):
+                accounts = res.get("value")
+            for a in accounts or []:
+                data = (a.get("account") or {}).get("data") or [""]
+                out.append((a["pubkey"], base64.b64decode(data[0] if isinstance(data, list) else data)))
+            key = res.get("paginationKey") if isinstance(res, dict) else None
+            if not key or not accounts:
+                break
+        return out
+
+    def first_time(self, address: str) -> float | None:
+        """blockTime of the oldest of an address's last 1,000 signatures (1 credit): an LP mint's creation."""
+        res = self._rpc("getSignaturesForAddress", [address, {"limit": 1000}], RPC_CREDITS)
+        times = [s.get("blockTime") for s in res or [] if s.get("blockTime")]
+        return float(min(times)) if times else None
+
+    def history_from_start(self, address: str, span_s: float, max_pages: int = 6) -> tuple[list[dict], bool, bool]:
+        """Oldest-first transactions from the first one until `span_s` seconds after it (or the end of the
+        history, or `max_pages` pages of 100). Returns (txs, reached span or end, every call succeeded)."""
+        txs: list[dict] = []
+        token, t0 = None, None
+        for _ in range(max_pages):
+            opts = {"transactionDetails": "full", "sortOrder": "asc", "limit": 100,
+                    "maxSupportedTransactionVersion": TX_VERSION, "encoding": "jsonParsed"}
+            if token:
+                opts["paginationToken"] = token
+            res = self._rpc("getTransactionsForAddress", [address, opts], HISTORY_CREDITS_PER_100)
+            if res is None:
+                return txs, False, False
+            page = res.get("data") or []
+            txs += page
+            if t0 is None and page:
+                t0 = page[0].get("blockTime") or 0
+            token = res.get("paginationToken")
+            if not page or not token or (page[-1].get("blockTime") or 0) > (t0 or 0) + span_s:
+                return txs, True, True
+        return txs, False, True
+
     def history(self, address: str, limit: int = 100) -> list[dict]:
         """Oldest-first full transactions touching `address`."""
         res = self._rpc("getTransactionsForAddress",
