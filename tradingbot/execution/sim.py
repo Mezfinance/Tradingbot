@@ -19,6 +19,8 @@ from tradingbot.config import Config
 from tradingbot.data.jupiter import RATE_LIMITED, USDC_DECIMALS, USDC_MINT, Jupiter, Quote
 from tradingbot.execution.base import Fill, failed
 
+UNKNOWN_IMPACT_PCT = 99.9  # Jupiter's 'can't value this token' answer (priceImpactPct 1)
+
 log = logging.getLogger(__name__)
 
 
@@ -38,16 +40,23 @@ class SimExecutor:
         return self._sol_usd(self.cfg.priority_fee_sol)
 
     # --- fills ----------------------------------------------------------------
-    def _execute(self, in_mint: str, out_mint: str, in_raw: int, cap_impact: bool) -> tuple[int | None, str]:
+    def _execute(self, in_mint: str, out_mint: str, in_raw: int, cap_impact: bool,
+                 estimate_impact=None) -> tuple[int | None, str]:
         """Returns (filled output raw amount, note). None output = reverted / no route.
 
-        Exits pass cap_impact=False: a stop must go through even on a thin pool.
+        Exits pass cap_impact=False: a stop must go through even on a thin pool. Jupiter reports 100% impact
+        when it can't value a token yet (seconds-old pools; measured 11-02: reported 100%, real 1.5-1.8%);
+        then `estimate_impact(quote)` gives the impact from the quote's price vs the trigger price.
         """
         first = self.jup.quote(in_mint, out_mint, in_raw)
         if first is None:
             return None, self._why_none("no route")
-        if cap_impact and first.price_impact_pct > self.cfg.max_price_impact_pct:
-            return None, f"price impact {first.price_impact_pct:.2f}%"
+        impact = first.price_impact_pct
+        if impact >= UNKNOWN_IMPACT_PCT and estimate_impact is not None:
+            est = estimate_impact(first)
+            impact = est if est is not None else impact
+        if cap_impact and impact > self.cfg.max_price_impact_pct:
+            return None, f"price impact {impact:.2f}%"
         if self.latency_s > 0:
             self.sleep(self.latency_s)
         landed = self.jup.quote(in_mint, out_mint, in_raw)
@@ -81,7 +90,12 @@ class SimExecutor:
         if swap_usd <= 0:
             self.last_note = "size below fees"
             return None
-        out_raw, note = self._execute(USDC_MINT, token, int(swap_usd * 10**USDC_DECIMALS), cap_impact=True)
+        def estimate(q):  # the quote's price per token vs the trigger price, in percent
+            if not ref_price or ref_price <= 0 or not q.out_raw:
+                return None
+            return max(0.0, (swap_usd / (q.out_raw / 10**decimals) / ref_price - 1) * 100)
+        out_raw, note = self._execute(USDC_MINT, token, int(swap_usd * 10**USDC_DECIMALS), cap_impact=True,
+                                      estimate_impact=estimate)
         self.last_note = note
         if out_raw is None:
             # Pre-flight rejections cost nothing; a reverted transaction costs its fee.

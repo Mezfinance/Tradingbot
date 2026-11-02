@@ -120,3 +120,19 @@ def test_token_too_new_for_the_price_api_gets_decimals_onchain_and_a_quote_price
     assert jup.decimals("NEWTOKEN") == 6
     assert jup.quote_price("NEWTOKEN") == pytest.approx(0.001)  # $20 bought 20,000 tokens
     assert calls.count("/") == 1  # decimals read on-chain once, then cached
+
+
+def test_jupiter_unknown_impact_is_estimated_from_the_trigger_price(sim):
+    # Jupiter says 100% (it can't value a seconds-old token); the quote's own price is 2% above the trigger
+    swap = 50 - 0.303928
+    tokens = swap / (1.02 * 0.001)  # quote price = 1.02 x trigger
+    raw = int(tokens * 1e6)
+    ok = sim([q(raw, int(raw * 0.97), impact=100.0), q(raw, int(raw * 0.97), impact=100.0)]).buy("T", 50, 0.001)
+    assert ok is not None and ok.ok
+    # a really bad price still gets declined: the quote is 20% worse than the trigger
+    bad_raw = int(swap / (1.20 * 0.001) * 1e6)
+    ex = sim([q(bad_raw, int(bad_raw * 0.97), impact=100.0)])
+    assert ex.buy("T", 50, 0.001) is None and "price impact 20" in ex.last_note
+    # no trigger price to compare with: the 100% stands
+    ex = sim([q(raw, int(raw * 0.97), impact=100.0)])
+    assert ex.buy("T", 50, 0) is None and "100.00%" in ex.last_note
