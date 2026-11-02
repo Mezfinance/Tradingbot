@@ -18,6 +18,8 @@ import base64
 import logging
 import os
 import re
+import time
+import threading
 
 import httpx
 
@@ -36,6 +38,12 @@ JITO_TIP_ACCOUNTS = {
     "DttWaMuVvTiduZRnguLF7jNxTgiMBZ1hyAumKUiL2KRL", "3AVi9Tg9Uo68tJfuvoKvqKNWKkC5wPdSSdeBnizKZ6jT",
 }
 HISTORY_CREDITS_PER_100 = 10
+# Solana has version-1 transactions since late 2026; asking for at most 0 makes Helius reject any history that
+# holds one (error -32015), which left pools with no launch data.
+TX_VERSION = 1
+# One process-wide pace for Helius (the free plan allows ~10 requests/s) and a few retries on 429.
+MIN_INTERVAL_S = 0.15
+RETRIES_429 = 4
 RPC_CREDITS = 1
 SOL_MINT = "So11111111111111111111111111111111111111112"
 # Program log lines of a liquidity withdrawal (pumpswap `Withdraw`, Meteora/Raydium remove-liquidity variants).
@@ -43,11 +51,28 @@ WITHDRAW_RE = re.compile(r"Instruction: (Withdraw|RemoveLiquidity|RemoveAllLiqui
                          r"remove_liquidity|withdraw)\b")
 
 
+_pace_lock = threading.Lock()
+_next_free = [0.0]
+
+
+def _pace(interval: float) -> None:
+    """Space Helius calls across every client and thread in the process."""
+    if interval <= 0:
+        return
+    with _pace_lock:
+        now = time.monotonic()
+        wait = _next_free[0] - now
+        _next_free[0] = max(now, _next_free[0]) + interval
+    if wait > 0:
+        time.sleep(wait)
+
+
 class Helius:
     def __init__(self, api_key: str | None = None, client: httpx.Client | None = None):
         self.api_key = api_key if api_key is not None else os.environ.get("HELIUS_API_KEY", "")
         self.http = client or httpx.Client(timeout=30)
         self.credits_used = 0
+        self.min_interval_s = MIN_INTERVAL_S
 
     @property
     def enabled(self) -> bool:
@@ -56,12 +81,18 @@ class Helius:
     def _rpc(self, method: str, params: list, credits: int):
         if not self.enabled:
             return None
-        try:
-            resp = self.http.post(RPC_URL, params={"api-key": self.api_key},
-                                  json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
-        except httpx.HTTPError as exc:
-            log.warning("helius %s failed: %s", method, exc)
-            return None
+        for attempt in range(RETRIES_429 + 1):
+            _pace(self.min_interval_s)
+            try:
+                resp = self.http.post(RPC_URL, params={"api-key": self.api_key},
+                                      json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+            except httpx.HTTPError as exc:
+                log.warning("helius %s failed: %s", method, exc)
+                return None
+            if resp.status_code != 429:
+                break
+            if attempt < RETRIES_429:
+                time.sleep(min(8.0, 1.0 * 2 ** attempt))
         if resp.status_code != 200:
             log.warning("helius %s -> HTTP %s", method, resp.status_code)
             return None
@@ -80,7 +111,7 @@ class Helius:
         token = None
         for _ in range(max_pages):
             opts = {"transactionDetails": "full", "sortOrder": "asc", "limit": 100,
-                    "maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}
+                    "maxSupportedTransactionVersion": TX_VERSION, "encoding": "jsonParsed"}
             if token:
                 opts["paginationToken"] = token
             res = self._rpc("getTransactionsForAddress", [address, opts], HISTORY_CREDITS_PER_100)
@@ -97,7 +128,7 @@ class Helius:
         """Oldest-first full transactions touching `address`."""
         res = self._rpc("getTransactionsForAddress",
                         [address, {"transactionDetails": "full", "sortOrder": "asc", "limit": limit,
-                                   "maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}],
+                                   "maxSupportedTransactionVersion": TX_VERSION, "encoding": "jsonParsed"}],
                         max(HISTORY_CREDITS_PER_100, HISTORY_CREDITS_PER_100 * limit // 100))
         return (res or {}).get("data") or []
 
@@ -130,7 +161,7 @@ class Helius:
         """Newest-first full transactions touching `address`."""
         res = self._rpc("getTransactionsForAddress",
                         [address, {"transactionDetails": "full", "sortOrder": "desc", "limit": limit,
-                                   "maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}],
+                                   "maxSupportedTransactionVersion": TX_VERSION, "encoding": "jsonParsed"}],
                         max(HISTORY_CREDITS_PER_100, HISTORY_CREDITS_PER_100 * limit // 100))
         return (res or {}).get("data") or []
 

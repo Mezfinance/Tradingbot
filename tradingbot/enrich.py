@@ -286,6 +286,8 @@ class Enricher:
         window = min(LAUNCH_WINDOW_S, max(0.0, r["seen_ts"] - r["created_ts"]) + LAUNCH_PAST_SEEN_S)
         txs, done, ok = self.helius.history_until(pool, r["created_ts"] + window + 60, LAUNCH_MAX_PAGES)
         if not txs or not ok:
+            if not retry and not ok:
+                return False  # a failed call (rate limit, error) says nothing about the pool: leave it for later
             tries = int(self.store.get_state(f"launch_try:{pool}") or 0) + 1
             if retry and tries < LAUNCH_MAX_TRIES:  # Helius errors and late indexing: try again later
                 self.store.set_state(f"launch_try:{pool}", str(tries))

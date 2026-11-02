@@ -533,3 +533,21 @@ def test_launch_backfill_takes_a_capped_random_sample_of_older_hand_made_pools()
     assert e._get(saved[0], "launch")["backfill"] and e._get(saved[0], "launch")["selection"] == "sample"
     again = e.backfill_launch(T0 - 2 * 86400, T0, max_pools=100, max_credits=200)
     assert again["candidates"] == 21  # done pools are not fetched again
+
+
+def test_helius_retries_rate_limits_and_accepts_version_1_transactions(monkeypatch):
+    from tradingbot.data import helius as hl
+    monkeypatch.setattr(hl.time, "sleep", lambda s: None)
+    sent, codes = [], [429, 429, 200]
+
+    class Http:
+        def post(self, url, params=None, json=None):
+            sent.append(json)
+            code = codes.pop(0)
+            return SimpleNamespace(status_code=code, json=lambda: {"result": {"data": [{"blockTime": 1}]}})
+
+    h = hl.Helius(api_key="k", client=Http())
+    h.min_interval_s = 0
+    txs, done, ok = h.history_until("POOL", until_ts=0)
+    assert ok and len(txs) == 1 and len(sent) == 3 and h.credits_used == 10  # only the answered call is billed
+    assert sent[0]["params"][1]["maxSupportedTransactionVersion"] == 1
