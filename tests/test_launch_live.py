@@ -218,8 +218,8 @@ def test_liquidity_and_size_estimate(setup):
     top5 = out["top 5%"]
     assert top5["n"] == 1 and top5["median"] == round(r["liq_usd"]) and top5["picks_per_day"] == 1.0
     full = top5["backtest edge"]
-    assert full["best_size_usd"] == round(0.27 * r["liq_usd"] / 8)
-    assert full["profit_per_trade_usd"] == round(0.27 ** 2 * r["liq_usd"] / 16)
+    assert full["best_size_usd"] == round(ll.BACKTEST_EDGE["top 5%"] * r["liq_usd"] / 8)
+    assert full["profit_per_trade_usd"] == round(ll.BACKTEST_EDGE["top 5%"] ** 2 * r["liq_usd"] / 16)
 
 
 def test_schema_migration_adds_liquidity_column():

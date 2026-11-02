@@ -482,9 +482,11 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
     "early6r": "as early5r, out by pool minute 6",
     "early7r": "as early5r, out by pool minute 7",
     "launch4_2": "hand-made pools scored on their first 4 seconds of chain data (websocket), top 2%, bought at pool "
-                 "second ~6 on the pool's reserves, out at minute 6. Walk-forward 10-28..11-02 without names: "
-                 "+39..+42%/trade, n=20-22, 90% range +11..+70%, 9-10% rugged (6 days, small n)",
-    "launch4_5": "as launch4_2, top 5%: +29..+32%/trade, n=46-47, 90% range +5..+57%, 22-23% rugged",
+                 "second ~6 through Jupiter, out at minute 6. Walk-forward 10-28..11-02 without names, n=23: "
+                 "+32.9%/trade on GeckoTerminal snapshot prices but +20..+22% on 1-minute trade candles "
+                 "(90% range -2..+46%), 13% rugged; random liquid pools -12% on candles",
+    "launch4_5": "as launch4_2, top 5%, n=48: +26.7% on snapshot prices, +6% on trade candles (90% range "
+                 "-12..+24%), 25% rugged",
 }
 
 

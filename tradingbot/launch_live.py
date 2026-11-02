@@ -67,7 +67,7 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS watch_launch_live(
     fill_sol REAL, exit_ts REAL, exit_px REAL, exit_sol REAL, pulled_ts REAL, ret REAL, status TEXT,
     reason TEXT, credits INTEGER DEFAULT 0, liq_usd REAL)"""
 # Backtest edge per trade after its 6% cost (decide 4 / fill 6, no names, 11-02), for the size estimate in status.
-BACKTEST_EDGE = {"top 2%": 0.33, "top 5%": 0.27}
+BACKTEST_EDGE = {"top 2%": 0.21, "top 5%": 0.06}  # on 1-minute trade candles (snapshot prices said 0.33 / 0.27)
 
 
 def ensure_schema(store) -> None:
