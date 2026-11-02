@@ -87,6 +87,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--days", type=float, default=7.0, help="launch-backfill: pools created in the last N days")
     parser.add_argument("--test-from", default=None,
                         help="launch-backtest: score only days from this UTC date (YYYY-MM-DD); earlier days only train")
+    parser.add_argument("--no-name", action="store_true",
+                        help="launch-backtest: timing table without name features (the live scorer can't see the name)")
     parser.add_argument("--timing", action="store_true",
                         help="launch-backtest: only the decide-at-d / fill-at-f timing table (faster)")
     parser.add_argument("--max-pools", type=int, default=2000, help="launch-backfill: at most this many pools")
@@ -270,7 +272,7 @@ def main(argv: list[str] | None = None) -> None:
                  if r["mint"] in mints}
         since = time.time() - args.hours * 3600 if args.hours else 0.0
         print(json.dumps(launch_analysis.backtest(store, cfg, since, picks, test_from=args.test_from,
-                                                  only_timing=args.timing), indent=2))
+                                                  only_timing=args.timing, no_name=args.no_name), indent=2))
         return
 
     if args.command == "model-status":

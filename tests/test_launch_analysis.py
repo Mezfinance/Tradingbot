@@ -117,3 +117,14 @@ def test_fill_return_uses_the_chain_price_at_the_fill_second():
     r = la.rows(st, Config())[0]["ret"]
     assert r[5] == pytest.approx(1.2 * 2.0 - 1 - 0.06) and r[6] == pytest.approx(1.2 - 1 - 0.06)
     assert 4 in r and 7 in r
+
+
+def test_timing_without_name_features(monkeypatch):
+    st = WatchStore(":memory:")
+    _three_days(st)
+    seen = []
+    real = la.wa._matrix
+    monkeypatch.setattr(la.wa, "_matrix", lambda feats, names, *a: seen.append(set(names)) or real(feats, names, *a))
+    out = la.backtest(st, Config(), only_timing=True, no_name=True)["timing (walk-forward: decide at d, fill at f)"]
+    assert seen and not any(n & set(la.LIVE_DROP) for n in seen)
+    assert out["decide 4s, fill 6s"]["top 5%"]["n"] > 0
