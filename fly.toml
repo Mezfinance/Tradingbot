@@ -21,6 +21,8 @@ primary_region = "iad"
   TB_SHADOWS = ""  # filters_only/random baselines off: with Claude off they only cost GeckoTerminal/Jupiter calls
   TB_LAUNCH_LIVE = "1"  # second-4 launch scorer (11-02): gets the Helius credits below
   TB_LAUNCH_BOOK = "1"  # launch4_2 / launch4_5 paper books trade its top 2% / 5% picks
+  TB_RESET_BOOKS = "launch4_2,launch4_5"  # fresh start after the first half hour's mis-picks (once per id)
+  TB_RESET_BOOKS_ID = "2026-11-02-drift"
   TB_HELIUS_DAILY_CREDITS = "0"  # early-buyer lookups off: their credits go to the launch scorer
   TB_OPERATOR_DAILY_CREDITS = "0"  # rug-catcher operator lookups off (ops books are off)
 

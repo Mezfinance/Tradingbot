@@ -137,6 +137,18 @@ class Journal:
         self.db.execute("INSERT OR REPLACE INTO state(key, value) VALUES(?, ?)", (key, value))
         self.db.commit()
 
+    @locked
+    def archive_strategy(self, strategy: str, tag: str) -> int:
+        """Start a book afresh: its positions (fills follow them), events, equity snapshots and costs are kept
+        under `<strategy>@<tag>` and its saved cash is cleared. Returns the number of positions moved."""
+        new = f"{strategy}@{tag}"
+        moved = self.db.execute("UPDATE positions SET strategy=? WHERE strategy=?", (new, strategy)).rowcount
+        for table in ("events", "equity", "costs"):
+            self.db.execute(f"UPDATE {table} SET strategy=? WHERE strategy=?", (new, strategy))
+        self.db.execute("DELETE FROM state WHERE key=?", (f"cash:{strategy}",))
+        self.db.commit()
+        return moved
+
     def get_cash(self, default: float, strategy: str = "claude") -> float:
         raw = self.get_state(f"cash:{strategy}")
         if raw is None:

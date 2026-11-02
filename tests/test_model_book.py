@@ -653,3 +653,27 @@ def test_launch_signals_go_to_the_matching_launch_book_with_a_minute_6_deadline(
         assert timing[mb.LAUNCH5]["buys"] == 2 and "created->decided" in timing[mb.LAUNCH5]
     finally:
         cfg.launch_book, cfg.launch_live = False, False
+
+
+def test_reset_books_archives_history_once(cfg, good_pair):
+    from tradingbot.models import Position
+    j = Journal(":memory:")
+    j.save_position(Position(None, "TOK", "T", 1.0, 0.0, 100.0, 100.0, time.time(), 0.0, 1.0, realized_usd=50.0,
+                             closed_at=time.time(), exit_reason="pool_age_exit", strategy=mb.LAUNCH2))
+    j.log_event("model_buy", "TOK", "x", strategy=mb.LAUNCH2)
+    j.set_cash(9_950.0, mb.LAUNCH2)
+    cfg.launch_book, cfg.launch_live = True, True
+    cfg.reset_books, cfg.reset_books_id = f"{mb.LAUNCH2},{mb.LAUNCH5}", "t1"
+    try:
+        eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                     model_executor=PaperExecutor(cfg))
+        assert eng.books[mb.LAUNCH2].cash == cfg.model_book_cash_usd
+        assert not j.query("SELECT 1 FROM positions WHERE strategy=?", (mb.LAUNCH2,))
+        assert j.query("SELECT COUNT(*) AS n FROM positions WHERE strategy=?", (f"{mb.LAUNCH2}@t1",))[0]["n"] == 1
+        assert not j.query("SELECT 1 FROM events WHERE strategy=?", (mb.LAUNCH2,))
+        j.set_cash(9_000.0, mb.LAUNCH2)  # trades after the reset survive a restart with the same id
+        Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+               model_executor=PaperExecutor(cfg))
+        assert float(j.get_state(f"cash:{mb.LAUNCH2}")) == 9_000.0
+    finally:
+        cfg.launch_book, cfg.launch_live, cfg.reset_books, cfg.reset_books_id = False, False, "", ""

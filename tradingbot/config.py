@@ -67,6 +67,10 @@ class Config:
     # Paper books launch4_2 / launch4_5 on the scorer's top 2% / top 5% picks (needs launch_live and model_book):
     # bought through Jupiter with the model books' simulated executor, sold at pool minute 6, no stop/take-profit.
     launch_book: bool = False
+    # One-off fresh start for some books (comma list): their history is kept as '<book>@<reset_books_id>' and
+    # their cash goes back to the starting amount. Runs once per reset_books_id, at engine start.
+    reset_books: str = ""
+    reset_books_id: str = ""
     enrich_wallets_per_token: int = 8  # early buyers whose wallet age/funder is looked up
     x_daily_budget_usd: float = 3.0
     x_cost_per_post: float = 0.005  # X pay-per-use estimate; adjust to your bill

@@ -74,6 +74,7 @@ class Engine:
         self.gecko = gecko  # optional GeckoTerminal discovery (trending by trading activity)
         self.journal = journal
         self.jupiter = jupiter  # None: no round-trip preflight, prices from DexScreener (tests)
+        self._reset_books()
         self.books: dict[str, Book] = {MAIN: self._open_book(MAIN, executor)}
         for name, ex in (shadow_executors or {}).items():
             self.books[name] = self._open_book(name, ex)
@@ -128,6 +129,18 @@ class Engine:
         until = time.time() + RECHECK_REJECTED_S
         self._cooldown[token] = until
         self.journal.set_cooldown(token, until)
+
+    def _reset_books(self) -> None:
+        """One-off fresh start for the books in `reset_books` (comma list), keyed by `reset_books_id` so a
+        later restart doesn't repeat it; runs before any book reads its cash."""
+        names = [n.strip() for n in (self.cfg.reset_books or "").split(",") if n.strip()]
+        tag = (self.cfg.reset_books_id or "").strip()
+        if not names or not tag or self.journal.get_state(f"books_reset:{tag}"):
+            return
+        for name in names:
+            moved = self.journal.archive_strategy(name, tag)
+            log.info("book %s reset (%d positions kept as %s@%s)", name, moved, name, tag)
+        self.journal.set_state(f"books_reset:{tag}", ",".join(names))
 
     def _open_book(self, name: str, executor: Executor, start_cash: float | None = None,
                    fixed_usd: float | None = None) -> Book:
