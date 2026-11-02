@@ -204,3 +204,26 @@ def test_real_vs_ideal_fills_pairs_book_trades_with_the_scorer(setup):
     out = ll.status(st, cfg, 24, now=clock.t, journal=j)["real vs ideal fills"]["launch4_5"]
     assert out["trades"] == 1 and out["filled at pool second (median)"] == 7
     assert out["gap per trade (real - ideal)"]["mean_pct"] == pytest.approx(10 - 19, abs=0.1)
+
+
+def test_liquidity_and_size_estimate(setup):
+    cfg, st, hel, clock, live, p, create = setup
+    live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+    live.step()
+    clock.t += cfg.launch_live_decide_delay_s
+    live.step()
+    r = live._row(HAND_POOL)
+    assert r["liq_usd"] == pytest.approx(2 * r["sol_at_decide"] * 200)
+    out = ll.status(st, cfg, 24, now=clock.t)["liquidity at second 4 (USD) and trade size"]
+    top5 = out["top 5%"]
+    assert top5["n"] == 1 and top5["median"] == round(r["liq_usd"]) and top5["picks_per_day"] == 1.0
+    full = top5["backtest edge"]
+    assert full["best_size_usd"] == round(0.27 * r["liq_usd"] / 8)
+    assert full["profit_per_trade_usd"] == round(0.27 ** 2 * r["liq_usd"] / 16)
+
+
+def test_schema_migration_adds_liquidity_column():
+    st = WatchStore(":memory:")
+    st.execute(ll.SCHEMA.replace(", liq_usd REAL", ""))
+    ll.ensure_schema(st)
+    assert "liq_usd" in [c[1] for c in st.query("PRAGMA table_info(watch_launch_live)")]

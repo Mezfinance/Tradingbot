@@ -65,7 +65,18 @@ SCHEMA = """CREATE TABLE IF NOT EXISTS watch_launch_live(
     decided_ts REAL, indexed_s REAL, liquid INTEGER, score REAL, top2 INTEGER, top5 INTEGER, feat TEXT,
     sol_at_decide REAL, peak_sol REAL, sol_vault TEXT, token_vault TEXT, fill_ts REAL, fill_px REAL,
     fill_sol REAL, exit_ts REAL, exit_px REAL, exit_sol REAL, pulled_ts REAL, ret REAL, status TEXT,
-    reason TEXT, credits INTEGER DEFAULT 0)"""
+    reason TEXT, credits INTEGER DEFAULT 0, liq_usd REAL)"""
+# Backtest edge per trade after its 6% cost (decide 4 / fill 6, no names, 11-02), for the size estimate in status.
+BACKTEST_EDGE = {"top 2%": 0.33, "top 5%": 0.27}
+
+
+def ensure_schema(store) -> None:
+    import sqlite3
+    store.execute(SCHEMA)
+    try:  # added 11-02: pool liquidity at second 4 in USD
+        store.execute("ALTER TABLE watch_launch_live ADD COLUMN liq_usd REAL")
+    except sqlite3.OperationalError:
+        pass
 
 
 def model_path(cfg: Config) -> Path:
@@ -140,7 +151,7 @@ class LaunchLive:
         self.signals = signals  # the engine's model-signal queue: top-2% / top-5% picks go to the launch books
         self.helius = helius or Helius()
         self.budget = Budget(store, "launch_live", cfg.launch_live_daily_credits)
-        store.execute(SCHEMA)
+        ensure_schema(store)
         self.lock = threading.Lock()
         self.jobs: list = []  # heap of (due, seq, kind, pool)
         self.seq = 0
@@ -373,7 +384,8 @@ class LaunchLive:
         meta = model.meta if model is not None else {}
         pick = lambda c: int(bool(liquid and score is not None and c is not None and score >= c - 1e-9))
         cols.update(liquid=int(liquid), score=score, top2=pick(meta.get("cut2")), top5=pick(meta.get("cut5")),
-                    feat=json.dumps(feat), sol_at_decide=sol4, peak_sol=max(t[6] for t in upto))
+                    feat=json.dumps(feat), sol_at_decide=sol4, peak_sol=max(t[6] for t in upto),
+                    liq_usd=2 * sol4 * sol_usd if sol_usd else None)
         if not liquid:
             self._update(pool, status="skipped", reason="not liquid at second 4", **cols)
             return
@@ -551,9 +563,34 @@ def fill_gap(store, journal, book: str, since: float, rng) -> dict:
             "sold at pool second (median)": _median([x["out_s"] for x in pairs])}
 
 
+def liquidity(rows, hours: float) -> dict:
+    """Pool liquidity at second 4 (2 x pool SOL x SOL price) of every liquid scored pool and of each pick group,
+    and what it allows: buying $s into a pool with $L of liquidity moves the price ~2s/L each way, so profit per
+    trade s x (edge - 4s/L) peaks at s = edge x L / 8 (profit edge^2 x L / 16). Shown at the backtest edge and half
+    of it, for the median pick pool, with the picks per day seen in the window."""
+    groups = {"every liquid pool": rows, "top 2%": [r for r in rows if r["top2"]],
+              "top 5%": [r for r in rows if r["top5"]]}
+    out = {}
+    for g, rs in groups.items():
+        liq = [r["liq_usd"] for r in rs if r["liq_usd"]]
+        if not liq:
+            out[g] = {"n": 0}
+            continue
+        q = lambda p: round(float(np.percentile(liq, p)))
+        out[g] = {"n": len(liq), "p10": q(10), "median": q(50), "p90": q(90)}
+        if g in BACKTEST_EDGE:
+            med, per_day = float(np.median(liq)), len(rs) * 24 / hours
+            out[g]["picks_per_day"] = round(per_day, 1)
+            for label, e in (("backtest edge", BACKTEST_EDGE[g]), ("half edge", BACKTEST_EDGE[g] / 2)):
+                profit = e * e * med / 16
+                out[g][label] = {"edge_pct": round(100 * e, 1), "best_size_usd": round(e * med / 8),
+                                 "profit_per_trade_usd": round(profit), "per_day_usd": round(profit * per_day)}
+    return out
+
+
 def status(store, cfg: Config, hours: float = 24, now: float | None = None, journal=None) -> dict:
     now = now if now is not None else time.time()
-    store.execute(SCHEMA)
+    ensure_schema(store)
     rows = store.query("SELECT * FROM watch_launch_live WHERE notified_ts >= ?", (now - hours * 3600,))
     day = datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m-%d")
     out: dict = {"hours": hours,
@@ -574,6 +611,7 @@ def status(store, cfg: Config, hours: float = 24, now: float | None = None, jour
     out["note"] = ("outcomes below are pool-level (vault price at second ~6 vs minute 6, 6% cost); the books' own "
                    "Jupiter-simulated trades are in `report`")
     out["picks"] = {"top 2%": sum(r["top2"] or 0 for r in scored), "top 5%": sum(r["top5"] or 0 for r in scored)}
+    out["liquidity at second 4 (USD) and trade size"] = liquidity(scored, hours)
     rng = np.random.default_rng(0)
     done = [r for r in rows if r["status"] == "done"]
     out["outcomes (fill at second ~6, out at minute 6, 6% cost)"] = {
