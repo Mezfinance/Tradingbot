@@ -227,3 +227,23 @@ def test_schema_migration_adds_liquidity_column():
     st.execute(ll.SCHEMA.replace(", liq_usd REAL", ""))
     ll.ensure_schema(st)
     assert "liq_usd" in [c[1] for c in st.query("PRAGMA table_info(watch_launch_live)")]
+
+
+def test_websocket_failure_is_recorded_not_silent(setup, monkeypatch):
+    import asyncio, sys, threading
+    cfg, st, hel, clock, live, p, create = setup
+    monkeypatch.setitem(sys.modules, "websockets", None)  # as on an image without the package
+    stop = threading.Event()
+
+    async def run():
+        try:
+            await asyncio.wait_for(live._ws_loop(stop), timeout=0.3)
+        except asyncio.TimeoutError:
+            pass
+    asyncio.run(run())
+    assert live.ws["reconnects"] >= 1 and "websockets" in (live.ws["last_error"] or "")
+
+
+def test_websockets_is_a_declared_dependency():
+    from pathlib import Path
+    assert '"websockets' in (Path(__file__).resolve().parent.parent / "pyproject.toml").read_text()

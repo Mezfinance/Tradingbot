@@ -456,13 +456,13 @@ class LaunchLive:
         return WS_HELIUS.format(key=self.helius.api_key) if self.helius.enabled else WS_PUBLIC
 
     async def _ws_loop(self, stop: threading.Event) -> None:
-        import websockets
         sub = {"jsonrpc": "2.0", "id": 1, "method": "programSubscribe",
                "params": [ps.TOKEN_2022, {"encoding": "base64", "commitment": "confirmed",
                                           "filters": [{"dataSize": ps.LP_MINT_SIZE}]}]}
         backoff = 1.0
         while not stop.is_set():
             try:
+                import websockets  # inside the try: a missing package shows in last_error, not a dead thread
                 async with websockets.connect(self.ws_url(), max_size=2 ** 22, ping_interval=20,
                                               ping_timeout=20, open_timeout=20) as ws:
                     await ws.send(json.dumps(sub))
