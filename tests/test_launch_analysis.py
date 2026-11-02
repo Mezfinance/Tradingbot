@@ -148,3 +148,22 @@ def test_exit_timing_check_compares_the_snapshot_with_minute_6():
     r = next(r for r in la.rows(st, Config()) if "cx" in r)
     assert la.candle_ret(r, 6, "c6") == pytest.approx(min(2.0 * r["cx"]["link"][6] - 1 - la.COST, 3.0))
     assert "exit timing check" not in out["decide 5s, fill 5s"]
+
+
+def test_fetch_candles_gets_history_for_picks_and_a_sample():
+    st = WatchStore(":memory:")
+    _three_days(st)
+    asked = []
+
+    class Gecko:
+        def ohlcv(self, pool, minutes=5, limit=300, before=None):
+            asked.append(pool)
+            c = before - la.HIST_CANDLE_WINDOW_S
+            return [[c, 1, 1, 1, 1.0, 5], [c + 330, 1, 2, 1, 2.0, 5], [c + 370, 2, 3, 2, 3.0, 5]]
+    out = la.backtest(st, Config(), only_timing=True, fetch_candles=10, gecko=Gecko())
+    chk = out["timing (walk-forward: decide at d, fill at f)"]["decide 4s, fill 6s"]["exit timing check"]
+    n_picks = int(chk["top 5%"]["pools with candles"].split(" of ")[1])
+    assert len(asked) == len(set(asked)) == n_picks + 10
+    assert chk["top 5%"]["pools with candles"] == f"{n_picks} of {n_picks}"
+    la.backtest(st, Config(), only_timing=True, fetch_candles=10, gecko=Gecko())
+    assert len(asked) == n_picks + 10  # saved: a rerun fetches nothing new

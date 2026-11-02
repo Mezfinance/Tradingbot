@@ -112,10 +112,11 @@ def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
     out = []
     for r in store.query(
             """SELECT p.pool, p.mint, p.dex, p.name, p.created_ts, p.seen_ts, p.first, e.data AS launch,
-                      s.data AS snap5, s.ts AS snap_ts, c.data AS candles
+                      s.data AS snap5, s.ts AS snap_ts, COALESCE(h.data, c.data) AS candles
                FROM watch_enrich e JOIN watch_pools p ON p.pool=e.pool
                LEFT JOIN watch_snaps s ON s.pool=p.pool AND s.age_min=5
                LEFT JOIN watch_enrich c ON c.pool=p.pool AND c.kind='candles15'
+               LEFT JOIN watch_enrich h ON h.pool=p.pool AND h.kind='candles_hist'
                WHERE e.kind='launch' AND p.created_ts >= ? AND json_extract(e.data, '$.txs') IS NOT NULL""",
             (since,)):
         launch, first = json.loads(r["launch"]), json.loads(r["first"] or "{}")
@@ -231,7 +232,31 @@ def exit_check(rows: list[dict], f: int, rng) -> dict:
     }
 
 
-def timing(data: list[dict], rng, test_from: str | None = None, no_name: bool = False) -> dict:
+HIST_CANDLE_WINDOW_S = 900  # historical 1-minute candles: the pool's first 15 minutes
+
+
+def fetch_history_candles(store, pools: list[dict], gecko, progress=None) -> int:
+    """GeckoTerminal's 1-minute candles of each pool's first 15 minutes, fetched after the fact (it serves them days
+    later) and saved as kind `candles_hist`; pools already fetched are skipped, failed calls are left for a rerun."""
+    done = {r[0] for r in store.query("SELECT pool FROM watch_enrich WHERE kind='candles_hist'")}
+    fetched = 0
+    for i, r in enumerate(pools):
+        if r["pool"] in done:
+            continue
+        rows = gecko.ohlcv(r["pool"], minutes=1, limit=20, before=int(r["created_ts"] + HIST_CANDLE_WINDOW_S))
+        if rows is None:
+            continue
+        store.execute("INSERT INTO watch_enrich(pool, kind, ts, data) VALUES(?,?,?,?)",
+                      (r["pool"], "candles_hist", time.time(), json.dumps({"candles": rows})))
+        done.add(r["pool"])
+        fetched += 1
+        if progress:
+            progress(i + 1, len(pools))
+    return fetched
+
+
+def timing(data: list[dict], rng, test_from: str | None = None, no_name: bool = False,
+           collect: dict | None = None) -> dict:
     """Live entries can't fill at the decision second. For each (decide at d, fill at f): walk-forward by day, a
     model on features at second d (label: the second-f trade made money) picks the top 2% / 5% of the training
     scores; each pick earns its second-f return. Pools must be liquid and not pulled at d. Days before
@@ -271,6 +296,8 @@ def timing(data: list[dict], rng, test_from: str | None = None, no_name: bool = 
         for k in TIMING_TOP_PCT:
             res[f"top {k:g}%"] = _summary(picks[k], rng)
         res["by day"] = by_day
+        if (d, f) == EXIT_CHECK_CELL and collect is not None:
+            collect.update(base=base_rows, picks=pick_rows[max(TIMING_TOP_PCT)])
         if (d, f) == EXIT_CHECK_CELL:
             res["exit timing check"] = {"every liquid pool": exit_check(base_rows, f, rng),
                                         **{f"top {k:g}%": exit_check(pick_rows[k], f, rng) for k in TIMING_TOP_PCT}}
@@ -329,8 +356,20 @@ def _summary(vals, rng) -> dict:
 
 
 def backtest(store, cfg: Config, since: float = 0.0, picks: set[str] | None = None,
-             test_from: str | None = None, only_timing: bool = False, no_name: bool = False) -> dict:
+             test_from: str | None = None, only_timing: bool = False, no_name: bool = False,
+             fetch_candles: int = 0, gecko=None, progress=None) -> dict:
     data = rows(store, cfg, since)
+    if fetch_candles:  # candles for the live cell's top-5% picks (top 2% included) + a random sample of the rest
+        got: dict = {}
+        timing(data, np.random.default_rng(0), test_from, no_name, collect=got)
+        pick_ids = {r["pool"] for r in got.get("picks", [])}
+        rest = [r for r in got.get("base", []) if r["pool"] not in pick_ids]
+        sample = [rest[i] for i in np.random.default_rng(1).permutation(len(rest))[:fetch_candles]]
+        if gecko is None:
+            from tradingbot.data.geckoterminal import GeckoTerminal
+            gecko = GeckoTerminal()
+        fetch_history_candles(store, got.get("picks", []) + sample, gecko, progress)
+        data = rows(store, cfg, since)
     out = {"pools": len(data), "dropped": {}}
     for r in data:
         if "drop" in r:

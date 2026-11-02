@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import sys
 
 from tradingbot.config import Config
 
@@ -89,6 +90,9 @@ def main(argv: list[str] | None = None) -> None:
                         help="launch-backtest: score only days from this UTC date (YYYY-MM-DD); earlier days only train")
     parser.add_argument("--no-name", action="store_true",
                         help="launch-backtest: timing table without name features (the live scorer can't see the name)")
+    parser.add_argument("--fetch-candles", type=int, default=0, metavar="N",
+                        help="launch-backtest: fetch historical 1-minute candles for the decide-4/fill-6 picks plus N "
+                             "random liquid pools (GeckoTerminal, saved for reruns) for the exit timing check")
     parser.add_argument("--timing", action="store_true",
                         help="launch-backtest: only the decide-at-d / fill-at-f timing table (faster)")
     parser.add_argument("--max-pools", type=int, default=2000, help="launch-backfill: at most this many pools")
@@ -284,7 +288,10 @@ def main(argv: list[str] | None = None) -> None:
                  if r["mint"] in mints}
         since = time.time() - args.hours * 3600 if args.hours else 0.0
         print(json.dumps(launch_analysis.backtest(store, cfg, since, picks, test_from=args.test_from,
-                                                  only_timing=args.timing, no_name=args.no_name), indent=2))
+                                                  only_timing=args.timing, no_name=args.no_name,
+                                                  fetch_candles=args.fetch_candles,
+                                                  progress=lambda i, n: i % 25 == 0 and print(
+                                                      f"candles {i}/{n}", file=sys.stderr, flush=True)), indent=2))
         return
 
     if args.command == "model-status":
