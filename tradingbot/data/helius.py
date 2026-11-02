@@ -149,6 +149,22 @@ class Helius:
                 out[pool] = b58encode(base64.b64decode(acct["data"][0])) if ok else None
         return out
 
+    def accounts(self, addresses: list[str], commitment: str = "confirmed") -> dict[str, tuple[str, bytes] | None] | None:
+        """Raw accounts (owner, data bytes), up to 100 per call (1 credit; the public RPC without a key).
+        None for an address that doesn't exist; returns None when the call failed."""
+        out: dict[str, tuple[str, bytes] | None] = {}
+        for i in range(0, len(addresses), 100):
+            chunk = addresses[i:i + 100]
+            params = [chunk, {"encoding": "base64", "commitment": commitment}]
+            res = self._rpc("getMultipleAccounts", params, RPC_CREDITS) if self.enabled else self._public(
+                "getMultipleAccounts", params)
+            values = (res or {}).get("value")
+            if values is None:
+                return None
+            for a, acct in zip(chunk, values):
+                out[a] = (acct["owner"], base64.b64decode(acct["data"][0])) if acct else None
+        return out
+
     def _public(self, method: str, params: list):
         try:
             body = self.http.post(PUBLIC_RPC, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}).json()

@@ -57,6 +57,13 @@ class Config:
     # transactions from Helius (~10 credits each), to test whether buying in the first seconds would pay.
     launch_sample_pct: float = 20.0  # busy pools need up to 4 pages of 100 txs: ~30 credits per pool
     launch_daily_credits: int = 6_000
+    # Second-4 launch scorer (shadow mode, never trades): an LP-mint websocket sees each new pumpswap pool,
+    # its first 4 seconds come from Helius, the launch4 model scores it and the would-be fill / minute-6 exit
+    # are read from the pool's vaults (table watch_launch_live, CLI launch-status).
+    launch_live: bool = False
+    launch_live_daily_credits: int = 20_000
+    launch_live_decide_delay_s: float = 4.0  # after the websocket notification (~1 s after creation)
+    launch_train_days: float = 14.0
     enrich_wallets_per_token: int = 8  # early buyers whose wallet age/funder is looked up
     x_daily_budget_usd: float = 3.0
     x_cost_per_post: float = 0.005  # X pay-per-use estimate; adjust to your bill

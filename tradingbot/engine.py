@@ -180,6 +180,11 @@ class Engine:
                                  args=(MODEL_POLL_S, self.buy_model_signals)).start()
             threading.Thread(target=self._loop, name="watcher", daemon=True,
                              args=(self.cfg.watch_poll_s, watcher.step)).start()
+            if self.cfg.launch_live:  # second-4 launch scorer, shadow mode: never trades
+                import httpx
+                from tradingbot.data.helius import Helius
+                from tradingbot.launch_live import LaunchLive
+                LaunchLive(self.cfg, watcher.store, Helius(client=httpx.Client(timeout=10))).start()
             if self.cfg.enrich:
                 from tradingbot.enrich import Enricher
                 enricher = Enricher.from_config(self.cfg, watcher.store, watcher)

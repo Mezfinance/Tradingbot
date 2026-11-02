@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "propose", "proposals", "watch-status", "watch-report",
                                             "watch-export", "watch-links", "watch-report-now",
                                             "watch-model-train", "model-status", "early-status",
-                                            "early-backtest", "launch-backtest", "launch-backfill"])
+                                            "early-backtest", "launch-backtest", "launch-backfill", "launch-status"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -230,6 +230,17 @@ def main(argv: list[str] | None = None) -> None:
         if cfg.early_book:
             out = model_book.train_early_and_save(store, cfg)
             print(f"early model written to {out}" if out else "early model: not enough data to train yet")
+        if cfg.launch_live:
+            from tradingbot import launch_live
+            out = launch_live.train_and_save(store, cfg)
+            print(f"launch4 model written to {out}" if out else "launch4 model: not enough data to train yet")
+        return
+
+    if args.command == "launch-status":
+        from tradingbot import launch_live
+        from tradingbot.watcher import WatchStore, watch_db_path
+        print(json.dumps(launch_live.status(WatchStore(watch_db_path(cfg)), cfg, args.hours or 24), indent=2,
+                         default=str))
         return
 
     if args.command == "early-status":
