@@ -1,0 +1,34 @@
+# Fly.io config for the Strategy 1 paper short book (separate app from `supermeme`).
+# Sydney: Binance futures and Bybit refuse US addresses (HTTP 451 / 403), so the US regions won't work.
+# If `python -m shortbook check` shows a venue FAILED from here, try another region (sin, nrt, hkg).
+app = "shortbook-paper"
+primary_region = "syd"
+
+[build]
+  dockerfile = "Dockerfile.shortbook"
+
+[env]
+  SB_DB_PATH = "/data/shortbook.db"
+  SB_CASH_USD = "1000000"
+  SB_GROUPS = "B:upbit,B:binance,B:coinbase,A:upbit"
+
+[mounts]
+  source = "shortbook_data"
+  destination = "/data"
+  snapshot_retention = 14
+
+[[restart]]
+  policy = "always"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+
+[checks]
+  [checks.alive]
+    type = "http"
+    port = 8080
+    path = "/"
+    interval = "60s"
+    timeout = "10s"
+    grace_period = "120s"

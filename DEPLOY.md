@@ -207,3 +207,29 @@ Billing or key problems (for example "credit balance is too low") pause Claude c
 ## Cost
 
 A `shared-cpu-1x` machine with 512 MB plus a 1 GB volume costs a few dollars a month. The Claude API will cost more; the report's `net after API $` line shows whether it pays for itself.
+
+## Strategy 1 paper short book (separate Fly app)
+
+`shortbook/` paper-shorts new exchange listings (see `research/listings/STRATEGIES.md`). It runs as its own Fly
+app in Sydney (Binance futures and Bybit refuse US addresses). It never places orders and needs no keys.
+
+```sh
+fly apps create shortbook-paper                       # pick another name if taken, and change `app` in fly.shortbook.toml
+fly volumes create shortbook_data -r syd -s 1 -a shortbook-paper
+fly deploy -c fly.shortbook.toml
+fly ssh console -a shortbook-paper -C "python -m shortbook check"    # every venue should say ok
+```
+
+If a perp venue says FAILED from Sydney, move the app: set `primary_region` (e.g. `sin`, `nrt`, `hkg`) in
+`fly.shortbook.toml`, create the volume in that region, deploy again and re-run `check`.
+
+Day to day:
+
+```sh
+fly ssh console -a shortbook-paper -C "python -m shortbook status"   # heartbeat, NAV, open shorts, pending listings
+fly ssh console -a shortbook-paper -C "python -m shortbook report"   # results by group vs the research, skip reasons
+fly logs -a shortbook-paper                                           # new markets, SHORT / COVER lines
+```
+
+The first pass records every existing market as a baseline; only markets that appear after that are traded.
+Settings are `SB_*` env vars (`shortbook/config.py`), e.g. `SB_CASH_USD`, `SB_GROUPS`, `SB_TRADE_PCT`, `SB_OI_CAP_PCT`.

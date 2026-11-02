@@ -33,7 +33,7 @@ Binance's 'New Cryptocurrency Listing' notices (catalog 48) matched to 174 of 23
 
 Shortable on Binance/Bybit/Gate at the listing hour, net of costs + funding: 239 trades, +14.3% (90% CI +11.8..+16.7), win 79%; every half-year positive (2024H2 +11.4, 2025H1 +17.8, 2025H2 +14.8, 2026H1 +10.5, 2026H2 +15.1). B Coinbase weakest (-3.9% in 2026H1). Stops hurt (+40% stop +12.9%, +15% stop +10.3%) and gap through. Fund model (10% NAV per trade, cap 2% of open interest, gross <= 100%, impact 0.10 x sqrt(size / 24h volume) per side): yearly profit paid out ~160% up to $1M, 98% at $5M, 57% at $10M, 6% at $100M; profit ceiling ~$6M/yr full edge, ~$1.8M/yr half edge. Co-founder guide: https://claude.ai/artifact/YXoW686wop64GhuJ7cKR1m (PDF: `Short_Only_Web3_Fund_Strategy_1_Guide.pdf`)
 
-Next: a live detector for new Upbit KRW / Coinbase / Binance listings; a paper short book with real perp prices, funding and position limits.
+Paper short book (2026-11-02): `shortbook/` in the repo root, deployed as its own Fly app (`fly.shortbook.toml`, Sydney). Detects new Upbit KRW / Coinbase / Binance spot markets, classifies A/B from perp launch times and Gate/OKX/Binance spot listing times, shorts the perp with the most open interest on Binance/Bybit/Gate with the research sizing and costs, books real funding, covers after 7 days. `python -m shortbook report` compares results with the research per group. Judge after 30+ closed trades.
 
 ## Strategy 2+
 
