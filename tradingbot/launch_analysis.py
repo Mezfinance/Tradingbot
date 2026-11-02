@@ -12,6 +12,8 @@ skips it: its pool is already empty)."""
 from __future__ import annotations
 
 import json
+import math
+import time
 
 import numpy as np
 
@@ -46,10 +48,55 @@ def pulled_by(txs: list, t: float) -> bool:
     return False
 
 
+def launch_features(txs: list, x: float, creator: str | None, prior_pools: int, seed_sol: float | None) -> dict:
+    """What the chain shows by second x: seed and current SOL, trades, traders, buy/sell flow, the creator's own
+    buys, bundling in the creation slot, price move since creation, and whether the creator has made pools before."""
+    upto = [r for r in txs if r[0] <= x]
+    if not upto:
+        return {}
+    seed_row = next((r for r in upto if r[4] > 0 and r[6] == r[4]), None)  # the creator funding the empty pool
+    trades = [r for r in upto if r is not seed_row]
+    buys = [r for r in trades if r[4] > 0]  # SOL into the pool = someone bought tokens
+    sells = [r for r in trades if r[4] < 0]
+    first_slot = upto[0][1]
+    p0, px = chain_price(txs, 0), chain_price(txs, x)
+    sol_x = upto[-1][6]
+    seed = seed_sol or upto[0][6] or 0.0
+    buy_sol, sell_sol = sum(r[4] for r in buys), -sum(r[4] for r in sells)
+    return {
+        "log_seed_sol": math.log1p(seed), "log_sol_now": math.log1p(max(sol_x, 0.0)),
+        "sol_growth": (sol_x / seed) if seed > 0 else 1.0,
+        "log_txs": math.log1p(len(trades)), "log_buys": math.log1p(len(buys)), "log_sells": math.log1p(len(sells)),
+        "buy_share": len(buys) / (len(buys) + len(sells)) if buys or sells else 0.5,
+        "log_buy_sol": math.log1p(buy_sol), "log_sell_sol": math.log1p(sell_sol),
+        "net_flow_share": (buy_sol - sell_sol) / seed if seed > 0 else 0.0,
+        "log_traders": math.log1p(len({r[2] for r in trades})),
+        "log_buyers": math.log1p(len({r[2] for r in buys})),
+        "creator_buys": float(sum(1 for r in buys if r[2] == creator)),
+        "first_slot_txs": float(sum(1 for r in upto if r[1] == first_slot)),
+        "log_price_move": math.log(px / p0) if p0 and px else 0.0,
+        "repeat_creator": float(prior_pools > 0), "log_prior_pools": math.log1p(prior_pools),
+    }
+
+
+def _sol_usd(store, ts: float) -> float | None:
+    r = store.query("SELECT sol_usd FROM watch_market WHERE ts <= ? AND sol_usd > 0 ORDER BY ts DESC LIMIT 1", (ts,))
+    return float(r[0]["sol_usd"]) if r else None
+
+
+def _prior_pools(store, creator: str | None, created_ts: float) -> int:
+    if not creator:
+        return 0
+    r = store.query("SELECT COUNT(*) AS n FROM watch_creators c JOIN watch_pools p ON p.pool=c.pool "
+                    "WHERE c.creator=? AND p.created_ts < ?", (creator, created_ts))
+    return int(r[0]["n"]) if r else 0
+
+
 def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
     out = []
     for r in store.query(
-            """SELECT p.pool, p.mint, p.created_ts, p.seen_ts, p.first, e.data AS launch, s.data AS snap5
+            """SELECT p.pool, p.mint, p.dex, p.name, p.created_ts, p.seen_ts, p.first, e.data AS launch,
+                      s.data AS snap5
                FROM watch_enrich e JOIN watch_pools p ON p.pool=e.pool
                LEFT JOIN watch_snaps s ON s.pool=p.pool AND s.age_min=5
                WHERE e.kind='launch' AND p.created_ts >= ? AND json_extract(e.data, '$.txs') IS NOT NULL""",
@@ -59,7 +106,7 @@ def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
         txs = launch["txs"]
         seen = r["seen_ts"] - launch["create_ts"]
         row = {"pool": r["pool"], "seen_s": seen, "first_liq": wa._f(first.get("liq")) or 0.0,
-               "sample": launch.get("selection", "sample") == "sample"}
+               "sample": launch.get("selection", "sample") == "sample", "created_ts": r["created_ts"]}
         if not txs or seen > MAX_SEEN_S or seen < 0:
             row["drop"] = "first sight outside the window"
         elif not launch.get("complete") and txs[-1][0] < seen:
@@ -72,6 +119,10 @@ def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
             seen_ret = -1.0 if gone else min(snap["price"] / first["price"] - 1 - COST, 3.0)
             row["eligible"] = row["first_liq"] >= cfg.model_book_min_liq_usd
             row["ret"] = {"first sight": None if pulled_by(txs, seen) else seen_ret}
+            sol_usd = _sol_usd(store, r["created_ts"])
+            prior = _prior_pools(store, launch.get("creator"), r["created_ts"])
+            static = wa._static_features({"name": r["name"], "dex": r["dex"], "created_ts": r["created_ts"]})
+            row["liquid"], row["feat"] = {}, {}
             for x in ENTRY_SECONDS:
                 if x >= seen:
                     continue
@@ -82,8 +133,69 @@ def rows(store, cfg: Config, since: float = 0.0) -> list[dict]:
                     row["ret"][x] = -1.0
                 else:
                     row["ret"][x] = -1.0 if gone else min((1 + seen_ret + COST) * p_seen / p_x - 1 - COST, 3.0)
+                # what a second-x buyer can see: the pool's own SOL then (both sides ~ 2 x SOL side), not first sight
+                sol_x = [t[6] for t in txs if t[0] <= x][-1]
+                row["liquid"][x] = (sol_usd is None or 2 * sol_x * sol_usd >= cfg.model_book_min_liq_usd) \
+                    and not pulled_by(txs, x)
+                row["feat"][x] = {**static, **launch_features(txs, x, launch.get("creator"), prior,
+                                                               launch.get("seed_sol"))}
         out.append(row)
     return out
+
+
+RANK_SECONDS = (5, 10, 20, 30)
+RANK_TOP_PCT = (2.0, 5.0, 10.0)
+RANK_MIN_TRAIN = 100  # pools a day's model must be trained on before it is scored
+
+
+def rank(data: list[dict], rng) -> dict:
+    """Walk-forward by day: for each test day a logistic model trained on earlier days' sampled pools (liquid at
+    second x by the chain's own numbers; label: the second-x trade made money) scores the day's pools; picks are
+    those above the top-k% quantile of the training scores. Compared with buying every liquid pool that day."""
+    day = lambda r: time.strftime("%m-%d", time.gmtime(r["created_ts"]))
+    out = {}
+    for x in RANK_SECONDS:
+        pool = sorted([r for r in data if r.get("sample") and x in r.get("ret", {}) and r["liquid"].get(x)],
+                      key=lambda r: r["created_ts"])
+        days = sorted({day(r) for r in pool})
+        picks = {k: [] for k in RANK_TOP_PCT}
+        base, scored = [], 0
+        for d in days:
+            train = [r for r in pool if day(r) < d]
+            test = [r for r in pool if day(r) == d]
+            if len(train) < RANK_MIN_TRAIN or not test:
+                continue
+            names = sorted({k for r in train for k in r["feat"][x]})
+            xs, med = wa._matrix([r["feat"][x] for r in train], names)
+            y = np.array([float(r["ret"][x] > 0) for r in train])
+            if y.min() == y.max():
+                continue
+            mu, sd = xs.mean(0), xs.std(0) + 1e-9
+            w, b = wa.logistic((xs - mu) / sd, y)
+            tr_scores = ((xs - mu) / sd) @ w + b
+            te = (wa._matrix([r["feat"][x] for r in test], names, med)[0] - mu) / sd @ w + b
+            base += [r["ret"][x] for r in test]
+            scored += 1
+            for k in RANK_TOP_PCT:
+                cut = float(np.quantile(tr_scores, 1 - k / 100))
+                picks[k] += [r["ret"][x] for r, s in zip(test, te) if s >= cut]
+        res = {"pools": len(pool), "days_scored": scored,
+               "every liquid pool (test days)": _summary(base, rng)}
+        for k in RANK_TOP_PCT:
+            res[f"top {k:g}%"] = _summary(picks[k], rng)
+        if not base:
+            res["note"] = f"needs {RANK_MIN_TRAIN}+ earlier sampled pools before a day can be scored"
+        out[f"second {x}"] = res
+    return out
+
+
+def _summary(vals, rng) -> dict:
+    a = np.array(vals)
+    if len(a) == 0:
+        return {"n": 0}
+    lo, hi = np.percentile([rng.choice(a, len(a)).mean() for _ in range(1000)], [5, 95])
+    return {"n": len(a), "mean_pct": round(a.mean() * 100, 1), "ci90": [round(lo * 100, 1), round(hi * 100, 1)],
+            "median_pct": round(float(np.median(a)) * 100, 1), "rugged_pct": round(float(np.mean(a <= -0.99)) * 100)}
 
 
 def backtest(store, cfg: Config, since: float = 0.0, picks: set[str] | None = None) -> dict:
@@ -93,14 +205,7 @@ def backtest(store, cfg: Config, since: float = 0.0, picks: set[str] | None = No
         if "drop" in r:
             out["dropped"][r["drop"]] = out["dropped"].get(r["drop"], 0) + 1
     rng = np.random.default_rng(0)
-
-    def summary(vals):
-        a = np.array(vals)
-        if len(a) == 0:
-            return {"n": 0}
-        lo, hi = np.percentile([rng.choice(a, len(a)).mean() for _ in range(1000)], [5, 95])
-        return {"n": len(a), "mean_pct": round(a.mean() * 100, 1), "ci90": [round(lo * 100, 1), round(hi * 100, 1)],
-                "median_pct": round(float(np.median(a)) * 100, 1), "rugged_pct": round(float(np.mean(a <= -0.99)) * 100)}
+    summary = lambda vals: _summary(vals, rng)
 
     groups = {"all sampled hand-made": [r for r in data if "ret" in r and r["sample"]],
               "eligible (first-sight liquidity >= min)": [r for r in data if r.get("eligible") and r["sample"]]}
@@ -115,4 +220,18 @@ def backtest(store, cfg: Config, since: float = 0.0, picks: set[str] | None = No
                                 if both else None}
         g["first sight seconds (median)"] = round(float(np.median([r["seen_s"] for r in rs])), 1) if rs else None
         out[name] = g
+    # The fair comparison: sampled pools a second-x buyer would take (liquid by the chain's numbers at x, not yet
+    # pulled), each pool's second-x return minus what the first-sight buyer got on it (0 when it skipped the pool
+    # because it was already pulled or no longer liquid enough at first sight).
+    fair = {}
+    for x in ENTRY_SECONDS:
+        rs = [r for r in data if r.get("sample") and x in r.get("ret", {}) and r["liquid"].get(x)]
+        first = [(r["ret"]["first sight"] if r["ret"]["first sight"] is not None and r["eligible"] else 0.0)
+                 for r in rs]
+        fair[f"second {x}"] = {"second x": summary([r["ret"][x] for r in rs]),
+                               "first sight on the same pools (0 = skipped)": summary(first),
+                               "paired gain (second x - first sight)": summary(
+                                   [r["ret"][x] - f for r, f in zip(rs, first)])}
+    out["fair: liquid at second x"] = fair
+    out["ranking (walk-forward, on-chain features at second x)"] = rank(data, rng)
     return out

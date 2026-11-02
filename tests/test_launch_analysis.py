@@ -40,3 +40,38 @@ def test_entry_seconds_link_chain_prices_to_first_sight_and_the_5_minute_exit():
     assert rug["first sight"] is None and rug[10] == -1.0  # the early buyer is caught; first sight skips it
     picks = out["early-book picks"]
     assert picks["first sight"]["n"] == 1 and picks["second 10"]["mean_pct"] == pytest.approx(194.0)
+
+
+def test_launch_features_read_what_the_chain_shows_by_second_x():
+    txs = [[0, 1, "OP", 1000, 50, 1000, 50], [0, 1, "OP", -10, 1, 990, 51],  # creator's own buy in the creation slot
+           [3, 2, "A", -20, 2, 970, 53], [8, 3, "B", 15, -1, 985, 52], [20, 4, "C", -50, 5, 935, 57]]
+    f = la.launch_features(txs, 10, "OP", prior_pools=2, seed_sol=50)
+    assert f["log_buys"] == pytest.approx(__import__("math").log1p(2)) and f["log_sells"] > 0
+    assert f["creator_buys"] == 1 and f["first_slot_txs"] == 2 and f["repeat_creator"] == 1
+    assert f["sol_growth"] == pytest.approx(52 / 50)  # the trade at second 20 isn't visible yet
+
+
+def test_ranking_walks_forward_and_its_top_picks_beat_buying_everything():
+    import numpy as np
+    st = WatchStore(":memory:")
+    rng = np.random.default_rng(3)
+    for i in range(360):  # three days; pools with many early buyers end up higher
+        busy = rng.random() < 0.3
+        pool = f"P{i}"
+        created = T0 + (i // 120) * 86400 + (i % 120) * 600
+        txs = [[0, 1, "OP", 1000, 50, 1000, 50]] + [[1 + j, 2 + j, f"W{j}", -1, 0.5, 1000 - j, 50 + 0.5 * j]
+                                                     for j in range(8 if busy else 1)]
+        st.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts, first) VALUES(?,?,?,?,?,?,?)",
+                   (pool, pool + "Mint", "pumpswap", "TOK", created, created + 60,  # same name: no drift
+                    json.dumps({"price": 1e-5, "liq": 20_000.0})))
+        st.execute("INSERT INTO watch_enrich(pool, kind, ts, data) VALUES(?,?,?,?)",
+                   (pool, "launch", created + 400, json.dumps({"create_ts": created, "txs": txs, "complete": True,
+                                                                "creator": "OP", "selection": "sample"})))
+        st.execute("INSERT INTO watch_snaps(pool, age_min, ts, data) VALUES(?,?,?,?)",
+                   (pool, 5, created + 380, json.dumps({"price": (1.6e-5 if busy else 0.8e-5), "liq": 20_000.0})))
+    out = la.backtest(st, Config())
+    r10 = out["ranking (walk-forward, on-chain features at second x)"]["second 10"]
+    assert r10["days_scored"] == 2 and r10["top 10%"]["n"] > 0
+    assert r10["top 10%"]["mean_pct"] > r10["every liquid pool (test days)"]["mean_pct"]
+    fair = out["fair: liquid at second x"]["second 10"]
+    assert fair["second x"]["n"] == 360 and "paired gain (second x - first sight)" in fair
