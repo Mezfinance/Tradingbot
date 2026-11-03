@@ -45,7 +45,9 @@ LAUNCHPAD_DEXES = {"pump-fun", "meteora-dbc", "raydium-launchlab", "letsbonk", "
 REPORT_MAX_TRIES = 3  # attempts per UTC day (a crash would otherwise retry forever)
 REPORT_RETRY_S = 3600
 REPORT_TIMEOUT_S = 4 * 3600
-REPORT_KEEP_LOCAL = 3  # dated report folders kept on the volume (all are in the bucket)
+BACKUP_SPACE_FACTOR = 1.5  # free space needed for a backup: raw copy (= database size) + its .gz
+BACKUP_SPACE_MARGIN = 500_000_000  # plus room for the bot to keep writing meanwhile
+REPORT_KEEP_LOCAL = 3 # dated report folders kept on the volume (all are in the bucket)
 WINDOWS = ("m5", "m15", "m30", "h1", "h6", "h24")
 MAX_PAGES = 3  # new_pools pages per poll; ~20 pools a page
 SNAP_CALLS_PER_STEP = 4  # 30 pools per call
@@ -470,14 +472,26 @@ class Watcher:
             out_dir = Path(self.store.path).resolve().parent / "backups"
             out_dir.mkdir(parents=True, exist_ok=True)
             raw, final = out_dir / f"watch-{date}.db", out_dir / f"watch-{date}.db.gz"
+            # Older copies are in the bucket: drop them first, so the volume never holds the database, its raw
+            # copy, the new .gz and all the old ones at once (that filled the volume on 2026-11-03).
+            keep_old = max(0, self.cfg.watch_backup_keep_local - 1)
+            olds = sorted(p for p in out_dir.glob("watch-*.db.gz") if p != final)
+            for old in olds[:len(olds) - keep_old] if keep_old else olds:
+                old.unlink()
+            db = Path(self.store.path)
+            size = sum(p.stat().st_size for p in (db, Path(f"{db}-wal")) if p.exists())
+            free = shutil.disk_usage(out_dir).free
+            need = int(size * BACKUP_SPACE_FACTOR) + BACKUP_SPACE_MARGIN
+            if free < need:  # the raw copy alone is the database's size; skip rather than fill the disk
+                log.error("watch backup skipped: %.0f MB free, needs %.0f MB", free / 1e6, need / 1e6)
+                self.store.set_state("last_backup", date)
+                return
             self.store.backup(str(raw))
             try:
                 with open(raw, "rb") as src, gzip.open(final, "wb", compresslevel=6) as dst:
                     shutil.copyfileobj(src, dst, length=1 << 20)
             finally:
                 raw.unlink(missing_ok=True)
-            for old in sorted(out_dir.glob("watch-*.db.gz"))[:-self.cfg.watch_backup_keep_local]:
-                old.unlink()
             client = self.s3_factory() if self.s3_factory else None
             if client is not None:
                 client.upload_file(str(final), os.environ["BUCKET_NAME"], f"watch/{final.name}")

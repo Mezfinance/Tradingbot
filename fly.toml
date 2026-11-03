@@ -32,8 +32,8 @@ primary_region = "iad"
   destination = "/data"
   snapshot_retention = 14
   auto_extend_size_threshold = 80
-  auto_extend_size_increment = "1GB"
-  auto_extend_size_limit = "5GB"
+  auto_extend_size_increment = "2GB"
+  auto_extend_size_limit = "30GB"
 
 # The bot's watchdog exits the process if a loop stalls; this brings it straight back.
 [[restart]]

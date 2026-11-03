@@ -126,6 +126,25 @@ def test_daily_backup_uploads_once(tmp_path, monkeypatch):
     assert (tmp_path / "backups" / "watch-2026-10-15.db.gz").exists()
 
 
+def test_backup_drops_old_copies_first_and_skips_when_the_disk_is_short(tmp_path, monkeypatch):
+    import shutil as sh
+    from tradingbot import watcher as wm
+    cfg = Config(db_path=str(tmp_path / "bot.db"))
+    w = Watcher(cfg, FakeGecko(), WatchStore(str(tmp_path / "watch.db")))
+    backups = tmp_path / "backups"
+    backups.mkdir()
+    (backups / "watch-2026-10-13.db.gz").write_bytes(b"old")
+    (backups / "watch-2026-10-14.db.gz").write_bytes(b"old")
+    w.backup_if_due(datetime(2026, 10, 15, 1, tzinfo=timezone.utc))
+    assert sorted(p.name for p in backups.iterdir()) == ["watch-2026-10-15.db.gz"]  # keep 1: the bucket has the rest
+    # too little free space for the raw copy: no backup, nothing half-written, tried again tomorrow
+    real = sh.disk_usage
+    monkeypatch.setattr(wm.shutil, "disk_usage", lambda p: real(p)._replace(free=10))
+    w.backup_if_due(datetime(2026, 10, 16, 1, tzinfo=timezone.utc))
+    assert sorted(p.name for p in backups.iterdir()) == []  # old copy dropped, new one skipped
+    assert w.store.get_state("last_backup") == "2026-10-16"
+
+
 def test_compact_flattens_windows():
     c = compact(pool("A", "MA")["attributes"])
     assert c["buys_m5"] == 10 and c["vol_m5"] == 800.0 and c["chg_m5"] == 12.5 and c["buys_h1"] is None

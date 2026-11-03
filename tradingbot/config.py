@@ -35,7 +35,7 @@ class Config:
     watch_ages_min: str = "5,15,30,60,180,360,1440"  # snapshot each pool at these ages
     watch_info_age_min: float = 15.0  # token info (socials, developer, holders) taken at this age
     watch_ohlcv_min_volume_usd: float = 5000.0  # fetch 5-min candles at 24h only above this 24h volume
-    watch_backup_keep_local: int = 2
+    watch_backup_keep_local: int = 1  # every copy is also in the bucket
     # --- watcher enrichment (tradingbot/enrich.py): extra pump factors, each budgeted
     enrich: bool = True
     enrich_poll_s: int = 20
