@@ -72,6 +72,8 @@ def main(argv: list[str] | None = None) -> None:
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
     parser.add_argument("--all", action="store_true", help="report: every book, not just model5")
+    parser.add_argument("--rps", type=float, default=2.0,
+                        help="launch-hist-backfill: Helius calls per second (the live scorer shares the plan's limit)")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
     parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
@@ -249,7 +251,9 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot import launch_hist
         from tradingbot.data.helius import Helius
         from tradingbot.watcher import WatchStore, watch_db_path
-        out = launch_hist.backfill(WatchStore(watch_db_path(cfg)), Helius(client=httpx.Client(timeout=60)), args.days,
+        helius = Helius(client=httpx.Client(timeout=60))
+        helius.min_interval_s = 1 / max(args.rps, 0.1)  # its own process: pace it below what the live scorer needs
+        out = launch_hist.backfill(WatchStore(watch_db_path(cfg)), helius, args.days,
                                    args.max_credits, progress=lambda i, n, c: print(
                                        f"pools {i}/{n}, credits {c}", file=sys.stderr, flush=True))
         print(json.dumps(out, indent=2))
