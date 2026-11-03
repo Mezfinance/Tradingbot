@@ -179,6 +179,18 @@ def _split(rs, rng) -> dict:
             "never listed": la._summary([r["ret"][FILL_S] for r in rs if not r["listed"]], rng)}
 
 
+def _shifted(train: list[dict], test_rows: list[dict], top: int = 3) -> dict:
+    """The features whose test-day mean is furthest from the training mean, in training standard deviations."""
+    out = {}
+    for k in sorted({k for r in train for k in r["feat"][DECIDE_S]} - set(la.LIVE_DROP)):
+        a = [r["feat"][DECIDE_S][k] for r in train if r["feat"][DECIDE_S].get(k) is not None]
+        b = [r["feat"][DECIDE_S][k] for r in test_rows if r["feat"][DECIDE_S].get(k) is not None]
+        if len(a) > 1 and b:
+            out[k] = (float(np.mean(b)) - float(np.mean(a))) / (float(np.std(a)) + 1e-9)
+    best = sorted(out, key=lambda k: -abs(out[k]))[:top]
+    return {k: round(out[k], 2) if abs(out[k]) < 1e6 else "constant in training" for k in best}
+
+
 def test(store, cfg: Config) -> dict:
     from tradingbot.launch_live import model_path
     from tradingbot.model_book import Model
@@ -214,15 +226,20 @@ def test(store, cfg: Config) -> dict:
             continue
         tr, te = fit
         base += test_rows
-        row = {"pools": len(test_rows), "all_mean_pct": round(100 * float(np.mean([r["ret"][FILL_S] for r in test_rows])), 1)}
+        row = {"pools": len(test_rows), "all_mean_pct": round(100 * float(np.mean([r["ret"][FILL_S] for r in test_rows])), 1),
+               # A cut-off from the training scores picked 99% of 11-02's pools: some feature shifts day to day.
+               # Picks are the top k% of the day's own scores; this shows how far the training cut-off was off.
+               "share above the training top-2% cut (%)": round(100 * float(np.mean(
+                   te >= np.quantile(tr, 0.98) - 1e-9)), 1),
+               "most shifted features (z vs training)": _shifted(train, test_rows)}
         for k in la.TIMING_TOP_PCT:
-            cut = float(np.quantile(tr, 1 - k / 100))
+            cut = float(np.quantile(te, 1 - k / 100))
             chosen = [r for r, s in zip(test_rows, te) if s >= cut - 1e-9]
             picks[k] += chosen
             row[f"top {k:g}%"] = {"n": len(chosen), "mean_pct": round(100 * float(np.mean(
                 [r["ret"][FILL_S] for r in chosen])), 1) if chosen else None}
         by_day[d] = row
-    out["walk-forward on these rows (train on earlier days, no names)"] = {
+    out["walk-forward on these rows (train on earlier days, no names; picks = top k% of each day's scores)"] = {
         "days_scored": len(by_day), "every liquid pool (test days)": _split(base, rng),
         **{f"top {k:g}%": _split(picks[k], rng) for k in la.TIMING_TOP_PCT}, "by day": by_day,
         **({} if by_day else {"note": f"needs {la.RANK_MIN_TRAIN}+ liquid pools on earlier days"})}

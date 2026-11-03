@@ -108,8 +108,12 @@ def test_test_reports_listed_and_unlisted():
     lh.backfill(st, make(pools), 4, 100_000, now=NOW)
     out = lh.test(st, Config(db_path=":memory:"))
     assert out["liquid at second 4"] == 300 and out["every liquid pool"]["never listed"]["n"] == 300
-    wf = out["walk-forward on these rows (train on earlier days, no names)"]
+    wf = out["walk-forward on these rows (train on earlier days, no names; picks = top k% of each day's scores)"]
     assert "top 2%" in wf and "by day" in wf
+    assert wf["by day"]
+    for d, row in wf["by day"].items():  # picks are a share of the day whatever the training scores did
+        assert row["top 5%"]["n"] <= max(2, round(0.05 * row["pools"]) + 1)
+        assert "share above the training top-2% cut (%)" in row and row["most shifted features (z vs training)"]
 
 
 class HeadOnlyHelius(FakeHelius):
