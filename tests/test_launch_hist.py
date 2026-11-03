@@ -82,6 +82,18 @@ def test_backfill_keeps_pools_created_in_the_window():
     assert lh.backfill(st, again, 3, 10_000, now=NOW)["already fetched"] == 3 and again.history_calls == 0
 
 
+def test_longer_window_refetches_pools_a_shorter_run_left_outside():
+    st = WatchStore(":memory:")
+    pools = {"P1": (NOW - 3600, 2.0), "MID": (NOW - 5 * 86400, 1.0), "OLD": (NOW - 10 * 86400, 1.0)}
+    lh.backfill(st, make(pools), 3, 10_000, now=NOW)  # MID and OLD fall outside the 3-day window
+    again = FakeHelius(pools)
+    again.t_for = lambda lp: pools["MID"][0]  # only MID is looked at again: OLD is outside 7 days too
+    out = lh.backfill(st, again, 7, 10_000, now=NOW)
+    assert out["already fetched"] == 2 and out["fetched"] == 1
+    rows = {r["pool"]: r["status"] for r in st.query("SELECT * FROM watch_launch_hist")}
+    assert rows == {"P1": "ok", "MID": "ok", "OLD": "outside window"}
+
+
 def test_backfill_stops_at_the_credit_cap():
     st = WatchStore(":memory:")
     pools = {f"P{i}": (NOW - 3600 - i, 1.0) for i in range(5)}

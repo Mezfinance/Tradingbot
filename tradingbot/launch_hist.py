@@ -73,8 +73,10 @@ def backfill(store, helius: Helius, days: float, max_credits: int, now: float | 
         return {"error": "could not list pools (getSlot / getProgramAccountsV2 failed; needs HELIUS_API_KEY)"}
     stats["candidates"] = len(pools)
     stats["listing pages"] = getattr(helius, "last_pages", None)
-    done = {r[0] for r in store.query("SELECT pool FROM watch_launch_hist")}
     start, end = now - days * 86400, now - SPAN_S - 60
+    # A pool saved as 'outside window' by a shorter run is fetched again once a longer window covers it.
+    done = {r[0] for r in store.query("SELECT pool, status, create_ts FROM watch_launch_hist")
+            if r[1] != "outside window" or r[2] is None or not start <= r[2] <= end}
     save = lambda p, status, create=None, data=None: store.execute(
         "INSERT OR REPLACE INTO watch_launch_hist(pool, token_mint, lp_mint, create_ts, status, data, ts) "
         "VALUES(?,?,?,?,?,?,?)", (p["pool"], p["token_mint"], p["lp_mint"], create, status, data, now))
