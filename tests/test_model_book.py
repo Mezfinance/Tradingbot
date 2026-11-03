@@ -612,6 +612,41 @@ def test_rolling_books_take_only_signals_in_the_top_of_the_past_day(cfg, good_pa
         cfg.early_book = cfg.early_rolling = False
 
 
+def test_the_wide_book_takes_signals_above_mean_plus_one_sd(cfg, good_pair, tmp_path):
+    cfg.db_path = str(tmp_path / "bot.db")
+    cfg.early_book = cfg.early_wide = True
+    try:
+        store = early_store()
+        cfg.model_train_days = 30
+        mb.train_early_and_save(store, cfg)
+        book = mb.ModelBook(cfg)
+        book.store = store
+        meta = book.early.meta
+        assert meta["cut_wide"] < book.early.threshold  # wider than the top 5%
+        assert 0.05 < meta["wide_share_recent"] < 0.5
+        now = time.time()
+        pool = {"pool": "XBUSY", "mint": "BUSY", "dex": "pumpswap", "name": "X / SOL", "created_ts": now - 120,
+                "seen_ts": now}
+        assert book.consider_first(pool, snap(1.0, buyers=300, liq=20_000.0)) is not None
+        assert book.signals.get_nowait()["wide"]
+        book.early.meta.pop("cut_wide")  # a model trained before the wide book: no wide signals
+        assert not mb.early_wants(mb.EARLY6W, {"fixed": True})
+        assert mb.active_books(cfg)[-1] == mb.EARLY6W
+        j = Journal(":memory:")
+        eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                     model_executor=PaperExecutor(cfg))
+        base = {"dex": "pumpswap", "created_ts": time.time() - 120, "name": "E", "price": 2.5e-5, "liq": 30_000.0,
+                "score": 1.0, "ts": time.time(), "kind": "early", "rolling": False}
+        eng.model_book.signals.put(dict(base, pool="P1", mint="WIDE", fixed=False, wide=True))
+        eng.model_book.signals.put(dict(base, pool="P2", mint="BOTH", fixed=True, wide=True))
+        eng.buy_model_signals()
+        assert {p.token_address for p in j.open_positions(mb.EARLY6W)} == {"WIDE", "BOTH"}
+        assert {p.token_address for p in j.open_positions(mb.EARLY6)} == {"BOTH"}
+        assert mb.exit_deadline(cfg, mb.EARLY6W, base) == base["created_ts"] + 360
+    finally:
+        cfg.early_book = cfg.early_wide = False
+
+
 def test_the_rolling_window_is_rebuilt_from_the_store_and_after_a_retrain(tmp_path):
     cfg = Config(db_path=str(tmp_path / "bot.db"), early_book=True, early_rolling=True, model_train_days=30)
     store = early_store()

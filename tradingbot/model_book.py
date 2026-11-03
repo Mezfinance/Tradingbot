@@ -20,6 +20,7 @@ No Claude anywhere.
 
 from __future__ import annotations
 
+import calendar
 import json
 import logging
 import math
@@ -49,7 +50,10 @@ EARLY5, EARLY6, EARLY7 = "early5", "early6", "early7"
 EARLY5R, EARLY6R, EARLY7R = "early5r", "early6r", "early7r"
 EARLY_FIXED = (EARLY5, EARLY6, EARLY7)
 EARLY_ROLLING = (EARLY5R, EARLY6R, EARLY7R)
-EARLY_EXIT_MIN = {EARLY5: 5.0, EARLY6: 6.0, EARLY7: 7.0, EARLY5R: 5.0, EARLY6R: 6.0, EARLY7R: 7.0}
+# Wide twin (11-03): early6's model and exits, but a lower fixed cut-off: the top `early_wide_top_pct` (16%) of the
+# recent training scores (`meta.cut_wide`). Mean + 1 SD was tried first: the scores are skewed, so it sat at ~top 5%.
+EARLY6W = "early6w"
+EARLY_EXIT_MIN = {EARLY5: 5.0, EARLY6: 6.0, EARLY7: 7.0, EARLY5R: 5.0, EARLY6R: 6.0, EARLY7R: 7.0, EARLY6W: 6.0}
 EARLY_BOOKS = tuple(EARLY_EXIT_MIN)
 # Launch books (11-02): picks of the second-4 launch scorer (launch_live), top 2% / top 5%, bought through Jupiter
 # (it routes hand-made pools within ~0.1-2.4 s of creation) and sold at pool minute 6.
@@ -111,12 +115,16 @@ def active_books(cfg: Config) -> list[str]:
     return ([NAME] if cfg.model_book_slow else []) + ([FAST] if cfg.model_book_fast else []) \
         + ([CLIMB] if cfg.model_book_climb else []) + ([OPS9, OPS10] if cfg.model_book_ops else []) \
         + (list(EARLY_FIXED) if cfg.early_book else []) + (list(EARLY_ROLLING) if cfg.early_rolling else []) \
+        + ([EARLY6W] if cfg.early_wide else []) \
         + ([LAUNCH2, LAUNCH5] if cfg.launch_book and cfg.launch_live else []) \
         + (list(LAUNCH_HIST_CUT) if cfg.launch_hist_book and cfg.launch_live else [])
 
 
 def early_wants(name: str, sig: dict) -> bool:
-    """Which early books take an early signal: the fixed books its fixed cut-off pass, the rolling ones its rolling."""
+    """Which early books take an early signal: the fixed books its fixed cut-off pass, the rolling ones its rolling,
+    the wide book its wide (top 16%) cut-off pass."""
+    if name == EARLY6W:
+        return bool(sig.get("wide"))
     return bool(sig.get("rolling")) if name in EARLY_ROLLING else bool(sig.get("fixed"))
 
 
@@ -294,18 +302,27 @@ def early_training_rows(store, now: float | None = None, days: float = 4) -> lis
             continue
         pulled = lf > 0 and l5 < wa.RUG_LIQ_SHARE * lf
         ret = -1.0 if pulled else min(p5 / pf - 1 - wa.ROUND_TRIP_COST, 3.0)  # cap: unit glitches print 500x
-        row = {"pool": p["pool"], "created_ts": p["created_ts"], "up": float(ret >= EARLY_GAIN), "ret": ret}
+        row = {"pool": p["pool"], "created_ts": p["created_ts"], "up": float(ret >= EARLY_GAIN), "ret": ret,
+               "first_liq": lf}
         row.update({k: v for k, v in early_features(dict(p), first, p["seen_ts"]).items() if v is not None})
         rows.append(row)
     return rows
 
 
+EARLY_NOT_FEATURES = {"pool", "created_ts", "up", "ret", "first_liq"}
+
+
 def train_early(store, cfg: Config, now: float | None = None) -> Model | None:
-    rows = early_training_rows(store, now, cfg.model_train_days)
+    return fit_early(early_training_rows(store, now, cfg.model_train_days), cfg)
+
+
+def fit_early(rows: list[dict], cfg: Config) -> Model | None:
+    """The early model on `rows` (oldest first): logistic on `up`, fixed cut-off = top `early_top_pct` of the last
+    2 days' scores, `cut_wide` = top `early_wide_top_pct` of the same scores."""
     if len(rows) < wa.MIN_ROWS or not any(r["up"] for r in rows):
         log.warning("early model: not enough rows to train (%d)", len(rows))
         return None
-    names = sorted({k for r in rows for k in r} - {"pool", "created_ts", "up", "ret"})
+    names = sorted({k for r in rows for k in r} - EARLY_NOT_FEATURES)
     x, med = wa._matrix(rows, names)
     y = np.array([r["up"] for r in rows])
     mu, sd = x.mean(0), x.std(0) + 1e-9
@@ -314,7 +331,9 @@ def train_early(store, cfg: Config, now: float | None = None) -> Model | None:
     recent = scores[[r["created_ts"] >= rows[-1]["created_ts"] - 2 * wa.DAY_S for r in rows]]
     threshold = float(np.quantile(recent, 1 - cfg.early_top_pct / 100))
     top = scores >= threshold
+    cut_wide = float(np.quantile(recent, 1 - cfg.early_wide_top_pct / 100))  # early6w: top early_wide_top_pct
     meta = {"trained_ts": time.time(), "rows": len(rows), "pump_rate": float(y.mean()),
+            "cut_wide": cut_wide, "wide_share_recent": float(np.mean(recent >= cut_wide)),
             "top_pump_rate_in_sample": float(y[top].mean()) if top.any() else None,
             "top_trade_ret_in_sample": float(np.mean([r["ret"] for r, t in zip(rows, top) if t])) if top.any() else None,
             "days": cfg.model_train_days, "top_pct": cfg.early_top_pct}
@@ -475,6 +494,62 @@ def early_backtest(store, cfg: Config, hours: float = 8, now: float | None = Non
             "note": "outcome = 5-minute snapshot (~pool minute 6) vs first-sight price, 6% round trip; emptied = -100%"}
 
 
+def early_walk_forward(store, cfg: Config, now: float | None = None, seed: int = 7) -> dict:
+    """Walk-forward test of the early books' cut-offs on every day the store holds: each UTC day is scored by an
+    early model trained only on the `model_train_days` before it (as the nightly retrain does), and its eligible
+    pools (liquid at first sight) are picked by the top-`early_top_pct` cut-off (early6) or the wide one (top
+    `early_wide_top_pct`, early6w). Outcome = the 5-minute snapshot (~pool minute 6) vs first sight, 6% round trip, emptied = -100%."""
+    rows = early_training_rows(store, now, days=10_000)
+    if not rows:
+        return {"error": "no rows"}
+    rng = np.random.default_rng(seed)
+    day = lambda ts: time.strftime("%Y-%m-%d", time.gmtime(ts))
+    days = sorted({day(r["created_ts"]) for r in rows})
+    groups = {"every eligible pool": [], "early6 (top 5%)": [], "early6w (top 16%)": [],
+              "added by early6w (between the cuts)": []}
+    by_day, cuts = [], []
+    for d in days:
+        start = calendar.timegm(time.strptime(d, "%Y-%m-%d"))  # UTC midnight
+        train = [r for r in rows if start - cfg.model_train_days * wa.DAY_S <= r["created_ts"] < start]
+        test = [r for r in rows if day(r["created_ts"]) == d and r["first_liq"] >= cfg.model_book_min_liq_usd]
+        if len(train) < wa.MIN_ROWS or not test:
+            continue
+        model = fit_early(train, cfg)
+        if model is None:
+            continue
+        scored = [(model.score({k: v for k, v in r.items() if k not in EARLY_NOT_FEATURES}), r["ret"]) for r in test]
+        cut5, wide = model.threshold, model.meta["cut_wide"]
+        picks = {"every eligible pool": [x for _, x in scored],
+                 "early6 (top 5%)": [x for s, x in scored if s >= cut5],
+                 "early6w (top 16%)": [x for s, x in scored if s >= wide],
+                 "added by early6w (between the cuts)": [x for s, x in scored if wide <= s < cut5]}
+        for k, v in picks.items():
+            groups[k] += v
+        by_day.append({"day": d, "train_rows": len(train), "eligible": len(test),
+                       **{k.split(" (")[0]: _ret_summary(v, rng, ci=False) for k, v in picks.items()
+                          if k != "every eligible pool"},
+                       "all_mean_pct": _ret_summary(picks["every eligible pool"], rng, ci=False)["mean_pct"]})
+        cuts.append({"day": d, "cut5": round(cut5, 3), "cut_wide": round(wide, 3),
+                     "wide_share_of_test_pct": round(100 * np.mean([s >= wide for s, _ in scored]), 1),
+                     "top5_share_of_test_pct": round(100 * np.mean([s >= cut5 for s, _ in scored]), 1)})
+    return {"days_tested": len(by_day), "first_day": days[0], "last_day": days[-1],
+            "overall": {k: _ret_summary(v, rng) for k, v in groups.items()}, "by_day": by_day, "cut_offs": cuts,
+            "note": "walk-forward by UTC day, trained on the previous model_train_days; outcome = 5-minute snapshot "
+                    "(~pool minute 6) vs first-sight price, 6% round trip, emptied = -100%; the last day may be partial"}
+
+
+def _ret_summary(rets: list[float], rng, ci: bool = True) -> dict:
+    if not rets:
+        return {"n": 0}
+    a = np.array(rets)
+    out = {"n": len(a), "mean_pct": round(float(a.mean()) * 100, 1), "median_pct": round(float(np.median(a)) * 100, 1),
+           "win_pct": round(float((a > 0).mean()) * 100), "emptied_pct": round(float((a <= -0.99).mean()) * 100)}
+    if ci and len(a) > 1:
+        means = rng.choice(a, (2000, len(a))).mean(1)
+        out["ci90"] = [round(float(np.percentile(means, 5)) * 100, 1), round(float(np.percentile(means, 95)) * 100, 1)]
+    return out
+
+
 def entry_audit(extras, mint: str) -> dict:
     """Jupiter's holder audit right now (free, one call)."""
     t = extras.jupiter_token(mint) if extras is not None else None
@@ -538,7 +613,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
     return {"finished_trades": len(trades), "rugs": len(rugs),
             "rug_rate_pct": round(100 * len(rugs) / len(trades), 1) if trades else None,
             "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0, OPS9: 13.0, OPS10: 15.0, EARLY5: 25.0, EARLY6: 25.0, EARLY7: 25.0,
-                                      EARLY5R: 26.0, EARLY6R: 26.0, EARLY7R: 26.0}.get(name, 76.0),  # 10-28 backtests
+                                      EARLY5R: 26.0, EARLY6R: 26.0, EARLY7R: 26.0, EARLY6W: 25.0}.get(name, 76.0),  # 10-28 backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 
@@ -646,7 +721,7 @@ class ModelBook:
         """Called by the watcher when it first sees a pool (`pool` has created_ts and seen_ts). Hand-made pools
         at or above the early model's fixed cut-off (fixed books) or in the top `early_top_pct` of the past day's
         eligible pools (rolling books) are queued."""
-        if not (self.cfg.early_book or self.cfg.early_rolling) or not first or \
+        if not (self.cfg.early_book or self.cfg.early_rolling or self.cfg.early_wide) or not first or \
                 not is_handmade(pool.get("dex") or "", pool.get("mint") or ""):
             return None
         self.reload()
@@ -665,14 +740,16 @@ class ModelBook:
             cut = rolling_cut_off(history, pool["seen_ts"], self.cfg.early_top_pct)
             rolling = cut is not None and score >= cut
             history.append((pool["seen_ts"], score))
-        if not (fixed or rolling):
+        cut_wide = self.early.meta.get("cut_wide")  # None on a model trained before 11-03: no wide signals
+        wide = bool(self.cfg.early_wide and cut_wide is not None and score >= cut_wide)
+        if not (fixed or rolling or wide):
             return None
         try:
             self.signals.put_nowait({"pool": pool["pool"], "mint": pool["mint"], "name": pool.get("name") or "",
                                      "score": score, "price": wa._f(first["price"]), "liq": liq, "ts": time.time(),
                                      "created_ts": pool["created_ts"], "seen_ts": pool["seen_ts"],
                                      "dex": pool.get("dex") or "", "kind": "early",
-                                     "fixed": fixed, "rolling": rolling})
+                                     "fixed": fixed, "rolling": rolling, "wide": wide})
         except queue.Full:
             return None
         if self.store is not None:  # the enricher records this pool's launch data whatever the random sample

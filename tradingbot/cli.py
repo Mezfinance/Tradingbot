@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "propose", "proposals", "watch-status", "watch-report",
                                             "watch-export", "watch-links", "watch-report-now",
                                             "watch-model-train", "model-status", "early-status",
-                                            "early-backtest", "launch-backtest", "launch-backfill", "launch-status",
+                                            "early-backtest", "early-walk-forward", "launch-backtest", "launch-backfill", "launch-status",
                                             "launch-hist-backfill", "launch-hist-test"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
@@ -287,6 +287,12 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot import model_book
         from tradingbot.watcher import WatchStore, watch_db_path
         print(json.dumps(model_book.early_backtest(WatchStore(watch_db_path(cfg)), cfg, args.hours or 8.0), indent=2))
+        return
+
+    if args.command == "early-walk-forward":
+        from tradingbot import model_book
+        from tradingbot.watcher import WatchStore, watch_db_path
+        print(json.dumps(model_book.early_walk_forward(WatchStore(watch_db_path(cfg)), cfg), indent=2))
         return
 
     if args.command == "launch-backfill":

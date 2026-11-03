@@ -150,6 +150,10 @@ class Config:
     # pools (rolling cut-off) instead of the fixed one set at training. Walk-forward on the 10-28 backup (snapshot
     # yardstick): -4.9%/trade, 90% CI -16..+6, vs -6.5% fixed and -4.1% for every eligible pool. Off unless switched on.
     early_rolling: bool = False
+    # early6w (11-03): early6's model and minute-6 exit, but a wider fixed cut-off: the top `early_wide_top_pct`
+    # of the recent training scores instead of the top 5% (`early-walk-forward` backtests it). Off unless switched on.
+    early_wide: bool = False
+    early_wide_top_pct: float = 16.0
     model_train_days: float = 4.0
 
     # --- Claude analyst -------------------------------------------------
