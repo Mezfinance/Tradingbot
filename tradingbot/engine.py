@@ -283,9 +283,16 @@ class Engine:
         prices = self.current_prices(set(held), held)
         now = time.time()
         self.journal.set_state("heartbeat", repr(now))
+        from tradingbot import model_book as mb
         for pos in positions:
             price = prices.get(pos.token_address)
             book = self.books.get(pos.strategy)
+            hold_only = pos.strategy in mb.LAUNCH_CUT
+            if hold_only and not price:
+                # A seconds-old token often has no feed price and no sell route yet, which used to read as $0
+                # and fire the stop (a launch4_5 trade was sold at pool second 17). These books only ever sell
+                # at their pool minute, so plan with the entry price; a real rug shows as no route at the exit.
+                price = pos.entry_price
             if price is None or book is None:
                 if price is None:
                     log.warning("no price for open position %s (%s)", pos.symbol, pos.strategy)
@@ -296,6 +303,8 @@ class Engine:
             before = (pos.tp_hits, pos.stop_price)
             exit_cfg = book.exit_cfg or self.cfg
             exits = risk.plan_exits(pos, price, now, exit_cfg)
+            if hold_only:  # no stop, as in their backtest: a bogus low feed price must not sell early
+                exits = [(q, r) for q, r in exits if r not in ("stop_loss", "breakeven_stop")]
             if not exits and now >= self._deadlines.get(pos.id, float("inf")):
                 exits = [(pos.qty, "pool_age_exit")]  # hand-made pool: out before its creator usually pulls it
             if not exits and self._climb_failed(pos.id, price, now):

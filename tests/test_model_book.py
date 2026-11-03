@@ -651,6 +651,15 @@ def test_launch_signals_go_to_the_matching_launch_book_with_a_minute_6_deadline(
         assert all(p.token_address not in ("L2", "L5") for p in j.open_positions(mb.FAST))
         timing = mb.early_timing(j, 0, tuple(mb.LAUNCH_CUT), mb.LAUNCH_STAGES)
         assert timing[mb.LAUNCH5]["buys"] == 2 and "created->decided" in timing[mb.LAUNCH5]
+        # a $0 or crashed feed price in the first seconds doesn't sell: only the minute-6 deadline does
+        for bad in ({"L2": 0.0, "L5": 0.0}, {"L2": 1e-12, "L5": 1e-12}, {}):
+            eng.current_prices = lambda tokens, held=None, bad=bad: dict(bad)
+            eng.manage_positions()
+            assert {p.token_address for p in j.open_positions(mb.LAUNCH5)} == {"L2", "L5"}
+        eng._deadlines[h5["L5"].id] = time.time() - 1
+        eng.current_prices = lambda tokens, held=None: {}
+        eng.manage_positions()
+        assert {p.token_address for p in j.open_positions(mb.LAUNCH5)} == {"L2"}  # sold at minute 6, no price needed
     finally:
         cfg.launch_book, cfg.launch_live = False, False
 
