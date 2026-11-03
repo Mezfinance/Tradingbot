@@ -154,6 +154,9 @@ class Config:
     # of the recent training scores instead of the top 5% (`early-walk-forward` backtests it). Off unless switched on.
     early_wide: bool = False
     early_wide_top_pct: float = 16.0
+    # early6t (11-03): early6's model and minute-6 exit, top `early_tight_top_pct` of the recent training scores.
+    early_tight: bool = False
+    early_tight_top_pct: float = 2.0
     model_train_days: float = 4.0
 
     # --- Claude analyst -------------------------------------------------

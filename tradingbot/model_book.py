@@ -53,7 +53,11 @@ EARLY_ROLLING = (EARLY5R, EARLY6R, EARLY7R)
 # Wide twin (11-03): early6's model and exits, but a lower fixed cut-off: the top `early_wide_top_pct` (16%) of the
 # recent training scores (`meta.cut_wide`). Mean + 1 SD was tried first: the scores are skewed, so it sat at ~top 5%.
 EARLY6W = "early6w"
-EARLY_EXIT_MIN = {EARLY5: 5.0, EARLY6: 6.0, EARLY7: 7.0, EARLY5R: 5.0, EARLY6R: 6.0, EARLY7R: 7.0, EARLY6W: 6.0}
+# Tight twin (11-03): early6's model and exits, top `early_tight_top_pct` (2%) of the recent training scores
+# (`meta.cut_tight`). Walk-forward 10-16..11-03: +1.1%/trade (n=202, CI -7.5..+9.9) vs top 5% -1.9%, every pool
+# -3.4%; but -8.3% on 10-16..10-29 and +15.2% on 10-30..11-03.
+EARLY6T = "early6t"
+EARLY_EXIT_MIN = {EARLY5: 5.0, EARLY6: 6.0, EARLY7: 7.0, EARLY5R: 5.0, EARLY6R: 6.0, EARLY7R: 7.0, EARLY6W: 6.0, EARLY6T: 6.0}
 EARLY_BOOKS = tuple(EARLY_EXIT_MIN)
 # Launch books (11-02): picks of the second-4 launch scorer (launch_live), top 2% / top 5%, bought through Jupiter
 # (it routes hand-made pools within ~0.1-2.4 s of creation) and sold at pool minute 6.
@@ -115,7 +119,7 @@ def active_books(cfg: Config) -> list[str]:
     return ([NAME] if cfg.model_book_slow else []) + ([FAST] if cfg.model_book_fast else []) \
         + ([CLIMB] if cfg.model_book_climb else []) + ([OPS9, OPS10] if cfg.model_book_ops else []) \
         + (list(EARLY_FIXED) if cfg.early_book else []) + (list(EARLY_ROLLING) if cfg.early_rolling else []) \
-        + ([EARLY6W] if cfg.early_wide else []) \
+        + ([EARLY6W] if cfg.early_wide else []) + ([EARLY6T] if cfg.early_tight else []) \
         + ([LAUNCH2, LAUNCH5] if cfg.launch_book and cfg.launch_live else []) \
         + (list(LAUNCH_HIST_CUT) if cfg.launch_hist_book and cfg.launch_live else [])
 
@@ -125,6 +129,8 @@ def early_wants(name: str, sig: dict) -> bool:
     the wide book its wide (top 16%) cut-off pass."""
     if name == EARLY6W:
         return bool(sig.get("wide"))
+    if name == EARLY6T:
+        return bool(sig.get("tight"))
     return bool(sig.get("rolling")) if name in EARLY_ROLLING else bool(sig.get("fixed"))
 
 
@@ -333,6 +339,7 @@ def fit_early(rows: list[dict], cfg: Config) -> Model | None:
     top = scores >= threshold
     cut_wide = float(np.quantile(recent, 1 - cfg.early_wide_top_pct / 100))  # early6w: top early_wide_top_pct
     meta = {"trained_ts": time.time(), "rows": len(rows), "pump_rate": float(y.mean()),
+            "cut_tight": float(np.quantile(recent, 1 - cfg.early_tight_top_pct / 100)),
             "cut_wide": cut_wide, "wide_share_recent": float(np.mean(recent >= cut_wide)),
             "cuts": {f"{t:g}": float(np.quantile(recent, 1 - t / 100)) for t in WALK_TOPS},
             "top_pump_rate_in_sample": float(y[top].mean()) if top.any() else None,
@@ -615,7 +622,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
     return {"finished_trades": len(trades), "rugs": len(rugs),
             "rug_rate_pct": round(100 * len(rugs) / len(trades), 1) if trades else None,
             "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0, OPS9: 13.0, OPS10: 15.0, EARLY5: 25.0, EARLY6: 25.0, EARLY7: 25.0,
-                                      EARLY5R: 26.0, EARLY6R: 26.0, EARLY7R: 26.0, EARLY6W: 25.0}.get(name, 76.0),  # 10-28 backtests
+                                      EARLY5R: 26.0, EARLY6R: 26.0, EARLY7R: 26.0, EARLY6W: 25.0, EARLY6T: 27.0}.get(name, 76.0),  # 10-28 backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 
@@ -723,7 +730,8 @@ class ModelBook:
         """Called by the watcher when it first sees a pool (`pool` has created_ts and seen_ts). Hand-made pools
         at or above the early model's fixed cut-off (fixed books) or in the top `early_top_pct` of the past day's
         eligible pools (rolling books) are queued."""
-        if not (self.cfg.early_book or self.cfg.early_rolling or self.cfg.early_wide) or not first or \
+        if not (self.cfg.early_book or self.cfg.early_rolling or self.cfg.early_wide
+                or self.cfg.early_tight) or not first or \
                 not is_handmade(pool.get("dex") or "", pool.get("mint") or ""):
             return None
         self.reload()
@@ -744,14 +752,16 @@ class ModelBook:
             history.append((pool["seen_ts"], score))
         cut_wide = self.early.meta.get("cut_wide")  # None on a model trained before 11-03: no wide signals
         wide = bool(self.cfg.early_wide and cut_wide is not None and score >= cut_wide)
-        if not (fixed or rolling or wide):
+        cut_tight = self.early.meta.get("cut_tight")  # None on a model trained before: no tight signals
+        tight = bool(self.cfg.early_tight and cut_tight is not None and score >= cut_tight)
+        if not (fixed or rolling or wide or tight):
             return None
         try:
             self.signals.put_nowait({"pool": pool["pool"], "mint": pool["mint"], "name": pool.get("name") or "",
                                      "score": score, "price": wa._f(first["price"]), "liq": liq, "ts": time.time(),
                                      "created_ts": pool["created_ts"], "seen_ts": pool["seen_ts"],
                                      "dex": pool.get("dex") or "", "kind": "early",
-                                     "fixed": fixed, "rolling": rolling, "wide": wide})
+                                     "fixed": fixed, "rolling": rolling, "wide": wide, "tight": tight})
         except queue.Full:
             return None
         if self.store is not None:  # the enricher records this pool's launch data whatever the random sample
