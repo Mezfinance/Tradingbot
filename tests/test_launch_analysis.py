@@ -178,3 +178,14 @@ def test_export_exit_rows_lists_picks_and_a_sample():
     r = tops[0]
     assert r["link"] > 0 and r["snap_min"] == pytest.approx(380 / 60, abs=0.01) and r["created"] and r["day"]
     assert {r["top"] for r in tops} <= {2.0, 5.0}
+
+
+def test_fit_score_caps_extreme_feature_values():
+    import numpy as np
+    rng = np.random.default_rng(1)
+    train = [{"feat": {4: {"a": float(rng.normal()), "b": float(rng.normal())}}, "ret": {6: float(rng.normal())}}
+             for _ in range(200)]
+    test = [{"feat": {4: {"a": 0.0, "b": 1e9}}, "ret": {6: 0.0}}]  # a ratio blown up by a near-zero denominator
+    tr, te = la._fit_score(train, test, 4, 6)
+    xs = np.array([[r["feat"][4]["a"], r["feat"][4]["b"]] for r in train])
+    assert abs(te[0]) <= np.abs(tr).max() + la.CLIP_Z * 10  # bounded, not ~1e9 times the weight

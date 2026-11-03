@@ -212,7 +212,11 @@ def test(store, cfg: Config) -> dict:
         out["live model (launch4.json; in-sample for listed pools it was trained on)"] = {
             "share above cut2 (%)": round(100 * len(pick(cut2)) / len(liquid), 1) if liquid else None,
             "share above cut5 (%)": round(100 * len(pick(cut5)) / len(liquid), 1) if liquid else None,
-            "top 2%": _split(pick(cut2), rng), "top 5%": _split(pick(cut5), rng)}
+            "top 2%": _split(pick(cut2), rng), "top 5%": _split(pick(cut5), rng),
+            # the live model was trained on these days (listed pools): one good day can carry the whole mean
+            "by day": {d: {f"top {k}%": _day_mean([r for r in pick(c) if la._day(r) == d])
+                           for k, c in ((2, cut2), (5, cut5))}
+                       for d in sorted({la._day(r) for r in liquid})}}
     except (OSError, ValueError, KeyError):
         out["live model (launch4.json; in-sample for listed pools it was trained on)"] = None
     out["walk-forward on these rows (train on earlier days, no names; picks = top k% of each day's scores)"] = \
@@ -223,6 +227,11 @@ def test(store, cfg: Config) -> dict:
 
 
 CALENDAR = ("hour_sin", "hour_cos", "weekend")
+
+
+def _day_mean(rows: list[dict]) -> dict:
+    return {"n": len(rows), "mean_pct": round(100 * float(np.mean([r["ret"][FILL_S] for r in rows])), 1) if rows else None,
+            "rugged": sum(r["ret"][FILL_S] <= -0.8 for r in rows)}
 
 
 def _walk(liquid: list[dict], rng, drop: tuple) -> dict:

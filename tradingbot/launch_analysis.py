@@ -184,6 +184,9 @@ def _day(r) -> str:
     return time.strftime("%Y-%m-%d", time.gmtime(r["created_ts"]))
 
 
+CLIP_Z = 5.0  # standardised feature values are capped at +-5 in the backtest models
+
+
 def _fit_score(train: list[dict], test: list[dict], feat_x: int, label_x: int, drop: tuple = ()):
     """Logistic on features at second feat_x, label: the trade filled at second label_x made money. Returns
     (training scores, test scores) or None when the training labels are all one class."""
@@ -193,9 +196,12 @@ def _fit_score(train: list[dict], test: list[dict], feat_x: int, label_x: int, d
     if y.min() == y.max():
         return None
     mu, sd = xs.mean(0), xs.std(0) + 1e-9
-    w, b = wa.logistic((xs - mu) / sd, y)
-    te = (wa._matrix([r["feat"][feat_x] for r in test], names, med)[0] - mu) / sd @ w + b
-    return ((xs - mu) / sd) @ w + b, te
+    # Cap standardised values: a near-constant feature in training (weekend) or a ratio over a near-zero seed
+    # (net_flow_share, sol_growth: z ~31 on 10-30) otherwise moves every score by a huge amount.
+    z = lambda m: np.clip((m - mu) / sd, -CLIP_Z, CLIP_Z)
+    w, b = wa.logistic(z(xs), y)
+    te = z(wa._matrix([r["feat"][feat_x] for r in test], names, med)[0]) @ w + b
+    return z(xs) @ w + b, te
 
 
 EXIT_CHECK_CELL = (4, 6)  # the live rule: decide on second-4 features, fill at second 6
