@@ -53,6 +53,9 @@ WITHDRAW_RE = re.compile(r"Instruction: (Withdraw|RemoveLiquidity|RemoveAllLiqui
 
 _pace_lock = threading.Lock()
 _next_free = [0.0]
+# Process-wide call counts, so slow live decisions can be traced to Helius refusing calls (429s are retried
+# silently with back-off). `wait_s` = time spent in the pace queue plus 429 back-off.
+STATS = {"calls": 0, "rate_limited": 0, "failed": 0, "wait_s": 0.0}
 
 
 def _pace(interval: float) -> None:
@@ -64,6 +67,7 @@ def _pace(interval: float) -> None:
         wait = _next_free[0] - now
         _next_free[0] = max(now, _next_free[0]) + interval
     if wait > 0:
+        STATS["wait_s"] += wait
         time.sleep(wait)
 
 
@@ -83,16 +87,21 @@ class Helius:
             return None
         for attempt in range(RETRIES_429 + 1):
             _pace(self.min_interval_s)
+            STATS["calls"] += 1
             try:
                 resp = self.http.post(RPC_URL, params={"api-key": self.api_key},
                                       json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
             except httpx.HTTPError as exc:
+                STATS["failed"] += 1
                 log.warning("helius %s failed: %s", method, exc)
                 return None
             if resp.status_code != 429:
                 break
+            STATS["rate_limited"] += 1
             if attempt < RETRIES_429:
-                time.sleep(min(8.0, 1.0 * 2 ** attempt))
+                back_off = min(8.0, 1.0 * 2 ** attempt)
+                STATS["wait_s"] += back_off
+                time.sleep(back_off)
         if resp.status_code != 200:
             log.warning("helius %s -> HTTP %s", method, resp.status_code)
             return None

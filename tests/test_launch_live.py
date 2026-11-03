@@ -151,6 +151,10 @@ def test_graduation_and_late_pools_are_skipped(setup):
     live.step()
     r = live._row(HAND_POOL)
     assert r["status"] == "skipped" and "too late" in r["reason"]
+    live.save_state(force=True)  # why it was late: the decide started 30 s after its due time, not a slow call
+    ws = json.loads(st.get_state("launch_live:ws"))
+    assert ws["decide_start_lag_s"]["median"] == pytest.approx(30 - cfg.launch_live_decide_delay_s, abs=0.5)
+    assert ws["history_call_s"]["n"] == 1 and "rate_limited" in ws["helius_process"]
 
 
 def test_websocket_message_and_restart(setup):

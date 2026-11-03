@@ -160,6 +160,8 @@ class LaunchLive:
         self.lp_pool: dict[str, str] = {}  # LP mint -> pool, for pools waiting on their outcome
         self.counts: collections.Counter = collections.Counter()
         self.ws = {"connected": False, "messages": 0, "bytes": 0, "reconnects": 0, "last_error": None}
+        self.history_s = collections.deque(maxlen=50)  # seconds each decision's history call took
+        self.start_lag_s = collections.deque(maxlen=50)  # seconds each first decide attempt started after its due time
         self.model, self.model_mtime, self.model_checked = None, None, 0.0
         self.pool = ThreadPoolExecutor(workers, thread_name_prefix="launch-live") if workers else None
         self.saved_at = 0.0
@@ -216,6 +218,15 @@ class LaunchLive:
         with self.lock:
             counts, self.counts = self.counts, collections.Counter()
             ws = dict(self.ws, saved_ts=now)
+            calls, lags = sorted(self.history_s), sorted(self.start_lag_s)
+        from tradingbot.data import helius as hl
+        ws["helius_process"] = {k: round(v, 1) for k, v in hl.STATS.items()}  # whole bot process, since start
+        if calls:  # how long the decision's history call took (recent ones), pace queue and 429 back-off included
+            ws["history_call_s"] = {"n": len(calls), "median": round(calls[len(calls) // 2], 2),
+                                    "max": round(calls[-1], 2)}
+        if lags:  # a large lag means the worker threads were busy with other jobs
+            ws["decide_start_lag_s"] = {"n": len(lags), "median": round(lags[len(lags) // 2], 2),
+                                        "max": round(lags[-1], 2)}
         key = f"launch_live:counts:{day}"
         old = collections.Counter(json.loads(self.store.get_state(key) or "{}"))
         old.update(counts)
@@ -346,8 +357,14 @@ class LaunchLive:
         if not self.budget.allows(10 * HISTORY_PAGES):
             self._update(pool, status="skipped", reason="out of budget")
             return
+        if pool not in self.tries and r["notified_ts"]:
+            with self.lock:
+                self.start_lag_s.append(self.clock() - r["notified_ts"] - self.cfg.launch_live_decide_delay_s)
         before = self.helius.credits_used
+        started = time.monotonic()
         txs, done, ok = self.helius.history_until(pool, self.clock(), HISTORY_PAGES)
+        with self.lock:
+            self.history_s.append(time.monotonic() - started)
         self._spend(before, pool)
         now = self.clock()
         if ok and not txs and self.tries.get(pool, 0) < EMPTY_RETRIES:
