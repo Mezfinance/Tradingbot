@@ -54,8 +54,12 @@ EARLY_BOOKS = tuple(EARLY_EXIT_MIN)
 # Launch books (11-02): picks of the second-4 launch scorer (launch_live), top 2% / top 5%, bought through Jupiter
 # (it routes hand-made pools within ~0.1-2.4 s of creation) and sold at pool minute 6.
 LAUNCH2, LAUNCH5 = "launch4_2", "launch4_5"
-LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5"}
-LAUNCH_EXIT_MIN = {LAUNCH2: 6.0, LAUNCH5: 6.0}
+# Their twins (11-03): a model trained on the chain-only history of every hand-made pool (launch_hist) plus the
+# scorer's own outcomes, no hour/weekend features, picking the top 2% / 5% of the past 24 h's scores (rolling).
+LAUNCH2H, LAUNCH5H = "launch4h_2", "launch4h_5"
+LAUNCH_HIST_CUT = {LAUNCH2H: "top2h", LAUNCH5H: "top5h"}
+LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", **LAUNCH_HIST_CUT}
+LAUNCH_EXIT_MIN = {b: 6.0 for b in LAUNCH_CUT}
 POOL_MINUTE_EXIT = {**EARLY_EXIT_MIN, **LAUNCH_EXIT_MIN}  # books that sell every position by a pool minute
 EARLY_MAX_SEEN_MIN = 4.0  # first sight later than this leaves no time to trade (and was left out of training)
 EARLY_GAIN = 0.10  # label: the 5-minute snapshot price >= first-sight price x 1.10 after costs, pool intact
@@ -107,7 +111,8 @@ def active_books(cfg: Config) -> list[str]:
     return ([NAME] if cfg.model_book_slow else []) + ([FAST] if cfg.model_book_fast else []) \
         + ([CLIMB] if cfg.model_book_climb else []) + ([OPS9, OPS10] if cfg.model_book_ops else []) \
         + (list(EARLY_FIXED) if cfg.early_book else []) + (list(EARLY_ROLLING) if cfg.early_rolling else []) \
-        + (list(LAUNCH_CUT) if cfg.launch_book and cfg.launch_live else [])
+        + ([LAUNCH2, LAUNCH5] if cfg.launch_book and cfg.launch_live else []) \
+        + (list(LAUNCH_HIST_CUT) if cfg.launch_hist_book and cfg.launch_live else [])
 
 
 def early_wants(name: str, sig: dict) -> bool:
@@ -175,7 +180,10 @@ class Model:
         for n in self.names:  # a missing or non-finite input takes the training median, as in training
             v = feat.get(n)
             vals.append(float(v) if v is not None and math.isfinite(float(v)) else self.med[n])
-        return float(((np.array(vals) - self.mu) / self.sd) @ self.w + self.b)
+        z = (np.array(vals) - self.mu) / self.sd
+        if self.meta.get("clip_z"):  # models trained on capped inputs (launch4h) score capped inputs too
+            z = np.clip(z, -self.meta["clip_z"], self.meta["clip_z"])
+        return float(z @ self.w + self.b)
 
     def to_json(self) -> dict:
         return {"names": self.names, "mu": self.mu.tolist(), "sd": self.sd.tolist(), "med": self.med,

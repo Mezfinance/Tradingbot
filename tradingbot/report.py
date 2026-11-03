@@ -487,6 +487,9 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
                  "(90% range -2..+46%), 13% rugged; random liquid pools -12% on candles",
     "launch4_5": "as launch4_2, top 5%, n=48: +26.7% on snapshot prices, +6% on trade candles (90% range "
                  "-12..+24%), 25% rugged",
+    "launch4h_2": "history-trained model (every hand-made pool, chain prices, no hour/weekend), top 2% of the past "
+                  "24 h's scores. 7-day walk-forward: +5.0%/trade (90% range -4.6..+14.5%), 25% rugged",
+    "launch4h_5": "as launch4h_2, top 5%: +8.8%/trade (90% range +2.8..+14.7%), 23% rugged; every pool -5.2%, 31%",
 }
 
 

@@ -244,6 +244,8 @@ def main(argv: list[str] | None = None) -> None:
             from tradingbot import launch_live
             out = launch_live.train_and_save(store, cfg)
             print(f"launch4 model written to {out}" if out else "launch4 model: not enough data to train yet")
+            out = launch_live.train_hist_and_save(store, cfg)
+            print(f"launch4h model written to {out}" if out else "launch4h model: not enough data to train yet")
         return
 
     if args.command == "launch-hist-backfill":

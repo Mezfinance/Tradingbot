@@ -59,6 +59,12 @@ STATE_SAVE_S = 60
 WS_HELIUS = "wss://mainnet.helius-rpc.com/?api-key={key}"
 WS_PUBLIC = "wss://api.mainnet-beta.solana.com"
 TOP2, TOP5 = 0.02, 0.05
+# History-trained model (11-03): 7-day walk-forward on every hand-made pool, no hour/weekend features, top 5% of
+# each day: +8.8%/trade (90% CI +2.8..+14.7), 23% rugged vs -5.2% / 31% for every pool; with them +4.6%.
+CALENDAR = ("hour_sin", "hour_cos", "weekend")
+HIST_DROP = tuple(la.LIVE_DROP) + CALENDAR
+ROLLING_S = 86400  # its cut-offs: the top 2% / 5% of the past day's scores of liquid pools
+ROLLING_MIN = 50  # fewer scores than this: fall back to the training scores' quantiles
 
 SCHEMA = """CREATE TABLE IF NOT EXISTS watch_launch_live(
     pool TEXT PRIMARY KEY, lp_mint TEXT, token_mint TEXT, creator TEXT, notified_ts REAL, create_ts REAL,
@@ -73,14 +79,20 @@ BACKTEST_EDGE = {"top 2%": 0.21, "top 5%": 0.06}  # on 1-minute trade candles (s
 def ensure_schema(store) -> None:
     import sqlite3
     store.execute(SCHEMA)
-    try:  # added 11-02: pool liquidity at second 4 in USD
-        store.execute("ALTER TABLE watch_launch_live ADD COLUMN liq_usd REAL")
-    except sqlite3.OperationalError:
-        pass
+    for col in ("liq_usd REAL",  # added 11-02: pool liquidity at second 4 in USD
+                "score_h REAL", "top2h INTEGER", "top5h INTEGER"):  # 11-03: the history-trained model's verdict
+        try:
+            store.execute(f"ALTER TABLE watch_launch_live ADD COLUMN {col}")
+        except sqlite3.OperationalError:
+            pass
 
 
 def model_path(cfg: Config) -> Path:
     return Path(cfg.db_path).resolve().parent / "model" / "launch4.json"
+
+
+def hist_model_path(cfg: Config) -> Path:
+    return Path(cfg.db_path).resolve().parent / "model" / "launch4h.json"
 
 
 # --- training -------------------------------------------------------------------------------------
@@ -119,6 +131,73 @@ def train(store, cfg: Config, now: float | None = None):
             "decide_s": DECIDE_S, "fill_s": FILL_S, "days": cfg.launch_train_days}
     return Model(names, mu.tolist(), sd.tolist(), {n: float(med[n]) for n in names}, w.tolist(), float(b),
                  cut5, meta)
+
+
+def hist_training_rows(store, cfg: Config, now: float | None = None) -> list[dict]:
+    """Every liquid hand-made pool with a known minute-6 outcome: the chain-only history (`launch_hist`, all pools,
+    listed or not) plus the scorer's own finished rows (vault prices), the newer of the two kept per pool."""
+    from tradingbot import launch_hist
+    now = now if now is not None else time.time()
+    since = now - cfg.launch_train_days * wa.DAY_S
+    rows = {}
+    try:
+        hist, _ = launch_hist.rows(store, cfg)
+    except Exception:  # no history table yet
+        hist = []
+    for r in hist:
+        if r["liquid"] and r["created_ts"] >= since and DECIDE_S in r["feat"] and FILL_S in r["ret"]:
+            rows[r["pool"]] = {"created_ts": r["created_ts"], "feat": r["feat"][DECIDE_S], "ret": r["ret"][FILL_S]}
+    ensure_schema(store)
+    for r in store.query("SELECT pool, create_ts, feat, ret FROM watch_launch_live WHERE status='done' AND liquid=1 "
+                         "AND feat IS NOT NULL AND ret IS NOT NULL AND create_ts >= ?", (since,)):
+        rows.setdefault(r["pool"], {"created_ts": r["create_ts"], "feat": json.loads(r["feat"]), "ret": r["ret"]})
+    return sorted(rows.values(), key=lambda r: r["created_ts"])
+
+
+def train_hist(store, cfg: Config, now: float | None = None):
+    """Logistic on second-4 features without names or hour/weekend, standardised values capped at
+    `la.CLIP_Z` (as in the walk-forward), label: the second-6 fill made money."""
+    from tradingbot.model_book import Model
+    rs = hist_training_rows(store, cfg, now)
+    if len(rs) < MIN_TRAIN:
+        log.warning("launch4h model: not enough rows to train (%d)", len(rs))
+        return None
+    names = sorted({k for r in rs for k in r["feat"]} - set(HIST_DROP))
+    x, med = wa._matrix([r["feat"] for r in rs], names)
+    rets = np.array([r["ret"] for r in rs])
+    y = (rets > 0).astype(float)
+    if y.min() == y.max():
+        return None
+    mu, sd = x.mean(0), x.std(0) + 1e-9
+    z = np.clip((x - mu) / sd, -la.CLIP_Z, la.CLIP_Z)
+    w, b = wa.logistic(z, y)
+    scores = z @ w + b
+    cut2, cut5 = float(np.quantile(scores, 1 - TOP2)), float(np.quantile(scores, 1 - TOP5))
+    top = lambda c: scores >= c - 1e-9
+    meta = {"trained_ts": time.time(), "rows": len(rs), "win_rate": float(y.mean()), "clip_z": la.CLIP_Z,
+            "score_quantiles": {str(q): float(np.quantile(scores, q / 100)) for q in (10, 50, 90, 95, 98)},
+            "mean_ret_all": float(rets.mean()), "cut2": cut2, "cut5": cut5,
+            "top2_in_sample": {"n": int(top(cut2).sum()), "mean_ret": float(rets[top(cut2)].mean())},
+            "top5_in_sample": {"n": int(top(cut5).sum()), "mean_ret": float(rets[top(cut5)].mean())},
+            "decide_s": DECIDE_S, "fill_s": FILL_S, "days": cfg.launch_train_days, "dropped": list(CALENDAR)}
+    return Model(names, mu.tolist(), sd.tolist(), {n: float(med[n]) for n in names}, w.tolist(), float(b),
+                 cut5, meta)
+
+
+def _save(model, path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(model.to_json()))
+    os.replace(tmp, path)
+    return path
+
+
+def train_hist_and_save(store, cfg: Config) -> Path | None:
+    model = train_hist(store, cfg)
+    if model is None:
+        return None
+    log.info("launch4h model trained on %d rows", model.meta["rows"])
+    return _save(model, hist_model_path(cfg))
 
 
 def train_and_save(store, cfg: Config) -> Path | None:
@@ -163,6 +242,8 @@ class LaunchLive:
         self.history_s = collections.deque(maxlen=50)  # seconds each decision's history call took
         self.start_lag_s = collections.deque(maxlen=50)  # seconds each first decide attempt started after its due time
         self.model, self.model_mtime, self.model_checked = None, None, 0.0
+        self.hist_model, self.hist_mtime, self.hist_checked = None, None, 0.0
+        self.hist_scores: collections.deque = collections.deque()  # (decided_ts, score_h) of liquid pools, past day
         self.pool = ThreadPoolExecutor(workers, thread_name_prefix="launch-live") if workers else None
         self.saved_at = 0.0
         self.tries: dict[str, int] = {}
@@ -251,6 +332,51 @@ class LaunchLive:
             except (OSError, ValueError, KeyError) as exc:
                 log.warning("launch4 model unreadable: %s", exc)
         return self.model
+
+    def _load_hist_model(self):
+        """The history-trained model (launch4h.json). When a new one is loaded, the past day's liquid pools are
+        re-scored from their stored features, so the rolling cut-offs compare like with like."""
+        now = self.clock()
+        if self.hist_model is not None and now - self.hist_checked < MODEL_RELOAD_S:
+            return self.hist_model
+        self.hist_checked = now
+        path = hist_model_path(self.cfg)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return self.hist_model
+        if mtime != self.hist_mtime:
+            from tradingbot.model_book import Model
+            try:
+                model = Model.from_json(json.loads(path.read_text()))
+            except (OSError, ValueError, KeyError) as exc:
+                log.warning("launch4h model unreadable: %s", exc)
+                return self.hist_model
+            past = [(r["decided_ts"], model.score(json.loads(r["feat"]))) for r in self.store.query(
+                "SELECT decided_ts, feat FROM watch_launch_live WHERE liquid=1 AND feat IS NOT NULL "
+                "AND decided_ts >= ? ORDER BY decided_ts", (now - ROLLING_S,))]
+            with self.lock:
+                self.hist_model, self.hist_mtime = model, mtime
+                self.hist_scores = collections.deque(past)
+        return self.hist_model
+
+    def _hist_verdict(self, feat: dict, now: float) -> dict:
+        """score_h and the rolling top-2% / top-5% flags for a liquid pool (the score joins the history after)."""
+        model = self._load_hist_model()
+        if model is None:
+            return {}
+        score = model.score(feat)
+        with self.lock:
+            while self.hist_scores and self.hist_scores[0][0] < now - ROLLING_S:
+                self.hist_scores.popleft()
+            past = [s for _, s in self.hist_scores]
+            self.hist_scores.append((now, score))
+        if len(past) >= ROLLING_MIN:
+            cut2, cut5 = float(np.quantile(past, 1 - TOP2)), float(np.quantile(past, 1 - TOP5))
+        else:
+            cut2, cut5 = model.meta.get("cut2"), model.meta.get("cut5")
+        pick = lambda c: int(c is not None and score >= c - 1e-9)
+        return {"score_h": score, "top2h": pick(cut2), "top5h": pick(cut5)}
 
     # websocket input ------------------------------------------------------------------------------
     def on_message(self, msg: str) -> None:
@@ -407,14 +533,16 @@ class LaunchLive:
         if not liquid:
             self._update(pool, status="skipped", reason="not liquid at second 4", **cols)
             return
+        cols.update(self._hist_verdict(feat, now))
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
-        if self.signals is not None and (cols["top2"] or cols["top5"]):
+        if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")):
             px = la.chain_price(rows, DECIDE_S)  # SOL per whole token (vault UI amounts)
             if sol_usd and px:
                 self.signals.put_nowait({
                     "pool": pool, "mint": r["token_mint"], "name": "", "score": score, "price": px * sol_usd,
                     "liq": 2 * sol4 * sol_usd, "ts": now, "decided_ts": now, "created_ts": create,
-                    "dex": "pumpswap", "kind": "launch", "top2": bool(cols["top2"]), "top5": bool(cols["top5"])})
+                    "dex": "pumpswap", "kind": "launch", "top2": bool(cols["top2"]), "top5": bool(cols["top5"]),
+                    "top2h": bool(cols.get("top2h")), "top5h": bool(cols.get("top5h"))})
                 self._count("signals sent to the launch books")
             else:
                 self._count("pick not sent: no SOL price")
@@ -662,14 +790,18 @@ def status(store, cfg: Config, hours: float = 24, now: float | None = None, jour
     out["scored_liquid"] = len(scored)
     out["note"] = ("outcomes below are pool-level (vault price at second ~6 vs minute 6, 6% cost); the books' own "
                    "Jupiter-simulated trades are in `report`")
-    out["picks"] = {"top 2%": sum(r["top2"] or 0 for r in scored), "top 5%": sum(r["top5"] or 0 for r in scored)}
+    out["picks"] = {"top 2%": sum(r["top2"] or 0 for r in scored), "top 5%": sum(r["top5"] or 0 for r in scored),
+                    "top 2% (history model)": sum(r["top2h"] or 0 for r in scored),
+                    "top 5% (history model)": sum(r["top5h"] or 0 for r in scored)}
     out["liquidity at second 4 (USD) and trade size"] = liquidity(scored, hours)
     rng = np.random.default_rng(0)
     done = [r for r in rows if r["status"] == "done"]
     out["outcomes (fill at second ~6, out at minute 6, 6% cost)"] = {
         "every liquid pool": _group(done, rng),
         "top 2%": _group([r for r in done if r["top2"]], rng),
-        "top 5%": _group([r for r in done if r["top5"]], rng)}
+        "top 5%": _group([r for r in done if r["top5"]], rng),
+        "top 2% (history model, rolling cut)": _group([r for r in done if r["top2h"]], rng),
+        "top 5% (history model, rolling cut)": _group([r for r in done if r["top5h"]], rng)}
     out["feature parity with the backtest"] = parity(store, scored)
     out["live vs training (drift)"] = drift(scored, cfg)
     if journal is not None:  # the launch books' own buys: where the seconds from creation to the fill go

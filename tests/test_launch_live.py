@@ -263,3 +263,69 @@ def test_drift_shows_pick_rate_and_shifted_features(setup):
     assert d["pools"] == 1 and d["share_above_cut5_pct"] == 100.0
     assert set(d["training_score_quantiles"]) == {"10", "50", "90", "95", "98"}
     assert d["most_shifted_features"] and {"feature", "z", "present_pct"} <= set(d["most_shifted_features"][0])
+
+
+def _done_rows(st, n, t0, rng):
+    """Finished scorer rows: a feature that predicts the outcome, an hour feature that doesn't."""
+    import random
+    ll.ensure_schema(st)
+    for i in range(n):
+        good = rng.random() < 0.5
+        feat = {"log_buyers": (2.0 if good else 0.0) + rng.random(), "hour_sin": rng.random(), "weekend": 1.0}
+        st.execute("INSERT INTO watch_launch_live(pool, lp_mint, create_ts, decided_ts, liquid, feat, ret, status) "
+                   "VALUES(?,?,?,?,?,?,?,?)", (f"D{t0}-{i}", f"L{t0}-{i}", t0 + i * 60, t0 + i * 60 + 4, 1,
+                                               json.dumps(feat), 0.3 if good else -0.2, "done"))
+
+
+def test_history_model_trains_on_scorer_rows_without_calendar_features(tmp_path):
+    import random
+    st = WatchStore(":memory:")
+    cfg = Config(db_path=str(tmp_path / "bot.db"))
+    _done_rows(st, 300, 2_000_000_000 - 3 * 86400, random.Random(1))
+    m = ll.train_hist(st, cfg, now=2_000_000_000)
+    assert m is not None and m.meta["rows"] == 300 and m.meta["clip_z"] == la.CLIP_Z
+    assert "log_buyers" in m.names and not set(m.names) & set(ll.CALENDAR)
+    assert m.score({"log_buyers": 2.5}) > m.score({"log_buyers": 0.5})
+    # a wild input is capped, as in training: it can't move the score without limit
+    assert abs(m.score({"log_buyers": 1e9}) - m.score({"log_buyers": 1e6})) < 1e-9
+
+
+def test_history_flags_use_a_rolling_cut_off_and_reach_the_twin_books(setup, monkeypatch):
+    import random
+    from tradingbot import model_book as mb
+    cfg, st, hel, clock, live, p, create = setup
+    _done_rows(st, 300, clock.t - 3 * 86400, random.Random(2))
+    assert ll.train_hist_and_save(st, cfg) is not None
+    # under ROLLING_MIN past scores: the training cut-offs; after that, the past day's quantiles
+    few = live._hist_verdict({"log_buyers": 2.9}, clock.t)
+    assert few["top5h"] == int(few["score_h"] >= live.hist_model.meta["cut5"] - 1e-9)
+    with live.lock:
+        live.hist_scores.extend((clock.t - 10, 100.0) for _ in range(ll.ROLLING_MIN))  # a day of very high scores
+    assert live._hist_verdict({"log_buyers": 2.9}, clock.t)["top5h"] == 0  # not in the top 5% of that day
+    with live.lock:
+        live.hist_scores.clear()
+        live.hist_scores.extend((clock.t - 10, -100.0) for _ in range(ll.ROLLING_MIN))
+    assert live._hist_verdict({"log_buyers": 0.0}, clock.t)["top5h"] == 1
+    cfg.launch_book, cfg.launch_hist_book, cfg.launch_live = True, True, True
+    try:
+        assert mb.active_books(cfg)[-4:] == [mb.LAUNCH2, mb.LAUNCH5, mb.LAUNCH2H, mb.LAUNCH5H]
+        sig = {"kind": "launch", "top2": False, "top5": False, "top2h": False, "top5h": True}
+        assert mb.wants(mb.LAUNCH5H, sig) and not mb.wants(mb.LAUNCH2H, sig) and not mb.wants(mb.LAUNCH5, sig)
+        assert mb.exit_deadline(cfg, mb.LAUNCH5H, {"created_ts": 100.0, "mint": "M"}) == 100.0 + 360
+    finally:
+        cfg.launch_book, cfg.launch_hist_book, cfg.launch_live = False, False, False
+
+
+def test_decision_stores_the_history_verdict(setup):
+    import random
+    cfg, st, hel, clock, live, p, create = setup
+    _done_rows(st, 300, clock.t - 3 * 86400, random.Random(3))
+    ll.train_hist_and_save(st, cfg)
+    live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+    live.step()
+    clock.t += cfg.launch_live_decide_delay_s
+    live.step()
+    r = live._row(HAND_POOL)
+    assert r["status"] == "scored" and r["score_h"] is not None and r["top5h"] in (0, 1)
+    out = ll.status(st, cfg, 24, now=clock.t)
+    assert "top 5% (history model)" in out["picks"]
