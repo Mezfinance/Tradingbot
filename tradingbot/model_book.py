@@ -334,6 +334,7 @@ def fit_early(rows: list[dict], cfg: Config) -> Model | None:
     cut_wide = float(np.quantile(recent, 1 - cfg.early_wide_top_pct / 100))  # early6w: top early_wide_top_pct
     meta = {"trained_ts": time.time(), "rows": len(rows), "pump_rate": float(y.mean()),
             "cut_wide": cut_wide, "wide_share_recent": float(np.mean(recent >= cut_wide)),
+            "cuts": {f"{t:g}": float(np.quantile(recent, 1 - t / 100)) for t in WALK_TOPS},
             "top_pump_rate_in_sample": float(y[top].mean()) if top.any() else None,
             "top_trade_ret_in_sample": float(np.mean([r["ret"] for r, t in zip(rows, top) if t])) if top.any() else None,
             "days": cfg.model_train_days, "top_pct": cfg.early_top_pct}
@@ -494,19 +495,23 @@ def early_backtest(store, cfg: Config, hours: float = 8, now: float | None = Non
             "note": "outcome = 5-minute snapshot (~pool minute 6) vs first-sight price, 6% round trip; emptied = -100%"}
 
 
+WALK_TOPS = (2.0, 5.0, 16.0)  # early-walk-forward compares these top-% cut-offs (early6 = 5, early6w = 16)
+
+
 def early_walk_forward(store, cfg: Config, now: float | None = None, seed: int = 7) -> dict:
-    """Walk-forward test of the early books' cut-offs on every day the store holds: each UTC day is scored by an
+    """Walk-forward test of the early model's cut-offs on every day the store holds: each UTC day is scored by an
     early model trained only on the `model_train_days` before it (as the nightly retrain does), and its eligible
-    pools (liquid at first sight) are picked by the top-`early_top_pct` cut-off (early6) or the wide one (top
-    `early_wide_top_pct`, early6w). Outcome = the 5-minute snapshot (~pool minute 6) vs first sight, 6% round trip, emptied = -100%."""
+    pools (liquid at first sight) are picked by each top-% cut-off in WALK_TOPS, set on the last 2 training days'
+    scores like the live one. Outcome = the 5-minute snapshot (~pool minute 6) vs first sight, 6% round trip,
+    emptied = -100%."""
     rows = early_training_rows(store, now, days=10_000)
     if not rows:
         return {"error": "no rows"}
     rng = np.random.default_rng(seed)
     day = lambda ts: time.strftime("%Y-%m-%d", time.gmtime(ts))
     days = sorted({day(r["created_ts"]) for r in rows})
-    groups = {"every eligible pool": [], "early6 (top 5%)": [], "early6w (top 16%)": [],
-              "added by early6w (between the cuts)": []}
+    label = lambda t: f"top {t:g}%"
+    groups = {"every eligible pool": [], **{label(t): [] for t in WALK_TOPS}}
     by_day, cuts = [], []
     for d in days:
         start = calendar.timegm(time.strptime(d, "%Y-%m-%d"))  # UTC midnight
@@ -518,20 +523,17 @@ def early_walk_forward(store, cfg: Config, now: float | None = None, seed: int =
         if model is None:
             continue
         scored = [(model.score({k: v for k, v in r.items() if k not in EARLY_NOT_FEATURES}), r["ret"]) for r in test]
-        cut5, wide = model.threshold, model.meta["cut_wide"]
-        picks = {"every eligible pool": [x for _, x in scored],
-                 "early6 (top 5%)": [x for s, x in scored if s >= cut5],
-                 "early6w (top 16%)": [x for s, x in scored if s >= wide],
-                 "added by early6w (between the cuts)": [x for s, x in scored if wide <= s < cut5]}
+        picks = {"every eligible pool": [x for _, x in scored]}
+        for t in WALK_TOPS:
+            cut = model.meta["cuts"][f"{t:g}"]
+            picks[label(t)] = [x for s, x in scored if s >= cut]
         for k, v in picks.items():
             groups[k] += v
         by_day.append({"day": d, "train_rows": len(train), "eligible": len(test),
-                       **{k.split(" (")[0]: _ret_summary(v, rng, ci=False) for k, v in picks.items()
-                          if k != "every eligible pool"},
-                       "all_mean_pct": _ret_summary(picks["every eligible pool"], rng, ci=False)["mean_pct"]})
-        cuts.append({"day": d, "cut5": round(cut5, 3), "cut_wide": round(wide, 3),
-                     "wide_share_of_test_pct": round(100 * np.mean([s >= wide for s, _ in scored]), 1),
-                     "top5_share_of_test_pct": round(100 * np.mean([s >= cut5 for s, _ in scored]), 1)})
+                       "all_mean_pct": _ret_summary(picks["every eligible pool"], rng, ci=False)["mean_pct"],
+                       **{label(t): _ret_summary(picks[label(t)], rng, ci=False) for t in WALK_TOPS}})
+        cuts.append({"day": d, **{f"share_above_{label(t)}_cut_pct":
+                                  round(100 * len(picks[label(t)]) / len(scored), 1) for t in WALK_TOPS}})
     return {"days_tested": len(by_day), "first_day": days[0], "last_day": days[-1],
             "overall": {k: _ret_summary(v, rng) for k, v in groups.items()}, "by_day": by_day, "cut_offs": cuts,
             "note": "walk-forward by UTC day, trained on the previous model_train_days; outcome = 5-minute snapshot "
