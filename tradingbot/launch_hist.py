@@ -181,10 +181,10 @@ def _split(rs, rng) -> dict:
             "never listed": la._summary([r["ret"][FILL_S] for r in rs if not r["listed"]], rng)}
 
 
-def _shifted(train: list[dict], test_rows: list[dict], top: int = 3) -> dict:
+def _shifted(train: list[dict], test_rows: list[dict], drop: tuple = (), top: int = 3) -> dict:
     """The features whose test-day mean is furthest from the training mean, in training standard deviations."""
     out = {}
-    for k in sorted({k for r in train for k in r["feat"][DECIDE_S]} - set(la.LIVE_DROP)):
+    for k in sorted({k for r in train for k in r["feat"][DECIDE_S]} - set(la.LIVE_DROP) - set(drop)):
         a = [r["feat"][DECIDE_S][k] for r in train if r["feat"][DECIDE_S].get(k) is not None]
         b = [r["feat"][DECIDE_S][k] for r in test_rows if r["feat"][DECIDE_S].get(k) is not None]
         if len(a) > 1 and b:
@@ -215,15 +215,26 @@ def test(store, cfg: Config) -> dict:
             "top 2%": _split(pick(cut2), rng), "top 5%": _split(pick(cut5), rng)}
     except (OSError, ValueError, KeyError):
         out["live model (launch4.json; in-sample for listed pools it was trained on)"] = None
-    days = sorted({la._day(r) for r in liquid})
+    out["walk-forward on these rows (train on earlier days, no names; picks = top k% of each day's scores)"] = \
+        _walk(liquid, rng, tuple(la.LIVE_DROP))
+    # Hour and weekend can only learn day effects from a few days (a near-constant weekend flag broke 11-02).
+    out["walk-forward without hour/weekend features"] = _walk(liquid, rng, tuple(la.LIVE_DROP) + CALENDAR)
+    return out
+
+
+CALENDAR = ("hour_sin", "hour_cos", "weekend")
+
+
+def _walk(liquid: list[dict], rng, drop: tuple) -> dict:
+    """Walk-forward by day: train on earlier days, pick the top k% of each test day's own scores."""
     picks = {k: [] for k in la.TIMING_TOP_PCT}
     base, by_day = [], {}
-    for d in days:
+    for d in sorted({la._day(r) for r in liquid}):
         train = [r for r in liquid if la._day(r) < d]
         test_rows = [r for r in liquid if la._day(r) == d]
         if len(train) < la.RANK_MIN_TRAIN or not test_rows:
             continue
-        fit = la._fit_score(train, test_rows, DECIDE_S, FILL_S, la.LIVE_DROP)
+        fit = la._fit_score(train, test_rows, DECIDE_S, FILL_S, drop)
         if fit is None:
             continue
         tr, te = fit
@@ -233,16 +244,15 @@ def test(store, cfg: Config) -> dict:
                # Picks are the top k% of the day's own scores; this shows how far the training cut-off was off.
                "share above the training top-2% cut (%)": round(100 * float(np.mean(
                    te >= np.quantile(tr, 0.98) - 1e-9)), 1),
-               "most shifted features (z vs training)": _shifted(train, test_rows)}
+               "most shifted features (z vs training)": _shifted(train, test_rows, drop)}
         for k in la.TIMING_TOP_PCT:
             cut = float(np.quantile(te, 1 - k / 100))
             chosen = [r for r, s in zip(test_rows, te) if s >= cut - 1e-9]
             picks[k] += chosen
             row[f"top {k:g}%"] = {"n": len(chosen), "mean_pct": round(100 * float(np.mean(
-                [r["ret"][FILL_S] for r in chosen])), 1) if chosen else None}
+                [r["ret"][FILL_S] for r in chosen])), 1) if chosen else None,
+                "rugged": sum(r["ret"][FILL_S] <= -0.8 for r in chosen)}
         by_day[d] = row
-    out["walk-forward on these rows (train on earlier days, no names; picks = top k% of each day's scores)"] = {
-        "days_scored": len(by_day), "every liquid pool (test days)": _split(base, rng),
-        **{f"top {k:g}%": _split(picks[k], rng) for k in la.TIMING_TOP_PCT}, "by day": by_day,
-        **({} if by_day else {"note": f"needs {la.RANK_MIN_TRAIN}+ liquid pools on earlier days"})}
-    return out
+    return {"days_scored": len(by_day), "every liquid pool (test days)": _split(base, rng),
+            **{f"top {k:g}%": _split(picks[k], rng) for k in la.TIMING_TOP_PCT}, "by day": by_day,
+            **({} if by_day else {"note": f"needs {la.RANK_MIN_TRAIN}+ liquid pools on earlier days"})}

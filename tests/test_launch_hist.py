@@ -126,6 +126,9 @@ def test_test_reports_listed_and_unlisted():
     for d, row in wf["by day"].items():  # picks are a share of the day whatever the training scores did
         assert row["top 5%"]["n"] <= max(2, round(0.05 * row["pools"]) + 1)
         assert "share above the training top-2% cut (%)" in row and row["most shifted features (z vs training)"]
+    plain = out["walk-forward without hour/weekend features"]
+    assert plain["by day"] and not any(set(r["most shifted features (z vs training)"]) & set(lh.CALENDAR)
+                                       for r in plain["by day"].values())
 
 
 class HeadOnlyHelius(FakeHelius):
