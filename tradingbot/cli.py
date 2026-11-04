@@ -66,7 +66,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "propose", "proposals", "watch-status", "watch-report",
                                             "watch-export", "watch-links", "watch-report-now",
                                             "watch-model-train", "model-status", "early-status",
-                                            "early-backtest", "early-walk-forward", "launch-backtest", "launch-backfill", "launch-status",
+                                            "early-backtest", "early-walk-forward", "launch-backtest", "launch-backfill", "launch-status", "launch-compare",
                                             "launch-hist-backfill", "launch-hist-test"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
@@ -265,6 +265,12 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot import launch_hist
         from tradingbot.watcher import WatchStore, watch_db_path
         print(json.dumps(launch_hist.test(WatchStore(watch_db_path(cfg)), cfg), indent=2))
+        return
+
+    if args.command == "launch-compare":
+        from tradingbot import launch_live
+        from tradingbot.watcher import WatchStore, watch_db_path
+        print(json.dumps(launch_live.compare(WatchStore(watch_db_path(cfg)), args.hours), indent=2))
         return
 
     if args.command == "launch-status":

@@ -665,6 +665,59 @@ def _group(rows, rng) -> dict:
     return out
 
 
+COMPARE_TOPS = (2.0, 5.0, 8.0)  # equal-share cuts: the old model's live top 2% has drifted to ~8% of pools
+EARLY_RUG_S = 90  # pulled before GeckoTerminal would list the pool (~70 s): pools the old model never trained on
+
+
+def _rug_split(rows) -> dict:
+    """Rugs by when the LP was pulled: early (< EARLY_RUG_S after creation), later, or drained with no pull seen."""
+    rugs = [r for r in rows if r["ret"] is not None and r["ret"] <= -0.999]
+    n = len([r for r in rows if r["ret"] is not None]) or 1
+    early = sum(1 for r in rugs if r["pulled_ts"] and r["pulled_ts"] - r["create_ts"] < EARLY_RUG_S)
+    late = sum(1 for r in rugs if r["pulled_ts"] and r["pulled_ts"] - r["create_ts"] >= EARLY_RUG_S)
+    return {"early_rug_pct": round(100 * early / n, 1), "later_rug_pct": round(100 * late / n, 1),
+            "drained_no_pull_pct": round(100 * (len(rugs) - early - late) / n, 1)}
+
+
+def compare(store, hours: float | None = None, now: float | None = None, seed: int = 7) -> dict:
+    """Old (launch4.json) vs history (launch4h.json) model on the same pools: every finished liquid pool both
+    scored, ranked by each model within the window (top 2/5/8%), plus the live flags. Outcomes are the scorer's
+    ideal trades (vault price at second ~6.5 in, minute 6 out, 6% cost); rugs split by pull time."""
+    ensure_schema(store)
+    now = now if now is not None else time.time()
+    since = now - hours * 3600 if hours else 0
+    rows = store.query("SELECT pool, create_ts, score, score_h, top2, top5, top2h, top5h, ret, pulled_ts "
+                       "FROM watch_launch_live WHERE status='done' AND liquid=1 AND ret IS NOT NULL "
+                       "AND score IS NOT NULL AND score_h IS NOT NULL AND create_ts >= ? ORDER BY create_ts",
+                       (since,))
+    if not rows:
+        return {"pools": 0, "note": "no finished pools scored by both models yet"}
+    rng = np.random.default_rng(seed)
+    group = lambda rs: {**_group(rs, rng), **_rug_split(rs)}
+    out = {"pools": len(rows),
+           "from": datetime.fromtimestamp(rows[0]["create_ts"], timezone.utc).strftime("%m-%d %H:%M"),
+           "to": datetime.fromtimestamp(rows[-1]["create_ts"], timezone.utc).strftime("%m-%d %H:%M"),
+           "every liquid pool": group(rows)}
+    ranked = {}
+    for t in COMPARE_TOPS:
+        k = max(1, round(len(rows) * t / 100))
+        old = sorted(rows, key=lambda r: -r["score"])[:k]
+        hist = sorted(rows, key=lambda r: -r["score_h"])[:k]
+        both = {r["pool"] for r in old} & {r["pool"] for r in hist}
+        ranked[f"top {t:g}%"] = {"picks_each": k, "old model": group(old), "history model": group(hist),
+                                 "picked by both": len(both),
+                                 "overlap_pct": round(100 * len(both) / k)}
+    out["ranked in the window (same share of pools for both)"] = ranked
+    out["live flags (as the books saw them)"] = {
+        "old top2": group([r for r in rows if r["top2"]]), "old top5": group([r for r in rows if r["top5"]]),
+        "history top2h": group([r for r in rows if r["top2h"]]),
+        "history top5h": group([r for r in rows if r["top5h"]])}
+    out["note"] = (f"ideal pool-level trades; early rug = LP pulled < {EARLY_RUG_S} s after creation, before "
+                   "GeckoTerminal lists a pool (the old model's training pools all survived that); "
+                   "drained = pool SOL fell below 10% of its peak or no price, no LP pull seen")
+    return out
+
+
 def parity(store, rows) -> dict:
     """Live features vs the ones the backtest builds from the enricher's later launch row (same pool)."""
     diffs = []

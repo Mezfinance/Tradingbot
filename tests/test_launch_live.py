@@ -329,3 +329,35 @@ def test_decision_stores_the_history_verdict(setup):
     assert r["status"] == "scored" and r["score_h"] is not None and r["top5h"] in (0, 1)
     out = ll.status(st, cfg, 24, now=clock.t)
     assert "top 5% (history model)" in out["picks"]
+
+
+def test_compare_ranks_both_models_on_the_same_pools_and_splits_rugs_by_pull_time():
+    st = WatchStore(":memory:")
+    ll.ensure_schema(st)
+    t0 = 1_800_000_000.0
+    for i in range(100):
+        # old model: pool i scores i; history model: reversed. Pools 95-99 rug early (old's top 5%),
+        # pools 0-2 rug late and 3-4 drain without a pull (history model's top 5%).
+        ret, pulled = 0.1, None
+        if i >= 95:
+            ret, pulled = -1.0, t0 + i + 30
+        elif i < 3:
+            ret, pulled = -1.0, t0 + i + 300
+        elif i < 5:
+            ret = -1.0
+        st.execute("INSERT INTO watch_launch_live(pool, create_ts, liquid, score, score_h, top2, top5, top2h, top5h, "
+                   "ret, pulled_ts, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (f"P{i}", t0 + i, 1, float(i), float(-i), int(i >= 98), int(i >= 95), int(i < 2), int(i < 5),
+                    ret, pulled, "done"))
+    st.execute("INSERT INTO watch_launch_live(pool, create_ts, liquid, score, ret, status) VALUES "
+               "('OLD', ?, 1, 5.0, 0.2, 'done')", (t0,))  # no history score: left out
+    out = ll.compare(st, now=t0 + 200)
+    assert out["pools"] == 100
+    top5 = out["ranked in the window (same share of pools for both)"]["top 5%"]
+    assert top5["picks_each"] == 5 and top5["picked by both"] == 0
+    assert top5["old model"]["early_rug_pct"] == 100 and top5["old model"]["rugged_pct"] == 100
+    hist = top5["history model"]
+    assert hist["early_rug_pct"] == 0 and hist["later_rug_pct"] == 60 and hist["drained_no_pull_pct"] == 40
+    assert out["live flags (as the books saw them)"]["old top2"]["n"] == 2
+    assert out["every liquid pool"]["rugged_pct"] == 10
+    assert ll.compare(WatchStore(":memory:"))["pools"] == 0
