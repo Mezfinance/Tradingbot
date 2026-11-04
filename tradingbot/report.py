@@ -517,48 +517,69 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
 }
 
 
+WIDTH = 100  # the model report fits a laptop terminal at this width
+
+
+def _cell(v, suffix="", digits=1) -> str:
+    return "-" if v is None else f"{v:,.{digits}f}{suffix}" if isinstance(v, float) else f"{v}{suffix}"
+
+
+def _short_audit(a: dict) -> str:
+    m = a["median"]
+    liq = m.get("liquidity")
+    return (f"n={a['n_with_audit']} holders {_cell(m.get('holders'), '', 0)}, top {_cell(m.get('top_holders_pct'), '%')}, "
+            f"dev {_cell(m.get('dev_balance_pct'), '%')}, liq {'$' + format(liq / 1000, ',.1f') + 'k' if liq else '-'}")
+
+
 def render_model(rep: dict) -> str:
+    """Books as rows, so the tables stay within WIDTH however many books run; details wrap at WIDTH."""
+    import textwrap
     books, m = rep["books"], rep["model"]
-    lines = ["MODEL PAPER BOOKS (5-minute pump model; same signals, separate $ and ledgers; simulated fills on real "
-             "Jupiter quotes)", "  exits: +100% take profit, -50% stop, out after the hold time"]
-    for b in books:
-        lines.append(f"  {b['name']:<12} backtest: {EXPECTED.get(b['name'], '-')}")
-    rows = [("hold", lambda b: f"{b['hold_min']:g} min"),
-            ("running since (UTC)", lambda b: time.strftime("%m-%d %H:%M", time.gmtime(b["started"])) if b["started"] else "not yet"),
-            ("running for", lambda b: _running_for(b["started"])),
-            ("equity $", lambda b: _fmt(b["book"]["equity"])), ("return %", lambda b: _fmt(b["book"]["return_pct"], "%")),
-            ("max drawdown %", lambda b: _fmt(b["book"]["max_drawdown_pct"], "%")),
-            ("signals / buys", lambda b: f"{b['signals']} / {b['buys']}"),
-            ("closed trades", lambda b: _fmt(b["book"]["closed_trades"])),
-            ("  of which stuck ($0)", lambda b: _fmt(b["book"]["stuck_trades"])),
-            ("win rate", lambda b: _fmt(b["book"]["win_rate"])),
-            ("median trade %", lambda b: _fmt(b["book"]["median_trade_return_pct"], "%")),
-            ("mean trade %", lambda b: _fmt(b["book"]["mean_trade_return_pct"], "%")),
-            ("profit factor", lambda b: _fmt(b["book"]["profit_factor"])),
-            ("rugged (lost >=80%)", lambda b: f"{b['rugs']['rugs']} ({_fmt(b['rugs']['rug_rate_pct'], '%', 0)})"),
-            ("network fees $", lambda b: _fmt(b["book"]["network_fees_usd"])),
-            ("failed txs", lambda b: _fmt(b["book"]["failed_txs"])),
-            ("entry slippage % (med)", lambda b: _fmt(b["book"]["median_entry_slippage_pct"], "%")),
-            ("exit slippage % (med, excl. rugs)", lambda b: _fmt(b["book"]["median_exit_slippage_excl_rugs_pct"], "%")),
-            ("  exits with a bad trigger price", lambda b: str(b["book"].get("exits_with_bad_trigger", 0)))]
-    lines += ["", f"  {'':<34}" + "".join(f"{b['name']:>16}" for b in books)]
-    for label, f in rows:
-        lines.append(f"  {label:<34}" + "".join(f"{f(b):>16}" for b in books))
+    wrap = lambda text, indent="  ", more="      ": textwrap.fill(text, WIDTH, initial_indent=indent,
+                                                             subsequent_indent=more)
+    lines = ["MODEL PAPER BOOKS (separate $ and ledgers; simulated fills on real Jupiter quotes)", ""]
+    head = f"  {'book':<14}{'hold':>5}{'ran':>9}{'equity $':>10}{'ret%':>7}{'maxDD':>6}{'trades':>7}{'win':>5}" \
+           f"{'median':>8}{'mean':>8}{'PF':>6}{'rugged':>11}"
+    lines += ["RESULTS", head, "  " + "-" * (len(head) - 2)]
     for b in books:
         s, r = b["book"], b["rugs"]
-        lines += ["", f"[{b['name']}]"]
+        lines.append(f"  {b['name']:<14}{b['hold_min']:>4g}m{_running_for(b['started']).replace(' days', 'd'):>9}"
+                     f"{_cell(s['equity'], '', 0):>10}{_cell(s['return_pct']):>7}{_cell(s['max_drawdown_pct']):>6}"
+                     f"{_cell(s['closed_trades']):>7}{_cell(s['win_rate'], '', 2):>5}"
+                     f"{_cell(s['median_trade_return_pct'], '%'):>8}{_cell(s['mean_trade_return_pct'], '%'):>8}"
+                     f"{_cell(s['profit_factor'], '', 2):>6}"
+                     f"{str(r['rugs']) + ' (' + _cell(r['rug_rate_pct'], '%', 0) + ')':>11}")
+    head = f"  {'book':<14}{'signals':>8}{'buys':>6}{'stuck':>6}{'fees $':>8}{'failed tx':>10}{'entry slip':>11}" \
+           f"{'exit slip':>10}{'bad trigger':>12}"
+    lines += ["", "EXECUTION (slippage = median vs trigger; exit excludes rugs and bad trigger prices)", head,
+              "  " + "-" * (len(head) - 2)]
+    for b in books:
+        s = b["book"]
+        lines.append(f"  {b['name']:<14}{b['signals']:>8}{b['buys']:>6}{_cell(s['stuck_trades']):>6}"
+                     f"{_cell(s['network_fees_usd'], '', 0):>8}{_cell(s['failed_txs']):>10}"
+                     f"{_cell(s['median_entry_slippage_pct'], '%'):>11}"
+                     f"{_cell(s['median_exit_slippage_excl_rugs_pct'], '%'):>10}"
+                     f"{s.get('exits_with_bad_trigger', 0):>12}")
+    lines += ["", "BACKTEST EXPECTATIONS"]
+    for b in books:
+        lines.append(wrap(f"{b['name']}: {EXPECTED.get(b['name'], '-')}"))
+    lines += ["", "BOOK DETAILS"]
+    for b in books:
+        s, r = b["book"], b["rugs"]
+        since = time.strftime("%m-%d %H:%M", time.gmtime(b["started"])) if b["started"] else "not yet"
+        lines += ["", f"[{b['name']}] running since (UTC) {since}, running for {_running_for(b['started'])}"]
         if not s["enough_trades"]:
             lines.append(f"  only {s['closed_trades']} finished trades; need {MIN_TRADES_FOR_CONCLUSION}+ before drawing conclusions")
-        lines += [f"  exits: {s['exit_reasons'] or '-'}", f"  skipped signals: {s['top_skip_reasons'] or '-'}",
-                  f"  causes of losing exits: {r['losing_exit_causes'] or '-'}"]
+        lines += [wrap(f"exits: {s['exit_reasons'] or '-'}"), wrap(f"skipped: {s['top_skip_reasons'] or '-'}"),
+                  wrap(f"losing exits: {r['losing_exit_causes'] or '-'}")]
         for p in s["open_positions"] or []:
-            blocked = f"  EXIT BLOCKED {p['exit_blocked']} (valued at $0 after 30 min)" if p.get("exit_blocked") else ""
-            lines.append(f"  open: {p['symbol']:<16} cost ${p['cost_usd']:<8} {p['hours']}h{blocked}")
-        for label, key in (("rugs", "entry_audit_rugs"), ("others", "entry_audit_others")):
-            a = r[key]
-            if a["n_with_audit"]:
-                lines.append(f"  entry audit, {label:<6} (n={a['n_with_audit']}): {a['median']}  "
-                             f"Jupiter 'suspicious': {_fmt(a['flagged_suspicious_pct'], '%', 1)}")
+            blocked = f"  EXIT BLOCKED {p['exit_blocked']}" if p.get("exit_blocked") else ""
+            lines.append(wrap(f"open: {p['symbol']:<12} ${p['cost_usd']:<6} {p['hours']}h{blocked}"))
+        audits = [f"{label} {_short_audit(r[key])}" for label, key in (("rugs", "entry_audit_rugs"),
+                                                                        ("others", "entry_audit_others"))
+                  if r[key]["n_with_audit"]]
+        if audits:
+            lines.append(wrap("entry audit: " + " | ".join(audits)))
     rc = rep.get("rug_catcher") or {}
     if any(rc.values()):
         lines += ["", "RUG CATCHER (blind test: verdict logged before each signal was traded; trading unchanged)",
