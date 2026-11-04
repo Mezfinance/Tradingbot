@@ -572,3 +572,34 @@ def test_low_decile_books_get_their_flags_from_the_live_scorer(setup, monkeypatc
         assert mb.exit_deadline(cfg, "launchd12_s30", {"created_ts": 100.0, "mint": "M"}) == 100.0 + 360
     finally:
         cfg.launch_low_book, cfg.launch_live = False, False
+
+
+class _AgeHelius:
+    def __init__(self, first):
+        self.first, self.credits_used, self.calls = first, 0, 0
+
+    def first_tx_time(self, address):
+        self.calls += 1
+        self.credits_used += 10
+        return self.first.get(address)
+
+
+def test_token_age_study_splits_new_tokens_from_new_pools_of_old_tokens():
+    st = WatchStore(":memory:")
+    ll.ensure_schema(st)
+    t0 = 1_800_000_000.0
+    first = {}
+    for i in range(100):
+        old = i < 10 and i % 2 == 0  # half of D1 (the lowest scores) are pools of tokens a week old
+        first[f"M{i}"] = t0 - 7 * 86400 if old else t0 + i * 60 - 30
+        st.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, liquid, score_h, ret, status) "
+                   "VALUES (?,?,?,?,?,?,?)", (f"P{i}", f"M{i}", t0 + i * 60, 1, float(i), 0.0 if old else 0.5, "done"))
+    h = _AgeHelius(first)
+    out = ll.token_age_study(st, h, now=t0 + 100 * 60)
+    low = out["history D1-D2"]
+    assert low["all"]["n"] == 20 and low["share by token age (%)"]["over 1 day old"] == 25.0
+    assert low["over 1 day old"]["mean_pct"] == 0.0 and low["fresh (minted < 10 min before the pool)"]["mean_pct"] == 50.0
+    assert out["random 150 of D3-D10"]["all"]["n"] == 80 and out["fetch"]["fetched"] == 100
+    calls = h.calls
+    ll.token_age_study(st, h, now=t0 + 100 * 60)
+    assert h.calls == calls  # cached

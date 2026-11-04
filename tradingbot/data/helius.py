@@ -211,6 +211,18 @@ class Helius:
                 return tx
         return None
 
+    def first_tx_time(self, address: str) -> float | None | bool:
+        """blockTime of the oldest transaction touching `address` (one call, 10 credits): a token mint's creation.
+        None if it has none, False if the call failed."""
+        res = self._rpc("getTransactionsForAddress",
+                        [address, {"transactionDetails": "full", "sortOrder": "asc", "limit": 1,
+                                   "maxSupportedTransactionVersion": TX_VERSION, "encoding": "jsonParsed"}],
+                        HISTORY_CREDITS_PER_100)
+        if res is None:
+            return False
+        times = [tx.get("blockTime") for tx in res.get("data") or [] if tx.get("blockTime")]
+        return float(min(times)) if times else None
+
     def history(self, address: str, limit: int = 100) -> list[dict]:
         """Oldest-first full transactions touching `address`."""
         res = self._rpc("getTransactionsForAddress",

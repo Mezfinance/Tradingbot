@@ -1251,6 +1251,90 @@ def early_pull_study(store, hours: float | None = None, now: float | None = None
                      "same size that did worse")}
 
 
+TOKEN_AGE_SCHEMA = "CREATE TABLE IF NOT EXISTS watch_token_age(mint TEXT PRIMARY KEY, first_ts REAL, ts REAL)"
+FRESH_TOKEN_S = 600  # minted less than 10 minutes before its pool = a new token launched with this pool
+AGE_BUCKETS = ((FRESH_TOKEN_S, "fresh (minted < 10 min before the pool)"), (3600, "10 min - 1 h old"),
+               (86400, "1 h - 1 day old"), (float("inf"), "over 1 day old"))
+AGE_BASELINE = 150
+
+
+def _age_bucket(age_s: float | None) -> str:
+    if age_s is None:
+        return "unknown"
+    return next(name for hi, name in AGE_BUCKETS if age_s < hi)
+
+
+def token_age_study(store, helius, hours: float | None = None, max_credits: int = 8_000, now: float | None = None,
+                    seed: int = 7) -> dict:
+    """11-04: some of the low-decile books' buys were tokens with ~1,050 holders at pool second 6, i.e. new
+    hand-made pools of tokens that already trade elsewhere (Jupiter then routes through their older pools, and the
+    backtest's vault prices measure a different trade). How many of the history model's D1-D2 pools are these, and
+    how did they do vs genuinely new tokens? Token age = pool creation minus the mint's oldest transaction (one
+    Helius call per mint, cached in `watch_token_age`); D1-D2 fetched first, then a random AGE_BASELINE of D3-D10."""
+    ensure_schema(store)
+    store.execute(TOKEN_AGE_SCHEMA)
+    now = now if now is not None else time.time()
+    since = now - hours * 3600 if hours else 0
+    rows = [dict(r) for r in store.query(
+        "SELECT pool, token_mint, create_ts, score_h, ret, pulled_ts FROM watch_launch_live WHERE status='done' "
+        "AND liquid=1 AND ret IS NOT NULL AND score_h IS NOT NULL AND token_mint IS NOT NULL AND create_ts >= ? "
+        "ORDER BY create_ts", (since,))]
+    if not rows:
+        return {"pools": 0}
+    from tradingbot.model_book import BIG_WIN, decile_index
+    idx = dict(zip((r["pool"] for r in rows), decile_index([r["score_h"] for r in rows])))
+    low = [r for r in rows if idx[r["pool"]] <= 1]
+    rest = sorted((r for r in rows if idx[r["pool"]] > 1),
+                  key=lambda r: hashlib.sha1(f"age:{r['pool']}".encode()).hexdigest())[:AGE_BASELINE]
+    have = {r["mint"]: r["first_ts"] for r in store.query("SELECT mint, first_ts FROM watch_token_age")}
+    stats = collections.Counter()
+    start = helius.credits_used
+    for r in low + rest:
+        m = r["token_mint"]
+        if m in have:
+            continue
+        if helius.credits_used - start + 10 > max_credits:
+            stats["left for a rerun (credit cap)"] += 1
+            continue
+        t = helius.first_tx_time(m)
+        if t is False:
+            stats["call failed"] += 1
+            continue
+        store.execute("INSERT OR REPLACE INTO watch_token_age(mint, first_ts, ts) VALUES (?,?,?)", (m, t, time.time()))
+        have[m] = t
+        stats["fetched"] += 1
+    stats["credits_used"] = helius.credits_used - start
+    rng = np.random.default_rng(seed)
+    for r in low + rest:
+        first = have.get(r["token_mint"], "missing")
+        r["age_s"] = None if first in (None, "missing") else max(0.0, r["create_ts"] - first)
+        r["bucket"] = "not fetched" if first == "missing" else _age_bucket(r["age_s"])
+
+    def group(rs):
+        if not rs:
+            return {"n": 0}
+        return {**_group(rs, rng), **_rug_split(rs),
+                "big_win_pct": round(100 * sum(r["ret"] >= BIG_WIN for r in rs) / len(rs))}
+
+    def split(rs):
+        buckets = [name for _, name in AGE_BUCKETS] + ["unknown", "not fetched"]
+        n = len(rs) or 1
+        return {"all": group(rs),
+                "share by token age (%)": {b: round(100 * sum(r["bucket"] == b for r in rs) / n, 1) for b in buckets
+                                           if any(r["bucket"] == b for r in rs)},
+                **{b: group([r for r in rs if r["bucket"] == b]) for b in buckets
+                   if any(r["bucket"] == b for r in rs)},
+                "median token age at pool creation (h)": round(float(np.median(
+                    [r["age_s"] for r in rs if r["age_s"] is not None])) / 3600, 2)
+                if any(r["age_s"] is not None for r in rs) else None}
+
+    return {"pools": len(rows), "fetch": dict(stats),
+            "history D1-D2": split(low), f"random {AGE_BASELINE} of D3-D10": split(rest),
+            "note": (f"token age = pool creation - the mint's oldest transaction; fresh = under {FRESH_TOKEN_S} s; "
+                     "returns are the scorer's ideal second-6 to minute-6 trades on the new pool's vault prices, 6% "
+                     "cost; deciles ranked within the window")}
+
+
 def parity(store, rows) -> dict:
     """Live features vs the ones the backtest builds from the enricher's later launch row (same pool)."""
     diffs = []

@@ -50,3 +50,21 @@ def test_report_end_to_end(cfg, good_pair, safe):
     assert claude["median_exit_slippage_pct"] == pytest.approx(3.0)  # PaperExecutor slippage
     text = report.render(rep)
     assert "STRATEGY COMPARISON" in text and "need 30+" in text
+
+
+def test_model_book_exit_slippage_leaves_out_rugs_and_bad_trigger_prices(tmp_path):
+    import time
+    from tradingbot.config import Config
+    from tradingbot.models import Position
+    cfg = Config(db_path=str(tmp_path / "bot.db"))
+    j = Journal(cfg.db_path)
+    # sells: a normal 2% slip, a rug (fill 1% of trigger), a bad trigger (fill 10^7 x the trigger)
+    for k, (price, trigger) in enumerate([(0.98, 1.0), (0.01, 1.0), (1.0, 1e-7)]):
+        pos = Position(id=None, token_address=f"T{k}", symbol=f"T{k}", entry_price=1.0, qty=1.0, initial_qty=1.0,
+                       cost_usd=100.0, opened_at=time.time(), stop_price=0.5, peak_price=1.0, strategy="launchd12")
+        j.save_position(pos, None)
+        j.log_fill(pos.id, "buy", 1.0, 1.0, 100.0, 0.0, "entry", "sim", trigger_price=1.0)
+        j.log_fill(pos.id, "sell", 1.0, price, 100.0 * price, 0.0, "pool_age_exit", "sim", trigger_price=trigger)
+    out = report._model_book_report(j, cfg, "launchd12")
+    assert out["book"]["median_exit_slippage_excl_rugs_pct"] == pytest.approx(2.0)
+    assert out["book"]["exits_with_bad_trigger"] == 1

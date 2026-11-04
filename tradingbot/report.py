@@ -417,6 +417,9 @@ def render(rep: dict) -> str:
 
 
 # --- model books report (the default `report`; `report --all` is the full one) -------------------------
+BAD_TRIGGER_MULT = 20.0
+
+
 def _model_book_report(j: Journal, cfg: Config, name: str) -> dict:
     from tradingbot import model_book as mb
     from tradingbot.engine import STUCK_AFTER_S
@@ -424,8 +427,11 @@ def _model_book_report(j: Journal, cfg: Config, name: str) -> dict:
     # Exit slippage without total-loss fills (a rugged pool's sale is a loss, not slippage).
     rows = j.query("""SELECT f.price, f.trigger_price FROM fills f JOIN positions p ON p.id=f.position_id
                       WHERE p.strategy=? AND f.side='sell' AND f.trigger_price > 0""", (name,))
-    stats["median_exit_slippage_excl_rugs_pct"] = _median(
-        [-(r["price"] / r["trigger_price"] - 1) * 100 for r in rows if r["price"] > 0.05 * r["trigger_price"]])
+    # Also without fills over BAD_TRIGGER_MULT x their trigger: the monitor's price was wrong (11-04: new pools of
+    # existing tokens gave triggers ~10^7 x below the fill), which is not slippage either; counted separately.
+    ok = [r for r in rows if 0.05 * r["trigger_price"] < r["price"] <= BAD_TRIGGER_MULT * r["trigger_price"]]
+    stats["median_exit_slippage_excl_rugs_pct"] = _median([-(r["price"] / r["trigger_price"] - 1) * 100 for r in ok])
+    stats["exits_with_bad_trigger"] = sum(r["price"] > BAD_TRIGGER_MULT * r["trigger_price"] for r in rows)
     now = time.time()
     open_pos = j.open_positions(name)
     stuck = {p.id for p in open_pos
@@ -529,7 +535,8 @@ def render_model(rep: dict) -> str:
             ("network fees $", lambda b: _fmt(b["book"]["network_fees_usd"])),
             ("failed txs", lambda b: _fmt(b["book"]["failed_txs"])),
             ("entry slippage % (med)", lambda b: _fmt(b["book"]["median_entry_slippage_pct"], "%")),
-            ("exit slippage % (med, excl. rugs)", lambda b: _fmt(b["book"]["median_exit_slippage_excl_rugs_pct"], "%"))]
+            ("exit slippage % (med, excl. rugs)", lambda b: _fmt(b["book"]["median_exit_slippage_excl_rugs_pct"], "%")),
+            ("  exits with a bad trigger price", lambda b: str(b["book"].get("exits_with_bad_trigger", 0)))]
     lines += ["", f"  {'':<34}" + "".join(f"{b['name']:>16}" for b in books)]
     for label, f in rows:
         lines.append(f"  {label:<34}" + "".join(f"{f(b):>16}" for b in books))
