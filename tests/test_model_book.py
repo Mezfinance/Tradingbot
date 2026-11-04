@@ -472,6 +472,17 @@ def early_store(n=800, seed=3):
     return store
 
 
+def test_early_walk_forward_compares_every_cut_off_down_to_the_top_0_1pct(tmp_path):
+    cfg = Config(db_path=str(tmp_path / "bot.db"), early_book=True)
+    out = mb.early_walk_forward(early_store(), cfg, now=T0 + 800 * 600 + 3600)
+    assert out["days_tested"] >= 1
+    groups = out["overall"]
+    ns = [groups[f"top {t:g}%"].get("n", 0) for t in mb.WALK_TOPS]
+    assert list(groups)[1:] == [f"top {t:g}%" for t in mb.WALK_TOPS]
+    assert ns == sorted(ns) and ns[-1] > ns[0]  # a stricter cut-off picks a subset
+    assert all(f"share_above_top {t:g}%_cut_pct" in out["cut_offs"][0] for t in mb.WALK_TOPS)
+
+
 def test_early_model_trains_on_hand_made_pools_and_queues_first_sight_signals(tmp_path):
     cfg = Config(db_path=str(tmp_path / "bot.db"), early_book=True)
     store = early_store()

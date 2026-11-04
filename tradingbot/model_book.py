@@ -506,7 +506,9 @@ def early_backtest(store, cfg: Config, hours: float = 8, now: float | None = Non
             "note": "outcome = 5-minute snapshot (~pool minute 6) vs first-sight price, 6% round trip; emptied = -100%"}
 
 
-WALK_TOPS = (2.0, 5.0, 16.0)  # early-walk-forward compares these top-% cut-offs (early6 = 5, early6w = 16)
+# early-walk-forward compares these top-% cut-offs (early6 = 5, early6t = 2, early6w = 16; 11-04: the super-premium
+# 1 / 0.5 / 0.25 / 0.1% too). A cut-off from 2 days of training scores (~1,500 pools) at 0.1% rests on 1-2 scores.
+WALK_TOPS = (0.1, 0.25, 0.5, 1.0, 2.0, 5.0, 16.0)
 
 
 def early_walk_forward(store, cfg: Config, now: float | None = None, seed: int = 7) -> dict:
