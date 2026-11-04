@@ -46,7 +46,16 @@ primary_region = "iad"
 [[restart]]
   policy = "always"
 
-# Private health check (no public service is exposed). See `fly checks list`.
+# Public HTTPS for the live dashboard (password: Fly secret DASHBOARD_TOKEN; without it the
+# dashboard routes return 404 and only /health answers). The machine is never stopped by Fly.
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = false
+  min_machines_running = 1
+
+# Private health check. See `fly checks list`.
 [checks]
   [checks.alive]
     type = "http"

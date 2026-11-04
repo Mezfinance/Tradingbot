@@ -208,7 +208,15 @@ class Engine:
         threading.Thread(target=self._loop, name="tracker", daemon=True,
                          args=(self.cfg.track_interval_s, self.update_outcomes)).start()
         if self.cfg.health_port > 0:
-            health.start_health_server(self.journal, self.cfg)
+            from tradingbot import dashboard as dash
+            board = None
+            if dash.token() and self.cfg.db_path != ":memory:":
+                store = None
+                if self.cfg.launch_live:
+                    from tradingbot.watcher import WatchStore, watch_db_path
+                    store = WatchStore(watch_db_path(self.cfg))  # its own connection for the dashboard thread
+                board = dash.Dashboard(self.journal, self.cfg, store).start()
+            health.start_health_server(self.journal, self.cfg, board)
         try:
             self._loop(self.cfg.scan_interval_s, self._scan_cycle)
         finally:
