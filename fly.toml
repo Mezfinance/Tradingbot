@@ -27,8 +27,8 @@ primary_region = "iad"
   TB_LAUNCH_LOW_BOOK = "1"  # launchd12 + _s10/_s20/_s30/_s50: history-model bottom 20% minus the riskiest k% early pullers (11-04)
   TB_LAUNCH_DAILY_CREDITS = "6000"  # sampled launch rows back on (11-04): launch4.json trains on them (14-day window)
   TB_LAUNCH_LIVE_DAILY_CREDITS = "28000"  # scorer (11-04: 600k of the plan's 1M used, 11 days left = ~36k/day; 28k + 6k sampled = 34k leaves ~26k for studies)
-  TB_RESET_BOOKS = "launch4_2,launch4_5"  # fresh start after the first half hour's mis-picks (once per id)
-  TB_RESET_BOOKS_ID = "2026-11-02-drift"
+  TB_RESET_BOOKS = "launchd12,launchd12_s10,launchd12_s20,launchd12_s30,launchd12_s50"  # fresh start after the impact-probe fix (once per id; launch4_2/5 were reset on 11-02 under id 2026-11-02-drift)
+  TB_RESET_BOOKS_ID = "2026-11-04-impact-probe"
   TB_HELIUS_DAILY_CREDITS = "0"  # early-buyer lookups off: their credits go to the launch scorer
   TB_OPERATOR_DAILY_CREDITS = "0"  # rug-catcher operator lookups off (ops books are off)
 
