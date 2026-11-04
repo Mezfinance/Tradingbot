@@ -4,6 +4,7 @@ import time
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from tradingbot import model_book as mb
 from tradingbot import risk
@@ -752,6 +753,10 @@ def test_launch_signals_go_to_the_matching_launch_book_with_a_minute_6_deadline(
             eng.current_prices = lambda tokens, held=None, bad=bad: dict(bad)
             eng.manage_positions()
             assert {p.token_address for p in j.open_positions(mb.LAUNCH5)} == {"L2", "L5"}
+        # ...and the open trades are valued at entry in equity, not at $0
+        held = sum(p.qty * p.entry_price for p in j.open_positions(mb.LAUNCH5))
+        book5 = eng.books[mb.LAUNCH5]
+        assert eng.equity(book5, {"L2": 0.0, "L5": 0.0}) == pytest.approx(book5.cash + held)
         eng._deadlines[h5["L5"].id] = time.time() - 1
         eng.current_prices = lambda tokens, held=None: {}
         eng.manage_positions()
