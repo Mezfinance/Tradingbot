@@ -69,7 +69,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "early-backtest", "early-walk-forward", "launch-backtest", "launch-backfill", "launch-status", "launch-compare",
                                             "launch-hist-backfill", "launch-hist-test", "launch-exit-study",
                                             "launch-late-entry", "launch-early-pulls",
-                                            "launch-pull-train", "launch-token-age"])
+                                            "launch-pull-train", "launch-token-age", "launch-d12-trades"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -283,6 +283,22 @@ def main(argv: list[str] | None = None) -> None:
         helius.min_interval_s = 1 / max(args.rps, 0.1)  # leave the live scorer its share of the plan's rate
         print(json.dumps(launch_live.exit_study(WatchStore(watch_db_path(cfg)), helius, args.hours,
                                                 int(args.max_credits or 10_000)), indent=2))
+        return
+
+    if args.command == "launch-d12-trades":
+        from tradingbot import launch_live
+        from tradingbot.watcher import WatchStore, watch_db_path
+        out = launch_live.low_decile_trades(WatchStore(watch_db_path(cfg)), args.hours)
+        if args.json:
+            print(json.dumps(out, indent=2))
+            return
+        print(f"history-model D1-D2 trades: {out.get('d1_d2_trades', 0)} of {out['pools']} finished liquid pools")
+        print(json.dumps(out.get("summary", {}), indent=2))
+        print(f"{'created (UTC)':16} {'token':45} {'return %':>9} {'pulled after s':>15} {'risk pct':>9}")
+        for t in out["trades"]:
+            pulled = "" if t["pulled_after_s"] is None else str(t["pulled_after_s"])
+            risk = "" if t["risk_pct"] is None else str(t["risk_pct"])
+            print(f"{t['created (UTC)']:16} {t['token']:45} {t['return_pct']:>9} {pulled:>15} {risk:>9}")
         return
 
     if args.command == "launch-token-age":

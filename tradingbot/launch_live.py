@@ -778,13 +778,21 @@ def _median(vals):
     return round(float(np.median(vals)), 2) if vals else None
 
 
+RETURN_BANDS = (("rugged (-100%)", -9.0, -0.999), ("-50% to -99%", -0.999, -0.5), ("0 to -50%", -0.5, 0.0),
+                ("0 to +50%", 0.0, 0.5), ("+50% or more", 0.5, 99.0))
+
+
 def _group(rows, rng) -> dict:
     rets = [r["ret"] for r in rows if r["ret"] is not None]
     if not rets:
         return {"n": 0}
-    out = {"n": len(rets), "mean_pct": round(100 * float(np.mean(rets)), 1),
+    n = len(rets)
+    out = {"n": n, "mean_pct": round(100 * float(np.mean(rets)), 1),
            "median_pct": round(100 * float(np.median(rets)), 1),
-           "rugged_pct": round(100 * sum(x <= -0.999 for x in rets) / len(rets))}
+           "win_pct": round(100 * sum(x > 0 for x in rets) / n),
+           "rugged_pct": round(100 * sum(x <= -0.999 for x in rets) / n),
+           "returns (% of trades)": {name: round(100 * sum(lo <= x < hi for x in rets) / n)
+                                     for name, lo, hi in RETURN_BANDS}}
     if len(rets) >= 5:
         boots = [np.mean(rng.choice(rets, len(rets))) for _ in range(2000)]
         out["ci90"] = [round(100 * float(np.quantile(boots, q)), 1) for q in (0.05, 0.95)]
@@ -1333,6 +1341,30 @@ def token_age_study(store, helius, hours: float | None = None, max_credits: int 
             "note": (f"token age = pool creation - the mint's oldest transaction; fresh = under {FRESH_TOKEN_S} s; "
                      "returns are the scorer's ideal second-6 to minute-6 trades on the new pool's vault prices, 6% "
                      "cost; deciles ranked within the window")}
+
+
+def low_decile_trades(store, hours: float | None = None, now: float | None = None) -> dict:
+    """Every finished trade of the history model's bottom 20% (D1-D2, ranked within the window as the studies
+    do), one row each: the scorer's ideal second-6 to minute-6 return (6% cost), when the LP was pulled, and the
+    early-pull risk percentile where the live scorer recorded one (pools decided after the 11-04 deploy)."""
+    ensure_schema(store)
+    now = now if now is not None else time.time()
+    since = now - hours * 3600 if hours else 0
+    rows = [dict(r) for r in store.query(
+        "SELECT pool, token_mint, create_ts, score_h, ret, pulled_ts, risk_pct FROM watch_launch_live "
+        "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND score_h IS NOT NULL AND create_ts >= ? "
+        "ORDER BY create_ts", (since,))]
+    if not rows:
+        return {"pools": 0, "trades": []}
+    from tradingbot.model_book import decile_index
+    idx = decile_index([r["score_h"] for r in rows])
+    low = [r for r, i in zip(rows, idx) if i <= 1]
+    trades = [{"created (UTC)": datetime.fromtimestamp(r["create_ts"], timezone.utc).strftime("%m-%d %H:%M:%S"),
+               "token": r["token_mint"], "return_pct": round(100 * r["ret"], 1),
+               "pulled_after_s": round(r["pulled_ts"] - r["create_ts"]) if r["pulled_ts"] else None,
+               "risk_pct": round(r["risk_pct"]) if r["risk_pct"] is not None else None} for r in low]
+    return {"pools": len(rows), "d1_d2_trades": len(trades),
+            "summary": _group(low, np.random.default_rng(0)), "trades": trades}
 
 
 def parity(store, rows) -> dict:

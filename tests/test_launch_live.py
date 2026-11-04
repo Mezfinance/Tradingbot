@@ -603,3 +603,21 @@ def test_token_age_study_splits_new_tokens_from_new_pools_of_old_tokens():
     calls = h.calls
     ll.token_age_study(st, h, now=t0 + 100 * 60)
     assert h.calls == calls  # cached
+
+
+def test_low_decile_trades_lists_every_bottom_20pct_trade_with_win_rate_and_return_bands():
+    st = WatchStore(":memory:")
+    ll.ensure_schema(st)
+    t0 = 1_800_000_000.0
+    rets = [-1.0, -0.7, -0.2, 0.1, 0.8]  # one per band
+    for i in range(25):
+        st.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, liquid, score_h, ret, pulled_ts, "
+                   "risk_pct, status) VALUES (?,?,?,?,?,?,?,?,?)",
+                   (f"P{i}", f"M{i}", t0 + i, 1, float(i), rets[i % 5], t0 + i + 40 if i % 5 == 0 else None,
+                    10.0 * i if i < 3 else None, "done"))
+    out = ll.low_decile_trades(st, now=t0 + 100)
+    assert out["pools"] == 25 and out["d1_d2_trades"] == 5 and len(out["trades"]) == 5
+    s = out["summary"]
+    assert s["win_pct"] == 40 and all(v == 20 for v in s["returns (% of trades)"].values())
+    first = out["trades"][0]
+    assert first["return_pct"] == -100.0 and first["pulled_after_s"] == 40 and first["risk_pct"] == 0
