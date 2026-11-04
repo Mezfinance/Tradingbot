@@ -69,6 +69,8 @@ class Config:
     launch_book: bool = False
     # twins of the launch books on the history-trained model with a rolling 24 h cut-off (launch4h_2 / launch4h_5)
     launch_hist_book: bool = False
+    # launch4_2m5 (11-04): launch4_2's picks (the old model's top2 flag), sold at pool minute 5 instead of 6
+    launch_m5_book: bool = False
     # One-off fresh start for some books (comma list): their history is kept as '<book>@<reset_books_id>' and
     # their cash goes back to the starting amount. Runs once per reset_books_id, at engine start.
     reset_books: str = ""

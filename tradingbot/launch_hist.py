@@ -223,6 +223,12 @@ def test(store, cfg: Config) -> dict:
         _walk(liquid, rng, tuple(la.LIVE_DROP))
     # Hour and weekend can only learn day effects from a few days (a near-constant weekend flag broke 11-02).
     out["walk-forward without hour/weekend features"] = _walk(liquid, rng, tuple(la.LIVE_DROP) + CALENDAR)
+    # 11-04: the live launch4.json (trained only on GeckoTerminal-listed pools, i.e. ones that survived ~70 s)
+    # beat the all-pools history model on the same live pools. Does training on survivors cause it? Same test
+    # pools (every liquid pool), only the training rows differ.
+    out["survivors test: trained on listed pools only (as launch4.json), tested on every pool"] = {
+        "with hour/weekend (like launch4.json)": _walk(liquid, rng, tuple(la.LIVE_DROP), lambda r: r["listed"]),
+        "without hour/weekend": _walk(liquid, rng, tuple(la.LIVE_DROP) + CALENDAR, lambda r: r["listed"])}
     return out
 
 
@@ -234,12 +240,13 @@ def _day_mean(rows: list[dict]) -> dict:
             "rugged": sum(r["ret"][FILL_S] <= -0.8 for r in rows)}
 
 
-def _walk(liquid: list[dict], rng, drop: tuple) -> dict:
-    """Walk-forward by day: train on earlier days, pick the top k% of each test day's own scores."""
+def _walk(liquid: list[dict], rng, drop: tuple, train_filter=None) -> dict:
+    """Walk-forward by day: train on earlier days (only rows passing `train_filter`, if given), pick the top k%
+    of each test day's own scores among every liquid pool."""
     picks = {k: [] for k in la.TIMING_TOP_PCT}
     base, by_day = [], {}
     for d in sorted({la._day(r) for r in liquid}):
-        train = [r for r in liquid if la._day(r) < d]
+        train = [r for r in liquid if la._day(r) < d and (train_filter is None or train_filter(r))]
         test_rows = [r for r in liquid if la._day(r) == d]
         if len(train) < la.RANK_MIN_TRAIN or not test_rows:
             continue

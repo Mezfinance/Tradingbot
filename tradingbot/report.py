@@ -493,6 +493,9 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
                  "-12..+24%), 25% rugged",
     "launch4h_2": "history-trained model (every hand-made pool, chain prices, no hour/weekend), top 2% of the past "
                   "24 h's scores. 7-day walk-forward: +5.0%/trade (90% range -4.6..+14.5%), 25% rugged",
+    "launch4_2m5": "launch4_2's picks sold at pool minute 5. launch-exit-study (old model top 8% of 906 live pools, "
+                   "11-03/04): minute 5 +13.0%/trade (90% range -1.8..+28.6%), 19% rugged vs minute 6 +6.2%; "
+                   "chosen after looking at minutes 1-6",
     "launch4h_5": "as launch4h_2, top 5%: +8.8%/trade (90% range +2.8..+14.7%), 23% rugged; every pool -5.2%, 31%",
 }
 

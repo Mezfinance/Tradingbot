@@ -732,6 +732,28 @@ def test_launch_signals_go_to_the_matching_launch_book_with_a_minute_6_deadline(
         cfg.launch_book, cfg.launch_live = False, False
 
 
+def test_minute_5_twin_takes_launch4_2s_picks_and_sells_at_pool_minute_5(cfg, good_pair):
+    cfg.launch_book = cfg.launch_m5_book = cfg.launch_live = True
+    try:
+        j = Journal(":memory:")
+        eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                     model_executor=PaperExecutor(cfg))
+        assert mb.active_books(cfg)[-3:] == [mb.LAUNCH2, mb.LAUNCH5, mb.LAUNCH2M5]
+        created = time.time() - 6
+        top5 = {"pool": "PL", "mint": "L5", "dex": "pumpswap", "created_ts": created, "name": "", "price": 2.5e-5,
+                "liq": 30_000.0, "score": 1.0, "ts": time.time(), "decided_ts": time.time(), "kind": "launch",
+                "top2": False, "top5": True}
+        for s in (top5, dict(top5, mint="L2", top2=True)):
+            eng.model_book.signals.put(s)
+        eng.buy_model_signals()
+        m5 = {p.token_address: p for p in j.open_positions(mb.LAUNCH2M5)}
+        assert set(m5) == {"L2"}  # the same picks as launch4_2
+        assert eng._deadlines[m5["L2"].id] == created + 300
+        assert mb.exit_config(cfg, mb.LAUNCH2M5).stop_loss_pct >= 99
+    finally:
+        cfg.launch_book = cfg.launch_m5_book = cfg.launch_live = False
+
+
 def test_reset_books_archives_history_once(cfg, good_pair):
     from tradingbot.models import Position
     j = Journal(":memory:")

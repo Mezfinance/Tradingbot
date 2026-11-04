@@ -129,6 +129,14 @@ def test_test_reports_listed_and_unlisted():
     plain = out["walk-forward without hour/weekend features"]
     assert plain["by day"] and not any(set(r["most shifted features (z vs training)"]) & set(lh.CALENDAR)
                                        for r in plain["by day"].values())
+    surv = out["survivors test: trained on listed pools only (as launch4.json), tested on every pool"]
+    assert surv["with hour/weekend (like launch4.json)"]["days_scored"] == 0  # no pool here was ever listed
+    import numpy as np
+    from tradingbot import launch_analysis as la
+    liquid = sorted([r for r in lh.rows(st, Config(db_path=":memory:"))[0] if r["liquid"]], key=lambda r: r["created_ts"])
+    every = lh._walk(liquid, np.random.default_rng(0), tuple(la.LIVE_DROP))
+    same = lh._walk(liquid, np.random.default_rng(0), tuple(la.LIVE_DROP), lambda r: True)
+    assert every["top 5%"] == same["top 5%"] and every["days_scored"] == same["days_scored"] > 0
 
 
 class HeadOnlyHelius(FakeHelius):

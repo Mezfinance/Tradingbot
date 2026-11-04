@@ -66,8 +66,11 @@ LAUNCH2, LAUNCH5 = "launch4_2", "launch4_5"
 # scorer's own outcomes, no hour/weekend features, picking the top 2% / 5% of the past 24 h's scores (rolling).
 LAUNCH2H, LAUNCH5H = "launch4h_2", "launch4h_5"
 LAUNCH_HIST_CUT = {LAUNCH2H: "top2h", LAUNCH5H: "top5h"}
-LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", **LAUNCH_HIST_CUT}
-LAUNCH_EXIT_MIN = {b: 6.0 for b in LAUNCH_CUT}
+# Minute-5 twin (11-04): launch4_2's signals sold at pool minute 5. launch-exit-study on 72 old-model picks:
+# minute 5 +13.0% (CI -1.8..+28.6) vs minute 6 +6.2%; pulls cluster at 60-120 s, two more land in minute 5-6.
+LAUNCH2M5 = "launch4_2m5"
+LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", **LAUNCH_HIST_CUT}
+LAUNCH_EXIT_MIN = {b: 5.0 if b == LAUNCH2M5 else 6.0 for b in LAUNCH_CUT}
 POOL_MINUTE_EXIT = {**EARLY_EXIT_MIN, **LAUNCH_EXIT_MIN}  # books that sell every position by a pool minute
 EARLY_MAX_SEEN_MIN = 4.0  # first sight later than this leaves no time to trade (and was left out of training)
 EARLY_GAIN = 0.10  # label: the 5-minute snapshot price >= first-sight price x 1.10 after costs, pool intact
@@ -121,6 +124,7 @@ def active_books(cfg: Config) -> list[str]:
         + (list(EARLY_FIXED) if cfg.early_book else []) + (list(EARLY_ROLLING) if cfg.early_rolling else []) \
         + ([EARLY6W] if cfg.early_wide else []) + ([EARLY6T] if cfg.early_tight else []) \
         + ([LAUNCH2, LAUNCH5] if cfg.launch_book and cfg.launch_live else []) \
+        + ([LAUNCH2M5] if cfg.launch_m5_book and cfg.launch_live else []) \
         + (list(LAUNCH_HIST_CUT) if cfg.launch_hist_book and cfg.launch_live else [])
 
 
