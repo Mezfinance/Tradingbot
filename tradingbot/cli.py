@@ -68,7 +68,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "watch-model-train", "model-status", "early-status",
                                             "early-backtest", "early-walk-forward", "launch-backtest", "launch-backfill", "launch-status", "launch-compare",
                                             "launch-hist-backfill", "launch-hist-test", "launch-exit-study",
-                                            "launch-late-entry"])
+                                            "launch-late-entry", "launch-early-pulls"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -273,6 +273,12 @@ def main(argv: list[str] | None = None) -> None:
         helius.min_interval_s = 1 / max(args.rps, 0.1)  # leave the live scorer its share of the plan's rate
         print(json.dumps(launch_live.exit_study(WatchStore(watch_db_path(cfg)), helius, args.hours,
                                                 int(args.max_credits or 10_000)), indent=2))
+        return
+
+    if args.command == "launch-early-pulls":
+        from tradingbot import launch_live
+        from tradingbot.watcher import WatchStore, watch_db_path
+        print(json.dumps(launch_live.early_pull_study(WatchStore(watch_db_path(cfg)), args.hours), indent=2))
         return
 
     if args.command == "launch-late-entry":

@@ -29,6 +29,7 @@ import hashlib
 import heapq
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -976,6 +977,141 @@ def late_entry_study(store, helius, hours: float | None = None, max_credits: int
                    "then (no latency or impact), 6% round trip, capped +300%; -100% once pulled or drained "
                    "(SOL < 10% of the highest seen since entry); pulls after minute 6 are only seen as drains")
     return out
+
+
+PULL_BLOCK_H = 6  # walk-forward test blocks
+PULL_MIN_TRAIN = 300
+PULL_SKIPS = (10, 20, 30, 50)  # % of pools skipped as most likely to be pulled early
+PULL_RANDOM_DRAWS = 500
+
+
+def _creator_history(rows: list[dict]) -> dict:
+    """Per pool, what the scorer had seen of its creator by the decision (create + DECIDE_S): earlier pools, and
+    how many of them had been pulled within EARLY_RUG_S (only pulls that had happened by then count)."""
+    by_creator = collections.defaultdict(list)
+    for r in rows:
+        if r["creator"]:
+            by_creator[r["creator"]].append(r)
+    out = {}
+    for r in rows:
+        now = r["create_ts"] + DECIDE_S
+        prior = [p for p in by_creator.get(r["creator"], []) if p["create_ts"] < r["create_ts"]]
+        early = [p for p in prior if p["pulled_ts"] and p["pulled_ts"] <= now
+                 and p["pulled_ts"] - p["create_ts"] < EARLY_RUG_S]
+        pulled = [p for p in prior if p["pulled_ts"] and p["pulled_ts"] <= now]
+        last = max((p["create_ts"] for p in prior), default=None)
+        out[r["pool"]] = {"op_prior": math.log1p(len(prior)), "op_early_pulls": math.log1p(len(early)),
+                          "op_early_share": len(early) / len(prior) if prior else 0.0,
+                          "op_pull_share": len(pulled) / len(prior) if prior else 0.0,
+                          "op_min_since_last": math.log1p((r["create_ts"] - last) / 60) if last else 0.0}
+    return out
+
+
+def early_pull_study(store, hours: float | None = None, now: float | None = None, seed: int = 7) -> dict:
+    """11-04: entering the history model's D1-D2 at 90 s missed their big moves, but the D1-D2 pools that
+    survived 90 s made +23.5% from second 6 (hindsight). Can second-4 data spot the early pullers? A walk-forward
+    logistic (expanding window, PULL_BLOCK_H test blocks) on the scorer's own features + the creator's history in
+    this table, label = LP pulled < EARLY_RUG_S after creation. Reports the AUC, and the scorer's second-6 trade
+    with the riskiest k% skipped vs the same share skipped at random (the check an 11-01 filter failed)."""
+    ensure_schema(store)
+    now = now if now is not None else time.time()
+    since = now - hours * 3600 if hours else 0
+    rows = store.query("SELECT pool, creator, create_ts, feat, score_h, ret, pulled_ts FROM watch_launch_live "
+                       "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND feat IS NOT NULL "
+                       "AND create_ts >= ? ORDER BY create_ts", (since,))
+    rows = [dict(r) for r in rows]
+    if len(rows) < PULL_MIN_TRAIN + 50:
+        return {"pools": len(rows), "note": f"needs {PULL_MIN_TRAIN + 50}+ finished liquid pools"}
+    hist = _creator_history(rows)
+    drop = set(la.LIVE_DROP) | set(CALENDAR)
+    for r in rows:
+        r["x"] = {**{k: v for k, v in json.loads(r["feat"]).items() if k not in drop}, **hist[r["pool"]]}
+        r["y"] = float(bool(r["pulled_ts"]) and r["pulled_ts"] - r["create_ts"] < EARLY_RUG_S)
+    rng = np.random.default_rng(seed)
+    start = rows[0]["create_ts"]
+    block = PULL_BLOCK_H * 3600
+    tested, blocks = [], []
+    t = start + block
+    while t < rows[-1]["create_ts"]:
+        train = [r for r in rows if r["create_ts"] < t]
+        test = [r for r in rows if t <= r["create_ts"] < t + block]
+        t += block
+        if len(train) < PULL_MIN_TRAIN or not test:
+            continue
+        y = np.array([r["y"] for r in train])
+        if y.min() == y.max():
+            continue
+        names = sorted({k for r in train for k in r["x"]})
+        xs, med = wa._matrix([r["x"] for r in train], names)
+        mu, sd = xs.mean(0), xs.std(0) + 1e-9
+        z = lambda m: np.clip((m - mu) / sd, -la.CLIP_Z, la.CLIP_Z)
+        w, b = wa.logistic(z(xs), y)
+        p = z(wa._matrix([r["x"] for r in test], names, med)[0]) @ w + b
+        # history-model deciles within the block (the late-entry study ranked within its window)
+        dec = None
+        if all(r["score_h"] is not None for r in test):
+            from tradingbot.model_book import decile_index
+            dec = decile_index([r["score_h"] for r in test])
+        for i, (r, s) in enumerate(zip(test, p)):
+            tested.append({"risk": float(s), "y": r["y"], "ret": r["ret"],
+                           "low": dec is not None and dec[i] <= 1, "block": len(blocks)})
+        blocks.append({"from": datetime.fromtimestamp(t - block, timezone.utc).strftime("%m-%d %H:%M"),
+                       "train": len(train), "test": len(test),
+                       "auc": wa.auc(np.array(p), np.array([r["y"] for r in test]))})
+        top = sorted(zip(w, names), key=lambda x: -abs(x[0]))[:8]
+        blocks[-1]["top_weights"] = {n: round(float(v), 2) for v, n in top}
+    if not tested:
+        return {"pools": len(rows), "note": "no block had enough training rows"}
+
+    def ev(group: list[dict]) -> dict:
+        if not group:
+            return {"n": 0}
+        rets = np.array([g["ret"] for g in group])
+        ys = np.array([g["y"] for g in group])
+        out = {"n": len(group), "early_pull_pct": round(100 * ys.mean(), 1),
+               "auc": wa.auc(np.array([g["risk"] for g in group]), ys),
+               "keep all": {"mean_pct": round(100 * rets.mean(), 1), "rugged_pct": round(100 * (rets <= -0.999).mean()),
+                            "big_win_pct": round(100 * (rets >= 0.5).mean())}}
+        # skip within each block, so a block whose scores run high isn't skipped wholesale
+        by_block = collections.defaultdict(list)
+        for i, g in enumerate(group):
+            by_block[g["block"]].append(i)
+        for k in PULL_SKIPS:
+            keep_idx = []
+            for idx in by_block.values():
+                idx = sorted(idx, key=lambda i: group[i]["risk"])
+                keep_idx += idx[:len(idx) - round(len(idx) * k / 100)]
+            kept = rets[keep_idx]
+            skipped = np.setdiff1d(np.arange(len(group)), keep_idx)
+            rand = []
+            for _ in range(PULL_RANDOM_DRAWS):
+                pick = []
+                for idx in by_block.values():
+                    pick += list(rng.choice(idx, len(idx) - round(len(idx) * k / 100), replace=False))
+                rand.append(rets[pick].mean())
+            rand = np.array(rand)
+            out[f"skip riskiest {k}%"] = {
+                "kept": len(kept), "mean_pct": round(100 * kept.mean(), 1),
+                "rugged_pct": round(100 * (kept <= -0.999).mean()),
+                "early_pulls_left_pct": round(100 * ys[keep_idx].mean(), 1),
+                "big_win_pct": round(100 * (kept >= 0.5).mean()),
+                "skipped_that_were_early_pulls_pct": round(100 * ys[skipped].mean(), 1) if len(skipped) else None,
+                "skipped_big_winners": int((rets[skipped] >= 0.5).sum()),
+                "random_skip_mean_pct": round(100 * rand.mean(), 1),
+                "random_skip_90pct_range": [round(100 * float(np.percentile(rand, 5)), 1),
+                                            round(100 * float(np.percentile(rand, 95)), 1)],
+                "beats_random_share_pct": round(100 * (rand < kept.mean()).mean())}
+        return out
+
+    return {"pools": len(rows), "tested": len(tested), "blocks": blocks,
+            "every liquid pool (test blocks)": ev(tested),
+            "history D1-D2 (test blocks)": ev([g for g in tested if g["low"]]),
+            "note": (f"label = LP pulled < {EARLY_RUG_S} s after creation; walk-forward, expanding window, "
+                     f"{PULL_BLOCK_H} h test blocks, min {PULL_MIN_TRAIN} training pools; features = the live "
+                     "scorer's second-4 features (no names, no hour/weekend) + the creator's earlier pools in this "
+                     "table (early pulls seen by the decision); trade = the scorer's second-6 to minute-6 return, "
+                     "6% cost; skips made within each block; beats_random_share = share of random skips of the "
+                     "same size that did worse")}
 
 
 def parity(store, rows) -> dict:

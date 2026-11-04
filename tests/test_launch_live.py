@@ -453,3 +453,32 @@ def test_late_entry_study_enters_the_low_deciles_after_the_early_pulls():
     assert h.calls == calls  # cached states are never fetched twice
     capped = ll.late_entry_study(st, _PathHelius(states), now=t0 + 2000, max_credits=0)
     assert capped["groups"]["history D1-D2"]["entered"] == 8  # all from the cache
+
+
+def test_early_pull_study_finds_a_planted_early_puller_signal_and_beats_random_skips():
+    import random as _random
+    st = WatchStore(":memory:")
+    ll.ensure_schema(st)
+    rnd = _random.Random(3)
+    t0 = 1_800_000_000.0
+    for i in range(900):
+        create = t0 + i * 200  # 50 hours
+        puller = rnd.random() < 0.2
+        creator = f"BAD{rnd.randrange(20)}" if puller else f"C{i}"
+        feat = {"creator_buys": float(puller) * 2 + rnd.random(), "log_txs": rnd.random(), "hour_sin": 0.3,
+                "name_len": 4.0}
+        pulled = create + 40 if puller else (create + 500 if rnd.random() < 0.3 else None)
+        ret = -1.0 if puller else rnd.choice([0.1, -0.1, 0.6])
+        st.execute("INSERT INTO watch_launch_live(pool, creator, create_ts, liquid, feat, score_h, ret, pulled_ts, "
+                   "status) VALUES (?,?,?,?,?,?,?,?,?)",
+                   (f"P{i}", creator, create, 1, json.dumps(feat), rnd.random(), ret, pulled, "done"))
+    out = ll.early_pull_study(st, now=t0 + 900 * 200)
+    assert out["tested"] > 300 and out["blocks"]
+    allp = out["every liquid pool (test blocks)"]
+    assert allp["auc"] > 0.9
+    s20 = allp["skip riskiest 20%"]
+    assert s20["early_pulls_left_pct"] < allp["early_pull_pct"] / 2
+    assert s20["mean_pct"] > s20["random_skip_mean_pct"] and s20["beats_random_share_pct"] == 100
+    assert "history D1-D2 (test blocks)" in out
+    assert all("name_len" not in b["top_weights"] and "hour_sin" not in b["top_weights"] for b in out["blocks"])
+    assert ll.early_pull_study(WatchStore(":memory:"))["pools"] == 0
