@@ -208,6 +208,12 @@ def test_real_vs_ideal_fills_pairs_book_trades_with_the_scorer(setup):
     out = ll.status(st, cfg, 24, now=clock.t, journal=j)["real vs ideal fills"]["launch4_5"]
     assert out["trades"] == 1 and out["filled at pool second (median)"] == 7
     assert out["gap per trade (real - ideal)"]["mean_pct"] == pytest.approx(10 - 19, abs=0.1)
+    assert out["signalled but not bought (ideal)"]["n"] == 0  # launch4_5 bought the pool
+    other = ll.status(st, cfg, 24, now=clock.t, journal=j)["real vs ideal fills"]["launch4_2"]
+    if live._row(HAND_POOL)["top2"]:  # flagged for launch4_2 too, which didn't buy it
+        assert other["signalled but not bought (ideal)"]["mean_pct"] == pytest.approx(19, abs=0.1)
+    else:
+        assert other["signalled but not bought (ideal)"]["n"] == 0
 
 
 def test_liquidity_and_size_estimate(setup):

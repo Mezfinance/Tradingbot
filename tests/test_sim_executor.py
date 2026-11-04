@@ -16,7 +16,10 @@ class FakeJupiter:
         self.quotes = list(quotes)
 
     def quote(self, in_mint, out_mint, in_raw):
-        return self.quotes.pop(0)
+        if not self.quotes:
+            return None
+        nxt = self.quotes.pop(0)
+        return nxt(in_raw) if callable(nxt) else nxt  # a callable describes a pool: quote for any size
 
     def decimals(self, mint):
         return 6
@@ -123,11 +126,13 @@ def test_token_too_new_for_the_price_api_gets_decimals_onchain_and_a_quote_price
 
 
 def test_jupiter_unknown_impact_is_estimated_from_the_trigger_price(sim):
-    # Jupiter says 100% (it can't value a seconds-old token); the quote's own price is 2% above the trigger
+    # Jupiter says 100% (it can't value a seconds-old token) and the size probe fails (None): the quote's own
+    # price is 2% above the trigger, so the estimate lets the buy through
     swap = 50 - 0.303928
     tokens = swap / (1.02 * 0.001)  # quote price = 1.02 x trigger
     raw = int(tokens * 1e6)
-    ok = sim([q(raw, int(raw * 0.97), impact=100.0), q(raw, int(raw * 0.97), impact=100.0)]).buy("T", 50, 0.001)
+    ok = sim([q(raw, int(raw * 0.97), impact=100.0), lambda n: None,
+              q(raw, int(raw * 0.97), impact=100.0)]).buy("T", 50, 0.001)
     assert ok is not None and ok.ok
     # a really bad price still gets declined: the quote is 20% worse than the trigger
     bad_raw = int(swap / (1.20 * 0.001) * 1e6)
@@ -136,3 +141,25 @@ def test_jupiter_unknown_impact_is_estimated_from_the_trigger_price(sim):
     # no trigger price to compare with: the 100% stands
     ex = sim([q(raw, int(raw * 0.97), impact=100.0)])
     assert ex.buy("T", 50, 0) is None and "100.00%" in ex.last_note
+
+
+def pool(tokens_per_usdc_raw, impact_per_full=0.0, reported=94.0):
+    """A quote for any size from a pool: a $1-equivalent rate, minus `impact_per_full` x (size / 50 USDC)."""
+    def quote(in_raw):
+        rate = tokens_per_usdc_raw * (1 - impact_per_full * in_raw / 50e6)
+        out = int(in_raw * rate)
+        return q(out, int(out * 0.97), impact=reported, in_raw=in_raw)
+    return quote
+
+
+def test_bogus_jupiter_impact_is_replaced_by_our_own_size_probe(sim):
+    # Jupiter reports 94% on a fresh token; quoting 1% of the size shows the real cost of our size is ~2%,
+    # even though the price ran 30% since the trigger (the trigger estimate would have declined it)
+    p = pool(1000, impact_per_full=0.02)
+    ex = sim([p, p, p])
+    fill = ex.buy("T", 50, 0.001 / 1.3)
+    assert fill is not None and fill.ok
+    # a really thin pool is still declined: our size costs ~20%
+    thin = pool(1000, impact_per_full=0.20)
+    ex = sim([thin, thin])
+    assert ex.buy("T", 50, 0.001) is None and "price impact 19" in ex.last_note

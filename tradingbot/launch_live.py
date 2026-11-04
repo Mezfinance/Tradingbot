@@ -1399,10 +1399,23 @@ def fill_gap(store, journal, book: str, since: float, rng) -> dict:
             continue
         pairs.append({"real": p["realized_usd"] / p["cost_usd"] - 1, "ideal": r[0]["ret"],
                       "in_s": p["opened_at"] - r[0]["create_ts"], "out_s": p["closed_at"] - r[0]["create_ts"]})
+    # pools the book was signalled on but didn't buy (declined, failed, skipped): their ideal trades
+    from tradingbot import model_book as mb
+    flag = mb.LAUNCH_CUT.get(book)
+    bought = {p["token"] for p in journal.query("SELECT token FROM positions WHERE strategy=? AND opened_at >= ?",
+                                                (book, since - 600))}
+    missed = []
+    if flag:
+        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct FROM watch_launch_live "
+                             "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND create_ts >= ?", (since,)):
+            hit = r[flag] if flag in ("top2", "top5", "top2h", "top5h") else low_flags(r["low_h"], r["risk_pct"])[flag]
+            if hit and r["token_mint"] not in bought:
+                missed.append({"ret": r["ret"]})
     if not pairs:
-        return {"trades": 0}
+        return {"trades": 0, "signalled but not bought (ideal)": _group(missed, rng)}
     gaps = [x["real"] - x["ideal"] for x in pairs]
     return {"trades": len(pairs),
+            "signalled but not bought (ideal)": _group(missed, rng),
             "book (real fills)": _group([{"ret": x["real"]} for x in pairs], rng),
             "scorer (ideal fills), same pools": _group([{"ret": x["ideal"]} for x in pairs], rng),
             "gap per trade (real - ideal)": {"mean_pct": round(100 * float(np.mean(gaps)), 1),
