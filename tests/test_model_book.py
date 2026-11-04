@@ -3,6 +3,8 @@ import random
 import time
 from types import SimpleNamespace
 
+import numpy as np
+
 from tradingbot import model_book as mb
 from tradingbot import risk
 from tradingbot.config import Config
@@ -481,6 +483,21 @@ def test_early_walk_forward_compares_every_cut_off_down_to_the_top_0_1pct(tmp_pa
     assert list(groups)[1:] == [f"top {t:g}%" for t in mb.WALK_TOPS]
     assert ns == sorted(ns) and ns[-1] > ns[0]  # a stricter cut-off picks a subset
     assert all(f"share_above_top {t:g}%_cut_pct" in out["cut_offs"][0] for t in mb.WALK_TOPS)
+    dec = out["by score decile (ranked within each day)"]
+    assert len(dec) == 10 and sum(b["n"] for b in dec.values()) == groups["every eligible pool"]["n"]
+
+
+def test_decile_table_ranks_within_each_group_and_counts_big_wins_and_rugs():
+    rng = np.random.default_rng(0)
+    # two days with different score levels: ranking is within each day, so each day fills every bucket
+    day1 = [(float(i), 1.0 if i >= 18 else -1.0 if i < 2 else 0.0) for i in range(20)]
+    day2 = [(100.0 + i, 1.0 if i >= 18 else -1.0 if i < 2 else 0.0) for i in range(20)]
+    dec = mb.decile_table([day1, day2, []], rng)
+    assert list(dec)[0] == "D1 (lowest scores)" and list(dec)[-1] == "D10 (highest scores)"
+    assert all(b["n"] == 4 for b in dec.values())
+    assert dec["D10 (highest scores)"]["big_win_pct"] == 100 and dec["D1 (lowest scores)"]["emptied_pct"] == 100
+    assert dec["D5"]["mean_pct"] == 0.0
+    assert mb.decile_index([3.0, 1.0, 2.0]) == [6, 0, 3]
 
 
 def test_early_model_trains_on_hand_made_pools_and_queues_first_sight_signals(tmp_path):

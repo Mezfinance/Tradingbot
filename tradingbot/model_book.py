@@ -525,7 +525,7 @@ def early_walk_forward(store, cfg: Config, now: float | None = None, seed: int =
     days = sorted({day(r["created_ts"]) for r in rows})
     label = lambda t: f"top {t:g}%"
     groups = {"every eligible pool": [], **{label(t): [] for t in WALK_TOPS}}
-    by_day, cuts = [], []
+    by_day, cuts, day_scores = [], [], []
     for d in days:
         start = calendar.timegm(time.strptime(d, "%Y-%m-%d"))  # UTC midnight
         train = [r for r in rows if start - cfg.model_train_days * wa.DAY_S <= r["created_ts"] < start]
@@ -536,6 +536,7 @@ def early_walk_forward(store, cfg: Config, now: float | None = None, seed: int =
         if model is None:
             continue
         scored = [(model.score({k: v for k, v in r.items() if k not in EARLY_NOT_FEATURES}), r["ret"]) for r in test]
+        day_scores.append(scored)
         picks = {"every eligible pool": [x for _, x in scored]}
         for t in WALK_TOPS:
             cut = model.meta["cuts"][f"{t:g}"]
@@ -548,9 +549,40 @@ def early_walk_forward(store, cfg: Config, now: float | None = None, seed: int =
         cuts.append({"day": d, **{f"share_above_{label(t)}_cut_pct":
                                   round(100 * len(picks[label(t)]) / len(scored), 1) for t in WALK_TOPS}})
     return {"days_tested": len(by_day), "first_day": days[0], "last_day": days[-1],
-            "overall": {k: _ret_summary(v, rng) for k, v in groups.items()}, "by_day": by_day, "cut_offs": cuts,
+            "overall": {k: _ret_summary(v, rng) for k, v in groups.items()},
+            "by score decile (ranked within each day)": decile_table(day_scores, rng),
+            "by_day": by_day, "cut_offs": cuts,
             "note": "walk-forward by UTC day, trained on the previous model_train_days; outcome = 5-minute snapshot "
-                    "(~pool minute 6) vs first-sight price, 6% round trip, emptied = -100%; the last day may be partial"}
+                    "(~pool minute 6) vs first-sight price, 6% round trip, emptied = -100%; the last day may be "
+                    f"partial; big win = +{BIG_WIN:.0%} or more after costs"}
+
+
+BIG_WIN = 0.5  # a trade that made +50% or more after costs counts as a pump in the decile tables
+
+
+def decile_index(scores) -> list[int]:
+    """Score bucket 0 (lowest 10%) .. 9 (top 10%) of each score within its own list (ties keep input order)."""
+    n = len(scores)
+    ranks = np.argsort(np.argsort(np.asarray(scores, dtype=float), kind="stable"), kind="stable")
+    return [min(9, int(10 * r / n)) for r in ranks]
+
+
+def decile_label(i: int) -> str:
+    return f"D{i + 1}" + (" (lowest scores)" if i == 0 else " (highest scores)" if i == 9 else "")
+
+
+def decile_table(groups: list[list[tuple[float, float]]], rng) -> dict:
+    """11-04 two-score plan, step 1: do pump rate and rug rate rise together with the score? Each group (a test
+    day, or the whole window) is split into ten buckets by its own scores; buckets are pooled across groups."""
+    buckets: list[list[float]] = [[] for _ in range(10)]
+    for g in groups:
+        if not g:
+            continue
+        for i, (_, ret) in zip(decile_index([s for s, _ in g]), g):
+            buckets[i].append(ret)
+    return {decile_label(i): {**_ret_summary(b, rng),
+                              "big_win_pct": round(100 * sum(x >= BIG_WIN for x in b) / len(b)) if b else None}
+            for i, b in enumerate(buckets)}
 
 
 def _ret_summary(rets: list[float], rng, ci: bool = True) -> dict:

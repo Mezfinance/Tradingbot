@@ -713,7 +713,18 @@ def compare(store, hours: float | None = None, now: float | None = None, seed: i
         "old top2": group([r for r in rows if r["top2"]]), "old top5": group([r for r in rows if r["top5"]]),
         "history top2h": group([r for r in rows if r["top2h"]]),
         "history top5h": group([r for r in rows if r["top5h"]])}
-    out["note"] = (f"ideal pool-level trades; early rug = LP pulled < {EARLY_RUG_S} s after creation, before "
+    from tradingbot.model_book import decile_index, decile_label, BIG_WIN
+    deciles = {}
+    for name, key in (("old model", "score"), ("history model", "score_h")):
+        idx = decile_index([r[key] for r in rows])
+        deciles[name] = {}
+        for i in range(10):
+            b = [r for r, j in zip(rows, idx) if j == i]
+            deciles[name][decile_label(i)] = {
+                **_group(b, rng), **_rug_split(b),
+                "big_win_pct": round(100 * sum(r["ret"] >= BIG_WIN for r in b) / len(b)) if b else None}
+    out["by score decile (ranked within the window)"] = deciles
+    out["note"] = (f"big win = +{BIG_WIN:.0%} or more after costs; ideal pool-level trades; early rug = LP pulled < {EARLY_RUG_S} s after creation, before "
                    "GeckoTerminal lists a pool (the old model's training pools all survived that); "
                    "drained = pool SOL fell below 10% of its peak or no price, no LP pull seen")
     return out

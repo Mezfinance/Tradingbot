@@ -360,6 +360,11 @@ def test_compare_ranks_both_models_on_the_same_pools_and_splits_rugs_by_pull_tim
     assert hist["early_rug_pct"] == 0 and hist["later_rug_pct"] == 60 and hist["drained_no_pull_pct"] == 40
     assert out["live flags (as the books saw them)"]["old top2"]["n"] == 2
     assert out["every liquid pool"]["rugged_pct"] == 10
+    dec = out["by score decile (ranked within the window)"]
+    old_top, hist_top = dec["old model"]["D10 (highest scores)"], dec["history model"]["D10 (highest scores)"]
+    assert old_top["n"] == 10 and old_top["rugged_pct"] == 50 and old_top["early_rug_pct"] == 50
+    assert hist_top["rugged_pct"] == 50 and hist_top["later_rug_pct"] == 30
+    assert dec["old model"]["D5"]["rugged_pct"] == 0
     assert ll.compare(WatchStore(":memory:"))["pools"] == 0
 
 

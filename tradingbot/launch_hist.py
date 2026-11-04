@@ -243,8 +243,9 @@ def _day_mean(rows: list[dict]) -> dict:
 def _walk(liquid: list[dict], rng, drop: tuple, train_filter=None) -> dict:
     """Walk-forward by day: train on earlier days (only rows passing `train_filter`, if given), pick the top k%
     of each test day's own scores among every liquid pool."""
+    from tradingbot.model_book import decile_table
     picks = {k: [] for k in la.TIMING_TOP_PCT}
-    base, by_day = [], {}
+    base, by_day, day_scores = [], {}, []
     for d in sorted({la._day(r) for r in liquid}):
         train = [r for r in liquid if la._day(r) < d and (train_filter is None or train_filter(r))]
         test_rows = [r for r in liquid if la._day(r) == d]
@@ -255,6 +256,7 @@ def _walk(liquid: list[dict], rng, drop: tuple, train_filter=None) -> dict:
             continue
         tr, te = fit
         base += test_rows
+        day_scores.append([(float(s), r["ret"][FILL_S]) for r, s in zip(test_rows, te)])
         row = {"pools": len(test_rows), "all_mean_pct": round(100 * float(np.mean([r["ret"][FILL_S] for r in test_rows])), 1),
                # A cut-off from the training scores picked 99% of 11-02's pools: some feature shifts day to day.
                # Picks are the top k% of the day's own scores; this shows how far the training cut-off was off.
@@ -270,5 +272,7 @@ def _walk(liquid: list[dict], rng, drop: tuple, train_filter=None) -> dict:
                 "rugged": sum(r["ret"][FILL_S] <= -0.8 for r in chosen)}
         by_day[d] = row
     return {"days_scored": len(by_day), "every liquid pool (test days)": _split(base, rng),
-            **{f"top {k:g}%": _split(picks[k], rng) for k in la.TIMING_TOP_PCT}, "by day": by_day,
+            **{f"top {k:g}%": _split(picks[k], rng) for k in la.TIMING_TOP_PCT},
+            "by score decile (ranked within each day; emptied = rugged)": decile_table(day_scores, rng),
+            "by day": by_day,
             **({} if by_day else {"note": f"needs {la.RANK_MIN_TRAIN}+ liquid pools on earlier days"})}
