@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import heapq
 import json
 import logging
@@ -715,6 +716,143 @@ def compare(store, hours: float | None = None, now: float | None = None, seed: i
     out["note"] = (f"ideal pool-level trades; early rug = LP pulled < {EARLY_RUG_S} s after creation, before "
                    "GeckoTerminal lists a pool (the old model's training pools all survived that); "
                    "drained = pool SOL fell below 10% of its peak or no price, no LP pull seen")
+    return out
+
+
+PATH_SCHEMA = """CREATE TABLE IF NOT EXISTS watch_launch_path(
+    pool TEXT, sec INTEGER, sol REAL, tok REAL, ts REAL, PRIMARY KEY(pool, sec))"""
+EXIT_MINUTES = (1, 2, 3, 4, 5)  # earlier exits tried against the books' minute 6
+PULL_BUCKETS = (30, 60, 90, 120, 180, 240, 300, 360)  # seconds after creation
+STUDY_BASELINE = 60  # random other liquid pools, for comparison
+
+
+def _raw_vault(tx: dict, pool: str, mint: str) -> float | None:
+    """Raw token units (or SOL for wSOL) the pool holds after `tx`, the units the scorer's fill price uses."""
+    for b in (tx.get("meta") or {}).get("postTokenBalances") or []:
+        if b.get("owner") == pool and b.get("mint") == mint:
+            amt = b.get("uiTokenAmount") or {}
+            return float(amt.get("uiAmount") or 0) if mint == ps.WSOL else float(amt.get("amount") or 0)
+    return None
+
+
+def _pull_timing(rows) -> dict:
+    """When each rug's LP was pulled (seconds after creation), as a share of the whole group."""
+    n = len(rows) or 1
+    out, lo = {}, 0
+    for hi in PULL_BUCKETS:
+        k = sum(1 for r in rows if r["pulled_ts"] and lo <= r["pulled_ts"] - r["create_ts"] < hi)
+        out[f"{lo}-{hi}s"] = f"{k} ({100 * k / n:.0f}%)"
+        lo = hi
+    late = sum(1 for r in rows if r["pulled_ts"] and r["pulled_ts"] - r["create_ts"] >= lo)
+    drained = sum(1 for r in rows if r["ret"] is not None and r["ret"] <= -0.999 and not r["pulled_ts"])
+    out["after 360s (counted as no rug at minute 6)"] = late
+    out["drained, no pull seen"] = drained
+    return out
+
+
+def exit_study(store, helius, hours: float | None = None, max_credits: int = 10_000, now: float | None = None,
+               seed: int = 7) -> dict:
+    """When do the picks rug, and would an earlier exit have paid? Picks = each model's top 8% of the same pools
+    (ranked in the window, as `compare`) plus the history model's live top5h/top2h flags, and a random baseline of
+    other liquid pools. For each, the pool's state at minutes 1-5 (balances after its last tx by then; one
+    Helius call each, saved in `watch_launch_path`) gives the return of selling then: vault price vs the scorer's
+    fill price, 6% cost, -100% once the LP was pulled or the pool's SOL fell below 10% of its peak."""
+    ensure_schema(store)
+    store.execute(PATH_SCHEMA)
+    now = now if now is not None else time.time()
+    since = now - hours * 3600 if hours else 0
+    rows = store.query("SELECT pool, token_mint, create_ts, score, score_h, top2h, top5h, fill_px, fill_sol, "
+                       "peak_sol, ret, pulled_ts FROM watch_launch_live WHERE status='done' AND liquid=1 "
+                       "AND ret IS NOT NULL AND score IS NOT NULL AND score_h IS NOT NULL AND fill_px IS NOT NULL "
+                       "AND create_ts >= ? ORDER BY create_ts", (since,))
+    if not rows:
+        return {"pools": 0}
+    k = max(1, round(len(rows) * 0.08))
+    groups = {"old model top 8%": sorted(rows, key=lambda r: -r["score"])[:k],
+              "history model top 8%": sorted(rows, key=lambda r: -r["score_h"])[:k],
+              "history live top5h (launch4h_5's picks)": [r for r in rows if r["top5h"]],
+              "history live top2h (launch4h_2's picks)": [r for r in rows if r["top2h"]]}
+    picked = {r["pool"] for g in groups.values() for r in g}
+    rest = sorted((r for r in rows if r["pool"] not in picked),
+                  key=lambda r: hashlib.sha1(f"study:{r['pool']}".encode()).hexdigest())
+    groups["random other liquid pools"] = rest[:STUDY_BASELINE]
+    # fetch the missing minute states, cheapest first (nothing is fetched twice)
+    have = {(r["pool"], r["sec"]): r for r in store.query("SELECT pool, sec, sol, tok FROM watch_launch_path")}
+    need = {r["pool"]: r for g in groups.values() for r in g}
+    stats = collections.Counter()
+    start_credits = helius.credits_used
+    for r in need.values():
+        for m in EXIT_MINUTES:
+            sec = 60 * m
+            if (r["pool"], sec) in have:
+                continue
+            if r["pulled_ts"] and r["pulled_ts"] <= r["create_ts"] + sec:
+                continue  # pulled by then: -100%, no call needed
+            if helius.credits_used - start_credits + 10 > max_credits:
+                stats["left for a rerun (credit cap)"] += 1
+                continue
+            tx = helius.last_before(r["pool"], r["create_ts"] + sec)
+            if tx is False:
+                stats["call failed"] += 1
+                continue
+            sol = _raw_vault(tx, r["pool"], ps.WSOL) if tx else None
+            tok = _raw_vault(tx, r["pool"], r["token_mint"]) if tx else None
+            store.execute("INSERT OR REPLACE INTO watch_launch_path(pool, sec, sol, tok, ts) VALUES (?,?,?,?,?)",
+                          (r["pool"], sec, sol, tok, time.time()))
+            have[(r["pool"], sec)] = {"sol": sol, "tok": tok}
+            stats["fetched"] += 1
+    stats["credits_used"] = helius.credits_used - start_credits
+    rng = np.random.default_rng(seed)
+
+    def state_at(r, sec, peak):
+        """(return if sold then, pool SOL / SOL at the fill, gone: 'pulled' | 'drained' | None, new peak)."""
+        if r["pulled_ts"] and r["pulled_ts"] <= r["create_ts"] + sec:
+            return -1.0, 0.0, "pulled", peak
+        st = have.get((r["pool"], sec))
+        if st is None:
+            return None, None, None, peak
+        sol, tok = st["sol"], st["tok"]
+        if not sol or not tok:
+            return -1.0, 0.0, "drained", peak
+        peak = max(peak, sol)
+        share = sol / r["fill_sol"] if r["fill_sol"] else None
+        if peak > 0 and sol < la.PULLED_SHARE * peak:
+            return -1.0, share, "drained", peak
+        return min((sol / tok) / r["fill_px"] - 1 - la.COST, 3.0), share, None, peak
+
+    out = {"pools": len(rows), "fetch": dict(stats), "groups": {}}
+    for name, g in groups.items():
+        by_min = {}
+        rets = {m: [] for m in EXIT_MINUTES}
+        liq = {m: [] for m in EXIT_MINUTES}
+        for r in g:
+            peak = max(r["peak_sol"] or 0.0, r["fill_sol"] or 0.0)
+            for m in EXIT_MINUTES:
+                x, share, gone, peak = state_at(r, 60 * m, peak)
+                if x is not None:
+                    rets[m].append({"ret": x})
+                    liq[m].append((share, gone))
+        for m in EXIT_MINUTES:
+            by_min[f"sell at minute {m}"] = _group(rets[m], rng)
+        by_min["sell at minute 6 (the books)"] = _group(g, rng)
+        liquidity = {}
+        for m in EXIT_MINUTES:
+            xs = liq[m]
+            if not xs:
+                continue
+            n = len(xs)
+            shares = [s for s, gone in xs if s is not None and not gone]
+            liquidity[f"minute {m}"] = {
+                "LP pulled by now %": round(100 * sum(1 for _, gone in xs if gone == "pulled") / n),
+                "drained without a pull seen %": round(100 * sum(1 for _, gone in xs if gone == "drained") / n),
+                "pool SOL below half the fill's (still live) %": round(
+                    100 * sum(1 for s in shares if s < 0.5) / n),
+                "median pool SOL vs fill (still live)": round(float(np.median(shares)), 2) if shares else None}
+        out["groups"][name] = {"n": len(g), "rug timing (LP pulls)": _pull_timing(g),
+                               "liquidity by minute": liquidity, "returns by exit": by_min}
+    out["note"] = ("ideal pool-level trades from the scorer's fill price; minute-m price = pool balances after its "
+                   "last tx by then; rugs before the exit = -100%; pools whose minute state wasn't fetched are left "
+                   "out of that minute only")
     return out
 
 

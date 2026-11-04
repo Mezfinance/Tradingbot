@@ -67,7 +67,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "watch-export", "watch-links", "watch-report-now",
                                             "watch-model-train", "model-status", "early-status",
                                             "early-backtest", "early-walk-forward", "launch-backtest", "launch-backfill", "launch-status", "launch-compare",
-                                            "launch-hist-backfill", "launch-hist-test"])
+                                            "launch-hist-backfill", "launch-hist-test", "launch-exit-study"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -259,6 +259,17 @@ def main(argv: list[str] | None = None) -> None:
                                    args.max_credits, progress=lambda i, n, c: print(
                                        f"pools {i}/{n}, credits {c}", file=sys.stderr, flush=True))
         print(json.dumps(out, indent=2))
+        return
+
+    if args.command == "launch-exit-study":
+        import httpx
+        from tradingbot import launch_live
+        from tradingbot.data.helius import Helius
+        from tradingbot.watcher import WatchStore, watch_db_path
+        helius = Helius(client=httpx.Client(timeout=60))
+        helius.min_interval_s = 1 / max(args.rps, 0.1)  # leave the live scorer its share of the plan's rate
+        print(json.dumps(launch_live.exit_study(WatchStore(watch_db_path(cfg)), helius, args.hours,
+                                                int(args.max_credits or 10_000)), indent=2))
         return
 
     if args.command == "launch-hist-test":

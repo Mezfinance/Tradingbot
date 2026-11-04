@@ -361,3 +361,50 @@ def test_compare_ranks_both_models_on_the_same_pools_and_splits_rugs_by_pull_tim
     assert out["live flags (as the books saw them)"]["old top2"]["n"] == 2
     assert out["every liquid pool"]["rugged_pct"] == 10
     assert ll.compare(WatchStore(":memory:"))["pools"] == 0
+
+
+class _PathHelius:
+    """Fake Helius for the exit study: pool state after its last tx by a time, from a table."""
+
+    def __init__(self, states):
+        self.states, self.credits_used, self.calls = states, 0, 0
+
+    def last_before(self, pool, ts):
+        self.calls += 1
+        self.credits_used += 10
+        sol, tok = self.states[pool](ts)
+        return {"meta": {"err": None, "postTokenBalances": [
+            {"owner": pool, "mint": ps.WSOL, "uiTokenAmount": {"uiAmount": sol, "amount": str(int(sol * 1e9))}},
+            {"owner": pool, "mint": "M" + pool, "uiTokenAmount": {"uiAmount": tok / 1e6, "amount": str(tok)}}]},
+            "blockTime": ts}
+
+
+def test_exit_study_returns_by_exit_minute_rug_timing_and_liquidity():
+    st = WatchStore(":memory:")
+    ll.ensure_schema(st)
+    t0 = 1_800_000_000.0
+    states = {}
+    for i in range(50):
+        pool = f"P{i}"
+        pulled = t0 + 150 if i >= 48 else None  # the two best-scored pools are pulled at 2.5 min
+        st.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, liquid, score, score_h, top2h, top5h, "
+                   "fill_px, fill_sol, peak_sol, ret, pulled_ts, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (pool, "M" + pool, t0, 1, float(i), float(i), 0, int(i >= 48), 100.0 / 1_000_000, 100.0, 100.0,
+                    -1.0 if pulled else 0.0, pulled, "done"))
+        # price rises 10% a minute (SOL up, tokens down 0), so selling at minute 1 = +10% - 6% cost
+        states[pool] = lambda ts: (100.0 * (1 + 0.1 * (ts - t0) / 60), 1_000_000)
+    h = _PathHelius(states)
+    out = ll.exit_study(st, h, now=t0 + 400, max_credits=100_000)
+    g = out["groups"]["history model top 8%"]
+    assert g["n"] == 4
+    assert g["rug timing (LP pulls)"]["120-180s"].startswith("2 ")
+    m1, m3 = g["returns by exit"]["sell at minute 1"], g["returns by exit"]["sell at minute 3"]
+    assert m1["mean_pct"] == 4.0 and m1["rugged_pct"] == 0
+    assert m3["rugged_pct"] == 50
+    assert g["liquidity by minute"]["minute 3"]["LP pulled by now %"] == 50
+    assert g["liquidity by minute"]["minute 1"]["median pool SOL vs fill (still live)"] == 1.1
+    calls = h.calls
+    ll.exit_study(st, h, now=t0 + 400, max_credits=100_000)
+    assert h.calls == calls  # saved states are never fetched twice
+    capped = ll.exit_study(WatchStore(":memory:"), h, now=t0)
+    assert capped["pools"] == 0
