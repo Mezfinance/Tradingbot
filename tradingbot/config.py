@@ -71,6 +71,9 @@ class Config:
     launch_hist_book: bool = False
     # launch4_2m5 (11-04): launch4_2's picks (the old model's top2 flag), sold at pool minute 5 instead of 6
     launch_m5_book: bool = False
+    # launchd12 + launchd12_s10/_s20/_s30/_s50 (11-04): the history model's bottom 20% (rolling 24 h), minus the
+    # riskiest 0/10/20/30/50% by the early-pull model (model/pull.json), sold at pool minute 6
+    launch_low_book: bool = False
     # One-off fresh start for some books (comma list): their history is kept as '<book>@<reset_books_id>' and
     # their cash goes back to the starting amount. Runs once per reset_books_id, at engine start.
     reset_books: str = ""

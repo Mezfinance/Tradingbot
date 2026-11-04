@@ -482,3 +482,93 @@ def test_early_pull_study_finds_a_planted_early_puller_signal_and_beats_random_s
     assert "history D1-D2 (test blocks)" in out
     assert all("name_len" not in b["top_weights"] and "hour_sin" not in b["top_weights"] for b in out["blocks"])
     assert ll.early_pull_study(WatchStore(":memory:"))["pools"] == 0
+
+
+def _pull_done_rows(st, n, t0, rng):
+    """Finished scorer rows where early pullers (LP pulled at 40 s) buy their own pool: creator_buys is high."""
+    ll.ensure_schema(st)
+    for i in range(n):
+        puller = rng.random() < 0.2
+        feat = {"creator_buys": float(puller) * 2 + rng.random(), "log_buyers": rng.random(), "hour_sin": 0.1}
+        create = t0 + i * 60
+        st.execute("INSERT INTO watch_launch_live(pool, lp_mint, creator, create_ts, decided_ts, liquid, feat, "
+                   "score_h, ret, pulled_ts, status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                   (f"Q{t0}-{i}", f"QL{t0}-{i}", "BAD" if puller else f"C{i}", create, create + 4, 1,
+                    json.dumps(feat), rng.random(), -1.0 if puller else 0.2, create + 40 if puller else None, "done"))
+
+
+def test_pull_model_trains_on_scorer_rows_and_keeps_risk_percentiles(tmp_path):
+    import random
+    st = WatchStore(":memory:")
+    cfg = Config(db_path=str(tmp_path / "bot.db"))
+    now = 2_000_000_000
+    assert ll.train_pull(st, cfg, now=now) is None  # no rows yet
+    _pull_done_rows(st, 600, now - 2 * 86400, random.Random(4))
+    m = ll.train_pull(st, cfg, now=now)
+    assert m is not None and m.meta["rows"] == 600 and m.meta["auc_in_sample"] > 0.9
+    assert len(m.meta["risk_quantiles"]) == len(ll.RISK_LEVELS) and 100 <= m.meta["low_rows"] <= 140
+    assert "hour_sin" not in m.names and "op_early_pulls" in m.names
+    assert m.score({"creator_buys": 2.5}) > m.score({"creator_buys": 0.5})
+    assert ll.train_pull_and_save(st, cfg) == ll.pull_model_path(cfg)
+
+
+def test_low_flags_follow_the_risk_percentile():
+    assert ll.low_flags(0, 5.0) == {"d12": False, "d12s10": False, "d12s20": False, "d12s30": False, "d12s50": False}
+    assert ll.low_flags(1, None) == {"d12": True, "d12s10": False, "d12s20": False, "d12s30": False, "d12s50": False}
+    f = ll.low_flags(1, 75.0)  # riskier than 75% of the past day's bottom-20% pools
+    assert f["d12"] and f["d12s10"] and f["d12s20"] and not f["d12s30"] and not f["d12s50"]
+
+
+def test_low_decile_books_get_their_flags_from_the_live_scorer(setup, monkeypatch):
+    import random
+    from tradingbot import model_book as mb
+    cfg, st, hel, clock, live, p, create = setup
+    _done_rows(st, 300, clock.t - 3 * 86400, random.Random(5))
+    _pull_done_rows(st, 600, clock.t - 2 * 86400, random.Random(6))
+    assert ll.train_hist_and_save(st, cfg) is not None and ll.train_pull_and_save(st, cfg) is not None
+    # loading a model rebuilds its rolling history from the table, so load both before planting scores
+    assert live._load_hist_model() is not None and live._load_pull_model() is not None
+    # bottom 20%: the training quantile until ROLLING_MIN past scores, then the past day's
+    with live.lock:
+        live.hist_scores.clear()
+        live.hist_scores.extend((clock.t - 10, 100.0) for _ in range(ll.ROLLING_MIN))
+    assert live._hist_verdict({"log_buyers": 0.0}, clock.t)["low_h"] == 1
+    with live.lock:
+        live.hist_scores.clear()
+        live.hist_scores.extend((clock.t - 10, -100.0) for _ in range(ll.ROLLING_MIN))
+    assert live._hist_verdict({"log_buyers": 0.0}, clock.t)["low_h"] == 0
+    # risk percentile: training percentiles first, then the past day's bottom-20% risks
+    few = live._risk_verdict({"creator_buys": 0.2}, "NEW", clock.t, clock.t)
+    assert few["risk"] is not None and 0 <= few["risk_pct"] <= 100
+    with live.lock:
+        live.low_risks.clear()
+        live.low_risks.extend((clock.t - 10, -100.0) for _ in range(ll.ROLLING_MIN))
+    assert live._risk_verdict({"creator_buys": 0.2}, "NEW", clock.t, clock.t)["risk_pct"] == 100.0
+    # the creator's record from the table counts: BAD pulled early many times before
+    risky = live._risk_verdict({"creator_buys": 0.2}, "BAD", clock.t, clock.t)["risk"]
+    safe = live._risk_verdict({"creator_buys": 0.2}, "NEW", clock.t, clock.t)["risk"]
+    assert risky != safe
+    # a decision on a bottom-20% pool sends a signal with every level's flag and stores the verdict
+    with live.lock:
+        live.low_risks.clear()
+        live.low_risks.extend((clock.t - 10, 100.0) for _ in range(ll.ROLLING_MIN))  # this pool is the safest
+    monkeypatch.setattr(live, "_hist_verdict", lambda feat, now: {"score_h": -5.0, "top2h": 0, "top5h": 0, "low_h": 1})
+    live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+    live.step()
+    clock.t += cfg.launch_live_decide_delay_s
+    live.step()
+    r = live._row(HAND_POOL)
+    assert r["low_h"] == 1 and r["risk"] is not None and r["risk_pct"] == 0.0
+    sig = live.signals.get_nowait()
+    assert sig["d12"] and sig["d12s10"] and sig["d12s30"] and sig["d12s50"]
+    assert any(k.startswith("history bottom 20%") for k in
+               ll.status(st, cfg, 24, now=clock.t)["outcomes (fill at second ~6, out at minute 6, 6% cost)"])
+    cfg.launch_low_book, cfg.launch_live = True, True
+    try:
+        assert mb.active_books(cfg)[-5:] == list(mb.LAUNCH_LOW_CUT)
+        low_only = dict(sig, top2=False, top5=False)  # the fixture's pool is also an old-model pick
+        assert all(mb.wants(b, low_only) for b in mb.LAUNCH_LOW_CUT) and not mb.wants(mb.LAUNCH2, low_only)
+        assert not mb.wants("launchd12_s30", dict(sig, d12s30=False))
+        assert mb.exit_deadline(cfg, "launchd12_s30", {"created_ts": 100.0, "mint": "M"}) == 100.0 + 360
+    finally:
+        cfg.launch_low_book, cfg.launch_live = False, False

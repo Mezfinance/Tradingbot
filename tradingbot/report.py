@@ -497,6 +497,13 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
                    "11-03/04): minute 5 +13.0%/trade (90% range -1.8..+28.6%), 19% rugged vs minute 6 +6.2%; "
                    "chosen after looking at minutes 1-6",
     "launch4h_5": "as launch4h_2, top 5%: +8.8%/trade (90% range +2.8..+14.7%), 23% rugged; every pool -5.2%, 31%",
+    # launch-early-pulls walk-forward (11-03/04, 188 D1-D2 pools, ideal vault prices, ranked within 6 h blocks)
+    "launchd12": "history model's bottom 20% (D1-D2), every pool: +2.9%/trade, 30% rugged, 24% big wins (n=188)",
+    "launchd12_s10": "D1-D2 minus the riskiest 10% early pullers: +6.6%/trade, 27% rugged (n=169; random skip +2.9%)",
+    "launchd12_s20": "D1-D2 minus the riskiest 20%: +5.5%/trade, 24% rugged (n=151; random skip +2.9%)",
+    "launchd12_s30": "D1-D2 minus the riskiest 30%: +12.0%/trade, 18% rugged (n=132; random skip +2.7%, 90% range "
+                     "-4.4..+10.2%)",
+    "launchd12_s50": "D1-D2 minus the riskiest 50%: +12.8%/trade, 11% rugged (n=94; random skip +2.6%)",
 }
 
 

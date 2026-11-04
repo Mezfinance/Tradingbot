@@ -82,7 +82,9 @@ def ensure_schema(store) -> None:
     import sqlite3
     store.execute(SCHEMA)
     for col in ("liq_usd REAL",  # added 11-02: pool liquidity at second 4 in USD
-                "score_h REAL", "top2h INTEGER", "top5h INTEGER"):  # 11-03: the history-trained model's verdict
+                "score_h REAL", "top2h INTEGER", "top5h INTEGER",  # 11-03: the history-trained model's verdict
+                # 11-04: history model's bottom 20% (rolling 24 h), early-pull risk and its rank among those pools
+                "low_h INTEGER", "risk REAL", "risk_pct REAL"):
         try:
             store.execute(f"ALTER TABLE watch_launch_live ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -95,6 +97,10 @@ def model_path(cfg: Config) -> Path:
 
 def hist_model_path(cfg: Config) -> Path:
     return Path(cfg.db_path).resolve().parent / "model" / "launch4h.json"
+
+
+def pull_model_path(cfg: Config) -> Path:
+    return Path(cfg.db_path).resolve().parent / "model" / "pull.json"
 
 
 # --- training -------------------------------------------------------------------------------------
@@ -177,7 +183,7 @@ def train_hist(store, cfg: Config, now: float | None = None):
     cut2, cut5 = float(np.quantile(scores, 1 - TOP2)), float(np.quantile(scores, 1 - TOP5))
     top = lambda c: scores >= c - 1e-9
     meta = {"trained_ts": time.time(), "rows": len(rs), "win_rate": float(y.mean()), "clip_z": la.CLIP_Z,
-            "score_quantiles": {str(q): float(np.quantile(scores, q / 100)) for q in (10, 50, 90, 95, 98)},
+            "score_quantiles": {str(q): float(np.quantile(scores, q / 100)) for q in (10, 20, 50, 90, 95, 98)},
             "mean_ret_all": float(rets.mean()), "cut2": cut2, "cut5": cut5,
             "top2_in_sample": {"n": int(top(cut2).sum()), "mean_ret": float(rets[top(cut2)].mean())},
             "top5_in_sample": {"n": int(top(cut5).sum()), "mean_ret": float(rets[top(cut5)].mean())},
@@ -200,6 +206,60 @@ def train_hist_and_save(store, cfg: Config) -> Path | None:
         return None
     log.info("launch4h model trained on %d rows", model.meta["rows"])
     return _save(model, hist_model_path(cfg))
+
+
+LOW_SHARE = 0.2  # the history model's bottom 20% of the past day's scores = its deciles D1-D2
+RISK_LEVELS = tuple(range(0, 101, 5))  # percentiles of training risk kept in the pull model's meta
+
+
+def low_flags(low_h, risk_pct) -> dict:
+    """Signal flags of the low-decile books: `d12` = the history model's bottom 20% (D1-D2); `d12s<k>` = also not
+    in the riskiest k% by early-pull risk (needs a pull model)."""
+    out = {"d12": bool(low_h)}
+    for k in PULL_SKIPS:
+        out[f"d12s{k}"] = bool(low_h) and risk_pct is not None and risk_pct < 100 - k
+    return out
+
+
+def train_pull(store, cfg: Config, now: float | None = None):
+    """Early-pull model (11-04, `launch-early-pulls`): logistic on the second-4 features + creator record, label
+    LP pulled < EARLY_RUG_S, trained on the scorer's finished liquid pools of the last `launch_train_days`. Meta
+    keeps the risk percentiles of the training pools in the history model's bottom 20% (fallback ranking until
+    the live scorer has seen ROLLING_MIN of them)."""
+    from tradingbot.model_book import Model
+    ensure_schema(store)
+    now = now if now is not None else time.time()
+    rows = _pull_rows(store, now - cfg.launch_train_days * 86400)
+    if len(rows) < PULL_MIN_TRAIN:
+        log.warning("pull model: not enough rows to train (%d)", len(rows))
+        return None
+    y = np.array([r["y"] for r in rows])
+    if y.min() == y.max():
+        return None
+    names = sorted({k for r in rows for k in r["x"]})
+    x, med = wa._matrix([r["x"] for r in rows], names)
+    mu, sd = x.mean(0), x.std(0) + 1e-9
+    z = np.clip((x - mu) / sd, -la.CLIP_Z, la.CLIP_Z)
+    w, b = wa.logistic(z, y)
+    risk = z @ w + b
+    sh = [r["score_h"] for r in rows if r["score_h"] is not None]
+    cut = float(np.quantile(sh, LOW_SHARE)) if len(sh) >= ROLLING_MIN else None
+    low = np.array([cut is not None and r["score_h"] is not None and r["score_h"] <= cut for r in rows])
+    base = risk[low] if low.sum() >= ROLLING_MIN else risk
+    meta = {"trained_ts": time.time(), "rows": len(rows), "early_pull_rate": float(y.mean()),
+            "low_rows": int(low.sum()), "auc_in_sample": wa.auc(risk, y), "clip_z": la.CLIP_Z,
+            "risk_quantiles": [float(np.quantile(base, q / 100)) for q in RISK_LEVELS],
+            "early_rug_s": EARLY_RUG_S, "days": cfg.launch_train_days}
+    return Model(names, mu.tolist(), sd.tolist(), {n: float(med[n]) for n in names}, w.tolist(), float(b), 0.0, meta)
+
+
+def train_pull_and_save(store, cfg: Config) -> Path | None:
+    model = train_pull(store, cfg)
+    if model is None:
+        return None
+    log.info("pull model trained on %d rows (early-pull rate %.1f%%)", model.meta["rows"],
+             100 * model.meta["early_pull_rate"])
+    return _save(model, pull_model_path(cfg))
 
 
 def train_and_save(store, cfg: Config) -> Path | None:
@@ -246,6 +306,8 @@ class LaunchLive:
         self.model, self.model_mtime, self.model_checked = None, None, 0.0
         self.hist_model, self.hist_mtime, self.hist_checked = None, None, 0.0
         self.hist_scores: collections.deque = collections.deque()  # (decided_ts, score_h) of liquid pools, past day
+        self.pull_model, self.pull_mtime, self.pull_checked = None, None, 0.0
+        self.low_risks: collections.deque = collections.deque()  # (decided_ts, risk) of bottom-20% pools, past day
         self.pool = ThreadPoolExecutor(workers, thread_name_prefix="launch-live") if workers else None
         self.saved_at = 0.0
         self.tries: dict[str, int] = {}
@@ -362,6 +424,61 @@ class LaunchLive:
                 self.hist_scores = collections.deque(past)
         return self.hist_model
 
+    def _op_live(self, creator: str | None, create_ts: float) -> dict:
+        """The creator's record from this table, as `_creator_history` builds it for training."""
+        if not creator:
+            return _op_features([], create_ts)
+        prior = self.store.query("SELECT create_ts, pulled_ts FROM watch_launch_live WHERE creator=? AND liquid=1 "
+                                 "AND status IN ('scored', 'done') AND create_ts < ?", (creator, create_ts))
+        return _op_features([dict(p) for p in prior], create_ts)
+
+    def _load_pull_model(self):
+        """The early-pull model (pull.json). A new one re-scores the past day's bottom-20% pools."""
+        now = self.clock()
+        if self.pull_model is not None and now - self.pull_checked < MODEL_RELOAD_S:
+            return self.pull_model
+        self.pull_checked = now
+        path = pull_model_path(self.cfg)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return self.pull_model
+        if mtime != self.pull_mtime:
+            from tradingbot.model_book import Model
+            try:
+                model = Model.from_json(json.loads(path.read_text()))
+            except (OSError, ValueError, KeyError) as exc:
+                log.warning("pull model unreadable: %s", exc)
+                return self.pull_model
+            past = [(r["decided_ts"], model.score(pull_inputs(json.loads(r["feat"]),
+                                                               self._op_live(r["creator"], r["create_ts"]))))
+                    for r in self.store.query(
+                        "SELECT creator, create_ts, decided_ts, feat FROM watch_launch_live WHERE low_h=1 "
+                        "AND feat IS NOT NULL AND decided_ts >= ? ORDER BY decided_ts", (now - ROLLING_S,))]
+            with self.lock:
+                self.pull_model, self.pull_mtime = model, mtime
+                self.low_risks = collections.deque(past)
+        return self.pull_model
+
+    def _risk_verdict(self, feat: dict, creator: str | None, create_ts: float, now: float) -> dict:
+        """Early-pull risk of a bottom-20% pool and its percentile among the past day's bottom-20% pools (the
+        training pools' percentiles until ROLLING_MIN of them have been seen)."""
+        model = self._load_pull_model()
+        if model is None:
+            return {}
+        risk = model.score(pull_inputs(feat, self._op_live(creator, create_ts)))
+        with self.lock:
+            while self.low_risks and self.low_risks[0][0] < now - ROLLING_S:
+                self.low_risks.popleft()
+            past = [r for _, r in self.low_risks]
+            self.low_risks.append((now, risk))
+        if len(past) >= ROLLING_MIN:
+            pct = 100.0 * float(np.mean(np.array(past) < risk))
+        else:
+            qs = model.meta.get("risk_quantiles")
+            pct = float(np.interp(risk, qs, RISK_LEVELS)) if qs else None
+        return {"risk": risk, "risk_pct": pct}
+
     def _hist_verdict(self, feat: dict, now: float) -> dict:
         """score_h and the rolling top-2% / top-5% flags for a liquid pool (the score joins the history after)."""
         model = self._load_hist_model()
@@ -375,10 +492,13 @@ class LaunchLive:
             self.hist_scores.append((now, score))
         if len(past) >= ROLLING_MIN:
             cut2, cut5 = float(np.quantile(past, 1 - TOP2)), float(np.quantile(past, 1 - TOP5))
+            low = float(np.quantile(past, LOW_SHARE))
         else:
             cut2, cut5 = model.meta.get("cut2"), model.meta.get("cut5")
+            low = (model.meta.get("score_quantiles") or {}).get("20")
         pick = lambda c: int(c is not None and score >= c - 1e-9)
-        return {"score_h": score, "top2h": pick(cut2), "top5h": pick(cut5)}
+        return {"score_h": score, "top2h": pick(cut2), "top5h": pick(cut5),
+                "low_h": int(low is not None and score <= low + 1e-9)}
 
     # websocket input ------------------------------------------------------------------------------
     def on_message(self, msg: str) -> None:
@@ -536,15 +656,19 @@ class LaunchLive:
             self._update(pool, status="skipped", reason="not liquid at second 4", **cols)
             return
         cols.update(self._hist_verdict(feat, now))
+        if cols.get("low_h"):
+            cols.update(self._risk_verdict(feat, rec.get("creator"), create, now))
+        flags = low_flags(cols.get("low_h"), cols.get("risk_pct"))
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
-        if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")):
+        if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")
+                                         or flags["d12"]):
             px = la.chain_price(rows, DECIDE_S)  # SOL per whole token (vault UI amounts)
             if sol_usd and px:
                 self.signals.put_nowait({
                     "pool": pool, "mint": r["token_mint"], "name": "", "score": score, "price": px * sol_usd,
                     "liq": 2 * sol4 * sol_usd, "ts": now, "decided_ts": now, "created_ts": create,
                     "dex": "pumpswap", "kind": "launch", "top2": bool(cols["top2"]), "top5": bool(cols["top5"]),
-                    "top2h": bool(cols.get("top2h")), "top5h": bool(cols.get("top5h"))})
+                    "top2h": bool(cols.get("top2h")), "top5h": bool(cols.get("top5h")), **flags})
                 self._count("signals sent to the launch books")
             else:
                 self._count("pick not sent: no SOL price")
@@ -985,26 +1109,48 @@ PULL_SKIPS = (10, 20, 30, 50)  # % of pools skipped as most likely to be pulled 
 PULL_RANDOM_DRAWS = 500
 
 
+def _op_features(prior: list, create_ts: float) -> dict:
+    """The creator's record by the decision (create + DECIDE_S) from its earlier pools in this table (dicts with
+    create_ts, pulled_ts): how many, how many pulled within EARLY_RUG_S (only pulls seen by then), how recent."""
+    now = create_ts + DECIDE_S
+    prior = [p for p in prior if p["create_ts"] < create_ts]
+    pulled = [p for p in prior if p["pulled_ts"] and p["pulled_ts"] <= now]
+    early = [p for p in pulled if p["pulled_ts"] - p["create_ts"] < EARLY_RUG_S]
+    last = max((p["create_ts"] for p in prior), default=None)
+    return {"op_prior": math.log1p(len(prior)), "op_early_pulls": math.log1p(len(early)),
+            "op_early_share": len(early) / len(prior) if prior else 0.0,
+            "op_pull_share": len(pulled) / len(prior) if prior else 0.0,
+            "op_min_since_last": math.log1p((create_ts - last) / 60) if last else 0.0}
+
+
 def _creator_history(rows: list[dict]) -> dict:
-    """Per pool, what the scorer had seen of its creator by the decision (create + DECIDE_S): earlier pools, and
-    how many of them had been pulled within EARLY_RUG_S (only pulls that had happened by then count)."""
+    """`_op_features` for every row, from the other rows of the same creator."""
     by_creator = collections.defaultdict(list)
     for r in rows:
         if r["creator"]:
             by_creator[r["creator"]].append(r)
-    out = {}
+    return {r["pool"]: _op_features(by_creator.get(r["creator"], []), r["create_ts"]) for r in rows}
+
+
+PULL_DROP = tuple(la.LIVE_DROP) + CALENDAR
+
+
+def pull_inputs(feat: dict, op: dict) -> dict:
+    """The early-pull model's inputs: the scorer's second-4 features (no names, no hour/weekend) + creator record."""
+    return {**{k: v for k, v in feat.items() if k not in PULL_DROP}, **op}
+
+
+def _pull_rows(store, since: float = 0.0) -> list[dict]:
+    """Finished liquid scorer rows with the early-pull inputs (`x`) and label (`y`: LP pulled < EARLY_RUG_S)."""
+    rows = [dict(r) for r in store.query(
+        "SELECT pool, creator, create_ts, feat, score_h, ret, pulled_ts FROM watch_launch_live "
+        "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND feat IS NOT NULL AND create_ts >= ? "
+        "ORDER BY create_ts", (since,))]
+    hist = _creator_history(rows)
     for r in rows:
-        now = r["create_ts"] + DECIDE_S
-        prior = [p for p in by_creator.get(r["creator"], []) if p["create_ts"] < r["create_ts"]]
-        early = [p for p in prior if p["pulled_ts"] and p["pulled_ts"] <= now
-                 and p["pulled_ts"] - p["create_ts"] < EARLY_RUG_S]
-        pulled = [p for p in prior if p["pulled_ts"] and p["pulled_ts"] <= now]
-        last = max((p["create_ts"] for p in prior), default=None)
-        out[r["pool"]] = {"op_prior": math.log1p(len(prior)), "op_early_pulls": math.log1p(len(early)),
-                          "op_early_share": len(early) / len(prior) if prior else 0.0,
-                          "op_pull_share": len(pulled) / len(prior) if prior else 0.0,
-                          "op_min_since_last": math.log1p((r["create_ts"] - last) / 60) if last else 0.0}
-    return out
+        r["x"] = pull_inputs(json.loads(r["feat"]), hist[r["pool"]])
+        r["y"] = float(bool(r["pulled_ts"]) and r["pulled_ts"] - r["create_ts"] < EARLY_RUG_S)
+    return rows
 
 
 def early_pull_study(store, hours: float | None = None, now: float | None = None, seed: int = 7) -> dict:
@@ -1015,18 +1161,9 @@ def early_pull_study(store, hours: float | None = None, now: float | None = None
     with the riskiest k% skipped vs the same share skipped at random (the check an 11-01 filter failed)."""
     ensure_schema(store)
     now = now if now is not None else time.time()
-    since = now - hours * 3600 if hours else 0
-    rows = store.query("SELECT pool, creator, create_ts, feat, score_h, ret, pulled_ts FROM watch_launch_live "
-                       "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND feat IS NOT NULL "
-                       "AND create_ts >= ? ORDER BY create_ts", (since,))
-    rows = [dict(r) for r in rows]
+    rows = _pull_rows(store, now - hours * 3600 if hours else 0)
     if len(rows) < PULL_MIN_TRAIN + 50:
         return {"pools": len(rows), "note": f"needs {PULL_MIN_TRAIN + 50}+ finished liquid pools"}
-    hist = _creator_history(rows)
-    drop = set(la.LIVE_DROP) | set(CALENDAR)
-    for r in rows:
-        r["x"] = {**{k: v for k, v in json.loads(r["feat"]).items() if k not in drop}, **hist[r["pool"]]}
-        r["y"] = float(bool(r["pulled_ts"]) and r["pulled_ts"] - r["create_ts"] < EARLY_RUG_S)
     rng = np.random.default_rng(seed)
     start = rows[0]["create_ts"]
     block = PULL_BLOCK_H * 3600
@@ -1250,7 +1387,10 @@ def status(store, cfg: Config, hours: float = 24, now: float | None = None, jour
         "top 2%": _group([r for r in done if r["top2"]], rng),
         "top 5%": _group([r for r in done if r["top5"]], rng),
         "top 2% (history model, rolling cut)": _group([r for r in done if r["top2h"]], rng),
-        "top 5% (history model, rolling cut)": _group([r for r in done if r["top5h"]], rng)}
+        "top 5% (history model, rolling cut)": _group([r for r in done if r["top5h"]], rng),
+        **{f"history bottom 20% ({'all' if k == 'd12' else 'skip riskiest ' + k[4:] + '%'})": _group(
+            [r for r in done if low_flags(r["low_h"], r["risk_pct"])[k]], rng)
+           for k in ("d12",) + tuple(f"d12s{s}" for s in PULL_SKIPS)}}
     out["feature parity with the backtest"] = parity(store, scored)
     out["live vs training (drift)"] = drift(scored, cfg)
     if journal is not None:  # the launch books' own buys: where the seconds from creation to the fill go
