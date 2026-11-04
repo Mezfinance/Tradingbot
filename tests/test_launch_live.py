@@ -627,3 +627,74 @@ def test_low_decile_trades_lists_every_bottom_20pct_trade_with_win_rate_and_retu
     assert s["win_pct"] == 40 and all(v == 20 for v in s["returns (% of trades)"].values())
     first = out["trades"][0]
     assert first["return_pct"] == -100.0 and first["pulled_after_s"] == 40 and first["risk_pct"] == 0
+
+
+def _rw_done_rows(st, n, t0, rng):
+    """Finished scorer rows: early pullers buy their own pool (creator_buys high, -100%), big winners draw many
+    buyers (log_buyers high, +80%), the rest drift."""
+    ll.ensure_schema(st)
+    for i in range(n):
+        kind = rng.choices(["rug", "win", "flat"], [0.2, 0.2, 0.6])[0]
+        feat = {"creator_buys": (2.0 if kind == "rug" else 0.0) + rng.random(),
+                "log_buyers": (2.0 if kind == "win" else 0.0) + rng.random(), "hour_sin": 0.1}
+        create = t0 + i * 60
+        st.execute("INSERT INTO watch_launch_live(pool, lp_mint, creator, create_ts, decided_ts, liquid, feat, "
+                   "score_h, ret, pulled_ts, status) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                   (f"R{t0}-{i}", f"RL{t0}-{i}", f"C{i}", create, create + 4, 1, json.dumps(feat), rng.random(),
+                    {"rug": -1.0, "win": 0.8, "flat": 0.05}[kind], create + 40 if kind == "rug" else None, "done"))
+
+
+def test_rw_flags_keep_the_less_risky_half():
+    assert ll.rw_flags(0, 10.0, None) == {"rw50": True, "d12rw50": False}
+    assert ll.rw_flags(1, 60.0, 30.0) == {"rw50": False, "d12rw50": True}
+    assert ll.rw_flags(1, None, None) == {"rw50": False, "d12rw50": False}
+
+
+def test_rug_vs_win_model_trains_scores_and_feeds_its_books(setup, monkeypatch, tmp_path):
+    import random
+    from tradingbot import model_book as mb
+    cfg, st, hel, clock, live, p, create = setup
+    assert ll.train_rw(st, cfg, now=clock.t) is None  # no rows yet
+    _done_rows(st, 300, clock.t - 3 * 86400, random.Random(5))
+    _rw_done_rows(st, 600, clock.t - 2 * 86400, random.Random(8))
+    m = ll.train_rw(st, cfg, now=clock.t)
+    assert m is not None and len(m.meta["quantiles"]) == len(ll.RISK_LEVELS)
+    rug_like = {"creator_buys": 2.5, "log_buyers": 0.5}
+    win_like = {"creator_buys": 0.5, "log_buyers": 2.5}
+    assert m.score(rug_like) > m.score({"creator_buys": 0.5, "log_buyers": 0.5}) > m.score(win_like)
+    assert ll.RugWinModel.from_json(json.loads(json.dumps(m.to_json()))).score(win_like) == pytest.approx(
+        m.score(win_like))
+    assert ll.train_rw_and_save(st, cfg) == ll.rw_model_path(cfg)
+    assert ll.train_hist_and_save(st, cfg) is not None
+    assert live._load_hist_model() is not None and live._load_rw_model() is not None
+    # percentile: the past day's liquid pools once there are enough of them
+    with live.lock:
+        live.rw_all.clear()
+        live.rw_all.extend((clock.t - 10, 5.0) for _ in range(ll.ROLLING_MIN))
+    v = live._rw_verdict(win_like, "NEW", clock.t, clock.t, low=False)
+    assert v["rw_pct"] == 0.0 and "rw_low_pct" not in v
+    # a decision sends the rug-vs-win flags; a bottom-20% pool also gets its rank among those
+    with live.lock:
+        live.rw_low.clear()
+        live.rw_low.extend((clock.t - 10, 5.0) for _ in range(ll.ROLLING_MIN))
+    monkeypatch.setattr(live, "_hist_verdict", lambda feat, now: {"score_h": -5.0, "top2h": 0, "top5h": 0, "low_h": 1})
+    live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+    live.step()
+    clock.t += cfg.launch_live_decide_delay_s
+    live.step()
+    r = live._row(HAND_POOL)
+    assert r["rw"] is not None and r["rw_pct"] < 5 and r["rw_low_pct"] == 0.0  # safer than every planted score
+    sig = live.signals.get_nowait()
+    assert sig["rw50"] and sig["d12rw50"]
+    outcomes = ll.status(st, cfg, 24, now=clock.t)["outcomes (fill at second ~6, out at minute 6, 6% cost)"]
+    assert any(k.startswith("rug-vs-win") for k in outcomes)
+    cfg.launch_rw_book, cfg.launch_live = True, True
+    try:
+        assert mb.active_books(cfg)[-2:] == list(mb.LAUNCH_RW_CUT)
+        rw_only = dict(sig, top2=False, top5=False, d12=False)
+        assert mb.wants("launchrw50", rw_only) and mb.wants("launchd12rw50", rw_only)
+        assert not mb.wants("launchd12rw50", dict(rw_only, d12rw50=False))
+        assert not mb.wants(mb.LAUNCH2, rw_only)
+        assert mb.exit_deadline(cfg, "launchrw50", {"created_ts": 100.0, "mint": "M"}) == 100.0 + 360
+    finally:
+        cfg.launch_rw_book, cfg.launch_live = False, False

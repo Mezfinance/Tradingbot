@@ -510,6 +510,10 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
     "launchd12_s30": "D1-D2 minus the riskiest 30%: +12.0%/trade, 18% rugged (n=132; random skip +2.7%, 90% range "
                      "-4.4..+10.2%)",
     "launchd12_s50": "D1-D2 minus the riskiest 50%: +12.8%/trade, 11% rugged (n=94; random skip +2.6%)",
+    "launchrw50": "every liquid hand-made pool minus the riskiest 50% by rug-vs-win odds (launch-filter-study "
+                  "option 4, walk-forward on 2,041 pools): +7.6%/trade, 21% rugged, 19% +50% wins (keep all -1.6%)",
+    "launchd12rw50": "history model's bottom 20% minus the riskiest 50% by rug-vs-win odds: +13.1%/trade, 17% "
+                     "rugged, 26% +50% wins (n=178; keep all +4.1%, 97% of random skips worse)",
 }
 
 

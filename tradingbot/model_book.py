@@ -74,7 +74,12 @@ LAUNCH2M5 = "launch4_2m5"
 # 188 D1-D2 pools: keep all +2.9%, skip 10% +6.6%, 20% +5.5%, 30% +12.0% (98% of random skips worse), 50% +12.8%.
 LAUNCH_LOW_CUT = {"launchd12": "d12", "launchd12_s10": "d12s10", "launchd12_s20": "d12s20",
                   "launchd12_s30": "d12s30", "launchd12_s50": "d12s50"}
-LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT}
+# Rug-vs-win books (11-04, launch-filter-study option 4): skip the riskiest half by P(rug before the exit) -
+# P(+50% win). Walk-forward on 2,041 pools: every liquid pool +7.6%/trade (keep all -1.6%), the history model's
+# bottom 20% +13.1% (keep all +4.1%); both beat random skips of the same size.
+LAUNCH_RW_CUT = {"launchrw50": "rw50", "launchd12rw50": "d12rw50"}
+LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
+              **LAUNCH_RW_CUT}
 LAUNCH_EXIT_MIN = {b: 5.0 if b == LAUNCH2M5 else 6.0 for b in LAUNCH_CUT}
 POOL_MINUTE_EXIT = {**EARLY_EXIT_MIN, **LAUNCH_EXIT_MIN}  # books that sell every position by a pool minute
 EARLY_MAX_SEEN_MIN = 4.0  # first sight later than this leaves no time to trade (and was left out of training)
@@ -131,7 +136,8 @@ def active_books(cfg: Config) -> list[str]:
         + ([LAUNCH2, LAUNCH5] if cfg.launch_book and cfg.launch_live else []) \
         + ([LAUNCH2M5] if cfg.launch_m5_book and cfg.launch_live else []) \
         + (list(LAUNCH_HIST_CUT) if cfg.launch_hist_book and cfg.launch_live else []) \
-        + (list(LAUNCH_LOW_CUT) if cfg.launch_low_book and cfg.launch_live else [])
+        + (list(LAUNCH_LOW_CUT) if cfg.launch_low_book and cfg.launch_live else []) \
+        + (list(LAUNCH_RW_CUT) if cfg.launch_rw_book and cfg.launch_live else [])
 
 
 def early_wants(name: str, sig: dict) -> bool:
@@ -668,7 +674,8 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
             "research_rug_rate_pct": {FAST: 16.0, CLIMB: 7.0, OPS9: 13.0, OPS10: 15.0, EARLY5: 25.0, EARLY6: 25.0, EARLY7: 25.0,
                                       EARLY5R: 26.0, EARLY6R: 26.0, EARLY7R: 26.0, EARLY6W: 25.0, EARLY6T: 27.0,
                                       "launchd12": 30.0, "launchd12_s10": 27.0, "launchd12_s20": 24.0,
-                                      "launchd12_s30": 18.0, "launchd12_s50": 11.0}.get(name, 76.0),  # backtests
+                                      "launchd12_s30": 18.0, "launchd12_s50": 11.0,
+                                      "launchrw50": 21.0, "launchd12rw50": 17.0}.get(name, 76.0),  # backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 

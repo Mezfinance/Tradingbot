@@ -84,7 +84,9 @@ def ensure_schema(store) -> None:
     for col in ("liq_usd REAL",  # added 11-02: pool liquidity at second 4 in USD
                 "score_h REAL", "top2h INTEGER", "top5h INTEGER",  # 11-03: the history-trained model's verdict
                 # 11-04: history model's bottom 20% (rolling 24 h), early-pull risk and its rank among those pools
-                "low_h INTEGER", "risk REAL", "risk_pct REAL"):
+                "low_h INTEGER", "risk REAL", "risk_pct REAL",
+                # 11-04: rug-vs-win score and its rank among the past day's liquid / bottom-20% pools
+                "rw REAL", "rw_pct REAL", "rw_low_pct REAL"):
         try:
             store.execute(f"ALTER TABLE watch_launch_live ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -101,6 +103,10 @@ def hist_model_path(cfg: Config) -> Path:
 
 def pull_model_path(cfg: Config) -> Path:
     return Path(cfg.db_path).resolve().parent / "model" / "pull.json"
+
+
+def rw_model_path(cfg: Config) -> Path:
+    return Path(cfg.db_path).resolve().parent / "model" / "rw.json"
 
 
 # --- training -------------------------------------------------------------------------------------
@@ -253,6 +259,94 @@ def train_pull(store, cfg: Config, now: float | None = None):
     return Model(names, mu.tolist(), sd.tolist(), {n: float(med[n]) for n in names}, w.tolist(), float(b), 0.0, meta)
 
 
+# Rug-vs-win filter (11-04, `launch-filter-study` option 4): P(rugged before the minute-6 exit) - P(+50% or more).
+# Walk-forward on 2,041 pools (8 blocks of 6 h): skipping the riskiest 50% kept +7.6%/trade over every liquid pool
+# (keep all -1.6%, every random skip worse) and +13.1% over the history model's bottom 20% (keep all +4.1%, 97%).
+RW_SKIP = 50  # % of pools skipped as riskiest (rug odds over win odds)
+RW_BIG = 0.5
+
+
+def rw_flags(low_h, rw_pct, rw_low_pct) -> dict:
+    """Signal flags of the rug-vs-win books: `rw50` = in the less risky half of the past day's liquid pools;
+    `d12rw50` = in the history model's bottom 20% and the less risky half of those."""
+    keep = 100 - RW_SKIP
+    return {"rw50": rw_pct is not None and rw_pct < keep,
+            "d12rw50": bool(low_h) and rw_low_pct is not None and rw_low_pct < keep}
+
+
+class RugWinModel:
+    """Two logistics on the early-pull inputs (second-4 features + creator record): rugged before the exit, and
+    +50% or more. Score = P(rug) - P(win); higher = riskier."""
+
+    def __init__(self, rug, big, meta):
+        self.rug, self.big, self.meta = rug, big, meta
+
+    def score(self, x: dict) -> float:
+        sig = lambda v: 1 / (1 + math.exp(-max(-50.0, min(50.0, v))))
+        return sig(self.rug.score(x)) - sig(self.big.score(x))
+
+    def to_json(self) -> dict:
+        return {"rug": self.rug.to_json(), "big": self.big.to_json(), "meta": self.meta}
+
+    @classmethod
+    def from_json(cls, d: dict) -> "RugWinModel":
+        from tradingbot.model_book import Model
+        return cls(Model.from_json(d["rug"]), Model.from_json(d["big"]), d.get("meta", {}))
+
+
+def _fit_capped(rows: list[dict], y: np.ndarray):
+    from tradingbot.model_book import Model
+    names = sorted({k for r in rows for k in r["x"]})
+    x, med = wa._matrix([r["x"] for r in rows], names)
+    mu, sd = x.mean(0), x.std(0) + 1e-9
+    w, b = wa.logistic(np.clip((x - mu) / sd, -la.CLIP_Z, la.CLIP_Z), y)
+    return Model(names, mu.tolist(), sd.tolist(), {n: float(med[n]) for n in names}, w.tolist(), float(b), 0.0,
+                 {"clip_z": la.CLIP_Z})
+
+
+def train_rw(store, cfg: Config, now: float | None = None):
+    """The rug-vs-win model on the scorer's finished liquid pools of the last `launch_train_days`. Meta keeps the
+    score percentiles of every training pool and of those in the history model's bottom 20% (fallback ranking
+    until the live scorer has seen ROLLING_MIN pools of each)."""
+    ensure_schema(store)
+    now = now if now is not None else time.time()
+    rows = _pull_rows(store, now - cfg.launch_train_days * 86400)
+    if len(rows) < PULL_MIN_TRAIN:
+        log.warning("rug-vs-win model: not enough rows to train (%d)", len(rows))
+        return None
+    rug = np.array([float(r["ret"] <= -0.999) for r in rows])
+    big = np.array([float(r["ret"] >= RW_BIG) for r in rows])
+    if rug.min() == rug.max() or big.min() == big.max():
+        return None
+    model = RugWinModel(_fit_capped(rows, rug), _fit_capped(rows, big), {})
+    scores = np.array([model.score(r["x"]) for r in rows])
+    sh = [r["score_h"] for r in rows if r["score_h"] is not None]
+    cut = float(np.quantile(sh, LOW_SHARE)) if len(sh) >= ROLLING_MIN else None
+    low = np.array([cut is not None and r["score_h"] is not None and r["score_h"] <= cut for r in rows])
+    model.meta = {"trained_ts": time.time(), "rows": len(rows), "rug_rate": float(rug.mean()),
+                  "big_win_rate": float(big.mean()), "low_rows": int(low.sum()),
+                  "quantiles": [float(np.quantile(scores, q / 100)) for q in RISK_LEVELS],
+                  "low_quantiles": [float(np.quantile(scores[low] if low.sum() >= ROLLING_MIN else scores, q / 100))
+                                    for q in RISK_LEVELS],
+                  "days": cfg.launch_train_days}
+    return model
+
+
+def train_rw_and_save(store, cfg: Config) -> Path | None:
+    model = train_rw(store, cfg)
+    if model is None:
+        return None
+    log.info("rug-vs-win model trained on %d rows", model.meta["rows"])
+    return _save(model, rw_model_path(cfg))
+
+
+def _rank_pct(past: list, value: float, quantiles) -> float | None:
+    """Percentile of `value` among the past day's scores, or the training quantiles while there are too few."""
+    if len(past) >= ROLLING_MIN:
+        return 100.0 * float(np.mean(np.array(past) < value))
+    return float(np.interp(value, quantiles, RISK_LEVELS)) if quantiles else None
+
+
 def train_pull_and_save(store, cfg: Config) -> Path | None:
     model = train_pull(store, cfg)
     if model is None:
@@ -308,6 +402,9 @@ class LaunchLive:
         self.hist_scores: collections.deque = collections.deque()  # (decided_ts, score_h) of liquid pools, past day
         self.pull_model, self.pull_mtime, self.pull_checked = None, None, 0.0
         self.low_risks: collections.deque = collections.deque()  # (decided_ts, risk) of bottom-20% pools, past day
+        self.rw_model, self.rw_mtime, self.rw_checked = None, None, 0.0
+        self.rw_all: collections.deque = collections.deque()  # (decided_ts, rw) of liquid pools, past day
+        self.rw_low: collections.deque = collections.deque()  # (decided_ts, rw) of bottom-20% pools, past day
         self.pool = ThreadPoolExecutor(workers, thread_name_prefix="launch-live") if workers else None
         self.saved_at = 0.0
         self.tries: dict[str, int] = {}
@@ -478,6 +575,56 @@ class LaunchLive:
             qs = model.meta.get("risk_quantiles")
             pct = float(np.interp(risk, qs, RISK_LEVELS)) if qs else None
         return {"risk": risk, "risk_pct": pct}
+
+    def _load_rw_model(self):
+        """The rug-vs-win model (rw.json). A new one re-scores the past day's liquid pools."""
+        now = self.clock()
+        if self.rw_model is not None and now - self.rw_checked < MODEL_RELOAD_S:
+            return self.rw_model
+        self.rw_checked = now
+        path = rw_model_path(self.cfg)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return self.rw_model
+        if mtime != self.rw_mtime:
+            try:
+                model = RugWinModel.from_json(json.loads(path.read_text()))
+            except (OSError, ValueError, KeyError) as exc:
+                log.warning("rug-vs-win model unreadable: %s", exc)
+                return self.rw_model
+            every, low = [], []
+            for r in self.store.query("SELECT creator, create_ts, decided_ts, feat, low_h FROM watch_launch_live "
+                                      "WHERE liquid=1 AND feat IS NOT NULL AND decided_ts >= ? ORDER BY decided_ts",
+                                      (now - ROLLING_S,)):
+                s = model.score(pull_inputs(json.loads(r["feat"]), self._op_live(r["creator"], r["create_ts"])))
+                every.append((r["decided_ts"], s))
+                if r["low_h"]:
+                    low.append((r["decided_ts"], s))
+            with self.lock:
+                self.rw_model, self.rw_mtime = model, mtime
+                self.rw_all, self.rw_low = collections.deque(every), collections.deque(low)
+        return self.rw_model
+
+    def _rw_verdict(self, feat: dict, creator: str | None, create_ts: float, now: float, low: bool) -> dict:
+        """Rug-vs-win score of a liquid pool and its percentile among the past day's liquid pools (and, for a
+        bottom-20% pool, among those)."""
+        model = self._load_rw_model()
+        if model is None:
+            return {}
+        rw = model.score(pull_inputs(feat, self._op_live(creator, create_ts)))
+        with self.lock:
+            for dq in (self.rw_all, self.rw_low):
+                while dq and dq[0][0] < now - ROLLING_S:
+                    dq.popleft()
+            past_all, past_low = [v for _, v in self.rw_all], [v for _, v in self.rw_low]
+            self.rw_all.append((now, rw))
+            if low:
+                self.rw_low.append((now, rw))
+        out = {"rw": rw, "rw_pct": _rank_pct(past_all, rw, model.meta.get("quantiles"))}
+        if low:
+            out["rw_low_pct"] = _rank_pct(past_low, rw, model.meta.get("low_quantiles"))
+        return out
 
     def _hist_verdict(self, feat: dict, now: float) -> dict:
         """score_h and the rolling top-2% / top-5% flags for a liquid pool (the score joins the history after)."""
@@ -658,10 +805,12 @@ class LaunchLive:
         cols.update(self._hist_verdict(feat, now))
         if cols.get("low_h"):
             cols.update(self._risk_verdict(feat, rec.get("creator"), create, now))
-        flags = low_flags(cols.get("low_h"), cols.get("risk_pct"))
+        cols.update(self._rw_verdict(feat, rec.get("creator"), create, now, bool(cols.get("low_h"))))
+        flags = {**low_flags(cols.get("low_h"), cols.get("risk_pct")),
+                 **rw_flags(cols.get("low_h"), cols.get("rw_pct"), cols.get("rw_low_pct"))}
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
         if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")
-                                         or flags["d12"]):
+                                         or flags["d12"] or flags["rw50"] or flags["d12rw50"]):
             px = la.chain_price(rows, DECIDE_S)  # SOL per whole token (vault UI amounts)
             if sol_usd and px:
                 self.signals.put_nowait({
@@ -1406,9 +1555,11 @@ def fill_gap(store, journal, book: str, since: float, rng) -> dict:
                                                 (book, since - 600))}
     missed = []
     if flag:
-        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct FROM watch_launch_live "
+        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct, rw_pct, rw_low_pct "
+                             "FROM watch_launch_live "
                              "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND create_ts >= ?", (since,)):
-            hit = r[flag] if flag in ("top2", "top5", "top2h", "top5h") else low_flags(r["low_h"], r["risk_pct"])[flag]
+            hit = r[flag] if flag in ("top2", "top5", "top2h", "top5h") else {
+                **low_flags(r["low_h"], r["risk_pct"]), **rw_flags(r["low_h"], r["rw_pct"], r["rw_low_pct"])}[flag]
             if hit and r["token_mint"] not in bought:
                 missed.append({"ret": r["ret"]})
     if not pairs:
@@ -1519,7 +1670,11 @@ def status(store, cfg: Config, hours: float = 24, now: float | None = None, jour
         "top 5% (history model, rolling cut)": _group([r for r in done if r["top5h"]], rng),
         **{f"history bottom 20% ({'all' if k == 'd12' else 'skip riskiest ' + k[4:] + '%'})": _group(
             [r for r in done if low_flags(r["low_h"], r["risk_pct"])[k]], rng)
-           for k in ("d12",) + tuple(f"d12s{s}" for s in PULL_SKIPS)}}
+           for k in ("d12",) + tuple(f"d12s{s}" for s in PULL_SKIPS)},
+        f"rug-vs-win: every liquid pool minus the riskiest {RW_SKIP}%": _group(
+            [r for r in done if rw_flags(r["low_h"], r["rw_pct"], r["rw_low_pct"])["rw50"]], rng),
+        f"rug-vs-win: history bottom 20% minus the riskiest {RW_SKIP}%": _group(
+            [r for r in done if rw_flags(r["low_h"], r["rw_pct"], r["rw_low_pct"])["d12rw50"]], rng)}
     out["feature parity with the backtest"] = parity(store, scored)
     out["live vs training (drift)"] = drift(scored, cfg)
     if journal is not None:  # the launch books' own buys: where the seconds from creation to the fill go
