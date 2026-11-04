@@ -350,15 +350,15 @@ class Engine:
         blocked = self._blocked.get(pos.id)
         if blocked and time.time() - blocked["since"] >= STUCK_AFTER_S:
             return 0.0
-        price = prices.get(pos.token_address, pos.entry_price)
-        if not price:
-            from tradingbot import model_book as mb
-            if pos.strategy in mb.LAUNCH_CUT:
-                # A seconds-old token has no feed price or sell route yet, which reads as $0 and showed every
-                # open launch trade as a full loss (and in drawdown). As in manage_positions, hold at entry until
-                # the pool-minute exit; a real rug shows up then as no route, and STUCK_AFTER_S zeroes it.
-                price = pos.entry_price
-        return pos.qty * price
+        from tradingbot import model_book as mb
+        if pos.strategy in mb.LAUNCH_CUT:
+            # A seconds-old token has no reliable feed price: no price at all, $0, or a Jupiter /price/v3 figure
+            # up to ~10^7 below what the pool trades at (11-04: launch books showed every open trade as a full
+            # loss in equity and drawdown). These books hold for minutes and sell at a pool minute whatever the
+            # price, so an open trade counts at its cost until then; a real rug shows at that sale as no route,
+            # and STUCK_AFTER_S zeroes it above.
+            return pos.qty * pos.entry_price
+        return pos.qty * prices.get(pos.token_address, pos.entry_price)
 
     def equity(self, book: Book | None = None, prices: dict[str, float] | None = None) -> float:
         book = book or self.books[MAIN]

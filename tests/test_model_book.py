@@ -757,6 +757,8 @@ def test_launch_signals_go_to_the_matching_launch_book_with_a_minute_6_deadline(
         held = sum(p.qty * p.entry_price for p in j.open_positions(mb.LAUNCH5))
         book5 = eng.books[mb.LAUNCH5]
         assert eng.equity(book5, {"L2": 0.0, "L5": 0.0}) == pytest.approx(book5.cash + held)
+        # ...also when the feed returns a bogus tiny price for a seconds-old token
+        assert eng.equity(book5, {"L2": 1e-12, "L5": 1e-12}) == pytest.approx(book5.cash + held)
         eng._deadlines[h5["L5"].id] = time.time() - 1
         eng.current_prices = lambda tokens, held=None: {}
         eng.manage_positions()
