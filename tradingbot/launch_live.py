@@ -867,6 +867,117 @@ def exit_study(store, helius, hours: float | None = None, max_credits: int = 10_
     return out
 
 
+LATE_ENTRY_S = 90  # after the early pulls (EARLY_RUG_S)
+LATE_EXITS_S = (180, 360, 600, 1200)
+LATE_BASELINE = 60
+
+
+def late_entry_study(store, helius, hours: float | None = None, max_credits: int = 12_000,
+                     entry_s: int = LATE_ENTRY_S, exits: tuple = LATE_EXITS_S, now: float | None = None,
+                     seed: int = 7) -> dict:
+    """11-04 user idea: the history model's lowest deciles (D1-D2) hold the most big wins and the most early rugs.
+    Enter them at `entry_s` (only pools not pulled or drained by then) and sell at each of `exits`. Prices = pool
+    balances after its last tx by that second (one Helius call each, cached in `watch_launch_path`); 6% cost,
+    capped +300%; -100% once the LP was pulled or the pool's SOL fell below 10% of the highest seen since entry
+    (or of the fill's). Compared with a random sample of the other liquid pools (D3-D10) under the same rule."""
+    ensure_schema(store)
+    store.execute(PATH_SCHEMA)
+    now = now if now is not None else time.time()
+    since = now - hours * 3600 if hours else 0
+    rows = store.query("SELECT pool, token_mint, create_ts, score_h, fill_px, fill_sol, ret, pulled_ts "
+                       "FROM watch_launch_live WHERE status='done' AND liquid=1 AND ret IS NOT NULL "
+                       "AND score_h IS NOT NULL AND fill_px IS NOT NULL AND fill_sol IS NOT NULL "
+                       "AND create_ts >= ? ORDER BY create_ts", (since,))
+    if not rows:
+        return {"pools": 0}
+    from tradingbot.model_book import decile_index
+    idx = dict(zip((r["pool"] for r in rows), decile_index([r["score_h"] for r in rows])))
+    low = [r for r in rows if idx[r["pool"]] <= 1]
+    rest = sorted((r for r in rows if idx[r["pool"]] > 1),
+                  key=lambda r: hashlib.sha1(f"late:{r['pool']}".encode()).hexdigest())[:LATE_BASELINE]
+    groups = {"history D1 (lowest 10%)": [r for r in low if idx[r["pool"]] == 0],
+              "history D2": [r for r in low if idx[r["pool"]] == 1],
+              "history D1-D2": low, f"random {LATE_BASELINE} of D3-D10": rest}
+    pulled_by = lambda r, sec: bool(r["pulled_ts"]) and r["pulled_ts"] <= r["create_ts"] + sec
+    have = {(r["pool"], r["sec"]): r for r in store.query("SELECT pool, sec, sol, tok FROM watch_launch_path")}
+    stats = collections.Counter()
+    start = helius.credits_used
+
+    def fetch(r, sec):
+        if (r["pool"], sec) in have:
+            return have[(r["pool"], sec)]
+        if helius.credits_used - start + 10 > max_credits:
+            stats["left for a rerun (credit cap)"] += 1
+            return None
+        tx = helius.last_before(r["pool"], r["create_ts"] + sec)
+        if tx is False:
+            stats["call failed"] += 1
+            return None
+        st = {"sol": _raw_vault(tx, r["pool"], ps.WSOL) if tx else None,
+              "tok": _raw_vault(tx, r["pool"], r["token_mint"]) if tx else None}
+        store.execute("INSERT OR REPLACE INTO watch_launch_path(pool, sec, sol, tok, ts) VALUES (?,?,?,?,?)",
+                      (r["pool"], sec, st["sol"], st["tok"], time.time()))
+        have[(r["pool"], sec)] = st
+        stats["fetched"] += 1
+        return st
+
+    def trade(r):
+        """None = not fetched; {'skipped': why} = no entry; else entry move and the return at each exit."""
+        if pulled_by(r, entry_s):
+            return {"skipped": "pulled before entry"}
+        st = fetch(r, entry_s)
+        if st is None:
+            return None
+        if not st["sol"] or not st["tok"] or st["sol"] < la.PULLED_SHARE * r["fill_sol"]:
+            return {"skipped": "drained before entry"}
+        entry, peak, out, dead = st["sol"] / st["tok"], st["sol"], {}, False
+        for sec in exits:
+            if dead or pulled_by(r, sec):
+                out[sec], dead = -1.0, True
+                continue
+            s = fetch(r, sec)
+            if s is None:
+                break
+            if not s["sol"] or not s["tok"] or s["sol"] < la.PULLED_SHARE * peak:
+                out[sec], dead = -1.0, True
+                continue
+            peak = max(peak, s["sol"])
+            out[sec] = min((s["sol"] / s["tok"]) / entry - 1 - la.COST, 3.0)
+        return {"before": entry / r["fill_px"] - 1, "rets": out}
+
+    trades = {}
+    for r in low + rest:  # the low deciles first, so a credit cap cuts the baseline
+        trades[r["pool"]] = trade(r)
+    stats["credits_used"] = helius.credits_used - start
+    rng = np.random.default_rng(seed)
+
+    def summary(rets):
+        g = _group([{"ret": x} for x in rets], rng)
+        if rets:
+            g["big_win_pct"] = round(100 * sum(x >= 0.5 for x in rets) / len(rets))
+        return g
+
+    out = {"pools": len(rows), "entry_s": entry_s, "fetch": dict(stats), "groups": {}}
+    for name, g in groups.items():
+        done = [(r, trades[r["pool"]]) for r in g if trades.get(r["pool"]) is not None]
+        entered = [(r, t) for r, t in done if "rets" in t]
+        skips = collections.Counter(t["skipped"] for _, t in done if "skipped" in t)
+        big = [r for r, _ in entered if r["ret"] >= 0.5]
+        out["groups"][name] = {
+            "n": len(g), "not fetched (credit cap)": len(g) - len(done), "entered": len(entered), **skips,
+            "from second 6 to minute 6 (all pools, the scorer's trade)": summary([r["ret"] for r, _ in done]),
+            "from second 6 to minute 6 (entered pools only)": summary([r["ret"] for r, _ in entered]),
+            f"big winners kept (second 6 -> minute 6 >= +50%, entered at {entry_s} s)": len(big),
+            f"median move second 6 -> {entry_s} s (entered)": round(100 * float(np.median(
+                [t["before"] for _, t in entered])), 1) if entered else None,
+            **{f"enter {entry_s} s, sell at {sec // 60} min" if sec % 60 == 0 else f"sell at {sec} s":
+               summary([t["rets"][sec] for _, t in entered if sec in t["rets"]]) for sec in exits}}
+    out["note"] = (f"history-model deciles ranked within the window; entry at second {entry_s} at the pool's price "
+                   "then (no latency or impact), 6% round trip, capped +300%; -100% once pulled or drained "
+                   "(SOL < 10% of the highest seen since entry); pulls after minute 6 are only seen as drains")
+    return out
+
+
 def parity(store, rows) -> dict:
     """Live features vs the ones the backtest builds from the enricher's later launch row (same pool)."""
     diffs = []

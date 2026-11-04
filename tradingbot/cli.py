@@ -67,7 +67,8 @@ def main(argv: list[str] | None = None) -> None:
                                             "watch-export", "watch-links", "watch-report-now",
                                             "watch-model-train", "model-status", "early-status",
                                             "early-backtest", "early-walk-forward", "launch-backtest", "launch-backfill", "launch-status", "launch-compare",
-                                            "launch-hist-backfill", "launch-hist-test", "launch-exit-study"])
+                                            "launch-hist-backfill", "launch-hist-test", "launch-exit-study",
+                                            "launch-late-entry"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -102,7 +103,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--timing", action="store_true",
                         help="launch-backtest: only the decide-at-d / fill-at-f timing table (faster)")
     parser.add_argument("--max-pools", type=int, default=2000, help="launch-backfill: at most this many pools")
-    parser.add_argument("--max-credits", type=int, default=60000, help="launch-backfill: Helius credit cap")
+    parser.add_argument("--max-credits", type=int, default=None,
+                        help="Helius credit cap (defaults: backfills 60000, launch-exit-study 10000, "
+                             "launch-late-entry 12000)")
     parser.add_argument("--idea", help="propose: what to build")
     parser.add_argument("--problem", default="", help="propose: what it should fix or improve")
     parser.add_argument("--priority", type=int, default=1, help="propose: 1 (first) to 5 (last)")
@@ -256,7 +259,7 @@ def main(argv: list[str] | None = None) -> None:
         helius = Helius(client=httpx.Client(timeout=60))
         helius.min_interval_s = 1 / max(args.rps, 0.1)  # its own process: pace it below what the live scorer needs
         out = launch_hist.backfill(WatchStore(watch_db_path(cfg)), helius, args.days,
-                                   args.max_credits, progress=lambda i, n, c: print(
+                                   args.max_credits or 60_000, progress=lambda i, n, c: print(
                                        f"pools {i}/{n}, credits {c}", file=sys.stderr, flush=True))
         print(json.dumps(out, indent=2))
         return
@@ -270,6 +273,17 @@ def main(argv: list[str] | None = None) -> None:
         helius.min_interval_s = 1 / max(args.rps, 0.1)  # leave the live scorer its share of the plan's rate
         print(json.dumps(launch_live.exit_study(WatchStore(watch_db_path(cfg)), helius, args.hours,
                                                 int(args.max_credits or 10_000)), indent=2))
+        return
+
+    if args.command == "launch-late-entry":
+        import httpx
+        from tradingbot import launch_live
+        from tradingbot.data.helius import Helius
+        from tradingbot.watcher import WatchStore, watch_db_path
+        helius = Helius(client=httpx.Client(timeout=60))
+        helius.min_interval_s = 1 / max(args.rps, 0.1)  # leave the live scorer its share of the plan's rate
+        print(json.dumps(launch_live.late_entry_study(WatchStore(watch_db_path(cfg)), helius, args.hours,
+                                                      int(args.max_credits or 12_000)), indent=2))
         return
 
     if args.command == "launch-hist-test":
@@ -321,7 +335,7 @@ def main(argv: list[str] | None = None) -> None:
             print("HELIUS_API_KEY is not set")
             return
         now = time.time()
-        out = e.backfill_launch(now - args.days * 86400, now - 3600, args.max_pools, args.max_credits,
+        out = e.backfill_launch(now - args.days * 86400, now - 3600, args.max_pools, args.max_credits or 60_000,
                                 progress=lambda m: print(m, flush=True))
         print(json.dumps(out, indent=2))
         return

@@ -413,3 +413,43 @@ def test_exit_study_returns_by_exit_minute_rug_timing_and_liquidity():
     assert h.calls == calls  # saved states are never fetched twice
     capped = ll.exit_study(WatchStore(":memory:"), h, now=t0)
     assert capped["pools"] == 0
+
+
+def test_late_entry_study_enters_the_low_deciles_after_the_early_pulls():
+    st = WatchStore(":memory:")
+    ll.ensure_schema(st)
+    t0 = 1_800_000_000.0
+    states = {}
+    for i in range(50):
+        pool = f"P{i}"
+        pulled = t0 + 60 if i == 0 else None  # pulled before the 90 s entry
+        ret = 1.0 if i == 2 else 0.0  # P2 is a big winner of the scorer's second-6 trade
+        st.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, liquid, score, score_h, fill_px, "
+                   "fill_sol, peak_sol, ret, pulled_ts, status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (pool, "M" + pool, t0, 1, 0.0, float(i), 100 / 1e6, 100.0, 100.0, ret, pulled, "done"))
+
+        def state(ts, i=i):
+            sec = ts - t0
+            if i == 1:
+                return 5.0, 1_000_000  # drained before entry
+            if i == 2 and sec >= 180:
+                return 100.0, 500_000  # price doubles after entry
+            if i == 3 and sec >= 360:
+                return 5.0, 1_000_000  # drained after entry
+            return 100.0, 1_000_000
+        states[pool] = state
+    h = _PathHelius(states)
+    out = ll.late_entry_study(st, h, now=t0 + 2000, max_credits=100_000)
+    d1 = out["groups"]["history D1 (lowest 10%)"]
+    assert d1["n"] == 5 and d1["entered"] == 3
+    assert d1["pulled before entry"] == 1 and d1["drained before entry"] == 1
+    assert d1["big winners kept (second 6 -> minute 6 >= +50%, entered at 90 s)"] == 1
+    m3, m6 = d1["enter 90 s, sell at 3 min"], d1["enter 90 s, sell at 6 min"]
+    assert m3["mean_pct"] == 27.3 and m3["big_win_pct"] == 33 and m3["rugged_pct"] == 0
+    assert m6["rugged_pct"] == 33 and d1["enter 90 s, sell at 20 min"]["rugged_pct"] == 33
+    assert out["groups"]["random 60 of D3-D10"]["entered"] == 40
+    calls = h.calls
+    ll.late_entry_study(st, h, now=t0 + 2000, max_credits=100_000)
+    assert h.calls == calls  # cached states are never fetched twice
+    capped = ll.late_entry_study(st, _PathHelius(states), now=t0 + 2000, max_credits=0)
+    assert capped["groups"]["history D1-D2"]["entered"] == 8  # all from the cache
