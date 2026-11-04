@@ -54,5 +54,7 @@ primary_region = "iad"
     grace_period = "2m"
 
 [[vm]]
-  size = "shared-cpu-1x"
-  memory = "2048mb"  # the daily watch report needs ~1.1 GB on a week of data (runs in its own process)
+  size = "shared-cpu-2x"
+  # 11-04: froze at 00:57 UTC on 2 GB (nightly report + retrain next to ten early/launch books, 19 days of data);
+  # 1 shared CPU allows at most 2 GB, so 2 CPUs for 4 GB
+  memory = "4096mb"
