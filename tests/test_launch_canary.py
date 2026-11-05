@@ -206,14 +206,14 @@ def test_canary_book_takes_top2_picks_at_its_own_size_and_limits(cfg, good_pair)
         assert book.executor is live and book.cash == cfg.launch_canary_budget_usd
         created = time.time() - 6
 
-        def sig(mint, top2=True):
+        def sig(mint, top2=True):  # the canary follows launchrw50_24h's flag
             return {"pool": "P" + mint, "mint": mint, "dex": "pumpswap", "created_ts": created, "name": "", "price": 1e-5,
                     "liq": 30_000.0, "score": 1.0, "ts": time.time(), "decided_ts": time.time(), "kind": "launch",
-                    "top2": top2, "top5": True}
+                    "rw50_24": top2, "top2": not top2, "top5": True}
         eng.model_book.signals.put(sig("A"))
         eng.model_book.signals.put(sig("B", top2=False))
         eng.buy_model_signals()
-        assert [p.token_address for p in j.open_positions(mb.CANARY4)] == ["A"]  # top 2% only
+        assert [p.token_address for p in j.open_positions(mb.CANARY4)] == ["A"]  # the twin's picks only
         assert live.sizes == [cfg.launch_canary_usd]
         assert eng._deadlines[j.open_positions(mb.CANARY4)[0].id] == created + 360
         j.set_state(CANARY_HALT, "1")  # kill switch
@@ -222,6 +222,10 @@ def test_canary_book_takes_top2_picks_at_its_own_size_and_limits(cfg, good_pair)
         cfg.launch_canary_max_open = 1
         assert eng._model_skip_reason(book, sig("C")) == "max open positions"
         cfg.launch_canary_max_open = 5
+        cfg.launch_canary_every_n = 3  # sampling: 1 in 3 signals goes through
+        reasons = [eng._model_skip_reason(book, sig(f"S{i}")) for i in range(6)]
+        assert reasons.count(None) == 2 and reasons.count("canary samples 1 in 3 signals") == 4
+        cfg.launch_canary_every_n = 1
         cfg.launch_canary_daily_loss_usd = 0.0
         assert eng._model_skip_reason(book, sig("C")) == "daily loss limit"
         st = launch_canary.status(j, cfg)
@@ -235,7 +239,7 @@ def test_calibration_pairs_real_and_simulated_trades():
     from tradingbot.models import Position
     j = Journal(":memory:")
     now = time.time()
-    for book, buy_px, sell_px, fee in ((mb.CANARY4, 1.02, 1.10, 0.4), (mb.LAUNCH2, 1.00, 1.15, 0.3)):
+    for book, buy_px, sell_px, fee in ((mb.CANARY4, 1.02, 1.10, 0.4), (mb.CANARY_TWIN, 1.00, 1.15, 0.3)):
         cost = 10.0 if book == mb.CANARY4 else 100.0
         qty = (cost - fee / 2) / buy_px
         proceeds = qty * sell_px - fee / 2

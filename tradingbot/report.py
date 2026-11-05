@@ -504,8 +504,8 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
                    "chosen after looking at minutes 1-6",
     "launch4_5m5": "launch4_5's picks sold at pool minute 5 (added 11-05). No backtest of its own: launch4_2m5 vs "
                    "launch4_2 on 59 paired picks gained +1.7 pts/trade from the earlier exit (within noise)",
-    "canary_launch4_2": "REAL MONEY: launch4_2's picks at $10 a trade, sold at pool minute 6. Its expectation is "
-                        "launch4_2's own results; the gap to launch4_2 (canary-status) is the simulator's error",
+    "canary_rw50_24h": "REAL MONEY: launchrw50_24h's picks at $10 a trade, sold at pool minute 6. Its expectation is "
+                       "launchrw50_24h's own results; the gap to it (canary-status) is the simulator's error",
     "launch4h_5": "as launch4h_2, top 5%: +8.8%/trade (90% range +2.8..+14.7%), 23% rugged; every pool -5.2%, 31%",
     # launch-early-pulls walk-forward (11-03/04, 188 D1-D2 pools, ideal vault prices, ranked within 6 h blocks)
     "launchd12": "history model's bottom 20% (D1-D2), every pool: +2.9%/trade, 30% rugged, 24% big wins (n=188)",

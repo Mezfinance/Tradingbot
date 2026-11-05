@@ -1,7 +1,7 @@
-"""The real-money launch canary (canary_launch4_2): status, calibration against its simulated twin, smoke test.
+"""The real-money launch canary (canary_rw50_24h): status, calibration against its simulated twin, smoke test.
 
-The canary buys launch4_2's picks for real and sells them at pool minute 6. Each of its trades is paired with
-launch4_2's simulated trade on the same token, so the gap between the two is the simulator's error:
+The canary buys launchrw50_24h's picks (`mb.CANARY_TWIN`) for real and sells them at pool minute 6. Each of its
+trades is paired with the twin's simulated trade on the same token, so the gap between the two is the simulator's error:
 entry price, exit price, fees, and how many picks the real book missed or couldn't sell.
 """
 
@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from tradingbot import model_book as mb
 from tradingbot.data.jupiter import USDC_MINT
 
-SIM_TWIN = mb.LAUNCH2
+SIM_TWIN = mb.CANARY_TWIN
 SMOKE_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"  # BONK: deep pools, for a tiny buy/sell test
 
 
@@ -97,7 +97,8 @@ def status(journal, cfg) -> dict:
         "open_positions": len(journal.open_positions(mb.CANARY4)),
         "realized_today": round(journal.realized_since(day_start, mb.CANARY4), 2),
         "limits": {"usd": cfg.launch_canary_usd, "budget": cfg.launch_canary_budget_usd,
-                   "daily_loss": cfg.launch_canary_daily_loss_usd, "max_open": cfg.launch_canary_max_open},
+                   "daily_loss": cfg.launch_canary_daily_loss_usd, "max_open": cfg.launch_canary_max_open,
+                   "every_n": cfg.launch_canary_every_n, "twin": SIM_TWIN},
         "failed_tx_today": {"n": failed["n"], "usd": round(failed["usd"], 4)},
         "skips_today": {r["detail"]: r["n"] for r in skips},
     }
