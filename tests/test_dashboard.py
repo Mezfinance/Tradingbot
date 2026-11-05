@@ -43,18 +43,19 @@ def test_feed_lists_buys_and_sells_with_returns_and_skips_archived_books():
     assert [f["symbol"] for f in dash.last_fills(j, 2)] == ["WIN", "OPEN"]
 
 
-def test_stream_sends_summary_backlog_and_new_trades(cfg, monkeypatch):
+def test_stream_sends_rows_then_deltas_and_new_trades(cfg, monkeypatch):
     monkeypatch.setattr(dash, "POLL_S", 0.01)
+    cfg.launch_book = cfg.launch_live = cfg.launch_rw_book = True
     j = Journal(":memory:")
     _trade(j, "launchrw50", "A", back=110.0)
     board = dash.Dashboard(j, cfg)
     board.refresh()
-    assert board.current()[1]["books"] is not None
+    assert board.current()[1]["expected"]
     out, stop = [], threading.Event()
 
     def write(data):
         out.append(data.decode())
-        if any('"symbol": "B"' in o for o in out):
+        if any('"symbol": "B"' in o or '"symbol":"B"' in o for o in out) and any(o.startswith("event: delta") for o in out):
             stop.set()
     t = threading.Thread(target=board.stream, args=(write, stop))
     t.start()
@@ -62,8 +63,40 @@ def test_stream_sends_summary_backlog_and_new_trades(cfg, monkeypatch):
     _trade(j, "launchrw50", "B")
     t.join(2)
     events = [o.split("\n")[0] for o in out]
-    assert events[:2] == ["event: summary", "event: backlog"] and "event: fill" in events
-    assert not t.is_alive()
+    assert events[:3] == ["event: init", "event: summary", "event: backlog"]
+    assert "event: fill" in events and "event: delta" in events and not t.is_alive()
+    init = json.loads(out[0].split("data: ", 1)[1])
+    rows = [dict(zip(init["pos_cols"], r)) for r in init["positions"]]
+    assert [r["symbol"] for r in rows if r["strategy"] == "launchrw50"] == ["A"]
+    assert {"name": "launchrw50", "hold_min": dash.Live(cfg).holds["launchrw50"], "flag": "rw50"} in init["books"]
+
+
+def test_live_versions_rows_marks_blocked_exits_and_reads_launch_pools(cfg):
+    from tradingbot import launch_live
+    from tradingbot.watcher import WatchStore
+    cfg.launch_book = cfg.launch_live = cfg.launch_rw_book = cfg.launch_low_book = True
+    j = Journal(":memory:")
+    store = WatchStore(":memory:")
+    launch_live.ensure_schema(store)
+    now = time.time()
+    store.execute("INSERT INTO watch_launch_live(pool, token_mint, decided_ts, liquid, ret, status, low_h, rw_pct, "
+                  "rw_low_pct) VALUES ('P1', 'M1', ?, 1, 0.25, 'done', 1, 10, 20)", (now,))
+    live = dash.Live(cfg, j, store)
+    live.poll()
+    v0, snap = live.snapshot()
+    pool = dict(zip(snap["launch_cols"], snap["launch"][0]))
+    assert pool["ret"] == 0.25 and {"d12", "rw50", "d12rw50"} <= set(pool["flags"])
+    assert live.delta(v0) == (v0, None)  # nothing changed: nothing sent
+    pos = _trade(j, "launchrw50", "STUCK")
+    j.log_event("exit_blocked", pos.token_address, "no route", strategy="launchrw50")
+    live.poll()
+    v1, d = live.delta(v0)
+    row = dict(zip(snap["pos_cols"], d["positions"][0]))
+    assert v1 > v0 and row["symbol"] == "STUCK" and row["blocked_since"] is not None and row["closed_at"] is None
+    store.execute("UPDATE watch_launch_live SET ret = -1.0 WHERE pool = 'P1'")
+    live.poll()
+    _, d = live.delta(v1)
+    assert d["positions"] == [] and dict(zip(snap["launch_cols"], d["launch"][0]))["ret"] == -1.0
 
 
 def test_routes_need_the_password_and_health_stays_open(cfg, monkeypatch):
@@ -87,7 +120,7 @@ def test_routes_need_the_password_and_health_stays_open(cfg, monkeypatch):
         code, _, body = get("/", cookie="tb_dash=s3cret")
         assert code == 200 and b"STRATEGY DESK" in body and b"EventSource" in body
         code, _, body = get("/api/summary", cookie="tb_dash=s3cret")
-        assert code == 200 and "books" in json.loads(body)
+        assert code == 200 and "expected" in json.loads(body)
         assert get("/nope", cookie="tb_dash=s3cret")[0] == 404
     finally:
         server.shutdown()
@@ -104,6 +137,6 @@ def test_summary_is_built_in_a_child_process_for_a_file_journal(cfg, tmp_path, m
     assert board.in_child
     board.refresh()
     version, summary = board.current()
-    assert version == 1 and [b["name"] for b in summary["books"]]
+    assert version == 1 and "expected" in summary and summary["downtime"] is not None
     assert (tmp_path / dash.SUMMARY_FILE).exists()
     assert not dash.Dashboard(Journal(":memory:"), cfg.with_overrides({"db_path": ":memory:"})).in_child

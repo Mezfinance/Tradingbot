@@ -5,13 +5,16 @@ Served by the health server (`health.start_health_server`) on `health_port`, beh
 `https://<app>.fly.dev/?key=<token>` once: it sets a cookie, so the plain address works afterwards.
 
   /             the page (no build step, one HTML file)
-  /api/stream   server-sent events: `fill` for every buy/sell (newest first on the page), `summary` when the
-                tables are rebuilt (every SUMMARY_S), comments as keep-alives
-  /api/summary  the latest tables as JSON
+  /api/stream   server-sent events: `init` (every position of the running books + the launch scorer's pools of
+                the last day), then `delta` (changed rows) and `fill` (new trades) every POLL_S, `summary`
+                (backtest notes, downtime) every SUMMARY_S, comments as keep-alives
+  /api/summary  the latest summary as JSON
 
-Fills are read from the journal by id every POLL_S, so a trade shows a second or two after it is booked. The
-tables (report books + launch-scorer outcomes) are rebuilt by a low-priority child process
-(`python -m tradingbot dashboard-summary PATH`) so neither a page view nor the bot's own threads wait on it."""
+11-05: the page computes every table itself (equity, return, drawdown, win rate, ideal outcomes, real vs ideal)
+from the raw rows, so the tables move with each trade. One shared `Live` poller reads the rows on read-only
+connections of its own (no journal lock; sqlite releases the GIL while reading) and versions each changed row,
+so a page costs no database reads. The summary extras come from a low-priority child process
+(`python -m tradingbot dashboard-summary PATH`)."""
 from __future__ import annotations
 
 import hmac
@@ -34,7 +37,6 @@ CHILD_TIMEOUT_S = 240
 SUMMARY_FILE = "dashboard-summary.json"
 KEEPALIVE_S = 15
 FEED_BACKLOG = 60  # fills sent when a page connects
-LAUNCH_HOURS = 6  # window of the launch scorer's ideal outcomes and real-vs-ideal gaps
 COOKIE = "tb_dash"
 
 
@@ -56,7 +58,7 @@ def authorised(headers, query: dict) -> bool:
     return bool(given) and hmac.compare_digest(given, secret)
 
 
-def fills_after(journal: Journal, after_id: int, limit: int = 200) -> list[dict]:
+def fills_after(journal, after_id: int, limit: int = 200) -> list[dict]:
     """Buys and sells of running books with id > after_id, oldest first (archived books, `name@id`, left out)."""
     rows = journal.query(
         "SELECT f.id, f.ts, f.side, f.usd, f.reason, p.strategy, p.symbol, p.token, p.cost_usd, p.realized_usd, "
@@ -80,47 +82,15 @@ def last_fills(journal: Journal, n: int = FEED_BACKLOG) -> list[dict]:
     return fills_after(journal, max(0, newest - 5 * n), 5 * n)[-n:]
 
 
-def _book_row(b: dict) -> dict:
-    s, r = b["book"], b["rugs"]
-    return {"name": b["name"], "hold_min": b["hold_min"], "started": b["started"],
-            "equity": s["equity"], "return_pct": s["return_pct"], "max_drawdown_pct": s["max_drawdown_pct"],
-            "trades": s["closed_trades"], "open": len(s["open_positions"] or []), "win_rate": s["win_rate"],
-            "median_pct": s["median_trade_return_pct"], "mean_pct": s["mean_trade_return_pct"],
-            "profit_factor": s["profit_factor"], "rugs": r["rugs"], "rug_pct": r["rug_rate_pct"],
-            "signals": b["signals"], "buys": b["buys"], "fees_usd": s["network_fees_usd"],
-            "failed_txs": s["failed_txs"], "skips": s["top_skip_reasons"]}
-
-
 def build_summary(journal: Journal, cfg: Config, store=None, now: float | None = None) -> dict:
+    """The slow-changing extras the page can't compute from the rows: backtest notes, downtime, last backup.
+    (Book tables and launch outcomes are computed in the browser from the streamed rows since 11-05.)"""
+    from tradingbot import model_book as mb
     from tradingbot import report
-    now = now if now is not None else time.time()
-    rep = report.build_model(journal, cfg)
-    out = {"built_ts": now, "books": [_book_row(b) for b in rep["books"]],
-           "expected": {b["name"]: report.EXPECTED.get(b["name"]) for b in rep["books"]},
-           "downtime": rep.get("downtime"), "last_backup": rep.get("last_backup")}
-    from tradingbot import health
-    out["health"] = health.status(journal, cfg)[1]
-    if store is not None and cfg.launch_live:
-        try:
-            from tradingbot import launch_live
-            st = launch_live.status(store, cfg, LAUNCH_HOURS, now=now, journal=journal)
-            gaps = {}
-            for book, g in (st.get("real vs ideal fills") or {}).items():
-                gaps[book] = {"trades": g.get("trades"),
-                              "real_mean_pct": (g.get("book (real fills)") or {}).get("mean_pct"),
-                              "ideal_mean_pct": (g.get("scorer (ideal fills), same pools") or {}).get("mean_pct"),
-                              "gap_pct": (g.get("gap per trade (real - ideal)") or {}).get("mean_pct"),
-                              "missed_n": (g.get("signalled but not bought (ideal)") or {}).get("n"),
-                              "missed_mean_pct": (g.get("signalled but not bought (ideal)") or {}).get("mean_pct")}
-            ws = st.get("websocket") or {}
-            out["launch"] = {"hours": LAUNCH_HOURS, "counts_today": st.get("counts_today"),
-                             "credits_today": st.get("credits_today"), "websocket_connected": ws.get("connected"),
-                             "outcomes": st.get("outcomes (fill at second ~6, out at minute 6, 6% cost)"),
-                             "real_vs_ideal": gaps}
-        except Exception as exc:  # noqa: BLE001 (the books still show without the scorer's view)
-            log.warning("dashboard: launch status failed: %s", exc)
-            out["launch"] = {"error": str(exc)}
-    return out
+    books = mb.active_books(cfg)
+    return {"built_ts": now if now is not None else time.time(),
+            "expected": {b: report.EXPECTED.get(b) for b in books},
+            "downtime": report.downtime(journal), "last_backup": json.loads(journal.get_state("last_backup") or "null")}
 
 
 class Dashboard:
@@ -136,6 +106,8 @@ class Dashboard:
         self.version = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
+        self.live = Live(cfg, journal, store)
+        self._external = True  # streams poll for themselves until start() runs the shared poller
 
     def _build_in_child(self) -> dict:
         path = os.path.join(os.path.dirname(os.path.abspath(self.cfg.db_path)), SUMMARY_FILE)
@@ -172,7 +144,13 @@ class Dashboard:
                 self.refresh()
                 if self._stop.wait(SUMMARY_S):
                     return
+        def live_loop():
+            while not self._stop.is_set():
+                self.live.poll()
+                self._stop.wait(POLL_S)
+        self._external = False
         threading.Thread(target=loop, name="dashboard", daemon=True).start()
+        threading.Thread(target=live_loop, name="dashboard-live", daemon=True).start()
         return self
 
     def current(self) -> tuple[int, dict | None]:
@@ -180,33 +158,218 @@ class Dashboard:
             return self.version, self.summary
 
     def stream(self, write, stop: threading.Event | None = None) -> None:
-        """Write server-sent events to `write(bytes)` until it raises (the page closed) or `stop` is set."""
+        """Write server-sent events to `write(bytes)` until it raises (the page closed) or `stop` is set.
+
+        `init` (every position of the running books + the scorer's pools of the last day), `summary` (the
+        slow extras), `backlog` (recent fills), then every POLL_S: `delta` (rows that changed), `fill` (new
+        buys and sells) and `summary` when rebuilt. The page computes the tables from the rows, so they move
+        with every trade. All of it comes from the shared `Live` poller: a page costs no database reads."""
         def send(event: str, data) -> None:
-            write(f"event: {event}\ndata: {json.dumps(data)}\n\n".encode())
+            write(f"event: {event}\ndata: {json.dumps(data, separators=(',', ':'))}\n\n".encode())
 
         stop = stop or threading.Event()
+        live = self.live
+        if live.ver == 0:
+            live.poll()
+        ver, init = live.snapshot()
+        send("init", init)
         version, summary = self.current()
         if summary is not None:
             send("summary", summary)
-        backlog = last_fills(self.journal)
+        backlog = live.fills[-FEED_BACKLOG:]
         send("backlog", backlog)
-        last_id = backlog[-1]["id"] if backlog else (self.journal.query("SELECT MAX(id) AS m FROM fills")[0]["m"] or 0)
+        last_fill = backlog[-1]["id"] if backlog else live.last_fill
         quiet = time.time()
         while not stop.is_set():
-            new = fills_after(self.journal, last_id)
-            for f in new:
+            if self._external:  # no poller thread (tests, or start() not called): poll here
+                live.poll()
+            sent = False
+            new_ver, delta = live.delta(ver)
+            if delta:
+                send("delta", delta)
+                sent = True
+            ver = new_ver
+            for f in [f for f in live.fills if f["id"] > last_fill]:
                 send("fill", f)
-                last_id = f["id"]
+                last_fill = f["id"]
+                sent = True
             v, summary = self.current()
             if v != version and summary is not None:
                 send("summary", summary)
                 version = v
-            if new or v != version:
+                sent = True
+            if sent:
                 quiet = time.time()
             elif time.time() - quiet > KEEPALIVE_S:
                 write(b": keep-alive\n\n")
                 quiet = time.time()
             stop.wait(POLL_S)
+
+
+POS_COLS = ("id", "strategy", "symbol", "token", "cost_usd", "realized_usd", "qty", "entry_price", "opened_at",
+            "closed_at", "exit_reason")
+LAUNCH_COLS = ("pool", "token_mint", "create_ts", "decided_ts", "liquid", "ret", "status", "pulled_ts", "liq_usd",
+               "top2", "top5", "top2h", "top5h", "low_h", "risk_pct", "rw_pct", "rw_low_pct")
+LAUNCH_KEEP_S = 86400  # the scorer's pools sent to the page (it windows them 1/6/24 h)
+STUCK_AFTER_S = 1800  # as engine.STUCK_AFTER_S: a position with no route out this long counts as $0
+
+
+class Live:
+    """Raw rows for the page, polled every POLL_S on read-only connections of their own (never the journal's
+    lock, and sqlite releases the GIL while it reads). Each changed row gets a new version number, so every
+    open page is sent only what changed since its last version."""
+
+    def __init__(self, cfg: Config, journal: Journal | None = None, store=None):
+        from tradingbot import model_book as mb
+        self.cfg = cfg
+        self.books = list(mb.active_books(cfg))
+        self.flag_of = {b: mb.LAUNCH_CUT.get(b) for b in self.books}
+        self.holds = {b: mb.hold_min(cfg, b) for b in self.books}
+        self.journal = journal
+        self.jdb = self._open(cfg.db_path) if cfg.db_path != ":memory:" else None
+        path = getattr(store, "path", None)
+        if path and path != ":memory:" and os.path.exists(path):
+            self.wdb = self._open(path)
+        else:  # in-memory store (tests): its own connection
+            self.wdb = getattr(store, "db", None)
+        self.lock = threading.Lock()
+        self.ver = 0
+        self.pos: dict[int, tuple[int, list]] = {}
+        self.launch: dict[str, tuple[int, list]] = {}
+        self.blocked: dict[tuple, list[float]] = {}
+        self.fills: list[dict] = []
+        self.last_fill = 0
+        self.last_event = None
+        self.health: dict | None = None
+        self.health_ver = 0
+        self._health_ts = 0.0
+
+    @staticmethod
+    def _open(path: str):
+        import sqlite3
+        db = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=2, check_same_thread=False)
+        db.row_factory = sqlite3.Row
+        return db
+
+    def _q(self, sql: str, params: tuple = ()) -> list:
+        if self.jdb is not None:
+            return self.jdb.execute(sql, params).fetchall()
+        return self.journal.query(sql, params) if self.journal is not None else []
+
+    def query(self, sql: str, params: tuple = ()) -> list:  # lets fills_after read through this connection
+        return self._q(sql, params)
+
+    def _bump(self, table: dict, key, row: list) -> None:
+        old = table.get(key)
+        if old is None or old[1] != row:
+            self.ver += 1
+            table[key] = (self.ver, row)
+
+    def poll(self) -> None:
+        try:
+            with self.lock:
+                self._poll_events()
+                self._poll_positions()
+                self._poll_fills()
+                self._poll_launch()
+                if time.time() - self._health_ts > 10 and self.journal is not None:
+                    from tradingbot import health
+                    h = health.status(self.journal, self.cfg)[1]
+                    self._health_ts = time.time()
+                    if h != self.health:
+                        self.health, self.health_ver = h, self.ver + 1
+                        self.ver += 1
+        except Exception:  # noqa: BLE001 (a failed read is retried next poll)
+            log.exception("dashboard live poll failed")
+
+    def _poll_events(self) -> None:
+        if self.last_event is None:  # first pass: the past week's blocked exits, then only new events by id
+            top = self._q("SELECT MAX(id) AS m FROM events")
+            rows = self._q("SELECT strategy, token, ts FROM events WHERE kind='exit_blocked' AND ts > ?",
+                           (time.time() - 7 * 86400,))
+            self.last_event = (top[0]["m"] if top else None) or 0
+        else:
+            rows = self._q("SELECT id, strategy, token, ts FROM events WHERE id > ? AND kind='exit_blocked'",
+                           (self.last_event,))
+            top = self._q("SELECT MAX(id) AS m FROM events")
+            self.last_event = (top[0]["m"] if top else None) or self.last_event
+        for r in rows:
+            self.blocked.setdefault((r["strategy"], r["token"]), []).append(r["ts"])
+
+    def _blocked_since(self, book: str, token: str, opened: float | None) -> float | None:
+        ts = [t for t in self.blocked.get((book, token), ()) if t >= (opened or 0)]
+        return min(ts) if ts else None
+
+    def _poll_positions(self) -> None:
+        if not self.books:
+            return
+        marks = ",".join("?" * len(self.books))
+        top = max(self.pos) if self.pos else 0
+        recent = time.time() - 60
+        rows = self._q(f"SELECT {', '.join(POS_COLS)} FROM positions WHERE strategy IN ({marks}) "
+                       f"AND (id > ? OR closed_at IS NULL OR closed_at > ?)", (*self.books, top, recent))
+        for r in rows:
+            row = [r[c] for c in POS_COLS]
+            row.append(self._blocked_since(r["strategy"], r["token"], r["opened_at"]) if r["closed_at"] is None
+                       else None)
+            self._bump(self.pos, r["id"], row)
+
+    def _poll_fills(self) -> None:
+        if not self.fills and not self.last_fill:
+            top = self._q("SELECT MAX(id) AS m FROM fills")
+            newest = (top[0]["m"] if top else None) or 0
+            self.fills = fills_after(self, max(0, newest - 5 * FEED_BACKLOG), 5 * FEED_BACKLOG)[-FEED_BACKLOG:]
+            self.last_fill = self.fills[-1]["id"] if self.fills else newest
+            return
+        new = fills_after(self, self.last_fill)
+        if new:
+            self.fills = (self.fills + new)[-300:]
+            self.last_fill = new[-1]["id"]
+
+    def _poll_launch(self) -> None:
+        if self.wdb is None:
+            return
+        from tradingbot import launch_live
+        cols = {r[1] for r in self.wdb.execute("PRAGMA table_info(watch_launch_live)")}
+        if not cols:
+            return
+        sel = ", ".join(c if c in cols else f"NULL AS {c}" for c in LAUNCH_COLS)
+        rows = self.wdb.execute(f"SELECT {sel} FROM watch_launch_live WHERE decided_ts > ?",
+                                (time.time() - LAUNCH_KEEP_S,)).fetchall()
+        for r in rows:
+            flags = [k for k in ("top2", "top5", "top2h", "top5h") if r[k]]
+            for fl in (launch_live.low_flags(r["low_h"], r["risk_pct"]),
+                       launch_live.rw_flags(r["low_h"], r["rw_pct"], r["rw_low_pct"])):
+                flags += [k for k, on in fl.items() if on]
+            ret = r["ret"]
+            self._bump(self.launch, r["pool"], [r["pool"], r["token_mint"], r["create_ts"], r["decided_ts"],
+                                                1 if r["liquid"] else 0, None if ret is None else round(ret, 4),
+                                                r["status"], r["pulled_ts"], r["liq_usd"], flags])
+        cut = time.time() - LAUNCH_KEEP_S - 3600
+        for k in [k for k, (_, row) in self.launch.items() if (row[3] or 0) < cut]:
+            del self.launch[k]
+
+    def snapshot(self) -> tuple[int, dict]:
+        with self.lock:
+            return self.ver, {
+                "now": time.time(), "cash": self.cfg.model_book_cash_usd, "stuck_after_s": STUCK_AFTER_S,
+                "books": [{"name": b, "hold_min": self.holds[b], "flag": self.flag_of[b]} for b in self.books],
+                "pos_cols": [*POS_COLS, "blocked_since"], "positions": [row for _, row in self.pos.values()],
+                "launch_cols": ["pool", "token", "create_ts", "decided_ts", "liquid", "ret", "status",
+                                "pulled_ts", "liq_usd", "flags"],
+                "launch": [row for _, row in self.launch.values()], "launch_keep_s": LAUNCH_KEEP_S,
+                "health": self.health}
+
+    def delta(self, since: int) -> tuple[int, dict | None]:
+        with self.lock:
+            if self.ver == since:
+                return since, None
+            out = {"now": time.time(),
+                   "positions": [row for v, row in self.pos.values() if v > since],
+                   "launch": [row for v, row in self.launch.values() if v > since]}
+            if self.health_ver > since:
+                out["health"] = self.health
+            return self.ver, out
 
 
 PAGE = r"""<!doctype html>
@@ -287,6 +450,9 @@ border-bottom:1px solid color-mix(in srgb,var(--on-band) 18%,transparent);font-s
 @media (prefers-color-scheme:dark){.feed .pos{color:#157347}.feed .neg{color:#c62828}}
 footer{max-width:1360px;margin:0 auto;padding:0 32px 32px;color:var(--ink-3);font-size:12px;font-weight:600}
 :focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.win{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.win .label{margin-right:4px}
+.win button{min-height:36px;padding:0 12px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:700 13px/1 inherit;font-family:inherit;cursor:pointer;border-radius:0}
+.win button.on{background:var(--lime);color:var(--on-lime)}.win button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 </style></head><body>
 <header>
 <div class="lockup"><svg viewBox="0 0 100 100" aria-hidden="true"><rect class="mk-sq" width="100" height="100"/><polygon class="mk-z" points="24,26 76,26 76,39 38,61 76,61 76,74 24,74 24,61 62,39 24,39"/></svg>
@@ -296,20 +462,21 @@ footer{max-width:1360px;margin:0 auto;padding:0 32px 32px;color:var(--ink-3);fon
 </header>
 <main>
 <div><p class="label eyebrow">Paper books · simulated fills on live Jupiter quotes</p><h1>Launch strategies</h1>
-<p class="lead">Every book starts at $10,000. Trades stream as they are booked. Tables are rebuilt every two minutes.</p></div>
+<p class="lead">Every book starts at $10,000. Trades and every table update live, within two seconds of a trade.</p></div>
 <div class="stats">
 <div class="stat lime"><span class="label">Leading book</span><span class="v" id="s-lead">-</span><span class="h" id="s-lead-h"></span></div>
 <div class="stat"><span class="label">P&amp;L, all books</span><span class="v num" id="s-pnl">-</span><span class="h" id="s-pnl-h"></span></div>
 <div class="stat"><span class="label">Closed trades</span><span class="v num" id="s-trades">-</span><span class="h" id="s-trades-h"></span></div>
-<div class="stat"><span class="label">Trades, last hour</span><span class="v num" id="s-rate">0</span><span class="h">Counted while this page is open</span></div>
+<div class="stat"><span class="label">Trades, last hour</span><span class="v num" id="s-rate">0</span><span class="h">Closed in the past 60 minutes</span></div>
 </div>
 <div class="cols">
 <section class="card"><p class="label eyebrow">Books</p><h2>Results by book</h2>
-<p class="sub">Sorted by return. Click a header to sort. The leading row is highlighted. Open launch trades count at cost until their pool-minute sale.</p>
+<p class="sub">Sorted by return. Click a header to sort. Open trades count at cost until sold; a trade with no route out for 30 min counts as $0. Rugged = closed at −80% or worse.</p>
 <div class="scroll"><table id="books"></table></div></section>
 <aside class="feed"><p class="label" style="color:var(--on-band-2);margin:0 0 6px">Live</p><h2>Trades</h2>
 <p class="sub" id="feed-sub">Newest first</p><ul id="feed"></ul></aside>
 </div>
+<div class="win" id="win"><span class="label">Launch window</span><button data-w="3600">1 h</button><button data-w="21600" class="on">6 h</button><button data-w="86400">24 h</button></div>
 <div class="two">
 <section class="card"><p class="label eyebrow">Launch scorer · last <span id="lh">6</span> h</p><h2>Ideal trades</h2>
 <p class="sub">Pool price at second ~6.5 in, minute 6 out, 6% cost. The yardstick the books are measured against.</p>
@@ -322,55 +489,86 @@ footer{max-width:1360px;margin:0 auto;padding:0 32px 32px;color:var(--ink-3);fon
 <footer>MZF Protocol · paper trading only, no funds at risk · <span id="foot"></span></footer>
 <script>
 const $=id=>document.getElementById(id);
-const fmt=(v,d=1,s="")=>v==null?"-":(typeof v==="number"?v.toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}):v)+s;
-const sgn=(v,d=1,s="%")=>v==null?"-":(v>0?"+":v<0?"−":"")+Math.abs(v).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d})+s;
+const fmt=(v,d=1,s="")=>v==null||Number.isNaN(v)?"-":(typeof v==="number"?v.toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}):v)+s;
+const sgn=(v,d=1,s="%")=>v==null||Number.isNaN(v)?"-":(v>0?"+":v<0?"−":"")+Math.abs(v).toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d})+s;
 const cls=v=>v==null?"":v>0?"pos":v<0?"neg":"";
-const ago=ts=>{const s=Math.max(0,Date.now()/1000-ts);return s<90?Math.round(s)+"s":s<5400?Math.round(s/60)+"m":s<172800?(s/3600).toFixed(1)+"h":(s/86400).toFixed(1)+"d"};
 const esc=t=>String(t??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
-let sortKey="return_pct",sortDir=-1,last=null;
+const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
+const median=a=>{if(!a.length)return null;const b=[...a].sort((x,y)=>x-y),m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2};
+const S={pos:new Map(),launch:new Map(),books:[],cash:10000,stuck:1800,pc:[],lc:[],skew:0,health:null,extra:null};
+let sortKey="return_pct",sortDir=-1,win=21600,pending=false;
+const now=()=>Date.now()/1000-S.skew;
+const obj=(cols,row)=>{const o={};cols.forEach((c,i)=>o[c]=row[i]);return o};
+function merge(d){if(d.now)S.skew=Date.now()/1000-d.now;
+(d.positions||[]).forEach(r=>{const o=obj(S.pc,r);S.pos.set(o.id,o)});
+(d.launch||[]).forEach(r=>{const o=obj(S.lc,r);S.launch.set(o.pool,o)});
+if("health" in d&&d.health)S.health=d.health}
+function bookStats(b){const t=now();let equity=S.cash,open=0,started=null;const tr=[];
+for(const p of S.pos.values()){if(p.strategy!==b.name)continue;started=started==null?p.opened_at:Math.min(started,p.opened_at);
+const cost=p.cost_usd||0,real=p.realized_usd||0;let pnl;
+if(p.closed_at){pnl=real-cost;tr.push({t:p.closed_at,ret:cost?real/cost-1:0,pnl})}
+else if(p.blocked_since&&t-p.blocked_since>=S.stuck){pnl=real-cost;tr.push({t:p.blocked_since+S.stuck,ret:cost?real/cost-1:-1,pnl})}
+else{open++;pnl=real+(p.qty||0)*(p.entry_price||0)-cost}
+equity+=pnl}
+tr.sort((x,y)=>x.t-y.t);let eq=S.cash,peak=S.cash,dd=0;for(const x of tr){eq+=x.pnl;peak=Math.max(peak,eq);dd=Math.max(dd,(peak-eq)/peak)}
+const rets=tr.map(x=>x.ret*100),gain=tr.filter(x=>x.pnl>0).reduce((a,x)=>a+x.pnl,0),loss=-tr.filter(x=>x.pnl<0).reduce((a,x)=>a+x.pnl,0);
+const rugs=tr.filter(x=>x.ret<=-0.8).length;
+return{name:b.name,hold_min:b.hold_min,started,equity,return_pct:(equity/S.cash-1)*100,trades:tr.length,open,
+win_rate:tr.length?tr.filter(x=>x.ret>0).length/tr.length:null,median_pct:median(rets),mean_pct:mean(rets),
+profit_factor:loss>0?gain/loss:(gain>0?null:null),rug_pct:tr.length?100*rugs/tr.length:null,max_drawdown_pct:100*dd,last_hour:tr.filter(x=>x.t>t-3600).length}}
 const COLS=[["name","Book",0],["hold_min","Hold",0],["equity","Equity $",0],["return_pct","Return",2],["trades","Trades",0],["open","Open",0],["win_rate","Win",2],["median_pct","Median",1],["mean_pct","Mean",1],["profit_factor","PF",2],["rug_pct","Rugged",0],["max_drawdown_pct","Max DD",1]];
-function books(s){const rows=[...s.books].sort((a,b)=>{const x=a[sortKey],y=b[sortKey];return (x==null)-(y==null)||(x<y?-1:x>y?1:0)*sortDir});
-const leader=[...s.books].filter(b=>b.trades>0).sort((a,b)=>(b.return_pct??-1e9)-(a.return_pct??-1e9))[0];
+function renderBooks(){const all=S.books.map(bookStats);
+const rows=[...all].sort((a,b)=>{const x=a[sortKey],y=b[sortKey];return (x==null)-(y==null)||(x<y?-1:x>y?1:0)*sortDir});
+const leader=all.filter(b=>b.trades>0).sort((a,b)=>b.return_pct-a.return_pct)[0];const exp=(S.extra&&S.extra.expected)||{};
 let h="<tr>"+COLS.map(c=>`<th data-k="${c[0]}">${c[1]}${sortKey===c[0]?(sortDir<0?" ↓":" ↑"):""}</th>`).join("")+"</tr>";
-for(const b of rows){h+=`<tr class="${leader&&b.name===leader.name?"lead-row":""}" title="${esc(s.expected[b.name]||"")}">`+COLS.map(([k,,d])=>{const v=b[k];
-if(k==="name")return`<td class="book">${esc(v)}</td>`;if(k==="started")return`<td class="muted">${v?ago(v):"-"}</td>`;
-if(k==="hold_min")return`<td>${v}m</td>`;if(k==="equity")return`<td>${fmt(v,0)}</td>`;
+for(const b of rows){h+=`<tr class="${leader&&b.name===leader.name?"lead-row":""}" title="${esc(exp[b.name]||"")}">`+COLS.map(([k,,d])=>{const v=b[k];
+if(k==="name")return`<td class="book">${esc(v)}</td>`;if(k==="hold_min")return`<td>${fmt(v,0)}m</td>`;if(k==="equity")return`<td>${fmt(v,0)}</td>`;
 if(["return_pct","median_pct","mean_pct"].includes(k))return`<td class="${cls(v)}">${sgn(v,d)}</td>`;
 if(k==="rug_pct"||k==="max_drawdown_pct")return`<td>${fmt(v,d,"%")}</td>`;return`<td>${fmt(v,d)}</td>`}).join("")+"</tr>"}
-$("books").innerHTML=h;$("books").querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;sortDir=sortKey===k?-sortDir:-1;sortKey=k;books(last)});
+$("books").innerHTML=h;$("books").querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;sortDir=sortKey===k?-sortDir:-1;sortKey=k;renderBooks()});
 if(leader){$("s-lead").textContent=leader.name;$("s-lead-h").textContent=`${sgn(leader.return_pct,2)} on ${leader.trades} trades`}
-const pnl=s.books.reduce((a,b)=>a+(b.equity??0)-10000,0);$("s-pnl").innerHTML=`<span class="${cls(pnl)}">${sgn(pnl,0,"")}</span>`;
-$("s-pnl-h").textContent=`$ across ${s.books.length} books`;
-$("s-trades").textContent=fmt(s.books.reduce((a,b)=>a+(b.trades||0),0),0);
-$("s-trades-h").textContent=`${s.books.reduce((a,b)=>a+(b.open||0),0)} open now`}
-function launch(s){const L=s.launch;if(!L||L.error){$("outcomes").innerHTML=`<tr><td class="muted">${esc(L&&L.error?L.error:"Launch scorer off")}</td></tr>`;$("gaps").innerHTML="";return}
-$("lh").textContent=$("lh2").textContent=L.hours;
+const pnl=all.reduce((a,b)=>a+b.equity-S.cash,0);$("s-pnl").innerHTML=`<span class="${cls(pnl)}">${sgn(pnl,0,"")}</span>`;
+$("s-pnl-h").textContent=`$ across ${all.length} books`;$("s-trades").textContent=fmt(all.reduce((a,b)=>a+b.trades,0),0);
+$("s-trades-h").textContent=`${all.reduce((a,b)=>a+b.open,0)} open now`;$("s-rate").textContent=fmt(all.reduce((a,b)=>a+b.last_hour,0),0)}
+function group(rs){const r=rs.map(x=>x.ret*100);return{n:r.length,mean:mean(r),median:median(r),win:r.length?100*r.filter(x=>x>0).length/r.length:null,
+rug:r.length?100*rs.filter(x=>x.ret<=-0.999).length/r.length:null,big:r.length?100*rs.filter(x=>x.ret>=0.5).length/r.length:null}}
+function renderLaunch(){const t=now(),done=[...S.launch.values()].filter(x=>x.decided_ts>=t-win&&x.liquid&&x.ret!=null);
+const label=win>=86400?"24":String(win/3600);$("lh").textContent=$("lh2").textContent=label;
+const flags=[];const byFlag={};for(const b of S.books)if(b.flag){(byFlag[b.flag]=byFlag[b.flag]||[]).push(b.name);if(!flags.includes(b.flag))flags.push(b.flag)}
 let h="<tr><th>Group</th><th>Trades</th><th>Mean</th><th>Median</th><th>Win</th><th>Rugged</th><th>+50%</th></tr>";
-for(const[k,g]of Object.entries(L.outcomes||{})){const big=g["returns (% of trades)"]?g["returns (% of trades)"]["+50% or more"]:null;
-h+=`<tr><td>${esc(k)}</td><td>${fmt(g.n,0)}</td><td class="${cls(g.mean_pct)}">${sgn(g.mean_pct)}</td><td>${sgn(g.median_pct)}</td><td>${fmt(g.win_pct,0,"%")}</td><td>${fmt(g.rugged_pct,0,"%")}</td><td>${fmt(big,0,"%")}</td></tr>`}
+const line=(name,g)=>`<tr><td>${name}</td><td>${fmt(g.n,0)}</td><td class="${cls(g.mean)}">${sgn(g.mean)}</td><td>${sgn(g.median)}</td><td>${fmt(g.win,0,"%")}</td><td>${fmt(g.rug,0,"%")}</td><td>${fmt(g.big,0,"%")}</td></tr>`;
+h+=line("Every liquid pool",group(done));
+for(const f of flags)h+=line(`<span class="book">${esc(byFlag[f].join(", "))}</span>`,group(done.filter(x=>x.flags.includes(f))));
 $("outcomes").innerHTML=h;
 h="<tr><th>Book</th><th>Trades</th><th>Real</th><th>Ideal</th><th>Gap</th><th>Missed</th><th>Missed ideal</th></tr>";
-for(const[k,g]of Object.entries(L.real_vs_ideal||{})){if(!g.trades&&!g.missed_n)continue;
-h+=`<tr><td class="book">${esc(k)}</td><td>${fmt(g.trades,0)}</td><td class="${cls(g.real_mean_pct)}">${sgn(g.real_mean_pct)}</td><td>${sgn(g.ideal_mean_pct)}</td><td class="${cls(g.gap_pct)}">${sgn(g.gap_pct,1," pts")}</td><td>${fmt(g.missed_n,0)}</td><td>${sgn(g.missed_mean_pct)}</td></tr>`}
+for(const b of S.books){if(!b.flag)continue;const ideal=done.filter(x=>x.flags.includes(b.flag));const byTok=new Map(ideal.map(x=>[x.token,x]));
+const mine=[...S.pos.values()].filter(p=>p.strategy===b.name&&p.closed_at&&p.opened_at>=t-win&&byTok.has(p.token));
+const held=new Set([...S.pos.values()].filter(p=>p.strategy===b.name).map(p=>p.token));
+const real=mine.map(p=>100*(p.realized_usd/p.cost_usd-1)),idl=mine.map(p=>100*byTok.get(p.token).ret),missed=ideal.filter(x=>!held.has(x.token)).map(x=>100*x.ret);
+if(!mine.length&&!missed.length)continue;const gap=mine.length?mean(real)-mean(idl):null;
+h+=`<tr><td class="book">${esc(b.name)}</td><td>${mine.length}</td><td class="${cls(mean(real))}">${sgn(mean(real))}</td><td>${sgn(mean(idl))}</td><td class="${cls(gap)}">${sgn(gap,1," pts")}</td><td>${missed.length}</td><td>${sgn(mean(missed))}</td></tr>`}
 $("gaps").innerHTML=h}
-function summary(s){last=s;books(s);launch(s);$("built").textContent="Tables "+new Date(s.built_ts*1000).toLocaleTimeString();
-const ok=Object.values(s.health||{}).every(x=>x.ok);$("health").innerHTML=`<span class="dot"></span>${ok?"Bot healthy":"Bot stalled"}`;$("health").className="tag "+(ok?"ink":"neg");
-const d=s.downtime;$("foot").textContent=d?`${d.outages} outages, ${fmt(d.hours_offline,1)} h offline since start`:""}
-const times=[];
-function fill(f,isNew){const li=document.createElement("li");if(isNew){li.className="new";times.push(Date.now())}
+function renderHealth(){const ok=S.health?Object.values(S.health).every(x=>x.ok):null;
+$("health").innerHTML=`<span class="dot"></span>${ok==null?"Bot":ok?"Bot healthy":"Bot stalled"}`;$("health").className="tag "+(ok==null?"":ok?"ink":"neg")}
+function render(){renderBooks();renderLaunch();renderHealth();$("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false})}
+function schedule(){if(!pending){pending=true;setTimeout(()=>{pending=false;render()},300)}}
+function fill(f,isNew){const li=document.createElement("li");if(isNew)li.className="new";
 const t=new Date(f.ts*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
 const side=f.side==="buy"?'<span class="side buy">BUY</span>':'<span class="side">SELL</span>';
 const right=f.side==="sell"?`<span class="r ${cls(f.ret_pct)}">${f.ret_pct==null?"part":sgn(f.ret_pct)}</span>`:`<span class="r">$${fmt(f.usd,0)}</span>`;
 const why=f.side==="sell"&&f.reason?` · ${esc(f.reason.replace(/_/g," "))}`:"";
 li.innerHTML=`<span class="t mono">${t}</span><span>${side}<b>${esc(f.symbol)}</b><span class="bk">${esc(f.book)}${why}</span></span>${right}`;
 const feed=$("feed");feed.prepend(li);while(feed.children.length>300)feed.lastChild.remove()}
-function rate(){const cut=Date.now()-3600e3;while(times.length&&times[0]<cut)times.shift();$("s-rate").textContent=times.length}
-setInterval(rate,10000);
+document.querySelectorAll("#win button").forEach(bt=>bt.onclick=()=>{win=+bt.dataset.w;document.querySelectorAll("#win button").forEach(x=>x.classList.toggle("on",x===bt));renderLaunch()});
+setInterval(render,30000);
 function connect(){const es=new EventSource("api/stream");
 es.onopen=()=>{$("conn").innerHTML='<span class="dot"></span>Live';$("conn").className="tag lime"};
 es.onerror=()=>{$("conn").innerHTML='<span class="dot"></span>Reconnecting';$("conn").className="tag neg"};
-es.addEventListener("summary",e=>summary(JSON.parse(e.data)));
+es.addEventListener("init",e=>{const d=JSON.parse(e.data);S.books=d.books;S.cash=d.cash;S.stuck=d.stuck_after_s;S.pc=d.pos_cols;S.lc=d.launch_cols;
+S.pos.clear();S.launch.clear();S.health=d.health;merge(d);render()});
+es.addEventListener("delta",e=>{merge(JSON.parse(e.data));schedule()});
+es.addEventListener("summary",e=>{S.extra=JSON.parse(e.data);const d=S.extra.downtime;$("foot").textContent=d?`${d.outages} outages, ${fmt(d.hours_offline,1)} h offline since start`:"";schedule()});
 es.addEventListener("backlog",e=>{$("feed").innerHTML="";JSON.parse(e.data).forEach(f=>fill(f,false))});
-es.addEventListener("fill",e=>{fill(JSON.parse(e.data),true);rate()})}
+es.addEventListener("fill",e=>fill(JSON.parse(e.data),true))}
 connect();
 </script></body></html>"""
