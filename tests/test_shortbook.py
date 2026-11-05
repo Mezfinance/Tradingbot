@@ -235,3 +235,44 @@ def test_bybit_funding_falls_back_to_latest_on_error():
     h = ErrThenOk([{"fundingRateTimestamp": str((now - 3600) * 1000), "fundingRate": "-0.0002"}])
     got = BybitPerp(h).funding(Contract("bybit", "XUSDT", "X", 1.0, None), now - 7200)
     assert got == [(now - 3600, -0.0002)] and len(h.calls) == 2
+
+
+def test_feed_serves_nav_positions_and_groups_over_ipv6_and_ipv4():
+    """11-05: the MZF dashboard reads the short book over Fly's private network (IPv6) from /api/feed."""
+    import json as _json
+    import urllib.request
+    from shortbook import cli
+    clock = Clock()
+    t0 = clock.t
+    perp = FakePerp("binance", {"XYZ": t0 - 30 * DAY, "ABC": t0 - 30 * DAY},
+                    {"XYZ": q(10.0, oi=100e6, vol=1e12, fr=0.0), "ABC": q(5.0, oi=100e6, vol=1e12, fr=0.0)})
+    book, up = make(clock, perps={"binance": perp})
+    book.detect(); up.m["XYZ"] = "KRW-XYZ"; book.detect(); up.trades["KRW-XYZ"] = t0
+    book.check_pending()
+    perp.qs["XYZ"] = q(8.0, oi=100e6, vol=1e12)
+    clock.t = t0 + 7 * DAY + 1
+    book.manage()                                             # XYZ closed with a 20% fall
+    up.m["ABC"] = "KRW-ABC"; book.detect(); up.trades["KRW-ABC"] = clock.t
+    book.check_pending()                                      # ABC open
+    book.s.put("heartbeat", clock.t)
+    f = cli.feed(book, now=clock.t)
+    assert f["program"] == "MZF Short Only" and f["healthy"] and f["closed_total"] == 1
+    assert [p["base"] for p in f["open"]] == ["ABC"] and f["closed"][0]["base"] == "XYZ"
+    assert f["closed"][0]["price_pct"] == pytest.approx(20.0)
+    g = f["strategies"][0]["groups"]["B upbit"]
+    assert g["open"] == 1 and g["closed"] == 1 and g["research_pct"] == 13.3 and g["mean_pct"] > 0
+    assert f["nav_usd"] == pytest.approx(book.nav(), abs=0.01)
+    srv = cli.serve(book, 0)
+    try:
+        port = srv.server_address[1]
+        import socket
+        try:  # this host may have no IPv6 (the sandbox doesn't); Fly machines do
+            socket.socket(socket.AF_INET6).close()
+            v6 = srv.address_family == socket.AF_INET6
+        except OSError:
+            v6 = False
+        for host in (["[::1]"] if v6 else []) + ["127.0.0.1"]:
+            body = _json.loads(urllib.request.urlopen(f"http://{host}:{port}/api/feed", timeout=5).read())
+            assert body["closed_total"] == 1
+    finally:
+        srv.shutdown()

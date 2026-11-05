@@ -142,3 +142,29 @@ def test_summary_is_built_in_a_child_process_for_a_file_journal(cfg, tmp_path, m
     assert version == 1 and "expected" in summary and summary["downtime"] is not None
     assert (tmp_path / dash.SUMMARY_FILE).exists()
     assert not dash.Dashboard(Journal(":memory:"), cfg.with_overrides({"db_path": ":memory:"})).in_child
+
+
+def test_short_book_feed_is_streamed_and_kept_stale_when_unreachable(cfg, monkeypatch):
+    """11-05: MZF Short Only (the shortbook app) on the same page, read over Fly's private network."""
+    monkeypatch.setattr(dash, "POLL_S", 0.01)
+    cfg.shortbook_feed_url = "http://shortbook-paper.internal:8080/api/feed"
+    board = dash.Dashboard(Journal(":memory:"), cfg)
+    board.refresh()
+    board.fetch_shorts(get=lambda url: {"program": "MZF Short Only", "nav_usd": 1_012_000.0, "start_usd": 1e6})
+    assert board.shorts["nav_usd"] == 1_012_000.0 and board.shorts["stale"] is False
+
+    def down(url):
+        raise ConnectionError("no route")
+    board.fetch_shorts(get=down)
+    assert board.shorts["stale"] and board.shorts["nav_usd"] == 1_012_000.0 and "no route" in board.shorts["error"]
+    out, stop = [], threading.Event()
+
+    def write(data):
+        out.append(data.decode())
+        if len(out) >= 4:
+            stop.set()
+    board.stream(write, stop)
+    events = [o.split("\n")[0] for o in out]
+    assert "event: shorts" in events and json.loads(out[0].split("data: ", 1)[1])["shorts_enabled"]
+    cfg.shortbook_feed_url = ""
+    assert not dash.Dashboard(Journal(":memory:"), cfg).live.snapshot()[1]["shorts_enabled"]

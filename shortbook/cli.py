@@ -101,15 +101,117 @@ def check(cfg: Config) -> dict:
     return out
 
 
+STRATEGY = "Strategy 1: listing shorts"
+FEED_EQUITY_POINTS = 500
+FEED_CLOSED = 300
+FEED_LISTINGS = 120
+
+
+def feed(book: Book, now: float | None = None) -> dict:
+    """Everything the MZF dashboard shows for this program, read-only (`GET /api/feed`)."""
+    s, now = book.s, now if now is not None else time.time()
+    start = book.cfg.cash_usd
+    nav = book.nav()
+    hb = s.get("heartbeat")
+    rows = s.q("SELECT * FROM positions ORDER BY entry_ts")
+    eq = s.q("SELECT ts, nav FROM equity ORDER BY ts")
+    peak, dd = 0.0, 0.0
+    for r in eq:
+        peak = max(peak, r["nav"]); dd = min(dd, r["nav"] / peak - 1 if peak else 0)
+    step = max(1, len(eq) // FEED_EQUITY_POINTS)
+    points = [[r["ts"], round(r["nav"], 2)] for r in eq[::step]]
+    if eq and (not points or points[-1][0] != eq[-1]["ts"]):
+        points.append([eq[-1]["ts"], round(eq[-1]["nav"], 2)])
+    groups: dict = {}
+    for p in rows:
+        g = groups.setdefault(p["group_name"], {"open": 0, "closed": 0, "pnl_usd": 0.0, "rets": []})
+        if p["status"] == "open":
+            g["open"] += 1
+            g["pnl_usd"] += book.unrealized(p)
+        else:
+            g["closed"] += 1
+            g["pnl_usd"] += p["pnl_usd"] or 0
+            g["rets"].append(100 * (p["pnl_usd"] or 0) / p["size_usd"])
+    for name, g in groups.items():
+        r = g.pop("rets")
+        g.update(pnl_usd=round(g["pnl_usd"], 2), mean_pct=round(sum(r) / len(r), 2) if r else None,
+                 win_pct=round(100 * sum(x > 0 for x in r) / len(r)) if r else None, research_pct=EXPECTED.get(name))
+
+    def pos(p):
+        is_open = p["status"] == "open"
+        pnl = book.unrealized(p) if is_open else (p["pnl_usd"] or 0)
+        px = p["last_px"] if is_open else p["exit_px"]
+        return {"id": p["id"], "base": p["base"], "group": p["group_name"], "venue": p["venue"], "symbol": p["symbol"],
+                "size_usd": round(p["size_usd"], 2), "entry_px": p["entry_px"], "px": px, "entry_ts": p["entry_ts"],
+                "due_ts": p["due_ts"], "exit_ts": p["exit_ts"], "status": p["status"],
+                "price_pct": round((p["entry_px"] - px) / p["entry_px"] * 100, 2) if px and p["entry_px"] else None,
+                "funding_usd": round(p["funding_usd"] or 0, 2), "fees_usd": round(p["fees_usd"] or 0, 2),
+                "pnl_usd": round(pnl, 2), "pnl_pct": round(100 * pnl / p["size_usd"], 2) if p["size_usd"] else None}
+    closed = [p for p in rows if p["status"] != "open"]
+    listings = s.q("SELECT venue, base, kind, status, reason, seen_ts, trade_ts FROM listings ORDER BY seen_ts DESC LIMIT ?",
+                   (FEED_LISTINGS,))
+    counts = collections.Counter((r["venue"], r["status"]) for r in s.q("SELECT venue, status FROM listings"))
+    return {
+        "program": "MZF Short Only", "built_ts": now, "start_usd": start, "nav_usd": round(nav, 2),
+        "cash_usd": round(float(s.get("cash")), 2), "return_pct": round((nav / start - 1) * 100, 3) if start else None,
+        "max_drawdown_pct": round(dd * 100, 2), "heartbeat_age_s": round(now - hb) if hb else None,
+        "healthy": hb is not None and now - hb < book.cfg.watchdog_s, "started_ts": s.get("started"),
+        "strategies": [{"name": STRATEGY, "groups": groups,
+                        "about": "Short new CEX listings of tokens that already traded elsewhere (B) or brand-new tokens "
+                                 "on Upbit (A) at the listing hour, cover after 7 days; perps on Binance/Bybit/Gate."}],
+        "open": [pos(p) for p in rows if p["status"] == "open"],
+        "closed": [pos(p) for p in closed[-FEED_CLOSED:]][::-1], "closed_total": len(closed),
+        "equity": points,
+        "listings": [dict(r) for r in listings],
+        "listing_counts": {f"{v} {st}": n for (v, st), n in sorted(counts.items())},
+        "pending": sum(n for (v, st), n in counts.items() if st == "pending"),
+    }
+
+
 class _Health(BaseHTTPRequestHandler):
     book: Book = None
 
     def do_GET(self):
+        if self.path.split("?")[0] == "/api/feed":  # read-only paper data for the MZF dashboard (private network)
+            try:
+                body, code = json.dumps(feed(self.book), default=str).encode(), 200
+            except Exception as exc:  # noqa: BLE001
+                body, code = json.dumps({"error": f"{type(exc).__name__}: {exc}"}).encode(), 500
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         hb = self.book.s.get("heartbeat")
         ok = hb is not None and time.time() - hb < self.book.cfg.watchdog_s
         self.send_response(200 if ok else 503)
         self.end_headers()
         self.wfile.write(json.dumps({"ok": ok, "heartbeat_age_s": round(time.time() - hb) if hb else None}).encode())
+
+
+class _DualStack(ThreadingHTTPServer):
+    """IPv6 and IPv4 on one port: Fly's private network between apps (`<app>.internal`) is IPv6."""
+    import socket as _socket
+    address_family = _socket.AF_INET6
+    daemon_threads = True
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(self._socket.IPPROTO_IPV6, self._socket.IPV6_V6ONLY, 0)
+        except (OSError, AttributeError):
+            pass
+        super().server_bind()
+
+
+def serve(book: Book, port: int):
+    _Health.book = book
+    try:
+        srv = _DualStack(("::", port), _Health)
+    except OSError:  # no IPv6 on this host: IPv4 only
+        srv = ThreadingHTTPServer(("0.0.0.0", port), _Health)
+    threading.Thread(target=srv.serve_forever, daemon=True, name="health").start()
+    return srv
 
     def log_message(self, *a):
         pass
@@ -130,9 +232,7 @@ def main(argv=None) -> int:
     book = build(cfg)
     if a.cmd == "run":
         if cfg.health_port:
-            _Health.book = book
-            srv = ThreadingHTTPServer(("0.0.0.0", cfg.health_port), _Health)
-            threading.Thread(target=srv.serve_forever, daemon=True, name="health").start()
+            serve(book, cfg.health_port)
         logging.info("shortbook paper book: NAV $%s, groups %s", f"{book.nav():,.0f}", cfg.groups)
         book.run_forever()
         return 0

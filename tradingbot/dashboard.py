@@ -36,6 +36,8 @@ SUMMARY_S = 300  # the tables are rebuilt this often
 CHILD_TIMEOUT_S = 240
 SUMMARY_FILE = "dashboard-summary.json"
 KEEPALIVE_S = 15
+SHORTS_POLL_S = 30  # MZF Short Only feed (another Fly app) is read this often
+SHORTS_TIMEOUT_S = 8
 FEED_BACKLOG = 60  # fills sent when a page connects
 COOKIE = "tb_dash"
 
@@ -108,6 +110,8 @@ class Dashboard:
         self._stop = threading.Event()
         self.live = Live(cfg, journal, store)
         self._external = True  # streams poll for themselves until start() runs the shared poller
+        self.shorts: dict | None = None  # MZF Short Only (the shortbook app's feed), refreshed every SHORTS_POLL_S
+        self.shorts_ver = 0
 
     def _build_in_child(self) -> dict:
         path = os.path.join(os.path.dirname(os.path.abspath(self.cfg.db_path)), SUMMARY_FILE)
@@ -148,10 +152,38 @@ class Dashboard:
             while not self._stop.is_set():
                 self.live.poll()
                 self._stop.wait(POLL_S)
+
+        def shorts_loop():
+            while not self._stop.is_set():
+                self.fetch_shorts()
+                self._stop.wait(SHORTS_POLL_S)
         self._external = False
         threading.Thread(target=loop, name="dashboard", daemon=True).start()
         threading.Thread(target=live_loop, name="dashboard-live", daemon=True).start()
+        if self.cfg.shortbook_feed_url:
+            threading.Thread(target=shorts_loop, name="dashboard-shorts", daemon=True).start()
         return self
+
+    def fetch_shorts(self, get=None) -> None:
+        """MZF Short Only: the shortbook app's read-only feed over Fly's private network. A failure keeps the
+        last good data and marks it stale, so the page can say so."""
+        url = self.cfg.shortbook_feed_url
+        if not url:
+            return
+        try:
+            if get is None:
+                import httpx
+                resp = httpx.get(url, timeout=SHORTS_TIMEOUT_S)
+                resp.raise_for_status()
+                data = resp.json()
+            else:
+                data = get(url)
+            data = {**data, "fetched_ts": time.time(), "stale": False}
+        except Exception as exc:  # noqa: BLE001 (the short book is another app: it may be down or redeploying)
+            log.warning("dashboard: short book feed failed: %s", exc)
+            data = {**(self.shorts or {}), "stale": True, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+        with self._lock:
+            self.shorts, self.shorts_ver = data, self.shorts_ver + 1
 
     def current(self) -> tuple[int, dict | None]:
         with self._lock:
@@ -178,6 +210,10 @@ class Dashboard:
             send("summary", summary)
         backlog = live.fills[-FEED_BACKLOG:]
         send("backlog", backlog)
+        shorts_ver = 0
+        if self.cfg.shortbook_feed_url and self.shorts is not None:
+            send("shorts", self.shorts)
+            shorts_ver = self.shorts_ver
         last_fill = backlog[-1]["id"] if backlog else live.last_fill
         quiet = time.time()
         while not stop.is_set():
@@ -197,6 +233,10 @@ class Dashboard:
             if v != version and summary is not None:
                 send("summary", summary)
                 version = v
+                sent = True
+            if self.shorts_ver != shorts_ver and self.shorts is not None:
+                send("shorts", self.shorts)
+                shorts_ver = self.shorts_ver
                 sent = True
             if sent:
                 quiet = time.time()
@@ -376,6 +416,7 @@ class Live:
         with self.lock:
             return self.ver, {
                 "now": time.time(), "cash": self.cfg.model_book_cash_usd, "stuck_after_s": STUCK_AFTER_S,
+                "shorts_enabled": bool(self.cfg.shortbook_feed_url),
                 "books": [{"name": b, "hold_min": self.holds[b], "flag": self.flag_of[b], "family": family_of(b)}
                           for b in self.books],
                 "families": [{"name": n, "about": a} for n, a in FAMILIES],
@@ -492,6 +533,15 @@ color:var(--ink);font:600 14px/1 var(--sans);border-radius:0}
 .filters input{min-width:180px}.more{margin:16px 0 0;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
 .more button{cursor:pointer;font-weight:700}.more button:hover{background:var(--sunken)}
 .tag.warn{color:var(--warn);border-color:var(--warn)}
+.tabs.sub{background:var(--sunken)}.tabs.sub a{min-height:40px;font-size:13px}
+.progs{display:grid;grid-template-columns:repeat(auto-fit,minmax(420px,1fr));gap:24px}
+@media (max-width:520px){.progs{grid-template-columns:minmax(0,1fr)}}
+.prog h2{font-size:30px!important;line-height:1.05!important}.prog h2 a{color:inherit;text-decoration:none}.prog h2 a:hover{text-decoration:underline}
+.kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px;margin:12px 0 20px}
+.kv div{border:2px solid var(--rule);padding:12px;display:flex;flex-direction:column;gap:4px;min-width:0}
+.kv b{font-size:22px;font-weight:800;letter-spacing:-.02em;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}
+.kv span{font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2)}
+.note{margin:0 0 16px;padding:12px 16px;border:2px solid var(--warn);color:var(--warn);font-size:14px;font-weight:600}
 th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.sm{font-size:11px;padding:2px 6px}
 .fams{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:24px}
 .fams .card h2 a{color:inherit;text-decoration:none}.fams .card h2 a:hover{text-decoration:underline}
@@ -507,9 +557,27 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div class="status"><span id="conn" class="tag"><span class="dot"></span>Connecting</span><span id="health" class="tag">Bot</span>
 <span id="built" class="label muted"></span></div>
 </header>
-<nav class="tabs" aria-label="Views"><a href="#/" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a></nav>
+<nav class="tabs" aria-label="Programs"><a href="#/" data-v="programs">All programs</a><a href="#/supermeme" data-v="supermeme">Supermeme</a><a href="#/shorts" data-v="shorts">MZF Short Only</a></nav>
+<nav class="tabs sub" id="subtabs" aria-label="Supermeme"><a href="#/supermeme" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a></nav>
+<main id="v-programs" hidden>
+<div><p class="label eyebrow">MZF Protocol · paper programs</p><h1>All programs</h1>
+<p class="lead">Each program holds its strategies; Supermeme's are grouped into families of books. Everything here is paper trading.</p></div>
+<div class="stats" id="p-stats"></div>
+<div class="progs" id="progs"></div>
+</main>
+<main id="v-shorts" hidden>
+<div><p class="label eyebrow"><a class="lk" href="#/">All programs</a> · program</p><h1>MZF Short Only</h1>
+<p class="lead" id="sh-about">Short-only strategies on centralised-exchange perps.</p></div>
+<div id="sh-note"></div>
+<div class="stats" id="sh-stats"></div>
+<section class="card"><p class="label eyebrow">Strategy</p><h2 id="sh-strat">Strategy 1: listing shorts</h2><p class="sub">Per group, against the research expectation per trade (after costs and funding). Judge after 30+ closed trades.</p><div class="scroll"><table id="sh-groups"></table></div></section>
+<section class="card chart"><p class="label eyebrow">Equity</p><h2>Net asset value</h2><p class="sub">Hourly NAV (cash + open shorts marked to market, funding and fees included). Dashed: the starting capital.</p><div id="sh-chart"></div></section>
+<section class="card"><p class="label eyebrow">Positions</p><h2>Open shorts</h2><div class="scroll"><table id="sh-open"></table></div></section>
+<section class="card"><p class="label eyebrow">Positions</p><h2>Closed shorts</h2><div class="scroll"><table id="sh-closed"></table></div></section>
+<section class="card"><p class="label eyebrow">Detector</p><h2>Recent listings</h2><p class="sub" id="sh-lcount"></p><div class="scroll"><table id="sh-listings"></table></div></section>
+</main>
 <main id="v-overview">
-<div><p class="label eyebrow">Paper books · simulated fills on live Jupiter quotes</p><h1>Launch strategies</h1>
+<div><p class="label eyebrow"><a class="lk" href="#/">All programs</a> · Supermeme · paper books on Solana launches, simulated fills on live Jupiter quotes</p><h1>Supermeme</h1>
 <p class="lead">Every book starts at $10,000. Trades and every table update live, within two seconds of a trade.</p></div>
 <div class="stats">
 <div class="stat lime"><span class="label">Leading book</span><span class="v nm" id="s-lead">-</span><span class="h" id="s-lead-h"></span></div>
@@ -550,7 +618,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div class="fams" id="fams"></div>
 </main>
 <main id="v-family" hidden>
-<div><p class="label eyebrow"><a class="lk" href="#/books">Books &amp; families</a> · family</p><h1 id="f-name"></h1><p class="lead" id="f-about"></p></div>
+<div><p class="label eyebrow"><a class="lk" href="#/supermeme">Supermeme</a> · <a class="lk" href="#/books">Books &amp; families</a> · family</p><h1 id="f-name"></h1><p class="lead" id="f-about"></p></div>
 <div class="stats" id="f-stats"></div>
 <section class="card"><p class="label eyebrow">Books</p><h2>Books in this family</h2><p class="sub">Click a book to open it.</p><div class="scroll"><table id="f-books"></table></div></section>
 <section class="card chart"><p class="label eyebrow">Equity</p><h2>Equity by book</h2><p class="sub">Each book's equity after every closed trade, from $10,000.</p><div id="f-chart"></div></section>
@@ -558,7 +626,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <p class="more"><button id="f-more">Show 200 more</button><span id="f-count" class="label muted"></span></p></section>
 </main>
 <main id="v-book" hidden>
-<div><p class="label eyebrow"><a class="lk" href="#/books">Books &amp; families</a> · <a class="lk" id="b-fam" href="#/books"></a></p><h1 id="b-name"></h1><p class="lead" id="b-about"></p></div>
+<div><p class="label eyebrow"><a class="lk" href="#/supermeme">Supermeme</a> · <a class="lk" id="b-fam" href="#/books"></a></p><h1 id="b-name"></h1><p class="lead" id="b-about"></p></div>
 <div class="stats" id="b-stats"></div>
 <section class="card chart"><p class="label eyebrow">Equity</p><h2>Equity curve</h2><p class="sub">Equity after every closed trade, from $10,000. Dashed: the starting $10,000.</p><div id="b-chart"></div></section>
 <section class="card" id="b-gap-card"><p class="label eyebrow">Execution · last <span id="b-lh">6</span> h (launch window on the overview)</p><h2>Real against ideal</h2>
@@ -575,7 +643,7 @@ const cls=v=>v==null?"":v>0?"pos":v<0?"neg":"";
 const esc=t=>String(t??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
 const median=a=>{if(!a.length)return null;const b=[...a].sort((x,y)=>x-y),m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2};
-const S={pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:1800,pc:[],lc:[],skew:0,health:null,extra:null};
+const S={shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:1800,pc:[],lc:[],skew:0,health:null,extra:null};
 let sortKey="return_pct",sortDir=-1,win=21600,pending=false;
 const R={v:"overview",arg:null},LIM={ledger:200,b:200,f:200};
 const now=()=>Date.now()/1000-S.skew;
@@ -660,15 +728,15 @@ const rows=trades(x=>(!f||famOf(x.book)===f)&&(!b||x.book===b)&&STATUS_OK(x,st)&
 const n=ledgerTable("ledger",rows,LIM.ledger,true);$("ledger-count").textContent=`${Math.min(n,LIM.ledger)} of ${n} trades`;$("ledger-more").hidden=n<=LIM.ledger}
 /* equity chart: one line per series, inline SVG, ink tones and dash patterns (lime is never a line) */
 const STY=[["var(--ink)",""],["var(--ink)","6 4"],["var(--ink-2)",""],["var(--ink-2)","6 4"],["var(--ink-3)",""],["var(--ink-3)","2 3"],["var(--ink-2)","2 3"],["var(--ink)","2 3"]];
-function chart(id,series){series=series.filter(s=>s.pts.length>1);if(!series.length){$(id).innerHTML='<p class="sub">No closed trades yet.</p>';return}
-const W=800,H=260,L=64,Rr=12,T=12,B=28;let x0=Infinity,x1=-Infinity,y0=S.cash,y1=S.cash;
+function chart(id,series,base=S.cash){series=series.filter(s=>s.pts.length>1);if(!series.length){$(id).innerHTML='<p class="sub">No closed trades yet.</p>';return}
+const W=800,H=260,L=72,Rr=12,T=12,B=28;let x0=Infinity,x1=-Infinity,y0=base,y1=base;
 for(const s of series)for(const[x,y]of s.pts){x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y)}
 if(x1<=x0)x1=x0+1;const pad=(y1-y0)*0.08||50;y0-=pad;y1+=pad;
 const X=x=>L+(x-x0)/(x1-x0)*(W-L-Rr),Y=y=>T+(y1-y)/(y1-y0)*(H-T-B);
 let g=`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Equity curve">`;
-g+=`<line x1="${L}" x2="${W-Rr}" y1="${Y(S.cash)}" y2="${Y(S.cash)}" style="stroke:var(--rule-soft);stroke-width:1.5" stroke-dasharray="5 5" vector-effect="non-scaling-stroke"/>`;
+g+=`<line x1="${L}" x2="${W-Rr}" y1="${Y(base)}" y2="${Y(base)}" style="stroke:var(--rule-soft);stroke-width:1.5" stroke-dasharray="5 5" vector-effect="non-scaling-stroke"/>`;
 g+=`<line x1="${L}" x2="${L}" y1="${T}" y2="${H-B}" style="stroke:var(--rule);stroke-width:2" vector-effect="non-scaling-stroke"/><line x1="${L}" x2="${W-Rr}" y1="${H-B}" y2="${H-B}" style="stroke:var(--rule);stroke-width:2" vector-effect="non-scaling-stroke"/>`;
-for(const v of[y1-pad,S.cash,y0+pad])g+=`<text class="ax" x="${L-6}" y="${Y(v)+4}" text-anchor="end">${fmt(v,0)}</text>`;
+const ys=[];for(const v of[base,y1-pad,y0+pad]){if(ys.some(y=>Math.abs(y-Y(v))<14))continue;ys.push(Y(v));g+=`<text class="ax" x="${L-6}" y="${Y(v)+4}" text-anchor="end">${fmt(v,0)}</text>`}
 g+=`<text class="ax" x="${L}" y="${H-8}">${when(x0).slice(0,11)}</text><text class="ax" x="${W-Rr}" y="${H-8}" text-anchor="end">${when(x1).slice(0,11)}</text>`;
 series.forEach((s,i)=>{const[c,d]=STY[i%STY.length];g+=`<polyline fill="none" style="stroke:${c};stroke-width:2" ${d?`stroke-dasharray="${d}"`:""} vector-effect="non-scaling-stroke" points="${s.pts.map(([x,y])=>X(x).toFixed(1)+","+Y(y).toFixed(1)).join(" ")}"><title>${esc(s.name)}</title></polyline>`});
 g+="</svg>";if(series.length>1)g+='<div class="legend">'+series.map((s,i)=>{const[c,d]=STY[i%STY.length];return`<span><svg viewBox="0 0 28 8"><line x1="0" x2="28" y1="4" y2="4" style="stroke:${c};stroke-width:2" ${d?`stroke-dasharray="${d}"`:""}/></svg>${esc(s.name)} ${sgn(s.ret,1)}</span>`}).join("")+"</div>";
@@ -702,16 +770,70 @@ tiles("b-stats",[["Equity",fmt(s.equity,0),`return <b>${sgn(s.return_pct,2)}</b>
 chart("b-chart",[{name,pts:s.pts,ret:s.return_pct}]);
 if(b.flag){$("b-gap-card").hidden=false;$("b-lh").textContent=win>=86400?"24":String(win/3600);$("b-gap").innerHTML=GAPHEAD+(gapRow(b,doneIn())||'<tr><td class="muted">No finished trades in the window.</td></tr>')}else $("b-gap-card").hidden=true;
 const rows=trades(x=>x.book===name);const n=ledgerTable("b-ledger",rows,LIM.b,false);$("b-count").textContent=`${Math.min(n,LIM.b)} of ${n} trades`;$("b-more").hidden=n<=LIM.b}
+/* programs: Supermeme (all books) and MZF Short Only (the shortbook app's feed) */
+function memeTotals(){const all=S.books.map(bookStats),tr=all.flatMap(b=>b.tr),pnl=all.reduce((a,b)=>a+b.equity-S.cash,0);
+return{all,pnl,cap:all.length*S.cash,trades:tr.length,open:all.reduce((a,b)=>a+b.open,0),mean:mean(tr.map(x=>x.ret*100)),last_hour:all.reduce((a,b)=>a+b.last_hour,0)}}
+function shortsState(){if(!S.shortsEnabled)return["off","Not connected: set TB_SHORTBOOK_FEED_URL on the Supermeme app."];
+if(!S.shorts||S.shorts.nav_usd==null)return["wait",S.shorts&&S.shorts.error?`Short book unreachable: ${S.shorts.error}`:"Waiting for the short book's first update."];
+if(S.shorts.stale)return["stale",`Showing the last update from ${when(S.shorts.fetched_ts||S.shorts.built_ts)} UTC: the short book is unreachable (${S.shorts.error||"no answer"}).`];
+if(!S.shorts.healthy)return["stale","The short book's loop looks stalled (its heartbeat is old)."];return["ok",""]}
+function shortStats(){const f=S.shorts;if(!f||f.nav_usd==null)return null;const cl=f.closed||[],rets=cl.map(p=>p.pnl_pct).filter(x=>x!=null);
+return{nav:f.nav_usd,pnl:f.nav_usd-f.start_usd,ret:f.return_pct,open:(f.open||[]).length,exposure:(f.open||[]).reduce((a,p)=>a+p.size_usd,0),
+closed:f.closed_total||0,mean:mean(rets),dd:f.max_drawdown_pct,pending:f.pending}}
+function renderPrograms(){const m=memeTotals(),sh=shortStats(),[st,msg]=shortsState();
+const comb=m.pnl+(sh?sh.pnl:0);
+tiles("p-stats",[["P&amp;L, all programs",`<span class="${cls(comb)}">${sgn(comb,0,"")}</span>`,"$, paper",true],
+["Supermeme",`<span class="${cls(m.pnl)}">${sgn(m.pnl,0,"")}</span>`,`$ on ${fmt(m.cap,0)} $ across ${m.all.length} books`],
+["MZF Short Only",sh?`<span class="${cls(sh.pnl)}">${sgn(sh.pnl,0,"")}</span>`:"-",sh?`$ on ${fmt(S.shorts.start_usd,0)} $ · NAV ${fmt(sh.nav,0)}`:esc(msg)],
+["Trades, last hour",fmt(m.last_hour,0),"Supermeme books (shorts hold 7 days)"]]);
+const fams=S.fams.map(f=>{const list=m.all.filter(b=>b.family===f.name);if(!list.length)return"";const s=famStats(list);
+return`<tr><td>${famLink(f.name)}</td><td>${list.length}</td><td class="${cls(s.pnl)}">${sgn(s.pnl,0,"")}</td><td>${fmt(s.trades,0)}</td><td class="${cls(s.mean)}">${sgn(s.mean)}</td></tr>`}).join("");
+const meme=`<section class="card prog"><p class="label eyebrow">Program · Solana launch books</p><h2><a href="#/supermeme">Supermeme</a></h2>
+<p class="sub">Paper books buying hand-made Solana pools seconds to minutes after launch, out within minutes. ${m.all.length} books in ${S.fams.filter(f=>m.all.some(b=>b.family===f.name)).length} families.</p>
+<div class="kv"><div><span>P&amp;L $</span><b class="${cls(m.pnl)}">${sgn(m.pnl,0,"")}</b></div><div><span>Return on capital</span><b class="${cls(m.pnl)}">${sgn(m.cap?100*m.pnl/m.cap:null,2)}</b></div>
+<div><span>Closed trades</span><b>${fmt(m.trades,0)}</b></div><div><span>Mean trade</span><b class="${cls(m.mean)}">${sgn(m.mean)}</b></div><div><span>Open now</span><b>${fmt(m.open,0)}</b></div></div>
+<div class="scroll"><table class="mini"><tr><th>Family</th><th>Books</th><th>P&amp;L $</th><th>Trades</th><th>Mean</th></tr>${fams}</table></div>
+<p class="more"><a class="lk" href="#/books">Books &amp; families</a> · <a class="lk" href="#/ledger">Trade ledger</a></p></section>`;
+let shorts=`<section class="card prog"><p class="label eyebrow">Program · centralised-exchange shorts</p><h2><a href="#/shorts">MZF Short Only</a></h2>
+<p class="sub">Short-only strategies on perps. Strategy 1 shorts new exchange listings at the listing hour and covers after 7 days.</p>`;
+if(st!=="ok")shorts+=`<p class="note">${esc(msg)}</p>`;
+if(sh){const strat=(S.shorts.strategies||[])[0]||{groups:{}};
+shorts+=`<div class="kv"><div><span>NAV $</span><b>${fmt(sh.nav,0)}</b></div><div><span>Return</span><b class="${cls(sh.ret)}">${sgn(sh.ret,2)}</b></div>
+<div><span>Open shorts</span><b>${fmt(sh.open,0)}</b></div><div><span>Closed shorts</span><b>${fmt(sh.closed,0)}</b></div><div><span>Max drawdown</span><b>${fmt(sh.dd==null?null:-sh.dd,1,"%")}</b></div></div>
+<div class="scroll"><table class="mini"><tr><th>${esc(strat.name||"Strategy")}</th><th>Open</th><th>Closed</th><th>Mean</th><th>Research</th></tr>`+
+Object.entries(strat.groups||{}).map(([g,v])=>`<tr><td>${esc(g)}</td><td>${v.open}</td><td>${v.closed}</td><td class="${cls(v.mean_pct)}">${sgn(v.mean_pct)}</td><td>${sgn(v.research_pct)}</td></tr>`).join("")+
+`</table></div>`}
+shorts+=`<p class="more"><a class="lk" href="#/shorts">Open MZF Short Only</a></p></section>`;
+$("progs").innerHTML=meme+shorts}
+const days=s=>s==null?"-":(s/86400).toFixed(1)+"d";
+function renderShorts(){const[st,msg]=shortsState();$("sh-note").innerHTML=st==="ok"?"":`<p class="note">${esc(msg)}</p>`;const f=S.shorts,sh=shortStats();
+if(!sh){["sh-stats","sh-groups","sh-chart","sh-open","sh-closed","sh-listings"].forEach(i=>$(i).innerHTML="");return}
+const strat=(f.strategies||[])[0]||{groups:{}};$("sh-strat").textContent=strat.name||"Strategy";$("sh-about").textContent=strat.about||"";
+tiles("sh-stats",[["Net asset value",fmt(sh.nav,0),`$ · started ${fmt(f.start_usd,0)} $`,true],["Return",`<span class="${cls(sh.ret)}">${sgn(sh.ret,2)}</span>`,`${sgn(sh.pnl,0," $")}`],
+["Open shorts",fmt(sh.open,0),`${fmt(sh.exposure,0)} $ short · ${fmt(sh.pending,0)} listings pending`],["Closed shorts",fmt(sh.closed,0),`mean ${sgn(sh.mean)} per trade`],
+["Max drawdown",fmt(sh.dd==null?null:-sh.dd,1,"%"),f.started_ts?`running since ${when(f.started_ts).slice(0,11)}`:""]]);
+$("sh-groups").innerHTML="<tr><th>Group</th><th>Open</th><th>Closed</th><th>Mean</th><th>Research</th><th>Win</th><th>P&amp;L $</th></tr>"+
+Object.entries(strat.groups||{}).map(([g,v])=>`<tr><td class="book">${esc(g)}</td><td>${v.open}</td><td>${v.closed}</td><td class="${cls(v.mean_pct)}">${sgn(v.mean_pct)}</td><td>${sgn(v.research_pct)}</td><td>${fmt(v.win_pct,0,"%")}</td><td class="${cls(v.pnl_usd)}">${sgn(v.pnl_usd,0,"")}</td></tr>`).join("");
+chart("sh-chart",[{name:"NAV",pts:f.equity||[],ret:sh.ret}],f.start_usd);
+const head="<tr><th>Opened (UTC)</th><th class=\"l\">Token</th><th class=\"l\">Group</th><th class=\"l\">Venue</th><th>Size $</th><th>Entry</th><th>Price</th><th>Move</th><th>Funding $</th><th>P&amp;L $</th><th>P&amp;L</th><th>",
+row=(p,last)=>`<tr><td class="mono">${when(p.entry_ts)}</td><td class="l book">${esc(p.base)}</td><td class="l">${esc(p.group)}</td><td class="l">${esc(p.venue)}</td><td>${fmt(p.size_usd,0)}</td><td>${fmt(p.entry_px,4)}</td><td>${fmt(p.px,4)}</td><td class="${cls(p.price_pct)}">${sgn(p.price_pct)}</td><td class="${cls(p.funding_usd)}">${sgn(p.funding_usd,0,"")}</td><td class="${cls(p.pnl_usd)}">${sgn(p.pnl_usd,0,"")}</td><td class="${cls(p.pnl_pct)}">${sgn(p.pnl_pct)}</td><td>${last}</td></tr>`;
+const t=now();$("sh-open").innerHTML=(f.open||[]).length?head+"Covers in</th></tr>"+f.open.map(p=>row(p,days(p.due_ts-t))).join(""):'<tr><td class="muted">No open shorts.</td></tr>';
+$("sh-closed").innerHTML=(f.closed||[]).length?head+"Covered (UTC)</th></tr>"+f.closed.map(p=>row(p,`<span class="mono">${when(p.exit_ts)}</span>`)).join(""):'<tr><td class="muted">No closed shorts yet.</td></tr>';
+$("sh-lcount").textContent=Object.entries(f.listing_counts||{}).map(([k,n])=>`${k} ${n}`).join(" · ");
+$("sh-listings").innerHTML="<tr><th>Seen (UTC)</th><th class=\"l\">Venue</th><th class=\"l\">Token</th><th class=\"l\">Kind</th><th class=\"l\">Status</th><th class=\"l\">Reason</th></tr>"+
+(f.listings||[]).map(r=>`<tr><td class="mono">${r.seen_ts?when(r.seen_ts):"-"}</td><td class="l">${esc(r.venue)}</td><td class="l book">${esc(r.base)}</td><td class="l">${esc(r.kind||"")}</td><td class="l"><span class="tag sm ${r.status==="entered"?"lime":r.status==="pending"?"warn":""}">${esc(r.status)}</span></td><td class="l muted">${esc(r.reason||"")}</td></tr>`).join("")}
 /* router */
 function route(){const h=decodeURIComponent(location.hash.replace(/^#\/?/,"")),[v,...rest]=h.split("/");const arg=rest.join("/");
-R.v=({ledger:"ledger",books:"books",book:"book",family:"family"})[v]||"overview";R.arg=arg||null;LIM.b=LIM.f=200;
+R.v=({supermeme:"overview",ledger:"ledger",books:"books",book:"book",family:"family",shorts:"shorts"})[v]||"programs";R.arg=arg||null;LIM.b=LIM.f=200;
 for(const m of document.querySelectorAll("main"))m.hidden=m.id!=="v-"+R.v;
-document.querySelectorAll(".tabs a").forEach(a=>a.classList.toggle("on",a.dataset.v===R.v||(a.dataset.v==="books"&&(R.v==="book"||R.v==="family"))));
+const meme=["overview","ledger","books","book","family"].includes(R.v);$("subtabs").hidden=!meme;
+document.querySelectorAll(".tabs:not(.sub) a").forEach(a=>a.classList.toggle("on",a.dataset.v===(meme?"supermeme":R.v)));
+document.querySelectorAll(".tabs.sub a").forEach(a=>a.classList.toggle("on",a.dataset.v===R.v||(a.dataset.v==="books"&&(R.v==="book"||R.v==="family"))));
 window.scrollTo(0,0);render()}
 function renderHealth(){const ok=S.health?Object.values(S.health).every(x=>x.ok):null;
 $("health").innerHTML=`<span class="dot"></span>${ok==null?"Bot":ok?"Bot healthy":"Bot stalled"}`;$("health").className="tag "+(ok==null?"":ok?"ink":"neg")}
 function render(){renderHealth();if(!S.books.length)return;
-if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
+if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
 $("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false})}
 function schedule(){if(!pending){pending=true;setTimeout(()=>{pending=false;render()},300)}}
 function fill(f,isNew){const li=document.createElement("li");if(isNew)li.className="new";
@@ -732,7 +854,8 @@ function connect(){const es=new EventSource("api/stream");
 es.onopen=()=>{$("conn").innerHTML='<span class="dot"></span>Live';$("conn").className="tag lime"};
 es.onerror=()=>{$("conn").innerHTML='<span class="dot"></span>Reconnecting';$("conn").className="tag neg"};
 es.addEventListener("init",e=>{const d=JSON.parse(e.data);S.books=d.books;S.fams=d.families||[];S.cash=d.cash;S.stuck=d.stuck_after_s;S.pc=d.pos_cols;S.lc=d.launch_cols;
-S.pos.clear();S.launch.clear();S.health=d.health;merge(d);fillSelects();render()});
+S.shortsEnabled=!!d.shorts_enabled;S.pos.clear();S.launch.clear();S.health=d.health;merge(d);fillSelects();render()});
+es.addEventListener("shorts",e=>{S.shorts=JSON.parse(e.data);schedule()});
 es.addEventListener("delta",e=>{merge(JSON.parse(e.data));schedule()});
 es.addEventListener("summary",e=>{S.extra=JSON.parse(e.data);const d=S.extra.downtime;$("foot").textContent=d?`${d.outages} outages, ${fmt(d.hours_offline,1)} h offline since start`:"";schedule()});
 es.addEventListener("backlog",e=>{$("feed").innerHTML="";JSON.parse(e.data).forEach(f=>fill(f,false))});
