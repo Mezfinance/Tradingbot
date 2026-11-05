@@ -244,8 +244,11 @@ sells them at pool minute 6, so its fills can be compared with the simulated lau
 
 1. Make a **new wallet used for nothing else** (e.g. `solana-keygen new -o canary.json`; never commit it).
    Fund it with about $50 USDC and ~0.05 SOL (fees and token-account rent; rent comes back after each sale).
-2. Set the secrets (the entrypoint writes the key to /run/secrets, never to the volume):
-   `fly secrets set TB_KEYPAIR_JSON="$(cat canary.json)" TB_LIVE_CONFIRM=I_ACCEPT_TOTAL_LOSS_RISK -a supermeme`
+2. Set the secrets (the entrypoint writes the key to /run/secrets, never to the volume). The key can be either the
+   solana-keygen JSON array or the base58 private key a wallet app exports (Phantom: Settings > Manage accounts >
+   Show private key). Use `fly secrets import` so it never lands in your shell history:
+   `fly secrets import -a supermeme`, then type `TB_KEYPAIR_JSON=<key>` and `TB_LIVE_CONFIRM=I_ACCEPT_TOTAL_LOSS_RISK`
+   on two lines and press Ctrl-D.
 3. Smoke test, one tiny real round trip on BONK:
    `fly machine exec <id> "python -m tradingbot canary-smoke --usd 2" -a supermeme`
    Check `buy` and `sell` both say `ok`, the round trip is a few % at most, and the wallet's USDC matches.

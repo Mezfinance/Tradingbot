@@ -249,3 +249,10 @@ def test_calibration_pairs_real_and_simulated_trades():
     p = out["pairs"][0]
     assert p["entry_vs_sim_pct"] == pytest.approx(2.0) and p["gap"] < 0
     assert p["swap_gap"] == pytest.approx((1.10 / 1.02 - 1.15) * 100, abs=0.01)
+
+
+def test_keypair_loads_from_json_array_or_base58():
+    kp = Keypair()
+    assert jx.load_keypair(str(list(bytes(kp)))).pubkey() == kp.pubkey()
+    assert jx.load_keypair(f"  {kp}\n").pubkey() == kp.pubkey()  # base58, as Phantom exports it
+    assert jx.load_keypair(f'"{kp}"').pubkey() == kp.pubkey()

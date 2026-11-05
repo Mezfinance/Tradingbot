@@ -51,15 +51,24 @@ def rpc_url(cfg: Config) -> str:
     return cfg.solana_rpc_url
 
 
+def load_keypair(text: str):
+    """A Solana key in either common form: the JSON array of 64 numbers (solana-keygen's file) or the base58
+    string a wallet app exports (Phantom, Solflare). Surrounding whitespace and quotes are ignored."""
+    from solders.keypair import Keypair  # optional dependency: pip install .[live]
+
+    text = text.strip().strip('"').strip("'").strip()
+    if text.startswith("["):
+        return Keypair.from_bytes(bytes(json.loads(text)))
+    return Keypair.from_base58_string(text)
+
+
 class JupiterExecutor:
     def __init__(self, cfg: Config, jupiter: Jupiter, http: httpx.Client | None = None, keypair=None,
                  priority_fee_sol: float | None = None, sell_slippage_bps: int | None = None,
                  sleep=time.sleep):
         if keypair is None:
-            from solders.keypair import Keypair  # optional dependency: pip install .[live]
-
             with open(cfg.keypair_path) as fh:
-                keypair = Keypair.from_bytes(bytes(json.load(fh)))
+                keypair = load_keypair(fh.read())
         self.keypair = keypair
         self.owner = str(keypair.pubkey())
         self.cfg = cfg
