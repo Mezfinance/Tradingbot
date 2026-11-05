@@ -28,8 +28,8 @@ primary_region = "iad"
   TB_LAUNCH_RW24_BOOK = "1"  # launchrw50_24h / launchd12rw50_24h: the same filter on the earlier rule (24 h ranking, daily 14-day model), beside the study-rule books (11-05)
   TB_SHORTBOOK_FEED_URL = "http://shortbook-paper.internal:8080/api/feed"  # MZF Short Only on the dashboard (Fly private network, read-only)
   TB_LAUNCH_LOW_BOOK = "1"  # launchd12 + _s10/_s20/_s30/_s50: history-model bottom 20% minus the riskiest k% early pullers (11-04)
-  TB_LAUNCH_DAILY_CREDITS = "10000000"  # sampled launch rows uncapped (11-05: user, run at full pelt and upgrade the Helius plan when it runs out)
-  TB_LAUNCH_LIVE_DAILY_CREDITS = "10000000"  # scorer uncapped (11-05): the 28k/day budget released 1/24 per UTC hour, so every book stopped ~25 min of each hour
+  TB_LAUNCH_DAILY_CREDITS = "6000"  # sampled launch rows back on (11-04): launch4.json trains on them (14-day window)
+  TB_LAUNCH_LIVE_DAILY_CREDITS = "28000"  # scorer (11-04: 600k of the plan's 1M used, 11 days left = ~36k/day; 28k + 6k sampled = 34k leaves ~26k for studies)
   TB_RESET_BOOKS = "launchrw50,launchd12rw50"  # fresh start on the study's rule (6 h ranking, 6-hourly retrain on all pools); once per id; earlier: 2026-11-02-drift launch4_2/5, 2026-11-04-impact-probe launchd12 books, 2026-11-05-dashboard-lag these two
   TB_RESET_BOOKS_ID = "2026-11-05-study-rule"
   TB_HELIUS_DAILY_CREDITS = "0"  # early-buyer lookups off: their credits go to the launch scorer
