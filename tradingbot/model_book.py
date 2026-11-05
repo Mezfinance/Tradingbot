@@ -132,6 +132,11 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
 
 
 def active_books(cfg: Config) -> list[str]:
+    off = {b.strip() for b in (cfg.disabled_books or "").split(",") if b.strip()}
+    return [b for b in _family_books(cfg) if b not in off]
+
+
+def _family_books(cfg: Config) -> list[str]:
     return ([NAME] if cfg.model_book_slow else []) + ([FAST] if cfg.model_book_fast else []) \
         + ([CLIMB] if cfg.model_book_climb else []) + ([OPS9, OPS10] if cfg.model_book_ops else []) \
         + (list(EARLY_FIXED) if cfg.early_book else []) + (list(EARLY_ROLLING) if cfg.early_rolling else []) \

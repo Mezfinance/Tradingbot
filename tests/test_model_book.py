@@ -838,3 +838,18 @@ def test_reset_books_archives_history_once(cfg, good_pair):
         assert float(j.get_state(f"cash:{mb.LAUNCH2}")) == 9_000.0
     finally:
         cfg.launch_book, cfg.launch_live, cfg.reset_books, cfg.reset_books_id = False, False, "", ""
+
+
+def test_disabled_books_and_no_daily_loss_limit(cfg):
+    on = cfg.with_overrides({"launch_live": "1", "launch_low_book": "1", "early_book": "1"})
+    assert {"launchd12_s10", "early7"} <= set(mb.active_books(on))
+    off = on.with_overrides({"disabled_books": "launchd12_s10, early7"})
+    books = mb.active_books(off)
+    assert "launchd12_s10" not in books and "early7" not in books and "launchd12" in books and "early5" in books
+    j = Journal(":memory:")
+    eng = Engine(off.with_overrides({"model_book_daily_loss_pct": "0"}), FakeDex(None),
+                 SimpleNamespace(report=lambda m: None), None, PaperExecutor(off), j,
+                 model_executor=PaperExecutor(off))
+    book = eng.books[mb.EARLY5]
+    j.realized_since = lambda since, name: -1e9  # a huge loss today
+    assert eng._model_skip_reason(book, {"token": "X", "ts": time.time()}) != "daily loss limit"

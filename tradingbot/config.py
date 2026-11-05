@@ -82,6 +82,8 @@ class Config:
     # One-off fresh start for some books (comma list): their history is kept as '<book>@<reset_books_id>' and
     # their cash goes back to the starting amount. Runs once per reset_books_id, at engine start.
     reset_books: str = ""
+    # Books switched off one by one (comma list), whatever their family switch says; their history stays in the journal
+    disabled_books: str = ""
     reset_books_id: str = ""
     enrich_wallets_per_token: int = 8  # early buyers whose wallet age/funder is looked up
     x_daily_budget_usd: float = 3.0
@@ -123,7 +125,7 @@ class Config:
     model_book_min_liq_usd: float = 5_000.0
     model_book_top_pct: float = 2.0  # buy pools scoring in the top this-% of recent pools
     model_book_max_open: int = 120
-    model_book_daily_loss_pct: float = 15.0  # of the book's equity; halts its entries for the UTC day
+    model_book_daily_loss_pct: float = 15.0  # of the book's equity; halts its entries for the UTC day (0 = no limit)
     model_book_max_drift_pct: float = 25.0  # skip if the live price ran this far above the snapshot
     model_book_max_impact_pct: float = 5.0  # its buys are up to 2% of a pool, so 2-4% impact is normal
     model_book_tp_pct: float = 100.0

@@ -677,7 +677,8 @@ class Engine:
         if len(open_) >= c.model_book_max_open:
             return "max open positions"
         day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-        if -self.journal.realized_since(day_start, book.name) >= self.equity(book) * c.model_book_daily_loss_pct / 100:
+        if c.model_book_daily_loss_pct > 0 and \
+                -self.journal.realized_since(day_start, book.name) >= self.equity(book) * c.model_book_daily_loss_pct / 100:
             return "daily loss limit"
         return None
 
