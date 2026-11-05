@@ -813,3 +813,31 @@ def test_earlier_rule_twin_books_score_rank_and_retrain_on_their_own(setup, monk
         assert runs == ["launch-rw-train"]
     finally:
         cfg.launch_rw24_book = cfg.launch_live = cfg.launch_rw_book = False
+
+
+def test_rw_check_tells_a_working_rule_from_chance():
+    """A rule whose kept half wins (riskier scores rug) beats skipped, random keeps, and has a rug AUC > 0.5;
+    the 24 h columns are random, so that rule shows no gap."""
+    import random
+    st = WatchStore(":memory:")
+    ll.ensure_schema(st)
+    rng = random.Random(1)
+    t0 = 1_700_000_000.0
+    for i in range(240):
+        risky = i % 2 == 0
+        ret = -1.0 if risky and rng.random() < 0.5 else rng.uniform(-0.2, 0.6)
+        st.execute("INSERT INTO watch_launch_live(pool, create_ts, liquid, rw, rw_pct, rw24, rw24_pct, low_h, ret, "
+                   "status) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                   (f"P{i}", t0 + i * 300, 1, 0.5 if risky else -0.5, 80.0 if risky else 20.0, rng.random(),
+                    rng.uniform(0, 100), 0, ret, "done"))
+    out = ll.rw_check(st, hours=6, now=t0 + 240 * 300)
+    life = out["whole life"]
+    study = life["study rule (6 h)"]["every liquid pool minus the riskiest half"]
+    assert study["kept minus skipped (pts)"]["mean"] > 20
+    assert study["random keeps of the same size"]["share worse than kept"] > 0.99
+    assert study["AUC (score = riskiness)"]["rugs (want > 0.5)"] > 0.7
+    assert study["blocks where kept beat skipped"] == "5 of 5"
+    other = life["24 h rule"]["every liquid pool minus the riskiest half"]
+    assert abs(other["kept minus skipped (pts)"]["mean"]) < study["kept minus skipped (pts)"]["mean"]
+    assert life["study rule (6 h)"]["history bottom 20% minus the riskiest half"]["pools"] == 0
+    assert out["last 6 h"]["pools"] == 72

@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -419,6 +419,14 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot import launch_live
         from tradingbot.watcher import WatchStore, watch_db_path
         print(json.dumps(launch_live.compare(WatchStore(watch_db_path(cfg)), args.hours), indent=2))
+        return
+
+    if args.command == "rw-check":  # is the rug-vs-win books' lead real?
+        from tradingbot import launch_live
+        from tradingbot.journal import Journal
+        from tradingbot.watcher import WatchStore, watch_db_path
+        print(json.dumps(launch_live.rw_check(WatchStore(watch_db_path(cfg)), Journal(cfg.db_path),
+                                              args.hours or 12), indent=2, default=str))
         return
 
     if args.command == "launch-status":

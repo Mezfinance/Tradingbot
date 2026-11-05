@@ -1811,3 +1811,110 @@ def status(store, cfg: Config, hours: float = 24, now: float | None = None, jour
     except (OSError, ValueError):
         out["model"] = None
     return out
+
+
+RW_CHECK_DRAWS = 2000
+RW_CHECK_BLOCK_H = 6
+
+
+def _rw_rules():
+    """(name, score column, all-pools keep test, bottom-20% keep test) for both rug-vs-win rules; a test returns
+    True = kept, False = skipped, None = not in that universe (unscored)."""
+    keep = 100 - RW_SKIP
+
+    def side(pct):
+        return None if pct is None else pct < keep
+    return (
+        ("study rule (6 h)", "rw",
+         lambda r: side(r["rw_pct"]),
+         lambda r: side(r["rw_low_pct"]) if rw_low(r) else None,
+         ("launchrw50", "launchd12rw50")),
+        ("24 h rule", "rw24",
+         lambda r: side(r["rw24_pct"]),
+         lambda r: side(r["rw24_low_pct"]) if r["low_h"] else None,
+         ("launchrw50_24h", "launchd12rw50_24h")))
+
+
+def _keep_test(rows, kept_fn, score_col, rng) -> dict:
+    """Is a rule's kept half better than chance? Kept vs skipped, kept vs every pool, kept vs random keeps of the
+    same size from the same pools, per-block gaps, and how its score sorts rugs and big wins (AUC)."""
+    from tradingbot.watch_analysis import auc
+    pool = [r for r in rows if kept_fn(r) is not None]
+    kept = [r for r in pool if kept_fn(r)]
+    skipped = [r for r in pool if not kept_fn(r)]
+    if len(kept) < 5 or len(skipped) < 5:
+        return {"pools": len(pool), "note": "too few pools"}
+    k = np.array([r["ret"] for r in kept])
+    s = np.array([r["ret"] for r in skipped])
+    a = np.array([r["ret"] for r in pool])
+    gaps = [rng.choice(k, len(k)).mean() - rng.choice(s, len(s)).mean() for _ in range(RW_CHECK_DRAWS)]
+    rand = np.array([rng.choice(a, len(k), replace=False).mean() for _ in range(RW_CHECK_DRAWS)])
+    out = {"pools": len(pool), "every pool": _group(pool, rng), "kept": _group(kept, rng),
+           "skipped": _group(skipped, rng),
+           "kept minus skipped (pts)": {"mean": round(100 * float(k.mean() - s.mean()), 1),
+                                        "ci90": [round(100 * float(np.quantile(gaps, q)), 1) for q in (0.05, 0.95)],
+                                        "share of bootstrap draws > 0": round(float(np.mean(np.array(gaps) > 0)), 3)},
+           "kept minus every pool (pts)": round(100 * float(k.mean() - a.mean()), 1),
+           "random keeps of the same size": {"mean_pct": round(100 * float(rand.mean()), 1),
+                                             "p90_pct": round(100 * float(np.quantile(rand, 0.9)), 1),
+                                             "share worse than kept": round(float(np.mean(rand < k.mean())), 3)}}
+    scored = [r for r in pool if r[score_col] is not None]
+    if len(scored) >= 20:
+        sc = np.array([r[score_col] for r in scored], dtype=float)
+        rets = np.array([r["ret"] for r in scored])
+        # score = P(rug) - P(big win): a working rule ranks rugs high (AUC > 0.5) and big wins low (< 0.5)
+        out["AUC (score = riskiness)"] = {
+            "rugs (want > 0.5)": _r3(auc(sc, (rets <= -0.999).astype(int))),
+            "big wins +50% (want < 0.5)": _r3(auc(sc, (rets >= RW_BIG).astype(int))),
+            "losers (want > 0.5)": _r3(auc(sc, (rets <= 0).astype(int)))}
+    blocks: dict = {}
+    for r in pool:
+        b = int(r["create_ts"] // (RW_CHECK_BLOCK_H * 3600)) * RW_CHECK_BLOCK_H * 3600
+        blocks.setdefault(b, []).append(r)
+    rows_b = []
+    for b in sorted(blocks):
+        kb = [r["ret"] for r in blocks[b] if kept_fn(r)]
+        sb = [r["ret"] for r in blocks[b] if not kept_fn(r)]
+        rows_b.append({"block (UTC)": datetime.fromtimestamp(b, timezone.utc).strftime("%m-%d %H:00"),
+                       "kept n": len(kb), "kept mean": _pct(kb), "skipped n": len(sb), "skipped mean": _pct(sb),
+                       "gap": round(_pct(kb) - _pct(sb), 1) if kb and sb else None})
+    out["by 6 h block"] = rows_b
+    gaps_b = [x["gap"] for x in rows_b if x["gap"] is not None]
+    out["blocks where kept beat skipped"] = f"{sum(g > 0 for g in gaps_b)} of {len(gaps_b)}"
+    return out
+
+
+def _pct(xs) -> float | None:
+    return round(100 * float(np.mean(xs)), 1) if xs else None
+
+
+def _r3(x):
+    return None if x is None else round(x, 3)
+
+
+def rw_check(store, journal=None, hours: float | None = None, now: float | None = None) -> dict:
+    """Is the rug-vs-win books' lead real? For each rule (study 6 h, earlier 24 h) and universe (every liquid pool,
+    history bottom 20%), on the scorer's finished liquid pools: kept vs skipped, vs every pool and vs random keeps
+    of the same size, per 6 h block, AUCs; plus the books' real fills vs ideal and launch4_2's top 2% for scale.
+    `hours` = the recent window (e.g. overnight); the whole life of the scores is shown too."""
+    now = now if now is not None else time.time()
+    ensure_schema(store)
+    rows = store.query("SELECT * FROM watch_launch_live WHERE status='done' AND liquid=1 AND ret IS NOT NULL "
+                       "ORDER BY create_ts")
+    windows = {"whole life": rows}
+    if hours:
+        windows[f"last {hours:g} h"] = [r for r in rows if r["create_ts"] >= now - hours * 3600]
+    out: dict = {}
+    for wname, wrows in windows.items():
+        rng = np.random.default_rng(0)
+        w: dict = {"pools": len(wrows),
+                   "from": datetime.fromtimestamp(wrows[0]["create_ts"], timezone.utc).isoformat() if wrows else None,
+                   "every liquid pool": _group(wrows, rng),
+                   "launch4_2 top 2% (scale)": _group([r for r in wrows if r["top2"]], rng)}
+        for name, col, all_fn, low_fn, books in _rw_rules():
+            w[name] = {"every liquid pool minus the riskiest half": _keep_test(wrows, all_fn, col, rng),
+                       "history bottom 20% minus the riskiest half": _keep_test(wrows, low_fn, col, rng)}
+            if journal is not None and wrows:
+                w[name]["real fills"] = {b: fill_gap(store, journal, b, wrows[0]["create_ts"], rng) for b in books}
+        out[wname] = w
+    return out
