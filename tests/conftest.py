@@ -10,6 +10,7 @@ from tradingbot.models import PairSnapshot, SafetyReport
 @pytest.fixture(autouse=True)
 def _no_jupiter_pace(monkeypatch):
     monkeypatch.setattr(jupiter.GATE, "interval_s", 0.0)
+    monkeypatch.setattr(jupiter, "SHARE_S", 0.0)  # no answers shared between tests (test_jupiter turns it on)
 
 
 @pytest.fixture

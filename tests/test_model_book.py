@@ -368,6 +368,30 @@ def test_the_pool_age_exit_sells_and_survives_a_restart(cfg, good_pair):
     assert [r for (r,) in j.query("SELECT reason FROM fills WHERE side='sell'")] == ["pool_age_exit"]
 
 
+def test_books_holding_the_same_token_sell_at_the_same_time(cfg, good_pair):
+    """11-05: exits used to run one after another (~3.5 s each), so books sold the same token ~30 s apart."""
+    cfg.model_book_fast = cfg.model_book_climb = True
+    j = Journal(":memory:")
+    eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                 model_executor=PaperExecutor(cfg))
+    sig = {"mint": "Scam111", "dex": "pumpswap", "created_ts": time.time() - 60, "name": "SCAM / SOL",
+           "price": 2.5e-5, "liq": 30_000.0, "score": 1.0}
+    for name in (mb.FAST, mb.CLIMB):
+        assert eng._buy_model(eng.books[name], sig) is None
+    started = []
+    for name in (mb.FAST, mb.CLIMB):
+        ex = eng.books[name].executor
+        ex.sell = (lambda orig: lambda *a, **k: (started.append(time.time()), time.sleep(0.4), orig(*a, **k))[2])(ex.sell)
+    for pos in j.open_positions(strategy=None):
+        eng._deadlines[pos.id] = time.time() - 1
+    eng.current_prices = lambda tokens, held=None: {"Scam111": 2.6e-5}
+    t0 = time.time()
+    eng.manage_positions()
+    assert j.open_positions(strategy=None) == []
+    assert len(started) == 2 and max(started) - min(started) < 0.2  # both sells started together
+    assert time.time() - t0 < 0.75  # one sell's time, not two
+
+
 def test_the_climb_book_sells_positions_that_have_not_climbed(cfg, good_pair):
     j = Journal(":memory:")
     make = lambda: Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg),

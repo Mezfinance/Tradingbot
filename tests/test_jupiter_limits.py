@@ -58,3 +58,43 @@ def test_sim_reports_rate_limit(monkeypatch):
     ex = SimExecutor(Config(db_path=":memory:"), jup, latency_s=0)
     fill = ex.sell(MINT, 10.0, 1.0)
     assert not fill.ok and fill.usd == 0 and fill.note == RATE_LIMITED
+
+
+def test_identical_requests_at_the_same_moment_share_one_call(monkeypatch):
+    """11-05: ten books buying one token sent ten identical quotes through the 8/s pace and filled seconds apart."""
+    import threading
+    import time
+    from tradingbot.data import jupiter as jup
+    monkeypatch.setattr(jup, "SHARE_S", 1.0)
+    monkeypatch.setattr(jup, "SHARED", jup._Shared())
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        time.sleep(0.2)
+        return httpx.Response(200, json={"inAmount": "100", "outAmount": "5000", "otherAmountThreshold": "4900",
+                                         "priceImpactPct": "0.01", "routePlan": []})
+    j = Jupiter(http=httpx.Client(transport=httpx.MockTransport(handler), base_url="https://x"), gate=Gate(0.0))
+    out = []
+    threads = [threading.Thread(target=lambda: out.append(j.quote("A", "B", 100))) for _ in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(calls) == 1 and len(out) == 10 and all(q.out_raw == 5000 for q in out)
+    assert j.quote("A", "B", 200).out_raw == 5000 and len(calls) == 2  # a different amount is its own request
+    time.sleep(1.05)
+    j.quote("A", "B", 100)
+    assert len(calls) == 3  # older than SHARE_S: asked again
+
+
+def test_a_failed_shared_request_is_not_reused(monkeypatch):
+    from tradingbot.data import jupiter as jup
+    monkeypatch.setattr(jup, "SHARE_S", 1.0)
+    monkeypatch.setattr(jup, "SHARED", jup._Shared())
+    codes = iter([400, 200])
+    j = Jupiter(http=httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(next(codes), json={
+        "inAmount": "1", "outAmount": "2", "otherAmountThreshold": "2", "routePlan": []})), base_url="https://x"),
+        gate=Gate(0.0))
+    assert j.quote("A", "B", 1) is None
+    assert j.quote("A", "B", 1).out_raw == 2

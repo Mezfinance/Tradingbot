@@ -44,6 +44,8 @@ DUST_QTY = 1e-12
 EQUITY_SNAPSHOT_S = 60
 EXIT_RETRY_S = 120  # a sell with no route is retried this often
 STUCK_AFTER_S = 1800  # ...and after this long the position is valued at zero (it cannot be sold)
+BUY_WORKERS = 16  # every book that wants a signal starts its buy at once (up to 17 books run)
+SELL_WORKERS = 16  # exits due in the same monitor pass are sold in parallel
 NO_LIQUIDITY_MULT = 10.0  # model entry: a live price this many times the snapshot means an empty pool
 DEAD_LIQ_USD = 100.0  # a DexScreener pool with less liquidity than this is treated as emptied (rugged)
 QUOTE_PRICE_MAX = 10  # positions per monitor pass priced from a swap quote when no feed lists the token
@@ -99,6 +101,7 @@ class Engine:
         self._deadlines = self._load_deadlines()  # position id -> sell by this time (pool-age exit)
         self._climbs = self._load_climbs()  # position id -> [check time, price to reach, best price seen]
         self._model_pool = None  # threads that let every book buy a signal at the same time
+        self._sell_pool = None  # threads that sell every due exit of a monitor pass at once
         self._last_snapshot = 0.0
         self._stop = threading.Event()
         self.restart_reason: str | None = None
@@ -292,6 +295,7 @@ class Engine:
         now = time.time()
         self.journal.set_state("heartbeat", repr(now))
         from tradingbot import model_book as mb
+        jobs: list[tuple] = []
         for pos in positions:
             price = prices.get(pos.token_address)
             book = self.books.get(pos.strategy)
@@ -327,14 +331,32 @@ class Engine:
                              book.name, pos.symbol, price, confirmed)
                     price = confirmed
                     exits = risk.plan_exits(pos, price, now, exit_cfg)
+            if exits:
+                jobs.append((book, pos, exits, price, before))
+            else:
+                self.journal.save_position(pos)
+        # 11-05: sells used to run one after another (~3.5 s each with the simulated landing), so books holding
+        # the same token sold up to ~30 s apart and every other exit waited. Now they all go out at once.
+        if len(jobs) > 1:
+            if self._sell_pool is None:
+                from concurrent.futures import ThreadPoolExecutor
+                self._sell_pool = ThreadPoolExecutor(max_workers=SELL_WORKERS, thread_name_prefix="sell")
+            list(self._sell_pool.map(lambda job: self._run_exits(*job), jobs))
+        else:
+            for job in jobs:
+                self._run_exits(*job)
+        self.snapshot_equity(prices)
+        return prices
+
+    def _run_exits(self, book: Book, pos: Position, exits: list, price: float, before: tuple) -> None:
+        try:
             for qty, reason in exits:
                 if not self._sell(book, pos, qty, price, reason):
                     # Roll the ladder back so the missed target is retried next pass.
                     pos.tp_hits, pos.stop_price = before
                     break
+        finally:
             self.journal.save_position(pos)
-        self.snapshot_equity(prices)
-        return prices
 
     def _confirm_sell_price(self, pos: Position) -> float | None:
         if self.jupiter is None or not hasattr(self.jupiter, "sell_price"):
@@ -614,7 +636,7 @@ class Engine:
             if len(targets) > 1:  # all books buy at once: one after another cost each later book ~3.5 s
                 if self._model_pool is None:
                     from concurrent.futures import ThreadPoolExecutor
-                    self._model_pool = ThreadPoolExecutor(max_workers=8, thread_name_prefix="model-buy")
+                    self._model_pool = ThreadPoolExecutor(max_workers=BUY_WORKERS, thread_name_prefix="model-buy")
                 bought += sum(self._model_pool.map(lambda b: self._try_model(b, sig), targets))
             else:
                 bought += sum(self._try_model(b, sig) for b in targets)

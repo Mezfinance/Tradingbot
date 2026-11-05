@@ -72,12 +72,29 @@ class Gate:
 
     def stats(self) -> dict:
         hours = max((time.time() - self.started) / 3600, 1e-9)
-        return {"calls": self.calls, "rate_limited": self.limited, "per_hour": round(self.calls / hours),
+        return {"calls": self.calls, "rate_limited": self.limited, "shared": SHARED.hits, "per_hour": round(self.calls / hours),
                 "month_projection": round(self.calls / hours * 24 * 31), "interval_s": self.interval_s,
                 "paid": bool(api_key())}
 
 
 GATE = Gate()
+
+# 11-05: books trading the same signal send identical requests within a second of each other (same mint, same
+# $ size). Each used to go through the shared 8/s pace on its own, so ten books buying one token trickled in over
+# ~6-10 s at different prices. Identical GETs now share one call: the first goes out, the rest wait for it and
+# reuse its answer for SHARE_S. Paper books then fill at the same moment on the same quote.
+SHARE_S = 1.0
+
+
+class _Shared:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.done: dict[tuple, tuple[float, httpx.Response]] = {}
+        self.inflight: dict[tuple, threading.Event] = {}
+        self.hits = 0
+
+
+SHARED = _Shared()
 
 
 @dataclass
@@ -113,6 +130,38 @@ class Jupiter:
         return getattr(self._local, "failure", "no route")
 
     def _get(self, path: str, params: dict) -> httpx.Response:
+        """GET through the shared gate; an identical request made within SHARE_S reuses the answer."""
+        if SHARE_S <= 0:
+            return self._fetch(path, params)
+        key = (id(self.http), path, tuple(sorted((k, str(v)) for k, v in params.items())))
+        while True:
+            with SHARED.lock:
+                hit = SHARED.done.get(key)
+                if hit and time.monotonic() - hit[0] < SHARE_S:
+                    SHARED.hits += 1
+                    return hit[1]
+                event = SHARED.inflight.get(key)
+                owner = event is None
+                if owner:
+                    event = SHARED.inflight[key] = threading.Event()
+            if owner:
+                break
+            event.wait(30)  # the same request is in flight: use its answer (or ask again if it failed)
+        resp = None
+        try:
+            resp = self._fetch(path, params)
+            return resp
+        finally:
+            with SHARED.lock:
+                if resp is not None and resp.status_code == 200:
+                    now = time.monotonic()
+                    SHARED.done[key] = (now, resp)
+                    if len(SHARED.done) > 500:
+                        for k in [k for k, (t, _) in SHARED.done.items() if now - t >= SHARE_S]:
+                            del SHARED.done[k]
+                SHARED.inflight.pop(key).set()
+
+    def _fetch(self, path: str, params: dict) -> httpx.Response:
         """GET through the shared gate, with back-off on 429 and 5xx."""
         for attempt in range(RETRIES_ON_429 + 1):
             self.gate.wait()
