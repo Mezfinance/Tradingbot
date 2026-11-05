@@ -800,7 +800,7 @@ def test_minute_5_twin_takes_launch4_2s_picks_and_sells_at_pool_minute_5(cfg, go
         j = Journal(":memory:")
         eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
                      model_executor=PaperExecutor(cfg))
-        assert mb.active_books(cfg)[-3:] == [mb.LAUNCH2, mb.LAUNCH5, mb.LAUNCH2M5]
+        assert mb.active_books(cfg)[-4:] == [mb.LAUNCH2, mb.LAUNCH5, mb.LAUNCH2M5, mb.LAUNCH5M5]
         created = time.time() - 6
         top5 = {"pool": "PL", "mint": "L5", "dex": "pumpswap", "created_ts": created, "name": "", "price": 2.5e-5,
                 "liq": 30_000.0, "score": 1.0, "ts": time.time(), "decided_ts": time.time(), "kind": "launch",
@@ -812,6 +812,9 @@ def test_minute_5_twin_takes_launch4_2s_picks_and_sells_at_pool_minute_5(cfg, go
         assert set(m5) == {"L2"}  # the same picks as launch4_2
         assert eng._deadlines[m5["L2"].id] == created + 300
         assert mb.exit_config(cfg, mb.LAUNCH2M5).stop_loss_pct >= 99
+        m55 = {p.token_address: p for p in j.open_positions(mb.LAUNCH5M5)}
+        assert set(m55) == {"L5", "L2"}  # launch4_5's picks (top 5% includes the top 2%)
+        assert eng._deadlines[m55["L5"].id] == created + 300
     finally:
         cfg.launch_book = cfg.launch_m5_book = cfg.launch_live = False
 
