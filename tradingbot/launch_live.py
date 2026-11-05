@@ -86,7 +86,9 @@ def ensure_schema(store) -> None:
                 # 11-04: history model's bottom 20% (rolling 24 h), early-pull risk and its rank among those pools
                 "low_h INTEGER", "risk REAL", "risk_pct REAL",
                 # 11-04: rug-vs-win score and its rank among the past day's liquid / bottom-20% pools
-                "rw REAL", "rw_pct REAL", "rw_low_pct REAL"):
+                "rw REAL", "rw_pct REAL", "rw_low_pct REAL",
+                # 11-05: the history model's bottom 20% of the past 6 h (the rug-vs-win books' D1-D2, as the study)
+                "rw_low6 INTEGER"):
         try:
             store.execute(f"ALTER TABLE watch_launch_live ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -264,14 +266,29 @@ def train_pull(store, cfg: Config, now: float | None = None):
 # (keep all -1.6%, every random skip worse) and +13.1% over the history model's bottom 20% (keep all +4.1%, 97%).
 RW_SKIP = 50  # % of pools skipped as riskiest (rug odds over win odds)
 RW_BIG = 0.5
+# 11-05: the live books now follow the study's rule as closely as a live system can (user: the 24 h ranking and
+# nightly 14-day training were changes from the backtest). The study retrained before every 6 h block on every
+# earlier finished pool and skipped the riskiest half within each block (D1-D2 also ranked within the block);
+# live can't see the rest of a block, so each pool is ranked against the past RW_BLOCK_S instead, and the model
+# is retrained every RW_BLOCK_S on all finished pools (`LaunchLive._rw_retrain_loop`).
+RW_BLOCK_S = 6 * 3600
+RW_RETRAIN_TIMEOUT_S = 900
+RW_RETRY_S = 600  # check the model's age (and retry a failed retrain) this often
 
 
-def rw_flags(low_h, rw_pct, rw_low_pct) -> dict:
-    """Signal flags of the rug-vs-win books: `rw50` = in the less risky half of the past day's liquid pools;
-    `d12rw50` = in the history model's bottom 20% and the less risky half of those."""
+def rw_low(r) -> bool:
+    """The rug-vs-win books' bottom-20% flag: the 6 h one (`rw_low6`), or `low_h` on rows scored before 11-05."""
+    v = r["rw_low6"] if "rw_low6" in r.keys() else None
+    return bool(r["low_h"] if v is None else v)
+
+
+def rw_flags(low, rw_pct, rw_low_pct) -> dict:
+    """Signal flags of the rug-vs-win books: `rw50` = in the less risky half of the past RW_BLOCK_S's liquid
+    pools; `d12rw50` = in the history model's bottom 20% of the past RW_BLOCK_S (`rw_low6`) and the less risky
+    half of those."""
     keep = 100 - RW_SKIP
     return {"rw50": rw_pct is not None and rw_pct < keep,
-            "d12rw50": bool(low_h) and rw_low_pct is not None and rw_low_pct < keep}
+            "d12rw50": bool(low) and rw_low_pct is not None and rw_low_pct < keep}
 
 
 class RugWinModel:
@@ -310,7 +327,7 @@ def train_rw(store, cfg: Config, now: float | None = None):
     until the live scorer has seen ROLLING_MIN pools of each)."""
     ensure_schema(store)
     now = now if now is not None else time.time()
-    rows = _pull_rows(store, now - cfg.launch_train_days * 86400)
+    rows = _pull_rows(store, 0.0)  # every finished pool, as the study (11-05; was the last launch_train_days)
     if len(rows) < PULL_MIN_TRAIN:
         log.warning("rug-vs-win model: not enough rows to train (%d)", len(rows))
         return None
@@ -328,7 +345,7 @@ def train_rw(store, cfg: Config, now: float | None = None):
                   "quantiles": [float(np.quantile(scores, q / 100)) for q in RISK_LEVELS],
                   "low_quantiles": [float(np.quantile(scores[low] if low.sum() >= ROLLING_MIN else scores, q / 100))
                                     for q in RISK_LEVELS],
-                  "days": cfg.launch_train_days}
+                  "days": round((now - rows[0]["create_ts"]) / 86400, 1)}
     return model
 
 
@@ -403,8 +420,8 @@ class LaunchLive:
         self.pull_model, self.pull_mtime, self.pull_checked = None, None, 0.0
         self.low_risks: collections.deque = collections.deque()  # (decided_ts, risk) of bottom-20% pools, past day
         self.rw_model, self.rw_mtime, self.rw_checked = None, None, 0.0
-        self.rw_all: collections.deque = collections.deque()  # (decided_ts, rw) of liquid pools, past day
-        self.rw_low: collections.deque = collections.deque()  # (decided_ts, rw) of bottom-20% pools, past day
+        self.rw_all: collections.deque = collections.deque()  # (decided_ts, rw) of liquid pools, past RW_BLOCK_S
+        self.rw_low: collections.deque = collections.deque()  # (decided_ts, rw) of bottom-20% pools, past RW_BLOCK_S
         self.pool = ThreadPoolExecutor(workers, thread_name_prefix="launch-live") if workers else None
         self.saved_at = 0.0
         self.tries: dict[str, int] = {}
@@ -594,12 +611,12 @@ class LaunchLive:
                 log.warning("rug-vs-win model unreadable: %s", exc)
                 return self.rw_model
             every, low = [], []
-            for r in self.store.query("SELECT creator, create_ts, decided_ts, feat, low_h FROM watch_launch_live "
-                                      "WHERE liquid=1 AND feat IS NOT NULL AND decided_ts >= ? ORDER BY decided_ts",
-                                      (now - ROLLING_S,)):
+            for r in self.store.query("SELECT creator, create_ts, decided_ts, feat, low_h, rw_low6 "
+                                      "FROM watch_launch_live WHERE liquid=1 AND feat IS NOT NULL AND decided_ts >= ? "
+                                      "ORDER BY decided_ts", (now - RW_BLOCK_S,)):
                 s = model.score(pull_inputs(json.loads(r["feat"]), self._op_live(r["creator"], r["create_ts"])))
                 every.append((r["decided_ts"], s))
-                if r["low_h"]:
+                if rw_low(r):
                     low.append((r["decided_ts"], s))
             with self.lock:
                 self.rw_model, self.rw_mtime = model, mtime
@@ -607,15 +624,15 @@ class LaunchLive:
         return self.rw_model
 
     def _rw_verdict(self, feat: dict, creator: str | None, create_ts: float, now: float, low: bool) -> dict:
-        """Rug-vs-win score of a liquid pool and its percentile among the past day's liquid pools (and, for a
-        bottom-20% pool, among those)."""
+        """Rug-vs-win score of a liquid pool and its percentile among the past RW_BLOCK_S's liquid pools (and, for
+        a pool in the 6 h bottom 20%, among those)."""
         model = self._load_rw_model()
         if model is None:
             return {}
         rw = model.score(pull_inputs(feat, self._op_live(creator, create_ts)))
         with self.lock:
             for dq in (self.rw_all, self.rw_low):
-                while dq and dq[0][0] < now - ROLLING_S:
+                while dq and dq[0][0] < now - RW_BLOCK_S:
                     dq.popleft()
             past_all, past_low = [v for _, v in self.rw_all], [v for _, v in self.rw_low]
             self.rw_all.append((now, rw))
@@ -636,16 +653,20 @@ class LaunchLive:
             while self.hist_scores and self.hist_scores[0][0] < now - ROLLING_S:
                 self.hist_scores.popleft()
             past = [s for _, s in self.hist_scores]
+            recent = [s for t, s in self.hist_scores if t >= now - RW_BLOCK_S]
             self.hist_scores.append((now, score))
+        fallback = (model.meta.get("score_quantiles") or {}).get("20")
         if len(past) >= ROLLING_MIN:
             cut2, cut5 = float(np.quantile(past, 1 - TOP2)), float(np.quantile(past, 1 - TOP5))
             low = float(np.quantile(past, LOW_SHARE))
         else:
             cut2, cut5 = model.meta.get("cut2"), model.meta.get("cut5")
-            low = (model.meta.get("score_quantiles") or {}).get("20")
+            low = fallback
+        low6 = float(np.quantile(recent, LOW_SHARE)) if len(recent) >= ROLLING_MIN else low
         pick = lambda c: int(c is not None and score >= c - 1e-9)
-        return {"score_h": score, "top2h": pick(cut2), "top5h": pick(cut5),
-                "low_h": int(low is not None and score <= low + 1e-9)}
+        under = lambda c: int(c is not None and score <= c + 1e-9)
+        return {"score_h": score, "top2h": pick(cut2), "top5h": pick(cut5), "low_h": under(low),
+                "rw_low6": under(low6)}
 
     # websocket input ------------------------------------------------------------------------------
     def on_message(self, msg: str) -> None:
@@ -805,9 +826,9 @@ class LaunchLive:
         cols.update(self._hist_verdict(feat, now))
         if cols.get("low_h"):
             cols.update(self._risk_verdict(feat, rec.get("creator"), create, now))
-        cols.update(self._rw_verdict(feat, rec.get("creator"), create, now, bool(cols.get("low_h"))))
+        cols.update(self._rw_verdict(feat, rec.get("creator"), create, now, bool(cols.get("rw_low6"))))
         flags = {**low_flags(cols.get("low_h"), cols.get("risk_pct")),
-                 **rw_flags(cols.get("low_h"), cols.get("rw_pct"), cols.get("rw_low_pct"))}
+                 **rw_flags(cols.get("rw_low6"), cols.get("rw_pct"), cols.get("rw_low_pct"))}
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
         if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")
                                          or flags["d12"] or flags["rw50"] or flags["d12rw50"]):
@@ -917,7 +938,47 @@ class LaunchLive:
                 wait = 0.5 if due is None else min(0.5, max(0.02, due - self.clock()))
                 stop.wait(wait)
         threading.Thread(target=run, name="launch-live", daemon=True).start()
+        if self.cfg.launch_rw_book and self.cfg.db_path != ":memory:":
+            threading.Thread(target=self._rw_retrain_loop, args=(stop,), name="rw-retrain", daemon=True).start()
         return stop
+
+    def _rw_retrain_loop(self, stop: threading.Event) -> None:
+        """Retrain the rug-vs-win model every RW_BLOCK_S on every finished pool, as the study did before each
+        6 h block (it used to be trained once a night on 14 days). A low-priority child process
+        (`launch-rw-train`), so the scorer's threads never wait on it; the scorer reloads the new file within
+        MODEL_RELOAD_S and re-ranks the past RW_BLOCK_S."""
+        import os
+        import subprocess
+        import sys
+
+        def low_priority():
+            try:
+                os.nice(19)
+                with open("/proc/self/oom_score_adj", "w") as fh:
+                    fh.write("1000")
+            except OSError:
+                pass
+        while not stop.is_set():
+            try:
+                age = time.time() - rw_model_path(self.cfg).stat().st_mtime
+            except OSError:
+                age = float("inf")
+            if age >= RW_BLOCK_S:
+                try:
+                    res = subprocess.run([sys.executable, "-m", "tradingbot", "launch-rw-train"],
+                                         env={**os.environ, "TB_DB_PATH": self.cfg.db_path},
+                                         preexec_fn=low_priority, timeout=RW_RETRAIN_TIMEOUT_S,
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    if res.returncode != 0:
+                        log.error("rug-vs-win retrain: child exited %s: %s", res.returncode,
+                                  res.stderr.decode(errors="replace")[-300:])
+                    else:
+                        log.info("rug-vs-win model retrained (every %d h, all finished pools)", RW_BLOCK_S // 3600)
+                except Exception as exc:  # noqa: BLE001 (the old model keeps scoring)
+                    log.error("rug-vs-win retrain could not run: %s: %s", type(exc).__name__, exc)
+                stop.wait(RW_RETRY_S)  # a failed run (no new file) is retried after RW_RETRY_S
+                continue
+            stop.wait(min(RW_BLOCK_S - age + 5, RW_RETRY_S))
 
 
 # --- status ---------------------------------------------------------------------------------------
@@ -1555,11 +1616,11 @@ def fill_gap(store, journal, book: str, since: float, rng) -> dict:
                                                 (book, since - 600))}
     missed = []
     if flag:
-        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct, rw_pct, rw_low_pct "
+        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct, rw_pct, rw_low_pct, rw_low6 "
                              "FROM watch_launch_live "
                              "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND create_ts >= ?", (since,)):
             hit = r[flag] if flag in ("top2", "top5", "top2h", "top5h") else {
-                **low_flags(r["low_h"], r["risk_pct"]), **rw_flags(r["low_h"], r["rw_pct"], r["rw_low_pct"])}[flag]
+                **low_flags(r["low_h"], r["risk_pct"]), **rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"])}[flag]
             if hit and r["token_mint"] not in bought:
                 missed.append({"ret": r["ret"]})
     if not pairs:
@@ -1672,9 +1733,9 @@ def status(store, cfg: Config, hours: float = 24, now: float | None = None, jour
             [r for r in done if low_flags(r["low_h"], r["risk_pct"])[k]], rng)
            for k in ("d12",) + tuple(f"d12s{s}" for s in PULL_SKIPS)},
         f"rug-vs-win: every liquid pool minus the riskiest {RW_SKIP}%": _group(
-            [r for r in done if rw_flags(r["low_h"], r["rw_pct"], r["rw_low_pct"])["rw50"]], rng),
+            [r for r in done if rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"])["rw50"]], rng),
         f"rug-vs-win: history bottom 20% minus the riskiest {RW_SKIP}%": _group(
-            [r for r in done if rw_flags(r["low_h"], r["rw_pct"], r["rw_low_pct"])["d12rw50"]], rng)}
+            [r for r in done if rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"])["d12rw50"]], rng)}
     out["feature parity with the backtest"] = parity(store, scored)
     out["live vs training (drift)"] = drift(scored, cfg)
     if journal is not None:  # the launch books' own buys: where the seconds from creation to the fill go

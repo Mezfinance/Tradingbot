@@ -209,7 +209,7 @@ class Dashboard:
 POS_COLS = ("id", "strategy", "symbol", "token", "cost_usd", "realized_usd", "qty", "entry_price", "opened_at",
             "closed_at", "exit_reason")
 LAUNCH_COLS = ("pool", "token_mint", "create_ts", "decided_ts", "liquid", "ret", "status", "pulled_ts", "liq_usd",
-               "top2", "top5", "top2h", "top5h", "low_h", "risk_pct", "rw_pct", "rw_low_pct")
+               "top2", "top5", "top2h", "top5h", "low_h", "risk_pct", "rw_pct", "rw_low_pct", "rw_low6")
 LAUNCH_KEEP_S = 86400  # the scorer's pools sent to the page (it windows them 1/6/24 h)
 STUCK_AFTER_S = 1800  # as engine.STUCK_AFTER_S: a position with no route out this long counts as $0
 
@@ -339,7 +339,7 @@ class Live:
         for r in rows:
             flags = [k for k in ("top2", "top5", "top2h", "top5h") if r[k]]
             for fl in (launch_live.low_flags(r["low_h"], r["risk_pct"]),
-                       launch_live.rw_flags(r["low_h"], r["rw_pct"], r["rw_low_pct"])):
+                       launch_live.rw_flags(launch_live.rw_low(r), r["rw_pct"], r["rw_low_pct"])):
                 flags += [k for k, on in fl.items() if on]
             ret = r["ret"]
             self._bump(self.launch, r["pool"], [r["pool"], r["token_mint"], r["create_ts"], r["decided_ts"],

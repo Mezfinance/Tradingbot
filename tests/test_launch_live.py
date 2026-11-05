@@ -677,7 +677,7 @@ def test_rug_vs_win_model_trains_scores_and_feeds_its_books(setup, monkeypatch, 
     with live.lock:
         live.rw_low.clear()
         live.rw_low.extend((clock.t - 10, 5.0) for _ in range(ll.ROLLING_MIN))
-    monkeypatch.setattr(live, "_hist_verdict", lambda feat, now: {"score_h": -5.0, "top2h": 0, "top5h": 0, "low_h": 1})
+    monkeypatch.setattr(live, "_hist_verdict", lambda feat, now: {"score_h": -5.0, "top2h": 0, "top5h": 0, "low_h": 1, "rw_low6": 1})
     live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
     live.step()
     clock.t += cfg.launch_live_decide_delay_s
@@ -698,3 +698,57 @@ def test_rug_vs_win_model_trains_scores_and_feeds_its_books(setup, monkeypatch, 
         assert mb.exit_deadline(cfg, "launchrw50", {"created_ts": 100.0, "mint": "M"}) == 100.0 + 360
     finally:
         cfg.launch_rw_book, cfg.launch_live = False, False
+
+
+def test_rug_vs_win_follows_the_study_rule(setup, monkeypatch):
+    """11-05: as launch-filter-study option 4: trained on every finished pool (not the last 14 days), each pool
+    ranked against the past 6 h (the study's block) and the bottom 20% taken over the same 6 h."""
+    import random
+    cfg, st, hel, clock, live, p, create = setup
+    cfg.launch_train_days = 1.0
+    _rw_done_rows(st, 600, clock.t - 30 * 86400, random.Random(8))  # a month old: outside launch_train_days
+    m = ll.train_rw(st, cfg, now=clock.t)
+    assert m is not None and m.meta["rows"] >= 600 and m.meta["days"] >= 29
+    assert ll.train_rw_and_save(st, cfg) is not None and live._load_rw_model() is not None
+    win_like = {"creator_buys": 0.5, "log_buyers": 2.5}
+    with live.lock:  # riskier scores, but 7 h old: outside the 6 h window, so the training quantiles rank it
+        live.rw_all.clear()
+        live.rw_all.extend((clock.t - 7 * 3600, 5.0) for _ in range(ll.ROLLING_MIN))
+    old = live._rw_verdict(win_like, "NEW", clock.t, clock.t, low=False)["rw_pct"]
+    with live.lock:
+        live.rw_all.clear()
+        live.rw_all.extend((clock.t - 5 * 3600, 5.0) for _ in range(ll.ROLLING_MIN))
+    assert live._rw_verdict(win_like, "NEW", clock.t, clock.t, low=False)["rw_pct"] == 0.0 != old
+    # bottom 20%: the past day's scores set low_h (the d12 books), the past 6 h set rw_low6 (the rw books)
+    assert ll.train_hist_and_save(st, cfg) is not None and live._load_hist_model() is not None
+    score = live._load_hist_model().score({"log_buyers": 1.0})
+    with live.lock:
+        live.hist_scores.clear()
+        live.hist_scores.extend((clock.t - 20 * 3600, score + 1.0) for _ in range(6 * ll.ROLLING_MIN))  # day
+        live.hist_scores.extend((clock.t - 3600, score - 1.0) for _ in range(ll.ROLLING_MIN))  # last 6 h: lower
+    v = live._hist_verdict({"log_buyers": 1.0}, clock.t)
+    assert v["low_h"] == 1 and v["rw_low6"] == 0
+    # rows scored before the change have no rw_low6: the flag falls back to low_h
+    assert ll.rw_low({"low_h": 1, "rw_low6": None}) and not ll.rw_low({"low_h": 1, "rw_low6": 0})
+    assert ll.rw_low({"low_h": 1})
+
+
+def test_rug_vs_win_model_is_retrained_every_6_hours(tmp_path, monkeypatch):
+    import subprocess
+    import threading
+    cfg = Config(db_path=str(tmp_path / "t.db"), launch_rw_book=True)
+    live = ll.LaunchLive(cfg, WatchStore(":memory:"), FakeHelius({}), clock=Clock(0.0), workers=0)
+    runs, waits = [], []
+    monkeypatch.setattr(subprocess, "run", lambda cmd, **k: (runs.append(cmd), ll.rw_model_path(cfg).parent.mkdir(
+        parents=True, exist_ok=True), ll.rw_model_path(cfg).write_text("{}"),
+        subprocess.CompletedProcess(cmd, 0, b"", b""))[-1])
+
+    class Stop(threading.Event):
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            if len(waits) >= 2:
+                self.set()
+            return self.is_set()
+    live._rw_retrain_loop(Stop())  # no model: trains at once, then waits for the file to age 6 h
+    assert len(runs) == 1 and runs[0][-1] == "launch-rw-train"
+    assert waits[0] == ll.RW_RETRY_S and waits[1] <= ll.RW_RETRY_S
