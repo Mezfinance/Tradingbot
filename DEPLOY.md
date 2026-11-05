@@ -235,3 +235,20 @@ fly logs -a shortbook-paper                                           # new mark
 
 The first pass records every existing market as a baseline; only markets that appear after that are traded.
 Settings are `SB_*` env vars (`shortbook/config.py`), e.g. `SB_CASH_USD`, `SB_GROUPS`, `SB_TRADE_PCT`, `SB_OI_CAP_PCT`.
+
+
+## Real-money launch canary (canary_launch4_2)
+
+Buys launch4_2's top-2% picks for real ($10 a trade, $50 book budget, $50 daily loss stop, at most 5 open) and
+sells them at pool minute 6, so its fills can be compared with the simulated launch4_2 trade on the same token.
+
+1. Make a **new wallet used for nothing else** (e.g. `solana-keygen new -o canary.json`; never commit it).
+   Fund it with about $50 USDC and ~0.05 SOL (fees and token-account rent; rent comes back after each sale).
+2. Set the secrets (the entrypoint writes the key to /run/secrets, never to the volume):
+   `fly secrets set TB_KEYPAIR_JSON="$(cat canary.json)" TB_LIVE_CONFIRM=I_ACCEPT_TOTAL_LOSS_RISK -a supermeme`
+3. Smoke test, one tiny real round trip on BONK:
+   `fly machine exec <id> "python -m tradingbot canary-smoke --usd 2" -a supermeme`
+   Check `buy` and `sell` both say `ok`, the round trip is a few % at most, and the wallet's USDC matches.
+4. Switch it on: uncomment `TB_LAUNCH_CANARY = "1"` in fly.toml, `fly deploy`.
+5. Watch: `python -m tradingbot canary-status [--hours N]` (limits, skips, failed txs, and real vs simulated per
+   token). Kill switch: `canary-stop` (no new buys; open trades still sell at minute 6), `canary-start` to resume.

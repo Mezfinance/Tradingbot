@@ -73,6 +73,9 @@ LAUNCH2M5 = "launch4_2m5"
 # fell from ~8-10% of pools to ~2%, so launch4_5 is now the nearest to the wider group launch4_2m5 traded at first).
 LAUNCH5M5 = "launch4_5m5"
 LAUNCH_M5 = (LAUNCH2M5, LAUNCH5M5)
+# Real-money twin of launch4_2 (11-05): same signals and minute-6 exit, filled by the live Jupiter executor
+CANARY4 = "canary_launch4_2"
+CANARY_BOOKS = (CANARY4,)
 # Low-decile books (11-04): the history model's bottom 20% (rolling 24 h; D1-D2 held the most big wins and the most
 # early pulls), with the riskiest 0/10/20/30/50% by the early-pull model skipped. launch-early-pulls walk-forward on
 # 188 D1-D2 pools: keep all +2.9%, skip 10% +6.6%, 20% +5.5%, 30% +12.0% (98% of random skips worse), 50% +12.8%.
@@ -85,7 +88,7 @@ LAUNCH_RW_CUT = {"launchrw50": "rw50", "launchd12rw50": "d12rw50"}
 # Twins on the earlier live rule (11-05; the books above moved to the study's 6 h rule): nightly 14-day model,
 # ranked against the past 24 h, bottom 20% = low_h. Run side by side so a good spell under either isn't missed.
 LAUNCH_RW24_CUT = {"launchrw50_24h": "rw50_24", "launchd12rw50_24h": "d12rw50_24"}
-LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
+LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", CANARY4: "top2", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
               **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT}
 LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 6.0 for b in LAUNCH_CUT}
 POOL_MINUTE_EXIT = {**EARLY_EXIT_MIN, **LAUNCH_EXIT_MIN}  # books that sell every position by a pool minute
@@ -150,7 +153,8 @@ def _family_books(cfg: Config) -> list[str]:
         + (list(LAUNCH_HIST_CUT) if cfg.launch_hist_book and cfg.launch_live else []) \
         + (list(LAUNCH_LOW_CUT) if cfg.launch_low_book and cfg.launch_live else []) \
         + (list(LAUNCH_RW_CUT) if cfg.launch_rw_book and cfg.launch_live else [])\
-        + (list(LAUNCH_RW24_CUT) if cfg.launch_rw24_book and cfg.launch_live else [])
+        + (list(LAUNCH_RW24_CUT) if cfg.launch_rw24_book and cfg.launch_live else []) \
+        + ([CANARY4] if cfg.launch_canary and cfg.launch_live else [])
 
 
 def early_wants(name: str, sig: dict) -> bool:

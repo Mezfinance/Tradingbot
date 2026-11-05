@@ -13,8 +13,9 @@ import argparse
 import json
 import logging
 import sys
+import time
 
-from tradingbot.config import Config
+from tradingbot.config import LIVE_CONFIRM_PHRASE, Config
 
 
 def build_engine(cfg: Config, with_analyst: bool = True):
@@ -32,6 +33,8 @@ def build_engine(cfg: Config, with_analyst: bool = True):
     else:
         from tradingbot.execution.sim import SimExecutor
         executor = SimExecutor(cfg, jupiter)
+    from dataclasses import replace
+
     from tradingbot.execution.sim import SimExecutor
     from tradingbot.shadows import parse_shadows
 
@@ -41,6 +44,12 @@ def build_engine(cfg: Config, with_analyst: bool = True):
     if cfg.canary_every_n > 0:
         from tradingbot.execution.jupiter import JupiterExecutor
         canary = JupiterExecutor(cfg, jupiter)
+    launch_canary = None
+    if cfg.launch_canary and cfg.model_book:
+        from tradingbot.execution.jupiter import JupiterExecutor
+        launch_canary = JupiterExecutor(replace(cfg, max_price_impact_pct=cfg.model_book_max_impact_pct), jupiter,
+                                        priority_fee_sol=cfg.launch_canary_priority_fee_sol,
+                                        sell_slippage_bps=cfg.launch_canary_sell_slippage_bps)
     analyst = Analyst(cfg) if with_analyst else None
     triage = None
     if analyst is not None and cfg.triage:
@@ -48,14 +57,14 @@ def build_engine(cfg: Config, with_analyst: bool = True):
         triage = Triage(cfg, analyst.client)
     from tradingbot.data.geckoterminal import GeckoTerminal
 
-    from dataclasses import replace
     # model5 is always simulated, with its own impact cap (the Claude book's 3% suits older, deeper pools).
     model_executor = (SimExecutor(replace(cfg, max_price_impact_pct=cfg.model_book_max_impact_pct), jupiter)
                       if cfg.model_book else None)
     from tradingbot.data.extras import Extras
     return Engine(cfg, DexScreener(), RugCheck(), analyst, executor, Journal(cfg.db_path), jupiter,
                   shadow_executors=shadow_executors, canary_executor=canary, gecko=GeckoTerminal(),
-                  triage=triage, model_executor=model_executor, extras=Extras() if cfg.model_book else None)
+                  triage=triage, model_executor=model_executor, extras=Extras() if cfg.model_book else None,
+                  launch_canary_executor=launch_canary)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -70,7 +79,8 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-hist-backfill", "launch-hist-test", "launch-exit-study",
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
-                                            "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary"])
+                                            "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary",
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -108,6 +118,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-credits", type=int, default=None,
                         help="Helius credit cap (defaults: backfills 60000, launch-exit-study 10000, "
                              "launch-late-entry 12000)")
+    parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--idea", help="propose: what to build")
     parser.add_argument("--problem", default="", help="propose: what it should fix or improve")
     parser.add_argument("--priority", type=int, default=1, help="propose: 1 (first) to 5 (last)")
@@ -277,6 +288,32 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore, watch_db_path
         out = launch_live.train_rw_and_save(WatchStore(watch_db_path(cfg)), cfg)
         print(f"rug-vs-win model written to {out}" if out else "rug-vs-win model: not enough data to train yet")
+        return
+
+    if args.command in ("canary-status", "canary-stop", "canary-start"):  # the real-money launch canary
+        from tradingbot import launch_canary
+        from tradingbot.engine import CANARY_HALT
+        from tradingbot.journal import Journal
+        journal = Journal(cfg.db_path)
+        if args.command == "canary-stop":
+            journal.set_state(CANARY_HALT, repr(time.time()))
+            print("launch canary halted: no new buys (open positions still sell at their pool minute)")
+        elif args.command == "canary-start":
+            journal.execute("DELETE FROM state WHERE key=?", (CANARY_HALT,))
+            print("launch canary kill switch cleared")
+        out = {"status": launch_canary.status(journal, cfg), "calibration": launch_canary.calibration(journal, args.hours)}
+        print(json.dumps(out, indent=2, default=str))
+        return
+
+    if args.command == "canary-smoke":  # one tiny real buy + sell of a deep token
+        if cfg.live_confirm != LIVE_CONFIRM_PHRASE:
+            raise SystemExit(f"canary-smoke spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+        from tradingbot import launch_canary
+        from tradingbot.data.jupiter import Jupiter
+        from tradingbot.execution.jupiter import JupiterExecutor
+        ex = JupiterExecutor(cfg, Jupiter(cfg.slippage_bps), priority_fee_sol=cfg.launch_canary_priority_fee_sol,
+                             sell_slippage_bps=cfg.launch_canary_sell_slippage_bps)
+        print(json.dumps(launch_canary.smoke(ex, args.path or launch_canary.SMOKE_MINT, args.usd), indent=2, default=str))
         return
 
     if args.command == "launch-rw24-train":  # the earlier rule's rug-vs-win model (rw24 twin books)

@@ -37,7 +37,8 @@ log = logging.getLogger(__name__)
 
 MAIN = "claude"
 CANARY = "canary"
-BOOK_PRIORITY = {MAIN: 0, CANARY: 1}  # real-money books are exited before simulated baselines
+CANARY_HALT = "launch_canary:halted"  # state key: set = the real-money launch canary buys nothing (kill switch)
+BOOK_PRIORITY = {MAIN: 0, CANARY: 1, "canary_launch4_2": 1}  # real-money books are exited before simulated baselines
 REANALYSE_AFTER_S = 6 * 3600
 RECHECK_REJECTED_S = 30 * 60
 DUST_QTY = 1e-12
@@ -70,7 +71,8 @@ class Engine:
                  executor: Executor, journal: Journal, jupiter: Jupiter | None = None,
                  shadow_executors: dict[str, Executor] | None = None,
                  canary_executor: Executor | None = None, gecko=None, triage=None,
-                 model_executor: Executor | None = None, extras=None):
+                 model_executor: Executor | None = None, extras=None,
+                 launch_canary_executor: Executor | None = None):
         self.cfg, self.dex, self.rug, self.analyst = cfg, dex, rug, analyst
         self.extras = extras  # optional free-source client (data/extras.py): model5's holder audits
         self.triage = triage  # optional cheap first pass before the analyst (tradingbot/triage.py)
@@ -87,6 +89,14 @@ class Engine:
         if model_executor is not None and cfg.model_book:
             from tradingbot import model_book as mb
             for name in mb.active_books(cfg):  # same signals, separate cash and ledgers
+                if name in mb.CANARY_BOOKS:  # real money: only with the live executor, at its own size and budget
+                    if launch_canary_executor is None:
+                        continue
+                    book = self._open_book(name, launch_canary_executor, cfg.launch_canary_budget_usd,
+                                           cfg.launch_canary_usd)
+                    book.exit_cfg = mb.exit_config(cfg, name)
+                    self.books[name] = book
+                    continue
                 ex = model_executor if name == mb.NAME else copy.copy(model_executor)
                 book = self._open_book(name, ex, cfg.model_book_cash_usd, cfg.model_book_usd)
                 book.exit_cfg = mb.exit_config(cfg, name)
@@ -674,9 +684,17 @@ class Engine:
         open_ = self.journal.open_positions(book.name)
         if any(p.token_address == sig["mint"] for p in open_):
             return "already held"
+        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        if book.name in mb.CANARY_BOOKS:  # real money: hard limits of its own
+            if self.journal.get_state(CANARY_HALT):
+                return "canary halted (kill switch)"
+            if len(open_) >= c.launch_canary_max_open:
+                return "max open positions"
+            if -self.journal.realized_since(day_start, book.name) >= c.launch_canary_daily_loss_usd:
+                return "daily loss limit"
+            return None
         if len(open_) >= c.model_book_max_open:
             return "max open positions"
-        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
         if c.model_book_daily_loss_pct > 0 and \
                 -self.journal.realized_since(day_start, book.name) >= self.equity(book) * c.model_book_daily_loss_pct / 100:
             return "daily loss limit"
@@ -685,7 +703,7 @@ class Engine:
     def _buy_model(self, book: Book, sig: dict) -> str | None:
         c = self.cfg
         started = time.time()
-        usd = min(c.model_book_usd, c.model_book_liq_share * sig["liq"], book.cash)
+        usd = min(book.fixed_usd or c.model_book_usd, c.model_book_liq_share * sig["liq"], book.cash)
         if usd < 5:
             return "size too small (cash or liquidity)"
         trigger = sig["price"]
@@ -811,7 +829,8 @@ class Engine:
 
     def _sell(self, book: Book, pos: Position, qty: float, price: float, reason: str) -> bool:
         fill = book.executor.sell(pos.token_address, min(qty, pos.qty), price)
-        if fill is not None and not fill.ok and RATE_LIMITED in (fill.note or ""):
+        if fill is not None and not fill.ok and (RATE_LIMITED in (fill.note or "")
+                                                 or (fill.note or "").startswith("not sent:")):
             log.info("[%s] sell %s (%s) postponed: %s", book.name, pos.symbol, reason, fill.note)
             return False  # Jupiter refused the quote: says nothing about the route, retry next pass
         if fill is not None and not fill.ok and fill.usd == 0:

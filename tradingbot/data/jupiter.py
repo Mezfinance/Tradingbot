@@ -173,14 +173,14 @@ class Jupiter:
             time.sleep(2 ** attempt)
         return resp
 
-    def quote(self, in_mint: str, out_mint: str, in_raw: int) -> Quote | None:
+    def quote(self, in_mint: str, out_mint: str, in_raw: int, slippage_bps: int | None = None) -> Quote | None:
         self._local.failure = "no route"
         if in_raw <= 0:
             return None
         try:
             resp = self._get("/swap/v1/quote", {
                 "inputMint": in_mint, "outputMint": out_mint,
-                "amount": in_raw, "slippageBps": self.slippage_bps,
+                "amount": in_raw, "slippageBps": self.slippage_bps if slippage_bps is None else slippage_bps,
             })
         except httpx.HTTPError as exc:
             log.warning("quote request failed: %s", exc)
