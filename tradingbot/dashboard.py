@@ -252,7 +252,7 @@ LAUNCH_COLS = ("pool", "token_mint", "create_ts", "decided_ts", "liquid", "ret",
                "top2", "top5", "top2h", "top5h", "low_h", "risk_pct", "rw_pct", "rw_low_pct", "rw_low6",
                "rw24_pct", "rw24_low_pct")
 LAUNCH_KEEP_S = 86400  # the scorer's pools sent to the page (it windows them 1/6/24 h)
-STUCK_AFTER_S = 1800  # as engine.STUCK_AFTER_S: a position with no route out this long counts as $0
+STUCK_AFTER_S = 0  # as engine.STUCK_AFTER_S: a position with no route out counts as $0 at once
 
 
 FAMILIES = (  # book families for the dashboard's family view, in display order
@@ -604,10 +604,10 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 </main>
 <main id="v-ledger" hidden>
 <div><p class="label eyebrow">Every trade of the running books</p><h1>Trade ledger</h1>
-<p class="lead">Newest first. Open trades count at cost until sold; no route out for 30 minutes counts as $0 (stuck).</p></div>
+<p class="lead">Newest first. Open trades count at cost until sold; a sale with no route out counts as $0 until a later sale gets through.</p></div>
 <section class="card"><div class="filters">
 <select id="lf-fam" aria-label="Family"></select><select id="lf-book" aria-label="Book"></select>
-<select id="lf-status" aria-label="Status"><option value="">Every status</option><option>Open</option><option>Exit blocked</option><option>Stuck ($0)</option><option>Won</option><option>Lost</option></select>
+<select id="lf-status" aria-label="Status"><option value="">Every status</option><option>Open</option><option>Exit blocked ($0)</option><option>Won</option><option>Lost</option></select>
 <input id="lf-q" type="search" placeholder="Token or symbol" aria-label="Token or symbol"></div>
 <div class="scroll"><table id="ledger"></table></div>
 <p class="more"><button id="ledger-more">Show 200 more</button><span id="ledger-count" class="label muted"></span></p></section>
@@ -643,7 +643,7 @@ const cls=v=>v==null?"":v>0?"pos":v<0?"neg":"";
 const esc=t=>String(t??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
 const median=a=>{if(!a.length)return null;const b=[...a].sort((x,y)=>x-y),m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2};
-const S={shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:1800,pc:[],lc:[],skew:0,health:null,extra:null};
+const S={shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null};
 let sortKey="return_pct",sortDir=-1,win=21600,pending=false;
 const R={v:"overview",arg:null},LIM={ledger:200,b:200,f:200};
 const now=()=>Date.now()/1000-S.skew;
@@ -660,10 +660,10 @@ if("health" in d&&d.health)S.health=d.health}
 /* one trade: status and result; stuck = no route out for S.stuck seconds, valued at $0 */
 function trade(p,t){const cost=p.cost_usd||0,real=p.realized_usd||0;let st,pnl=null,end=null;
 if(p.closed_at){end=p.closed_at;pnl=real-cost;st=pnl>0?"Won":"Lost"}
-else if(p.blocked_since&&t-p.blocked_since>=S.stuck){end=p.blocked_since+S.stuck;pnl=real-cost;st="Stuck ($0)"}
+else if(p.blocked_since&&t-p.blocked_since>=S.stuck){end=p.blocked_since+S.stuck;pnl=real-cost;st="Exit blocked ($0)"}
 else if(p.blocked_since){st="Exit blocked"}else{st="Open"}
 return{id:p.id,book:p.strategy,sym:p.symbol||(p.token||"").slice(0,6),token:p.token,opened:p.opened_at,end,cost,pnl,
-pct:pnl==null||!cost?null:100*pnl/cost,st,reason:p.exit_reason,held:(end||t)-p.opened_at,open:!p.closed_at&&st!=="Stuck ($0)",real,p}}
+pct:pnl==null||!cost?null:100*pnl/cost,st,reason:p.exit_reason,held:(end||t)-p.opened_at,open:!p.closed_at&&st!=="Exit blocked ($0)",real,p}}
 function trades(pred){const t=now(),out=[];for(const p of S.pos.values()){const x=trade(p,t);if(!pred||pred(x))out.push(x)}
 return out.sort((a,b)=>b.opened-a.opened)}
 function bookStats(b){const t=now();let equity=S.cash,open=0,started=null;const tr=[];
@@ -713,7 +713,7 @@ h+=line("Every liquid pool",group(done));
 for(const f of flags)h+=line(byFlag[f].map(bookLink).join(", "),group(done.filter(x=>x.flags.includes(f))));
 $("outcomes").innerHTML=h;$("gaps").innerHTML=GAPHEAD+S.books.filter(b=>b.flag).map(b=>gapRow(b,done)).join("")}
 /* ledger */
-const STAG={"Open":"lime","Exit blocked":"warn","Stuck ($0)":"neg","Won":"","Lost":""};
+const STAG={"Open":"lime","Exit blocked":"warn","Exit blocked ($0)":"neg","Won":"","Lost":""};
 function ledgerTable(id,rows,limit,showBook){let h=`<tr><th>Bought (UTC)</th>${showBook?'<th class="l">Book</th>':""}<th class="l">Token</th><th class="l">Status</th><th>Result</th><th>Result $</th><th>Held</th><th>Cost $</th><th>Exit</th></tr>`;
 for(const x of rows.slice(0,limit)){const tok=x.token?`<a class="lk" href="https://dexscreener.com/solana/${encodeURIComponent(x.token)}" target="_blank" rel="noopener" title="${esc(x.token)}">${esc(x.sym)}</a>`:esc(x.sym);
 h+=`<tr><td class="mono">${when(x.opened)}</td>${showBook?`<td class="l">${bookLink(x.book)}</td>`:""}<td class="l">${tok}</td><td class="l"><span class="tag sm ${STAG[x.st]}">${esc(x.st)}</span></td>`+

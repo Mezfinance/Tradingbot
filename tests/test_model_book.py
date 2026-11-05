@@ -125,9 +125,7 @@ def test_a_position_with_no_route_out_backs_off_and_is_valued_at_zero(cfg, good_
     assert len(sells) == 1  # one attempt, then a 2-minute back-off
     assert j.query("SELECT COUNT(*) FROM events WHERE kind='tx_failed'")[0][0] == 0
     assert j.query("SELECT COUNT(*) FROM events WHERE kind='exit_blocked'")[0][0] == 1
-    assert eng.equity(book, crash) > book.cash  # not yet written off
-    clock[0] += eng_mod.STUCK_AFTER_S
-    assert eng.equity(book, crash) == book.cash  # can't be sold: worth nothing
+    assert eng.equity(book, crash) == book.cash  # blocked: written off at once (11-05)
     import time as real_time
     from tradingbot import report as report_mod
     later = real_time.time() + eng_mod.STUCK_AFTER_S + 60  # events carry wall-clock time
@@ -138,6 +136,11 @@ def test_a_position_with_no_route_out_backs_off_and_is_valued_at_zero(cfg, good_
     assert m5["mean_trade_return_pct"] == -100.0 and m5["exit_reasons"] == {"stuck": 1}
     text = render(rep)
     assert "EXIT BLOCKED" in text and "of which stuck" in text
+    cash_before = book.cash
+    paper.sell = PaperExecutor(cfg).sell
+    clock[0] += eng_mod.EXIT_RETRY_S + 10
+    eng.manage_positions()  # a later sale finds a route: the position closes and the money comes back
+    assert not j.open_positions(book.name) and book.cash > cash_before
 
 
 class RuggedJupiter:

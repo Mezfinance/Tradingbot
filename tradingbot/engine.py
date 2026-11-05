@@ -43,7 +43,8 @@ RECHECK_REJECTED_S = 30 * 60
 DUST_QTY = 1e-12
 EQUITY_SNAPSHOT_S = 60
 EXIT_RETRY_S = 120  # a sell with no route is retried this often
-STUCK_AFTER_S = 1800  # ...and after this long the position is valued at zero (it cannot be sold)
+STUCK_AFTER_S = 0  # a position with no route out is valued at zero from its first blocked sale (11-05, was 1800);
+# a later sale that finds a route closes it and brings the money back
 BUY_WORKERS = 16  # every book that wants a signal starts its buy at once (up to 17 books run)
 SELL_WORKERS = 16  # exits due in the same monitor pass are sold in parallel
 NO_LIQUIDITY_MULT = 10.0  # model entry: a live price this many times the snapshot means an empty pool
