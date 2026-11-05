@@ -91,3 +91,19 @@ def test_routes_need_the_password_and_health_stays_open(cfg, monkeypatch):
         assert get("/nope", cookie="tb_dash=s3cret")[0] == 404
     finally:
         server.shutdown()
+
+
+def test_summary_is_built_in_a_child_process_for_a_file_journal(cfg, tmp_path, monkeypatch):
+    """11-05: building the summary inside the bot delayed the scorer by ~40 s; a file journal uses a child."""
+    db = str(tmp_path / "bot.db")
+    j = Journal(db)
+    _trade(j, "launchrw50", "A", back=110.0)
+    cfg.db_path, cfg.launch_live = db, False
+    monkeypatch.setenv("TB_LAUNCH_LIVE", "0")
+    board = dash.Dashboard(j, cfg)
+    assert board.in_child
+    board.refresh()
+    version, summary = board.current()
+    assert version == 1 and [b["name"] for b in summary["books"]]
+    assert (tmp_path / dash.SUMMARY_FILE).exists()
+    assert not dash.Dashboard(Journal(":memory:"), cfg.with_overrides({"db_path": ":memory:"})).in_child

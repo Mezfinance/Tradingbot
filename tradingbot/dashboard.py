@@ -10,14 +10,16 @@ Served by the health server (`health.start_health_server`) on `health_port`, beh
   /api/summary  the latest tables as JSON
 
 Fills are read from the journal by id every POLL_S, so a trade shows a second or two after it is booked. The
-tables (report books + launch-scorer outcomes) are rebuilt on a background thread so a page view never runs
-the report."""
+tables (report books + launch-scorer outcomes) are rebuilt by a low-priority child process
+(`python -m tradingbot dashboard-summary PATH`) so neither a page view nor the bot's own threads wait on it."""
 from __future__ import annotations
 
 import hmac
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 import time
 
@@ -27,7 +29,9 @@ from tradingbot.journal import Journal
 log = logging.getLogger(__name__)
 
 POLL_S = 2.0  # new fills are looked for this often
-SUMMARY_S = 120  # the tables are rebuilt this often
+SUMMARY_S = 300  # the tables are rebuilt this often
+CHILD_TIMEOUT_S = 240
+SUMMARY_FILE = "dashboard-summary.json"
 KEEPALIVE_S = 15
 FEED_BACKLOG = 60  # fills sent when a page connects
 LAUNCH_HOURS = 6  # window of the launch scorer's ideal outcomes and real-vs-ideal gaps
@@ -122,16 +126,40 @@ def build_summary(journal: Journal, cfg: Config, store=None, now: float | None =
 class Dashboard:
     """Keeps the latest summary (rebuilt on its own thread) and serves the stream."""
 
-    def __init__(self, journal: Journal, cfg: Config, store=None):
+    def __init__(self, journal: Journal, cfg: Config, store=None, in_child: bool | None = None):
         self.journal, self.cfg, self.store = journal, cfg, store
+        # 11-05: built inside the bot, the summary (full report + launch-status, ~1 min of Python) held the
+        # GIL and the journal lock every 2 min: scorer decisions started ~40 s late, buys waited 25-50 s.
+        # So it runs in its own low-priority process unless the journal is in memory (tests).
+        self.in_child = (cfg.db_path != ":memory:") if in_child is None else in_child
         self.summary: dict | None = None
         self.version = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
+    def _build_in_child(self) -> dict:
+        path = os.path.join(os.path.dirname(os.path.abspath(self.cfg.db_path)), SUMMARY_FILE)
+
+        def low_priority():
+            try:
+                os.nice(19)
+                with open("/proc/self/oom_score_adj", "w") as fh:
+                    fh.write("1000")
+            except OSError:
+                pass
+        res = subprocess.run([sys.executable, "-m", "tradingbot", "dashboard-summary", path],
+                             env={**os.environ, "TB_DB_PATH": self.cfg.db_path},
+                             preexec_fn=low_priority, timeout=CHILD_TIMEOUT_S,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if res.returncode != 0:
+            raise RuntimeError(f"child exited {res.returncode}: {res.stderr.decode(errors='replace')[-300:]}")
+        with open(path) as fh:
+            return json.load(fh)
+
     def refresh(self) -> None:
         try:
-            summary = build_summary(self.journal, self.cfg, self.store)
+            summary = (self._build_in_child() if self.in_child
+                       else build_summary(self.journal, self.cfg, self.store))
         except Exception:  # noqa: BLE001 (keep the last good summary)
             log.exception("dashboard summary failed")
             return

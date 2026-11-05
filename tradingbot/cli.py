@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-hist-backfill", "launch-hist-test", "launch-exit-study",
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
-                                            "launch-filter-study", "launch-rw-train"])
+                                            "launch-filter-study", "launch-rw-train", "dashboard-summary"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -119,6 +119,21 @@ def main(argv: list[str] | None = None) -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     cfg = Config.from_env()
     logging.getLogger(__name__).info("mode=%s model=%s", cfg.mode, cfg.model)
+
+    if args.command == "dashboard-summary":  # run by the dashboard in a low-priority child process
+        import os
+        from tradingbot import dashboard
+        from tradingbot.journal import Journal
+        store = None
+        if cfg.launch_live:
+            from tradingbot.watcher import WatchStore, watch_db_path
+            store = WatchStore(watch_db_path(cfg))
+        out = dashboard.build_summary(Journal(cfg.db_path), cfg, store)
+        tmp = args.path + ".tmp"
+        with open(tmp, "w") as fh:
+            json.dump(out, fh, default=str)
+        os.replace(tmp, args.path)
+        return
 
     if args.command == "report":
         from tradingbot import report
