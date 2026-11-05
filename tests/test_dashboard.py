@@ -120,7 +120,7 @@ def test_routes_need_the_password_and_health_stays_open(cfg, monkeypatch):
         code, headers, _ = get("/?key=s3cret")
         assert code == 303 and headers["Location"] == "/" and "tb_dash=s3cret" in headers["Set-Cookie"]
         code, _, body = get("/", cookie="tb_dash=s3cret")
-        assert code == 200 and b"STRATEGY DESK" in body and b"EventSource" in body
+        assert code == 200 and b"QUANT DESK" in body and b"EventSource" in body
         code, _, body = get("/api/summary", cookie="tb_dash=s3cret")
         assert code == 200 and "expected" in json.loads(body)
         assert get("/nope", cookie="tb_dash=s3cret")[0] == 404

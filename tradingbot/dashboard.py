@@ -440,7 +440,7 @@ class Live:
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>MZF Strategy Desk</title>
+<title>MZFq Quant Desk</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700;800;900&display=swap" rel="stylesheet">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect width='100' height='100' fill='%230A0A0A'/%3E%3Cpolygon points='24,26 76,26 76,39 38,61 76,61 76,74 24,74 24,61 62,39 24,39' fill='%23C8FF4D'/%3E%3C/svg%3E">
@@ -553,20 +553,20 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 </style></head><body>
 <header>
 <div class="lockup"><svg viewBox="0 0 100 100" aria-hidden="true"><rect class="mk-sq" width="100" height="100"/><polygon class="mk-z" points="24,26 76,26 76,39 38,61 76,61 76,74 24,74 24,61 62,39 24,39"/></svg>
-<div><div class="word">MZF</div><div class="desc">STRATEGY DESK</div></div></div>
+<div><div class="word">MZFq</div><div class="desc">QUANT DESK</div></div></div>
 <div class="status"><span id="conn" class="tag"><span class="dot"></span>Connecting</span><span id="health" class="tag">Bot</span>
 <span id="built" class="label muted"></span></div>
 </header>
-<nav class="tabs" aria-label="Programs"><a href="#/" data-v="programs">All programs</a><a href="#/supermeme" data-v="supermeme">Supermeme</a><a href="#/shorts" data-v="shorts">MZF Short Only</a></nav>
+<nav class="tabs" aria-label="Programs"><a href="#/" data-v="programs">MZFq</a><a href="#/supermeme" data-v="supermeme" id="tab-meme">Supermeme</a><a href="#/shorts" data-v="shorts">MZF Short Only</a></nav>
 <nav class="tabs sub" id="subtabs" aria-label="Supermeme"><a href="#/supermeme" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a></nav>
 <main id="v-programs" hidden>
-<div><p class="label eyebrow">MZF Protocol · paper programs</p><h1>All programs</h1>
+<div><p class="label eyebrow">Quant programs · paper trading</p><h1>MZFq</h1>
 <p class="lead">Each program holds its strategies; Supermeme's are grouped into families of books. Everything here is paper trading.</p></div>
 <div class="stats" id="p-stats"></div>
 <div class="progs" id="progs"></div>
 </main>
 <main id="v-shorts" hidden>
-<div><p class="label eyebrow"><a class="lk" href="#/">All programs</a> · program</p><h1>MZF Short Only</h1>
+<div><p class="label eyebrow"><a class="lk" href="#/">MZFq</a> · program</p><h1>MZF Short Only</h1>
 <p class="lead" id="sh-about">Short-only strategies on centralised-exchange perps.</p></div>
 <div id="sh-note"></div>
 <div class="stats" id="sh-stats"></div>
@@ -577,7 +577,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <section class="card"><p class="label eyebrow">Detector</p><h2>Recent listings</h2><p class="sub" id="sh-lcount"></p><div class="scroll"><table id="sh-listings"></table></div></section>
 </main>
 <main id="v-overview">
-<div><p class="label eyebrow"><a class="lk" href="#/">All programs</a> · Supermeme · paper books on Solana launches, simulated fills on live Jupiter quotes</p><h1>Supermeme</h1>
+<div><p class="label eyebrow"><a class="lk" href="#/">MZFq</a> · Supermeme · paper books on Solana launches, simulated fills on live Jupiter quotes</p><h1>Supermeme</h1>
 <p class="lead">Every book starts at $10,000. Trades and every table update live, within two seconds of a trade.</p></div>
 <div class="stats">
 <div class="stat lime"><span class="label">Leading book</span><span class="v nm" id="s-lead">-</span><span class="h" id="s-lead-h"></span></div>
@@ -587,7 +587,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 </div>
 <div class="cols">
 <section class="card"><p class="label eyebrow">Books</p><h2>Results by book</h2>
-<p class="sub">Sorted by return. Click a header to sort. Open trades count at cost until sold; a trade with no route out for 30 min counts as $0. Rugged = closed at −80% or worse.</p>
+<p class="sub">Sorted by return. Click a header to sort. Open trades count at cost until sold; a trade with no route out counts as $0 until a later sale gets through. Rugged = closed at −80% or worse.</p>
 <div class="scroll"><table id="books"></table></div></section>
 <aside class="feed"><p class="label" style="color:var(--on-band-2);margin:0 0 6px">Live</p><h2>Trades</h2>
 <p class="sub" id="feed-sub">Newest first</p><ul id="feed"></ul></aside>
@@ -634,7 +634,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <section class="card"><p class="label eyebrow">Trades</p><h2>Book ledger</h2><div class="scroll"><table id="b-ledger"></table></div>
 <p class="more"><button id="b-more">Show 200 more</button><span id="b-count" class="label muted"></span></p></section>
 </main>
-<footer>MZF Protocol · paper trading only, no funds at risk · <span id="foot"></span></footer>
+<footer>MZFq · paper trading only, no funds at risk · <span id="foot"></span></footer>
 <script>
 const $=id=>document.getElementById(id);
 const fmt=(v,d=1,s="")=>v==null||Number.isNaN(v)?"-":(typeof v==="number"?v.toLocaleString(undefined,{minimumFractionDigits:d,maximumFractionDigits:d}):v)+s;
@@ -829,7 +829,11 @@ for(const m of document.querySelectorAll("main"))m.hidden=m.id!=="v-"+R.v;
 const meme=["overview","ledger","books","book","family"].includes(R.v);$("subtabs").hidden=!meme;
 document.querySelectorAll(".tabs:not(.sub) a").forEach(a=>a.classList.toggle("on",a.dataset.v===(meme?"supermeme":R.v)));
 document.querySelectorAll(".tabs.sub a").forEach(a=>a.classList.toggle("on",a.dataset.v===R.v||(a.dataset.v==="books"&&(R.v==="book"||R.v==="family"))));
-window.scrollTo(0,0);render()}
+alignSub();window.scrollTo(0,0);render()}
+/* the Supermeme sub menu starts under the Supermeme tab (its left rule on the tab's left rule); on narrow screens it keeps the page gutter */
+function alignSub(){const s=$("subtabs"),t=$("tab-meme");if(s.hidden)return;s.style.paddingLeft="";
+const x=t.getBoundingClientRect().left-s.getBoundingClientRect().left-2,w=[...s.children].reduce((a,c)=>a+c.offsetWidth,0);
+const cs=getComputedStyle(s);if(x>parseFloat(cs.paddingLeft)&&x+w<=s.clientWidth-parseFloat(cs.paddingRight))s.style.paddingLeft=x+"px"}
 function renderHealth(){const ok=S.health?Object.values(S.health).every(x=>x.ok):null;
 $("health").innerHTML=`<span class="dot"></span>${ok==null?"Bot":ok?"Bot healthy":"Bot stalled"}`;$("health").className="tag "+(ok==null?"":ok?"ink":"neg")}
 function render(){renderHealth();if(!S.books.length)return;
@@ -848,7 +852,7 @@ $("lf-fam").onchange=()=>{fillSelects();LIM.ledger=200;renderLedger()};
 for(const id of["lf-book","lf-status"])$(id).onchange=()=>{LIM.ledger=200;renderLedger()};
 $("lf-q").oninput=()=>{LIM.ledger=200;renderLedger()};
 $("ledger-more").onclick=()=>{LIM.ledger+=200;renderLedger()};$("b-more").onclick=()=>{LIM.b+=200;render()};$("f-more").onclick=()=>{LIM.f+=200;render()};
-window.addEventListener("hashchange",route);
+window.addEventListener("hashchange",route);window.addEventListener("resize",alignSub);if(document.fonts)document.fonts.ready.then(alignSub);
 setInterval(render,30000);
 function connect(){const es=new EventSource("api/stream");
 es.onopen=()=>{$("conn").innerHTML='<span class="dot"></span>Live';$("conn").className="tag lime"};
