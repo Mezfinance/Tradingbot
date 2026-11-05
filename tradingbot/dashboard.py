@@ -215,6 +215,27 @@ LAUNCH_KEEP_S = 86400  # the scorer's pools sent to the page (it windows them 1/
 STUCK_AFTER_S = 1800  # as engine.STUCK_AFTER_S: a position with no route out this long counts as $0
 
 
+FAMILIES = (  # book families for the dashboard's family view, in display order
+    ("Launch picks", "the second-4 launch scorer's top 2% / 5% picks"),
+    ("Low decile", "the history model's bottom 20% (D1-D2), minus the riskiest early pullers"),
+    ("Rug-vs-win", "skip the riskiest half by P(rug before the exit) - P(+50% win); study rule and 24 h rule"),
+    ("Early", "hand-made pools at first sight, out by pool minute 5-7"),
+    ("model5", "the 5-minute snapshot model's short-hold books"))
+
+
+def family_of(name: str) -> str:
+    from tradingbot import model_book as mb
+    if name in mb.LAUNCH_RW_CUT or name in mb.LAUNCH_RW24_CUT:
+        return "Rug-vs-win"
+    if name in mb.LAUNCH_LOW_CUT:
+        return "Low decile"
+    if name in mb.LAUNCH_CUT:
+        return "Launch picks"
+    if name in mb.EARLY_BOOKS:
+        return "Early"
+    return "model5"
+
+
 class Live:
     """Raw rows for the page, polled every POLL_S on read-only connections of their own (never the journal's
     lock, and sqlite releases the GIL while it reads). Each changed row gets a new version number, so every
@@ -355,7 +376,9 @@ class Live:
         with self.lock:
             return self.ver, {
                 "now": time.time(), "cash": self.cfg.model_book_cash_usd, "stuck_after_s": STUCK_AFTER_S,
-                "books": [{"name": b, "hold_min": self.holds[b], "flag": self.flag_of[b]} for b in self.books],
+                "books": [{"name": b, "hold_min": self.holds[b], "flag": self.flag_of[b], "family": family_of(b)}
+                          for b in self.books],
+                "families": [{"name": n, "about": a} for n, a in FAMILIES],
                 "pos_cols": [*POS_COLS, "blocked_since"], "positions": [row for _, row in self.pos.values()],
                 "launch_cols": ["pool", "token", "create_ts", "decided_ts", "liquid", "ret", "status",
                                 "pulled_ts", "liq_usd", "flags"],
@@ -409,6 +432,7 @@ color:var(--ink);font-size:12px;font-weight:700;letter-spacing:.06em;text-transf
 .tag.neg{color:var(--neg);border-color:var(--neg)}
 .dot{width:8px;height:8px;background:currentColor}
 main{max-width:1360px;margin:0 auto;padding:32px;display:grid;gap:24px}
+main[hidden],[hidden]{display:none!important}
 h1{margin:0;font-size:30px;line-height:1.05;font-weight:800;letter-spacing:-.02em}
 .lead{margin:6px 0 0;color:var(--ink-2);font-size:14px}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px}
@@ -455,6 +479,27 @@ footer{max-width:1360px;margin:0 auto;padding:0 32px 32px;color:var(--ink-3);fon
 .win{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.win .label{margin-right:4px}
 .win button{min-height:36px;padding:0 12px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:700 13px/1 inherit;font-family:inherit;cursor:pointer;border-radius:0}
 .win button.on{background:var(--lime);color:var(--on-lime)}.win button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
+.tabs{display:flex;gap:0;flex-wrap:wrap;background:var(--surface);border-bottom:2px solid var(--rule);padding:0 32px}
+.tabs a{display:inline-flex;align-items:center;min-height:44px;padding:0 16px;font-size:14px;font-weight:700;color:var(--ink);
+text-decoration:none;border-right:2px solid var(--rule)}.tabs a:first-child{border-left:2px solid var(--rule)}
+.tabs a.on{background:var(--lime);color:var(--on-lime)}.tabs a:hover:not(.on){background:var(--sunken)}
+@media (max-width:520px){.tabs{padding:0 16px}.tabs a{padding:0 10px;font-size:13px}}
+a.lk{color:inherit;text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:3px}
+a.lk:hover{text-decoration-thickness:2px}
+.filters{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 16px;align-items:center}
+.filters select,.filters input,.more button{min-height:44px;padding:0 12px;border:2px solid var(--rule);background:var(--surface);
+color:var(--ink);font:600 14px/1 var(--sans);border-radius:0}
+.filters input{min-width:180px}.more{margin:16px 0 0;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.more button{cursor:pointer;font-weight:700}.more button:hover{background:var(--sunken)}
+.tag.warn{color:var(--warn);border-color:var(--warn)}
+th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.sm{font-size:11px;padding:2px 6px}
+.fams{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:24px}
+.fams .card h2 a{color:inherit;text-decoration:none}.fams .card h2 a:hover{text-decoration:underline}
+.mini td,.mini th{padding:7px 6px}
+.chart svg{width:100%;height:260px;display:block}
+.chart .ax{font:600 11px var(--sans);fill:var(--ink-2)}
+.legend{display:flex;flex-wrap:wrap;gap:6px 16px;margin:10px 0 0;font-size:13px;font-weight:600}
+.legend span{display:inline-flex;align-items:center;gap:6px}.legend svg{width:28px;height:8px}
 </style></head><body>
 <header>
 <div class="lockup"><svg viewBox="0 0 100 100" aria-hidden="true"><rect class="mk-sq" width="100" height="100"/><polygon class="mk-z" points="24,26 76,26 76,39 38,61 76,61 76,74 24,74 24,61 62,39 24,39"/></svg>
@@ -462,11 +507,12 @@ footer{max-width:1360px;margin:0 auto;padding:0 32px 32px;color:var(--ink-3);fon
 <div class="status"><span id="conn" class="tag"><span class="dot"></span>Connecting</span><span id="health" class="tag">Bot</span>
 <span id="built" class="label muted"></span></div>
 </header>
-<main>
+<nav class="tabs" aria-label="Views"><a href="#/" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a></nav>
+<main id="v-overview">
 <div><p class="label eyebrow">Paper books · simulated fills on live Jupiter quotes</p><h1>Launch strategies</h1>
 <p class="lead">Every book starts at $10,000. Trades and every table update live, within two seconds of a trade.</p></div>
 <div class="stats">
-<div class="stat lime"><span class="label">Leading book</span><span class="v" id="s-lead">-</span><span class="h" id="s-lead-h"></span></div>
+<div class="stat lime"><span class="label">Leading book</span><span class="v nm" id="s-lead">-</span><span class="h" id="s-lead-h"></span></div>
 <div class="stat"><span class="label">P&amp;L, all books</span><span class="v num" id="s-pnl">-</span><span class="h" id="s-pnl-h"></span></div>
 <div class="stat"><span class="label">Closed trades</span><span class="v num" id="s-trades">-</span><span class="h" id="s-trades-h"></span></div>
 <div class="stat"><span class="label">Trades, last hour</span><span class="v num" id="s-rate">0</span><span class="h">Closed in the past 60 minutes</span></div>
@@ -488,6 +534,38 @@ footer{max-width:1360px;margin:0 auto;padding:0 32px 32px;color:var(--ink-3);fon
 <div class="scroll"><table id="gaps"></table></div></section>
 </div>
 </main>
+<main id="v-ledger" hidden>
+<div><p class="label eyebrow">Every trade of the running books</p><h1>Trade ledger</h1>
+<p class="lead">Newest first. Open trades count at cost until sold; no route out for 30 minutes counts as $0 (stuck).</p></div>
+<section class="card"><div class="filters">
+<select id="lf-fam" aria-label="Family"></select><select id="lf-book" aria-label="Book"></select>
+<select id="lf-status" aria-label="Status"><option value="">Every status</option><option>Open</option><option>Exit blocked</option><option>Stuck ($0)</option><option>Won</option><option>Lost</option></select>
+<input id="lf-q" type="search" placeholder="Token or symbol" aria-label="Token or symbol"></div>
+<div class="scroll"><table id="ledger"></table></div>
+<p class="more"><button id="ledger-more">Show 200 more</button><span id="ledger-count" class="label muted"></span></p></section>
+</main>
+<main id="v-books" hidden>
+<div><p class="label eyebrow">Paper books by family</p><h1>Books &amp; families</h1>
+<p class="lead">A family is a group of books trading one idea with different settings. Open a family to compare its books, or a book for its own equity and trades.</p></div>
+<div class="fams" id="fams"></div>
+</main>
+<main id="v-family" hidden>
+<div><p class="label eyebrow"><a class="lk" href="#/books">Books &amp; families</a> · family</p><h1 id="f-name"></h1><p class="lead" id="f-about"></p></div>
+<div class="stats" id="f-stats"></div>
+<section class="card"><p class="label eyebrow">Books</p><h2>Books in this family</h2><p class="sub">Click a book to open it.</p><div class="scroll"><table id="f-books"></table></div></section>
+<section class="card chart"><p class="label eyebrow">Equity</p><h2>Equity by book</h2><p class="sub">Each book's equity after every closed trade, from $10,000.</p><div id="f-chart"></div></section>
+<section class="card"><p class="label eyebrow">Trades</p><h2>Family ledger</h2><div class="scroll"><table id="f-ledger"></table></div>
+<p class="more"><button id="f-more">Show 200 more</button><span id="f-count" class="label muted"></span></p></section>
+</main>
+<main id="v-book" hidden>
+<div><p class="label eyebrow"><a class="lk" href="#/books">Books &amp; families</a> · <a class="lk" id="b-fam" href="#/books"></a></p><h1 id="b-name"></h1><p class="lead" id="b-about"></p></div>
+<div class="stats" id="b-stats"></div>
+<section class="card chart"><p class="label eyebrow">Equity</p><h2>Equity curve</h2><p class="sub">Equity after every closed trade, from $10,000. Dashed: the starting $10,000.</p><div id="b-chart"></div></section>
+<section class="card" id="b-gap-card"><p class="label eyebrow">Execution · last <span id="b-lh">6</span> h (launch window on the overview)</p><h2>Real against ideal</h2>
+<p class="sub">This book's fills against the scorer's ideal trade on the same pools, and the flagged pools it did not buy.</p><div class="scroll"><table id="b-gap"></table></div></section>
+<section class="card"><p class="label eyebrow">Trades</p><h2>Book ledger</h2><div class="scroll"><table id="b-ledger"></table></div>
+<p class="more"><button id="b-more">Show 200 more</button><span id="b-count" class="label muted"></span></p></section>
+</main>
 <footer>MZF Protocol · paper trading only, no funds at risk · <span id="foot"></span></footer>
 <script>
 const $=id=>document.getElementById(id);
@@ -497,80 +575,167 @@ const cls=v=>v==null?"":v>0?"pos":v<0?"neg":"";
 const esc=t=>String(t??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
 const median=a=>{if(!a.length)return null;const b=[...a].sort((x,y)=>x-y),m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2};
-const S={pos:new Map(),launch:new Map(),books:[],cash:10000,stuck:1800,pc:[],lc:[],skew:0,health:null,extra:null};
+const S={pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:1800,pc:[],lc:[],skew:0,health:null,extra:null};
 let sortKey="return_pct",sortDir=-1,win=21600,pending=false;
+const R={v:"overview",arg:null},LIM={ledger:200,b:200,f:200};
 const now=()=>Date.now()/1000-S.skew;
 const obj=(cols,row)=>{const o={};cols.forEach((c,i)=>o[c]=row[i]);return o};
+const bookLink=n=>`<a class="lk book" href="#/book/${encodeURIComponent(n)}">${esc(n)}</a>`;
+const famLink=n=>`<a class="lk" href="#/family/${encodeURIComponent(n)}">${esc(n)}</a>`;
+const famOf=n=>(S.books.find(b=>b.name===n)||{}).family||"";
+const when=ts=>{const d=new Date(ts*1000);return d.toISOString().slice(5,10)+" "+d.toISOString().slice(11,19)};
+const dur=s=>s==null?"-":s<90?Math.round(s)+"s":s<5400?Math.round(s/60)+"m":(s/3600).toFixed(1)+"h";
 function merge(d){if(d.now)S.skew=Date.now()/1000-d.now;
 (d.positions||[]).forEach(r=>{const o=obj(S.pc,r);S.pos.set(o.id,o)});
 (d.launch||[]).forEach(r=>{const o=obj(S.lc,r);S.launch.set(o.pool,o)});
 if("health" in d&&d.health)S.health=d.health}
+/* one trade: status and result; stuck = no route out for S.stuck seconds, valued at $0 */
+function trade(p,t){const cost=p.cost_usd||0,real=p.realized_usd||0;let st,pnl=null,end=null;
+if(p.closed_at){end=p.closed_at;pnl=real-cost;st=pnl>0?"Won":"Lost"}
+else if(p.blocked_since&&t-p.blocked_since>=S.stuck){end=p.blocked_since+S.stuck;pnl=real-cost;st="Stuck ($0)"}
+else if(p.blocked_since){st="Exit blocked"}else{st="Open"}
+return{id:p.id,book:p.strategy,sym:p.symbol||(p.token||"").slice(0,6),token:p.token,opened:p.opened_at,end,cost,pnl,
+pct:pnl==null||!cost?null:100*pnl/cost,st,reason:p.exit_reason,held:(end||t)-p.opened_at,open:!p.closed_at&&st!=="Stuck ($0)",real,p}}
+function trades(pred){const t=now(),out=[];for(const p of S.pos.values()){const x=trade(p,t);if(!pred||pred(x))out.push(x)}
+return out.sort((a,b)=>b.opened-a.opened)}
 function bookStats(b){const t=now();let equity=S.cash,open=0,started=null;const tr=[];
 for(const p of S.pos.values()){if(p.strategy!==b.name)continue;started=started==null?p.opened_at:Math.min(started,p.opened_at);
-const cost=p.cost_usd||0,real=p.realized_usd||0;let pnl;
-if(p.closed_at){pnl=real-cost;tr.push({t:p.closed_at,ret:cost?real/cost-1:0,pnl})}
-else if(p.blocked_since&&t-p.blocked_since>=S.stuck){pnl=real-cost;tr.push({t:p.blocked_since+S.stuck,ret:cost?real/cost-1:-1,pnl})}
-else{open++;pnl=real+(p.qty||0)*(p.entry_price||0)-cost}
-equity+=pnl}
-tr.sort((x,y)=>x.t-y.t);let eq=S.cash,peak=S.cash,dd=0;for(const x of tr){eq+=x.pnl;peak=Math.max(peak,eq);dd=Math.max(dd,(peak-eq)/peak)}
+const x=trade(p,t);
+if(x.end!=null){tr.push({t:x.end,ret:x.cost?x.pnl/x.cost:0,pnl:x.pnl});equity+=x.pnl}
+else{open++;equity+=x.real+(p.qty||0)*(p.entry_price||0)-x.cost}}
+tr.sort((x,y)=>x.t-y.t);let eq=S.cash,peak=S.cash,dd=0;const pts=started==null?[]:[[started,S.cash]];
+for(const x of tr){eq+=x.pnl;peak=Math.max(peak,eq);dd=Math.max(dd,(peak-eq)/peak);pts.push([x.t,eq])}
 const rets=tr.map(x=>x.ret*100),gain=tr.filter(x=>x.pnl>0).reduce((a,x)=>a+x.pnl,0),loss=-tr.filter(x=>x.pnl<0).reduce((a,x)=>a+x.pnl,0);
 const rugs=tr.filter(x=>x.ret<=-0.8).length;
-return{name:b.name,hold_min:b.hold_min,started,equity,return_pct:(equity/S.cash-1)*100,trades:tr.length,open,
+return{name:b.name,family:b.family,hold_min:b.hold_min,started,equity,return_pct:(equity/S.cash-1)*100,trades:tr.length,open,
 win_rate:tr.length?tr.filter(x=>x.ret>0).length/tr.length:null,median_pct:median(rets),mean_pct:mean(rets),
-profit_factor:loss>0?gain/loss:(gain>0?null:null),rug_pct:tr.length?100*rugs/tr.length:null,max_drawdown_pct:100*dd,last_hour:tr.filter(x=>x.t>t-3600).length}}
+profit_factor:loss>0?gain/loss:null,rug_pct:tr.length?100*rugs/tr.length:null,max_drawdown_pct:100*dd,
+last_hour:tr.filter(x=>x.t>t-3600).length,tr,pts,gain,loss,rugs}}
 const COLS=[["name","Book",0],["hold_min","Hold",0],["equity","Equity $",0],["return_pct","Return",2],["trades","Trades",0],["open","Open",0],["win_rate","Win",2],["median_pct","Median",1],["mean_pct","Mean",1],["profit_factor","PF",2],["rug_pct","Rugged",0],["max_drawdown_pct","Max DD",1]];
-function renderBooks(){const all=S.books.map(bookStats);
-const rows=[...all].sort((a,b)=>{const x=a[sortKey],y=b[sortKey];return (x==null)-(y==null)||(x<y?-1:x>y?1:0)*sortDir});
-const leader=all.filter(b=>b.trades>0).sort((a,b)=>b.return_pct-a.return_pct)[0];const exp=(S.extra&&S.extra.expected)||{};
+function booksTable(id,list){const rows=[...list].sort((a,b)=>{const x=a[sortKey],y=b[sortKey];return (x==null)-(y==null)||(x<y?-1:x>y?1:0)*sortDir});
+const leader=list.filter(b=>b.trades>0).sort((a,b)=>b.return_pct-a.return_pct)[0];const exp=(S.extra&&S.extra.expected)||{};
 let h="<tr>"+COLS.map(c=>`<th data-k="${c[0]}">${c[1]}${sortKey===c[0]?(sortDir<0?" ↓":" ↑"):""}</th>`).join("")+"</tr>";
 for(const b of rows){h+=`<tr class="${leader&&b.name===leader.name?"lead-row":""}" title="${esc(exp[b.name]||"")}">`+COLS.map(([k,,d])=>{const v=b[k];
-if(k==="name")return`<td class="book">${esc(v)}</td>`;if(k==="hold_min")return`<td>${fmt(v,0)}m</td>`;if(k==="equity")return`<td>${fmt(v,0)}</td>`;
+if(k==="name")return`<td>${bookLink(v)}</td>`;if(k==="hold_min")return`<td>${fmt(v,0)}m</td>`;if(k==="equity")return`<td>${fmt(v,0)}</td>`;
 if(["return_pct","median_pct","mean_pct"].includes(k))return`<td class="${cls(v)}">${sgn(v,d)}</td>`;
 if(k==="rug_pct"||k==="max_drawdown_pct")return`<td>${fmt(v,d,"%")}</td>`;return`<td>${fmt(v,d)}</td>`}).join("")+"</tr>"}
-$("books").innerHTML=h;$("books").querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;sortDir=sortKey===k?-sortDir:-1;sortKey=k;renderBooks()});
-if(leader){$("s-lead").textContent=leader.name;$("s-lead-h").textContent=`${sgn(leader.return_pct,2)} on ${leader.trades} trades`}
+$(id).innerHTML=h;$(id).querySelectorAll("th").forEach(th=>th.onclick=()=>{const k=th.dataset.k;sortDir=sortKey===k?-sortDir:-1;sortKey=k;render()});
+return leader}
+function tiles(id,items){$(id).innerHTML=items.map(([l,v,h,lime,nm])=>`<div class="stat${lime?" lime":""}"><span class="label">${l}</span><span class="v num${nm?" nm":""}">${v}</span><span class="h">${h||""}</span></div>`).join("")}
+function renderOverview(){const all=S.books.map(bookStats);const leader=booksTable("books",all);
+if(leader){$("s-lead").innerHTML=bookLink(leader.name);$("s-lead-h").textContent=`${sgn(leader.return_pct,2)} on ${leader.trades} trades`}
 const pnl=all.reduce((a,b)=>a+b.equity-S.cash,0);$("s-pnl").innerHTML=`<span class="${cls(pnl)}">${sgn(pnl,0,"")}</span>`;
 $("s-pnl-h").textContent=`$ across ${all.length} books`;$("s-trades").textContent=fmt(all.reduce((a,b)=>a+b.trades,0),0);
-$("s-trades-h").textContent=`${all.reduce((a,b)=>a+b.open,0)} open now`;$("s-rate").textContent=fmt(all.reduce((a,b)=>a+b.last_hour,0),0)}
+$("s-trades-h").textContent=`${all.reduce((a,b)=>a+b.open,0)} open now`;$("s-rate").textContent=fmt(all.reduce((a,b)=>a+b.last_hour,0),0);renderLaunch()}
 function group(rs){const r=rs.map(x=>x.ret*100);return{n:r.length,mean:mean(r),median:median(r),win:r.length?100*r.filter(x=>x>0).length/r.length:null,
 rug:r.length?100*rs.filter(x=>x.ret<=-0.999).length/r.length:null,big:r.length?100*rs.filter(x=>x.ret>=0.5).length/r.length:null}}
-function renderLaunch(){const t=now(),done=[...S.launch.values()].filter(x=>x.decided_ts>=t-win&&x.liquid&&x.ret!=null);
-const label=win>=86400?"24":String(win/3600);$("lh").textContent=$("lh2").textContent=label;
+const doneIn=()=>{const t=now();return[...S.launch.values()].filter(x=>x.decided_ts>=t-win&&x.liquid&&x.ret!=null)};
+function gapRow(b,done){const t=now(),ideal=done.filter(x=>x.flags.includes(b.flag)),byTok=new Map(ideal.map(x=>[x.token,x]));
+const mine=[...S.pos.values()].filter(p=>p.strategy===b.name&&p.closed_at&&p.opened_at>=t-win&&byTok.has(p.token));
+const held=new Set([...S.pos.values()].filter(p=>p.strategy===b.name).map(p=>p.token));
+const real=mine.map(p=>100*(p.realized_usd/p.cost_usd-1)),idl=mine.map(p=>100*byTok.get(p.token).ret),missed=ideal.filter(x=>!held.has(x.token)).map(x=>100*x.ret);
+if(!mine.length&&!missed.length)return"";const gap=mine.length?mean(real)-mean(idl):null;
+return`<tr><td>${bookLink(b.name)}</td><td>${mine.length}</td><td class="${cls(mean(real))}">${sgn(mean(real))}</td><td>${sgn(mean(idl))}</td><td class="${cls(gap)}">${sgn(gap,1," pts")}</td><td>${missed.length}</td><td>${sgn(mean(missed))}</td></tr>`}
+const GAPHEAD="<tr><th>Book</th><th>Trades</th><th>Real</th><th>Ideal</th><th>Gap</th><th>Missed</th><th>Missed ideal</th></tr>";
+function renderLaunch(){const done=doneIn();const label=win>=86400?"24":String(win/3600);$("lh").textContent=$("lh2").textContent=label;
 const flags=[];const byFlag={};for(const b of S.books)if(b.flag){(byFlag[b.flag]=byFlag[b.flag]||[]).push(b.name);if(!flags.includes(b.flag))flags.push(b.flag)}
 let h="<tr><th>Group</th><th>Trades</th><th>Mean</th><th>Median</th><th>Win</th><th>Rugged</th><th>+50%</th></tr>";
 const line=(name,g)=>`<tr><td>${name}</td><td>${fmt(g.n,0)}</td><td class="${cls(g.mean)}">${sgn(g.mean)}</td><td>${sgn(g.median)}</td><td>${fmt(g.win,0,"%")}</td><td>${fmt(g.rug,0,"%")}</td><td>${fmt(g.big,0,"%")}</td></tr>`;
 h+=line("Every liquid pool",group(done));
-for(const f of flags)h+=line(`<span class="book">${esc(byFlag[f].join(", "))}</span>`,group(done.filter(x=>x.flags.includes(f))));
-$("outcomes").innerHTML=h;
-h="<tr><th>Book</th><th>Trades</th><th>Real</th><th>Ideal</th><th>Gap</th><th>Missed</th><th>Missed ideal</th></tr>";
-for(const b of S.books){if(!b.flag)continue;const ideal=done.filter(x=>x.flags.includes(b.flag));const byTok=new Map(ideal.map(x=>[x.token,x]));
-const mine=[...S.pos.values()].filter(p=>p.strategy===b.name&&p.closed_at&&p.opened_at>=t-win&&byTok.has(p.token));
-const held=new Set([...S.pos.values()].filter(p=>p.strategy===b.name).map(p=>p.token));
-const real=mine.map(p=>100*(p.realized_usd/p.cost_usd-1)),idl=mine.map(p=>100*byTok.get(p.token).ret),missed=ideal.filter(x=>!held.has(x.token)).map(x=>100*x.ret);
-if(!mine.length&&!missed.length)continue;const gap=mine.length?mean(real)-mean(idl):null;
-h+=`<tr><td class="book">${esc(b.name)}</td><td>${mine.length}</td><td class="${cls(mean(real))}">${sgn(mean(real))}</td><td>${sgn(mean(idl))}</td><td class="${cls(gap)}">${sgn(gap,1," pts")}</td><td>${missed.length}</td><td>${sgn(mean(missed))}</td></tr>`}
-$("gaps").innerHTML=h}
+for(const f of flags)h+=line(byFlag[f].map(bookLink).join(", "),group(done.filter(x=>x.flags.includes(f))));
+$("outcomes").innerHTML=h;$("gaps").innerHTML=GAPHEAD+S.books.filter(b=>b.flag).map(b=>gapRow(b,done)).join("")}
+/* ledger */
+const STAG={"Open":"lime","Exit blocked":"warn","Stuck ($0)":"neg","Won":"","Lost":""};
+function ledgerTable(id,rows,limit,showBook){let h=`<tr><th>Bought (UTC)</th>${showBook?'<th class="l">Book</th>':""}<th class="l">Token</th><th class="l">Status</th><th>Result</th><th>Result $</th><th>Held</th><th>Cost $</th><th>Exit</th></tr>`;
+for(const x of rows.slice(0,limit)){const tok=x.token?`<a class="lk" href="https://dexscreener.com/solana/${encodeURIComponent(x.token)}" target="_blank" rel="noopener" title="${esc(x.token)}">${esc(x.sym)}</a>`:esc(x.sym);
+h+=`<tr><td class="mono">${when(x.opened)}</td>${showBook?`<td class="l">${bookLink(x.book)}</td>`:""}<td class="l">${tok}</td><td class="l"><span class="tag sm ${STAG[x.st]}">${esc(x.st)}</span></td>`+
+`<td class="${cls(x.pct)}">${sgn(x.pct)}</td><td class="${cls(x.pnl)}">${x.pnl==null?"-":sgn(x.pnl,2,"")}</td><td>${dur(x.held)}</td><td>${fmt(x.cost,2)}</td><td class="muted">${esc((x.reason||"").replace(/_/g," "))}</td></tr>`}
+$(id).innerHTML=h;return rows.length}
+const STATUS_OK=(x,st)=>!st||x.st===st;
+function fillSelects(){const fs=$("lf-fam"),bs=$("lf-book"),fv=fs.value,bv=bs.value;
+fs.innerHTML='<option value="">Every family</option>'+S.fams.map(f=>`<option ${f.name===fv?"selected":""}>${esc(f.name)}</option>`).join("");
+bs.innerHTML='<option value="">Every book</option>'+S.books.filter(b=>!fs.value||b.family===fs.value).map(b=>`<option ${b.name===bv?"selected":""}>${esc(b.name)}</option>`).join("")}
+function renderLedger(){const f=$("lf-fam").value,b=$("lf-book").value,st=$("lf-status").value,q=$("lf-q").value.trim().toLowerCase();
+const rows=trades(x=>(!f||famOf(x.book)===f)&&(!b||x.book===b)&&STATUS_OK(x,st)&&(!q||(x.sym||"").toLowerCase().includes(q)||(x.token||"").toLowerCase().includes(q)));
+const n=ledgerTable("ledger",rows,LIM.ledger,true);$("ledger-count").textContent=`${Math.min(n,LIM.ledger)} of ${n} trades`;$("ledger-more").hidden=n<=LIM.ledger}
+/* equity chart: one line per series, inline SVG, ink tones and dash patterns (lime is never a line) */
+const STY=[["var(--ink)",""],["var(--ink)","6 4"],["var(--ink-2)",""],["var(--ink-2)","6 4"],["var(--ink-3)",""],["var(--ink-3)","2 3"],["var(--ink-2)","2 3"],["var(--ink)","2 3"]];
+function chart(id,series){series=series.filter(s=>s.pts.length>1);if(!series.length){$(id).innerHTML='<p class="sub">No closed trades yet.</p>';return}
+const W=800,H=260,L=64,Rr=12,T=12,B=28;let x0=Infinity,x1=-Infinity,y0=S.cash,y1=S.cash;
+for(const s of series)for(const[x,y]of s.pts){x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y)}
+if(x1<=x0)x1=x0+1;const pad=(y1-y0)*0.08||50;y0-=pad;y1+=pad;
+const X=x=>L+(x-x0)/(x1-x0)*(W-L-Rr),Y=y=>T+(y1-y)/(y1-y0)*(H-T-B);
+let g=`<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Equity curve">`;
+g+=`<line x1="${L}" x2="${W-Rr}" y1="${Y(S.cash)}" y2="${Y(S.cash)}" style="stroke:var(--rule-soft);stroke-width:1.5" stroke-dasharray="5 5" vector-effect="non-scaling-stroke"/>`;
+g+=`<line x1="${L}" x2="${L}" y1="${T}" y2="${H-B}" style="stroke:var(--rule);stroke-width:2" vector-effect="non-scaling-stroke"/><line x1="${L}" x2="${W-Rr}" y1="${H-B}" y2="${H-B}" style="stroke:var(--rule);stroke-width:2" vector-effect="non-scaling-stroke"/>`;
+for(const v of[y1-pad,S.cash,y0+pad])g+=`<text class="ax" x="${L-6}" y="${Y(v)+4}" text-anchor="end">${fmt(v,0)}</text>`;
+g+=`<text class="ax" x="${L}" y="${H-8}">${when(x0).slice(0,11)}</text><text class="ax" x="${W-Rr}" y="${H-8}" text-anchor="end">${when(x1).slice(0,11)}</text>`;
+series.forEach((s,i)=>{const[c,d]=STY[i%STY.length];g+=`<polyline fill="none" style="stroke:${c};stroke-width:2" ${d?`stroke-dasharray="${d}"`:""} vector-effect="non-scaling-stroke" points="${s.pts.map(([x,y])=>X(x).toFixed(1)+","+Y(y).toFixed(1)).join(" ")}"><title>${esc(s.name)}</title></polyline>`});
+g+="</svg>";if(series.length>1)g+='<div class="legend">'+series.map((s,i)=>{const[c,d]=STY[i%STY.length];return`<span><svg viewBox="0 0 28 8"><line x1="0" x2="28" y1="4" y2="4" style="stroke:${c};stroke-width:2" ${d?`stroke-dasharray="${d}"`:""}/></svg>${esc(s.name)} ${sgn(s.ret,1)}</span>`}).join("")+"</div>";
+$(id).innerHTML=g}
+/* families index, family view, book view */
+function famStats(list){const tr=list.flatMap(b=>b.tr),rets=tr.map(x=>x.ret*100),pnl=list.reduce((a,b)=>a+b.equity-S.cash,0);
+return{pnl,trades:tr.length,open:list.reduce((a,b)=>a+b.open,0),win:tr.length?100*tr.filter(x=>x.ret>0).length/tr.length:null,mean:mean(rets),median:median(rets),
+rug:tr.length?100*tr.filter(x=>x.ret<=-0.8).length/tr.length:null,best:[...list].filter(b=>b.trades).sort((a,b)=>b.return_pct-a.return_pct)[0]}}
+function renderFams(){const all=S.books.map(bookStats);
+$("fams").innerHTML=S.fams.map(f=>{const list=all.filter(b=>b.family===f.name);if(!list.length)return"";const s=famStats(list);
+return`<section class="card"><p class="label eyebrow">Family · ${list.length} book${list.length>1?"s":""}</p><h2>${famLink(f.name)}</h2><p class="sub">${esc(f.about)}</p>`+
+`<p class="sub"><b class="${cls(s.pnl)}">${sgn(s.pnl,0," $")}</b> · ${fmt(s.trades,0)} trades · mean ${sgn(s.mean)} · rugged ${fmt(s.rug,0,"%")}</p>`+
+`<div class="scroll"><table class="mini"><tr><th>Book</th><th>Return</th><th>Trades</th><th>Mean</th></tr>`+
+list.sort((a,b)=>b.return_pct-a.return_pct).map(b=>`<tr><td>${bookLink(b.name)}</td><td class="${cls(b.return_pct)}">${sgn(b.return_pct,2)}</td><td>${fmt(b.trades,0)}</td><td class="${cls(b.mean_pct)}">${sgn(b.mean_pct)}</td></tr>`).join("")+"</table></div></section>"}).join("")}
+function renderFamily(name){const fam=S.fams.find(f=>f.name===name)||{name,about:""};const list=S.books.filter(b=>b.family===name).map(bookStats);
+$("f-name").textContent=name;$("f-about").textContent=fam.about;const s=famStats(list);
+tiles("f-stats",[["Leading book",s.best?bookLink(s.best.name):"-",s.best?`${sgn(s.best.return_pct,2)} on ${s.best.trades} trades`:"",true,true],
+["P&amp;L, family",`<span class="${cls(s.pnl)}">${sgn(s.pnl,0,"")}</span>`,`$ across ${list.length} books`],
+["Closed trades",fmt(s.trades,0),`${s.open} open now`],["Mean trade",`<span class="${cls(s.mean)}">${sgn(s.mean)}</span>`,`median ${sgn(s.median)} · win ${fmt(s.win,0,"%")}`],
+["Rugged",fmt(s.rug,0,"%"),"closed at −80% or worse"]]);
+booksTable("f-books",list);chart("f-chart",list.map(b=>({name:b.name,pts:b.pts,ret:b.return_pct})));
+const names=new Set(list.map(b=>b.name)),rows=trades(x=>names.has(x.book));const n=ledgerTable("f-ledger",rows,LIM.f,true);
+$("f-count").textContent=`${Math.min(n,LIM.f)} of ${n} trades`;$("f-more").hidden=n<=LIM.f}
+function renderBook(name){const b=S.books.find(x=>x.name===name);if(!b){$("b-name").textContent=name;$("b-about").textContent="This book is not running.";return}
+const s=bookStats(b),exp=(S.extra&&S.extra.expected)||{};$("b-name").textContent=name;$("b-fam").textContent=b.family;$("b-fam").href="#/family/"+encodeURIComponent(b.family);
+$("b-about").textContent=exp[name]||`Hold ${fmt(b.hold_min,0)} min.`;
+tiles("b-stats",[["Equity",fmt(s.equity,0),`return <b>${sgn(s.return_pct,2)}</b> · max drawdown ${fmt(s.max_drawdown_pct,1,"%")}`,true],
+["Closed trades",fmt(s.trades,0),`${s.open} open now · ${s.last_hour} in the past hour`],
+["Mean trade",`<span class="${cls(s.mean_pct)}">${sgn(s.mean_pct)}</span>`,`median ${sgn(s.median_pct)} · win ${fmt(s.win_rate==null?null:100*s.win_rate,0,"%")}`],
+["Profit factor",fmt(s.profit_factor,2),`won ${fmt(s.gain,0)} $ · lost ${fmt(s.loss,0)} $`],["Rugged",fmt(s.rug_pct,0,"%"),`${s.rugs} trade${s.rugs===1?"":"s"} at −80% or worse`]]);
+chart("b-chart",[{name,pts:s.pts,ret:s.return_pct}]);
+if(b.flag){$("b-gap-card").hidden=false;$("b-lh").textContent=win>=86400?"24":String(win/3600);$("b-gap").innerHTML=GAPHEAD+(gapRow(b,doneIn())||'<tr><td class="muted">No finished trades in the window.</td></tr>')}else $("b-gap-card").hidden=true;
+const rows=trades(x=>x.book===name);const n=ledgerTable("b-ledger",rows,LIM.b,false);$("b-count").textContent=`${Math.min(n,LIM.b)} of ${n} trades`;$("b-more").hidden=n<=LIM.b}
+/* router */
+function route(){const h=decodeURIComponent(location.hash.replace(/^#\/?/,"")),[v,...rest]=h.split("/");const arg=rest.join("/");
+R.v=({ledger:"ledger",books:"books",book:"book",family:"family"})[v]||"overview";R.arg=arg||null;LIM.b=LIM.f=200;
+for(const m of document.querySelectorAll("main"))m.hidden=m.id!=="v-"+R.v;
+document.querySelectorAll(".tabs a").forEach(a=>a.classList.toggle("on",a.dataset.v===R.v||(a.dataset.v==="books"&&(R.v==="book"||R.v==="family"))));
+window.scrollTo(0,0);render()}
 function renderHealth(){const ok=S.health?Object.values(S.health).every(x=>x.ok):null;
 $("health").innerHTML=`<span class="dot"></span>${ok==null?"Bot":ok?"Bot healthy":"Bot stalled"}`;$("health").className="tag "+(ok==null?"":ok?"ink":"neg")}
-function render(){renderBooks();renderLaunch();renderHealth();$("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false})}
+function render(){renderHealth();if(!S.books.length)return;
+if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
+$("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false})}
 function schedule(){if(!pending){pending=true;setTimeout(()=>{pending=false;render()},300)}}
 function fill(f,isNew){const li=document.createElement("li");if(isNew)li.className="new";
 const t=new Date(f.ts*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});
 const side=f.side==="buy"?'<span class="side buy">BUY</span>':'<span class="side">SELL</span>';
 const right=f.side==="sell"?`<span class="r ${cls(f.ret_pct)}">${f.ret_pct==null?"part":sgn(f.ret_pct)}</span>`:`<span class="r">$${fmt(f.usd,0)}</span>`;
 const why=f.side==="sell"&&f.reason?` · ${esc(f.reason.replace(/_/g," "))}`:"";
-li.innerHTML=`<span class="t mono">${t}</span><span>${side}<b>${esc(f.symbol)}</b><span class="bk">${esc(f.book)}${why}</span></span>${right}`;
+li.innerHTML=`<span class="t mono">${t}</span><span>${side}<b>${esc(f.symbol)}</b><span class="bk"><a class="lk" href="#/book/${encodeURIComponent(f.book)}">${esc(f.book)}</a>${why}</span></span>${right}`;
 const feed=$("feed");feed.prepend(li);while(feed.children.length>300)feed.lastChild.remove()}
-document.querySelectorAll("#win button").forEach(bt=>bt.onclick=()=>{win=+bt.dataset.w;document.querySelectorAll("#win button").forEach(x=>x.classList.toggle("on",x===bt));renderLaunch()});
+document.querySelectorAll("#win button").forEach(bt=>bt.onclick=()=>{win=+bt.dataset.w;document.querySelectorAll("#win button").forEach(x=>x.classList.toggle("on",x===bt));render()});
+$("lf-fam").onchange=()=>{fillSelects();LIM.ledger=200;renderLedger()};
+for(const id of["lf-book","lf-status"])$(id).onchange=()=>{LIM.ledger=200;renderLedger()};
+$("lf-q").oninput=()=>{LIM.ledger=200;renderLedger()};
+$("ledger-more").onclick=()=>{LIM.ledger+=200;renderLedger()};$("b-more").onclick=()=>{LIM.b+=200;render()};$("f-more").onclick=()=>{LIM.f+=200;render()};
+window.addEventListener("hashchange",route);
 setInterval(render,30000);
 function connect(){const es=new EventSource("api/stream");
 es.onopen=()=>{$("conn").innerHTML='<span class="dot"></span>Live';$("conn").className="tag lime"};
 es.onerror=()=>{$("conn").innerHTML='<span class="dot"></span>Reconnecting';$("conn").className="tag neg"};
-es.addEventListener("init",e=>{const d=JSON.parse(e.data);S.books=d.books;S.cash=d.cash;S.stuck=d.stuck_after_s;S.pc=d.pos_cols;S.lc=d.launch_cols;
-S.pos.clear();S.launch.clear();S.health=d.health;merge(d);render()});
+es.addEventListener("init",e=>{const d=JSON.parse(e.data);S.books=d.books;S.fams=d.families||[];S.cash=d.cash;S.stuck=d.stuck_after_s;S.pc=d.pos_cols;S.lc=d.launch_cols;
+S.pos.clear();S.launch.clear();S.health=d.health;merge(d);fillSelects();render()});
 es.addEventListener("delta",e=>{merge(JSON.parse(e.data));schedule()});
 es.addEventListener("summary",e=>{S.extra=JSON.parse(e.data);const d=S.extra.downtime;$("foot").textContent=d?`${d.outages} outages, ${fmt(d.hours_offline,1)} h offline since start`:"";schedule()});
 es.addEventListener("backlog",e=>{$("feed").innerHTML="";JSON.parse(e.data).forEach(f=>fill(f,false))});
 es.addEventListener("fill",e=>fill(JSON.parse(e.data),true))}
-connect();
+route();connect();
 </script></body></html>"""

@@ -68,7 +68,9 @@ def test_stream_sends_rows_then_deltas_and_new_trades(cfg, monkeypatch):
     init = json.loads(out[0].split("data: ", 1)[1])
     rows = [dict(zip(init["pos_cols"], r)) for r in init["positions"]]
     assert [r["symbol"] for r in rows if r["strategy"] == "launchrw50"] == ["A"]
-    assert {"name": "launchrw50", "hold_min": dash.Live(cfg).holds["launchrw50"], "flag": "rw50"} in init["books"]
+    assert {"name": "launchrw50", "hold_min": dash.Live(cfg).holds["launchrw50"], "flag": "rw50",
+            "family": "Rug-vs-win"} in init["books"]
+    assert [f["name"] for f in init["families"]] == [n for n, _ in dash.FAMILIES]
 
 
 def test_live_versions_rows_marks_blocked_exits_and_reads_launch_pools(cfg):
