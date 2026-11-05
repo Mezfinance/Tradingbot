@@ -752,3 +752,64 @@ def test_rug_vs_win_model_is_retrained_every_6_hours(tmp_path, monkeypatch):
     live._rw_retrain_loop(Stop())  # no model: trains at once, then waits for the file to age 6 h
     assert len(runs) == 1 and runs[0][-1] == "launch-rw-train"
     assert waits[0] == ll.RW_RETRY_S and waits[1] <= ll.RW_RETRY_S
+
+
+def test_earlier_rule_twin_books_score_rank_and_retrain_on_their_own(setup, monkeypatch):
+    """11-05: launchrw50_24h / launchd12rw50_24h keep the earlier live rule (14-day model, 24 h ranking, low_h)
+    beside the study-rule books."""
+    import os
+    import random
+    import subprocess
+    import time
+    import threading
+    from tradingbot import model_book as mb
+    cfg, st, hel, clock, live, p, create = setup
+    cfg.launch_train_days = 1.0
+    _rw_done_rows(st, 600, clock.t - 30 * 86400, random.Random(8))  # older than the 24 h rule's 1-day window
+    assert ll.train_rw24_and_save(st, cfg, now=clock.t) is None  # the earlier rule sees no rows inside its window
+    _rw_done_rows(st, 600, clock.t - 12 * 3600, random.Random(9))
+    assert ll.train_rw24_and_save(st, cfg, now=clock.t) == ll.rw24_model_path(cfg)
+    assert ll.train_rw_and_save(st, cfg) == ll.rw_model_path(cfg)
+    m24 = ll.RugWinModel.from_json(json.loads(ll.rw24_model_path(cfg).read_text()))
+    m6 = ll.RugWinModel.from_json(json.loads(ll.rw_model_path(cfg).read_text()))
+    assert m24.meta["rows"] < m6.meta["rows"]  # 14-day window vs every finished pool
+    win_like = {"creator_buys": 0.5, "log_buyers": 2.5}
+    assert live._load_rw_model("rw24") is not None  # loading rebuilds the window from the table: load first
+    with live.lock:  # 20 h old: inside the 24 h rule's window, outside the 6 h one
+        live.rw24_all.clear()
+        live.rw24_low.clear()
+        live.rw24_all.extend((clock.t - 20 * 3600, 5.0) for _ in range(ll.ROLLING_MIN))
+        live.rw24_low.extend((clock.t - 20 * 3600, 5.0) for _ in range(ll.ROLLING_MIN))
+    v = live._rw_verdict(win_like, "NEW", clock.t, clock.t, low=True, track="rw24")
+    assert v["rw24_pct"] == 0.0 and v["rw24_low_pct"] == 0.0 and "rw_pct" not in v
+    assert ll.rw24_flags(1, 10.0, 10.0) == {"rw50_24": True, "d12rw50_24": True}
+    assert ll.rw24_flags(0, 10.0, None) == {"rw50_24": True, "d12rw50_24": False}
+    cfg.launch_rw24_book = cfg.launch_live = True
+    try:
+        assert mb.active_books(cfg)[-2:] == list(mb.LAUNCH_RW24_CUT)
+        assert mb.wants("launchrw50_24h", {"rw50_24": True}) and not mb.wants("launchrw50", {"rw50_24": True})
+        assert mb.exit_deadline(cfg, "launchd12rw50_24h", {"created_ts": 100.0, "mint": "M"}) == 100.0 + 360
+        # a decision stores both rules' ranks and sends the twin flags
+        monkeypatch.setattr(live, "_hist_verdict", lambda feat, now: {"score_h": -5.0, "top2h": 0, "top5h": 0,
+                                                                      "low_h": 1, "rw_low6": 0})
+        live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+        live.step()
+        clock.t += cfg.launch_live_decide_delay_s
+        live.step()
+        r = live._row(HAND_POOL)
+        assert r["rw24"] is not None and r["rw24_pct"] is not None and r["rw24_low_pct"] is not None
+        sig = live.signals.get_nowait()
+        assert "rw50_24" in sig and "d12rw50_24" in sig and not sig["d12rw50"]  # rw_low6 0: not in the 6 h bottom
+        # retrain: the 24 h rule's model once a day, the study rule's every 6 h
+        cfg.launch_rw_book = True
+        runs = []
+        monkeypatch.setattr(subprocess, "run", lambda cmd, **k: (runs.append(cmd[-1]),
+                                                                  subprocess.CompletedProcess(cmd, 0, b"", b""))[-1])
+        old = time.time() - 7 * 3600
+        os.utime(ll.rw_model_path(cfg), (old, old))  # 7 h old: due under the 6 h rule, not the 24 h one
+        stop = threading.Event()
+        monkeypatch.setattr(stop, "wait", lambda t=None: stop.set() or True)
+        live._rw_retrain_loop(stop)
+        assert runs == ["launch-rw-train"]
+    finally:
+        cfg.launch_rw24_book = cfg.launch_live = cfg.launch_rw_book = False

@@ -510,10 +510,15 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
     "launchd12_s30": "D1-D2 minus the riskiest 30%: +12.0%/trade, 18% rugged (n=132; random skip +2.7%, 90% range "
                      "-4.4..+10.2%)",
     "launchd12_s50": "D1-D2 minus the riskiest 50%: +12.8%/trade, 11% rugged (n=94; random skip +2.6%)",
-    "launchrw50": "every liquid hand-made pool minus the riskiest 50% by rug-vs-win odds (launch-filter-study "
-                  "option 4, walk-forward on 2,041 pools): +7.6%/trade, 21% rugged, 19% +50% wins (keep all -1.6%)",
-    "launchd12rw50": "history model's bottom 20% minus the riskiest 50% by rug-vs-win odds: +13.1%/trade, 17% "
-                     "rugged, 26% +50% wins (n=178; keep all +4.1%, 97% of random skips worse)",
+    "launchrw50": "rug-vs-win, study rule (6 h ranking, retrained every 6 h on all pools). Live-rule replay on "
+                  "2,039 pools (11-03..11-05): kept +11.5%/trade vs every pool -1.1%, 19% rugged vs 33% skipped, "
+                  "100% of random keeps worse",
+    "launchd12rw50": "rug-vs-win within the past 6 h's history bottom 20%, study rule. Live-rule replay: kept "
+                     "+8.3%/trade (n=219), 20% rugged, 96% of random keeps worse",
+    "launchrw50_24h": "rug-vs-win, earlier live rule (24 h ranking, nightly 14-day model). Replay (11-04..11-05, "
+                      "n=1,179): kept +17.7%/trade vs every pool +3.9%, 17% rugged vs 31% skipped",
+    "launchd12rw50_24h": "rug-vs-win within the past 24 h's history bottom 20%, earlier live rule. Replay: kept "
+                         "+14.7%/trade (n=112), 12% rugged, 89% of random keeps worse",
 }
 
 

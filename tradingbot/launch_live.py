@@ -88,7 +88,9 @@ def ensure_schema(store) -> None:
                 # 11-04: rug-vs-win score and its rank among the past day's liquid / bottom-20% pools
                 "rw REAL", "rw_pct REAL", "rw_low_pct REAL",
                 # 11-05: the history model's bottom 20% of the past 6 h (the rug-vs-win books' D1-D2, as the study)
-                "rw_low6 INTEGER"):
+                "rw_low6 INTEGER",
+                # 11-05: the earlier live rule's score and ranks, kept for the rw24 twin books
+                "rw24 REAL", "rw24_pct REAL", "rw24_low_pct REAL"):
         try:
             store.execute(f"ALTER TABLE watch_launch_live ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -109,6 +111,10 @@ def pull_model_path(cfg: Config) -> Path:
 
 def rw_model_path(cfg: Config) -> Path:
     return Path(cfg.db_path).resolve().parent / "model" / "rw.json"
+
+
+def rw24_model_path(cfg: Config) -> Path:
+    return Path(cfg.db_path).resolve().parent / "model" / "rw24.json"
 
 
 # --- training -------------------------------------------------------------------------------------
@@ -274,12 +280,24 @@ RW_BIG = 0.5
 RW_BLOCK_S = 6 * 3600
 RW_RETRAIN_TIMEOUT_S = 900
 RW_RETRY_S = 600  # check the model's age (and retry a failed retrain) this often
+# The earlier live rule (11-04 to 11-05), kept as twin books at the user's request so a good spell under either
+# rule isn't missed: trained once a day on the last `launch_train_days`, ranked against the past 24 h, bottom 20%
+# = `low_h` (the history model's past 24 h).
+RW24_WINDOW_S = 86400
+RW24_RETRAIN_S = 86400
 
 
 def rw_low(r) -> bool:
     """The rug-vs-win books' bottom-20% flag: the 6 h one (`rw_low6`), or `low_h` on rows scored before 11-05."""
     v = r["rw_low6"] if "rw_low6" in r.keys() else None
     return bool(r["low_h"] if v is None else v)
+
+
+def rw24_flags(low_h, rw24_pct, rw24_low_pct) -> dict:
+    """Signal flags of the earlier-rule twin books: `rw50_24` / `d12rw50_24` (see RW24_WINDOW_S)."""
+    keep = 100 - RW_SKIP
+    return {"rw50_24": rw24_pct is not None and rw24_pct < keep,
+            "d12rw50_24": bool(low_h) and rw24_low_pct is not None and rw24_low_pct < keep}
 
 
 def rw_flags(low, rw_pct, rw_low_pct) -> dict:
@@ -321,13 +339,14 @@ def _fit_capped(rows: list[dict], y: np.ndarray):
                  {"clip_z": la.CLIP_Z})
 
 
-def train_rw(store, cfg: Config, now: float | None = None):
+def train_rw(store, cfg: Config, now: float | None = None, days: float | None = None):
     """The rug-vs-win model on the scorer's finished liquid pools of the last `launch_train_days`. Meta keeps the
     score percentiles of every training pool and of those in the history model's bottom 20% (fallback ranking
     until the live scorer has seen ROLLING_MIN pools of each)."""
     ensure_schema(store)
     now = now if now is not None else time.time()
-    rows = _pull_rows(store, 0.0)  # every finished pool, as the study (11-05; was the last launch_train_days)
+    # every finished pool, as the study (11-05); `days` = the earlier rule's window (the rw24 twin books)
+    rows = _pull_rows(store, now - days * 86400 if days else 0.0)
     if len(rows) < PULL_MIN_TRAIN:
         log.warning("rug-vs-win model: not enough rows to train (%d)", len(rows))
         return None
@@ -347,6 +366,15 @@ def train_rw(store, cfg: Config, now: float | None = None):
                                     for q in RISK_LEVELS],
                   "days": round((now - rows[0]["create_ts"]) / 86400, 1)}
     return model
+
+
+def train_rw24_and_save(store, cfg: Config, now: float | None = None) -> Path | None:
+    """The earlier rule's model (rw24.json): the last `launch_train_days` only."""
+    model = train_rw(store, cfg, now=now, days=cfg.launch_train_days)
+    if model is None:
+        return None
+    log.info("rug-vs-win (24 h rule) model trained on %d rows", model.meta["rows"])
+    return _save(model, rw24_model_path(cfg))
 
 
 def train_rw_and_save(store, cfg: Config) -> Path | None:
@@ -422,6 +450,10 @@ class LaunchLive:
         self.rw_model, self.rw_mtime, self.rw_checked = None, None, 0.0
         self.rw_all: collections.deque = collections.deque()  # (decided_ts, rw) of liquid pools, past RW_BLOCK_S
         self.rw_low: collections.deque = collections.deque()  # (decided_ts, rw) of bottom-20% pools, past RW_BLOCK_S
+        # the earlier live rule, kept as twin books (11-05): nightly 14-day model, 24 h ranking, low_h
+        self.rw24_model, self.rw24_mtime, self.rw24_checked = None, None, 0.0
+        self.rw24_all: collections.deque = collections.deque()
+        self.rw24_low: collections.deque = collections.deque()
         self.pool = ThreadPoolExecutor(workers, thread_name_prefix="launch-live") if workers else None
         self.saved_at = 0.0
         self.tries: dict[str, int] = {}
@@ -593,54 +625,68 @@ class LaunchLive:
             pct = float(np.interp(risk, qs, RISK_LEVELS)) if qs else None
         return {"risk": risk, "risk_pct": pct}
 
-    def _load_rw_model(self):
-        """The rug-vs-win model (rw.json). A new one re-scores the past day's liquid pools."""
+    def _rw_track(self, track: str):
+        """(model path, ranking window, bottom-20% test) of a rug-vs-win rule: `rw` = the study's rule since 11-05
+        (6 h), `rw24` = the earlier live rule kept as twin books (24 h ranking, nightly 14-day model, low_h)."""
+        if track == "rw24":
+            return rw24_model_path(self.cfg), RW24_WINDOW_S, lambda r: bool(r["low_h"])
+        return rw_model_path(self.cfg), RW_BLOCK_S, rw_low
+
+    def _load_rw_model(self, track: str = "rw"):
+        """A rug-vs-win model (rw.json / rw24.json). A new one re-scores its ranking window's liquid pools."""
+        path, window, is_low = self._rw_track(track)
         now = self.clock()
-        if self.rw_model is not None and now - self.rw_checked < MODEL_RELOAD_S:
-            return self.rw_model
-        self.rw_checked = now
-        path = rw_model_path(self.cfg)
+        model = getattr(self, f"{track}_model")
+        if model is not None and now - getattr(self, f"{track}_checked") < MODEL_RELOAD_S:
+            return model
+        setattr(self, f"{track}_checked", now)
         try:
             mtime = path.stat().st_mtime
         except OSError:
-            return self.rw_model
-        if mtime != self.rw_mtime:
+            return model
+        if mtime != getattr(self, f"{track}_mtime"):
             try:
-                model = RugWinModel.from_json(json.loads(path.read_text()))
+                new = RugWinModel.from_json(json.loads(path.read_text()))
             except (OSError, ValueError, KeyError) as exc:
-                log.warning("rug-vs-win model unreadable: %s", exc)
-                return self.rw_model
+                log.warning("rug-vs-win model %s unreadable: %s", path.name, exc)
+                return model
             every, low = [], []
             for r in self.store.query("SELECT creator, create_ts, decided_ts, feat, low_h, rw_low6 "
                                       "FROM watch_launch_live WHERE liquid=1 AND feat IS NOT NULL AND decided_ts >= ? "
-                                      "ORDER BY decided_ts", (now - RW_BLOCK_S,)):
-                s = model.score(pull_inputs(json.loads(r["feat"]), self._op_live(r["creator"], r["create_ts"])))
-                every.append((r["decided_ts"], s))
-                if rw_low(r):
-                    low.append((r["decided_ts"], s))
+                                      "ORDER BY decided_ts", (now - window,)):
+                sc = new.score(pull_inputs(json.loads(r["feat"]), self._op_live(r["creator"], r["create_ts"])))
+                every.append((r["decided_ts"], sc))
+                if is_low(r):
+                    low.append((r["decided_ts"], sc))
             with self.lock:
-                self.rw_model, self.rw_mtime = model, mtime
-                self.rw_all, self.rw_low = collections.deque(every), collections.deque(low)
-        return self.rw_model
+                setattr(self, f"{track}_model", new)
+                setattr(self, f"{track}_mtime", mtime)
+                setattr(self, f"{track}_all", collections.deque(every))
+                setattr(self, f"{track}_low", collections.deque(low))
+            model = new
+        return model
 
-    def _rw_verdict(self, feat: dict, creator: str | None, create_ts: float, now: float, low: bool) -> dict:
-        """Rug-vs-win score of a liquid pool and its percentile among the past RW_BLOCK_S's liquid pools (and, for
-        a pool in the 6 h bottom 20%, among those)."""
-        model = self._load_rw_model()
+    def _rw_verdict(self, feat: dict, creator: str | None, create_ts: float, now: float, low: bool,
+                    track: str = "rw") -> dict:
+        """Rug-vs-win score of a liquid pool and its percentile among the ranking window's liquid pools (and, for
+        a pool in that rule's bottom 20%, among those). Columns `<track>`, `<track>_pct`, `<track>_low_pct`."""
+        model = self._load_rw_model(track)
         if model is None:
             return {}
+        _, window, _ = self._rw_track(track)
         rw = model.score(pull_inputs(feat, self._op_live(creator, create_ts)))
         with self.lock:
-            for dq in (self.rw_all, self.rw_low):
-                while dq and dq[0][0] < now - RW_BLOCK_S:
+            every, lows = getattr(self, f"{track}_all"), getattr(self, f"{track}_low")
+            for dq in (every, lows):
+                while dq and dq[0][0] < now - window:
                     dq.popleft()
-            past_all, past_low = [v for _, v in self.rw_all], [v for _, v in self.rw_low]
-            self.rw_all.append((now, rw))
+            past_all, past_low = [v for _, v in every], [v for _, v in lows]
+            every.append((now, rw))
             if low:
-                self.rw_low.append((now, rw))
-        out = {"rw": rw, "rw_pct": _rank_pct(past_all, rw, model.meta.get("quantiles"))}
+                lows.append((now, rw))
+        out = {track: rw, f"{track}_pct": _rank_pct(past_all, rw, model.meta.get("quantiles"))}
         if low:
-            out["rw_low_pct"] = _rank_pct(past_low, rw, model.meta.get("low_quantiles"))
+            out[f"{track}_low_pct"] = _rank_pct(past_low, rw, model.meta.get("low_quantiles"))
         return out
 
     def _hist_verdict(self, feat: dict, now: float) -> dict:
@@ -827,11 +873,15 @@ class LaunchLive:
         if cols.get("low_h"):
             cols.update(self._risk_verdict(feat, rec.get("creator"), create, now))
         cols.update(self._rw_verdict(feat, rec.get("creator"), create, now, bool(cols.get("rw_low6"))))
+        if self.cfg.launch_rw24_book:
+            cols.update(self._rw_verdict(feat, rec.get("creator"), create, now, bool(cols.get("low_h")), track="rw24"))
         flags = {**low_flags(cols.get("low_h"), cols.get("risk_pct")),
-                 **rw_flags(cols.get("rw_low6"), cols.get("rw_pct"), cols.get("rw_low_pct"))}
+                 **rw_flags(cols.get("rw_low6"), cols.get("rw_pct"), cols.get("rw_low_pct")),
+                 **rw24_flags(cols.get("low_h"), cols.get("rw24_pct"), cols.get("rw24_low_pct"))}
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
         if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")
-                                         or flags["d12"] or flags["rw50"] or flags["d12rw50"]):
+                                         or flags["d12"] or flags["rw50"] or flags["d12rw50"]
+                                         or flags["rw50_24"] or flags["d12rw50_24"]):
             px = la.chain_price(rows, DECIDE_S)  # SOL per whole token (vault UI amounts)
             if sol_usd and px:
                 self.signals.put_nowait({
@@ -938,7 +988,7 @@ class LaunchLive:
                 wait = 0.5 if due is None else min(0.5, max(0.02, due - self.clock()))
                 stop.wait(wait)
         threading.Thread(target=run, name="launch-live", daemon=True).start()
-        if self.cfg.launch_rw_book and self.cfg.db_path != ":memory:":
+        if (self.cfg.launch_rw_book or self.cfg.launch_rw24_book) and self.cfg.db_path != ":memory:":
             threading.Thread(target=self._rw_retrain_loop, args=(stop,), name="rw-retrain", daemon=True).start()
         return stop
 
@@ -958,27 +1008,31 @@ class LaunchLive:
                     fh.write("1000")
             except OSError:
                 pass
+        jobs = ([(rw_model_path, RW_BLOCK_S, "launch-rw-train")] if self.cfg.launch_rw_book else []) + \
+            ([(rw24_model_path, RW24_RETRAIN_S, "launch-rw24-train")] if self.cfg.launch_rw24_book else [])
         while not stop.is_set():
-            try:
-                age = time.time() - rw_model_path(self.cfg).stat().st_mtime
-            except OSError:
-                age = float("inf")
-            if age >= RW_BLOCK_S:
+            wait = RW_RETRY_S
+            for path_fn, every, command in jobs:
                 try:
-                    res = subprocess.run([sys.executable, "-m", "tradingbot", "launch-rw-train"],
+                    age = time.time() - path_fn(self.cfg).stat().st_mtime
+                except OSError:
+                    age = float("inf")
+                if age < every:
+                    wait = min(wait, every - age + 5)
+                    continue
+                try:
+                    res = subprocess.run([sys.executable, "-m", "tradingbot", command],
                                          env={**os.environ, "TB_DB_PATH": self.cfg.db_path},
                                          preexec_fn=low_priority, timeout=RW_RETRAIN_TIMEOUT_S,
                                          stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                     if res.returncode != 0:
-                        log.error("rug-vs-win retrain: child exited %s: %s", res.returncode,
+                        log.error("%s: child exited %s: %s", command, res.returncode,
                                   res.stderr.decode(errors="replace")[-300:])
                     else:
-                        log.info("rug-vs-win model retrained (every %d h, all finished pools)", RW_BLOCK_S // 3600)
+                        log.info("rug-vs-win model retrained (%s, every %d h)", command, every // 3600)
                 except Exception as exc:  # noqa: BLE001 (the old model keeps scoring)
-                    log.error("rug-vs-win retrain could not run: %s: %s", type(exc).__name__, exc)
-                stop.wait(RW_RETRY_S)  # a failed run (no new file) is retried after RW_RETRY_S
-                continue
-            stop.wait(min(RW_BLOCK_S - age + 5, RW_RETRY_S))
+                    log.error("%s could not run: %s: %s", command, type(exc).__name__, exc)
+            stop.wait(wait)  # a failed run (no new file) is retried after RW_RETRY_S
 
 
 # --- status ---------------------------------------------------------------------------------------
@@ -1616,11 +1670,12 @@ def fill_gap(store, journal, book: str, since: float, rng) -> dict:
                                                 (book, since - 600))}
     missed = []
     if flag:
-        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct, rw_pct, rw_low_pct, rw_low6 "
+        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct, rw_pct, rw_low_pct, rw_low6, rw24_pct, rw24_low_pct "
                              "FROM watch_launch_live "
                              "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND create_ts >= ?", (since,)):
             hit = r[flag] if flag in ("top2", "top5", "top2h", "top5h") else {
-                **low_flags(r["low_h"], r["risk_pct"]), **rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"])}[flag]
+                **low_flags(r["low_h"], r["risk_pct"]), **rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"]),
+                **rw24_flags(r["low_h"], r["rw24_pct"], r["rw24_low_pct"])}[flag]
             if hit and r["token_mint"] not in bought:
                 missed.append({"ret": r["ret"]})
     if not pairs:
@@ -1735,7 +1790,11 @@ def status(store, cfg: Config, hours: float = 24, now: float | None = None, jour
         f"rug-vs-win: every liquid pool minus the riskiest {RW_SKIP}%": _group(
             [r for r in done if rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"])["rw50"]], rng),
         f"rug-vs-win: history bottom 20% minus the riskiest {RW_SKIP}%": _group(
-            [r for r in done if rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"])["d12rw50"]], rng)}
+            [r for r in done if rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"])["d12rw50"]], rng),
+        f"rug-vs-win 24 h rule: every liquid pool minus the riskiest {RW_SKIP}%": _group(
+            [r for r in done if rw24_flags(r["low_h"], r["rw24_pct"], r["rw24_low_pct"])["rw50_24"]], rng),
+        f"rug-vs-win 24 h rule: history bottom 20% minus the riskiest {RW_SKIP}%": _group(
+            [r for r in done if rw24_flags(r["low_h"], r["rw24_pct"], r["rw24_low_pct"])["d12rw50_24"]], rng)}
     out["feature parity with the backtest"] = parity(store, scored)
     out["live vs training (drift)"] = drift(scored, cfg)
     if journal is not None:  # the launch books' own buys: where the seconds from creation to the fill go

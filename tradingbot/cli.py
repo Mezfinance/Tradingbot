@@ -70,7 +70,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-hist-backfill", "launch-hist-test", "launch-exit-study",
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
-                                            "launch-filter-study", "launch-rw-train", "dashboard-summary"])
+                                            "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -277,6 +277,13 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore, watch_db_path
         out = launch_live.train_rw_and_save(WatchStore(watch_db_path(cfg)), cfg)
         print(f"rug-vs-win model written to {out}" if out else "rug-vs-win model: not enough data to train yet")
+        return
+
+    if args.command == "launch-rw24-train":  # the earlier rule's rug-vs-win model (rw24 twin books)
+        from tradingbot import launch_live
+        from tradingbot.watcher import WatchStore, watch_db_path
+        out = launch_live.train_rw24_and_save(WatchStore(watch_db_path(cfg)), cfg)
+        print(f"rug-vs-win (24 h rule) model written to {out}" if out else "rug-vs-win (24 h rule) model: not enough data")
         return
 
     if args.command == "launch-pull-train":  # only the early-pull model (light; watch-model-train does all)

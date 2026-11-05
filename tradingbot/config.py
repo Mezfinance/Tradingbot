@@ -77,6 +77,7 @@ class Config:
     # launchrw50 / launchd12rw50 (11-04): every liquid pool / the history model's bottom 20%, minus the riskiest
     # half by the rug-vs-win model (model/rw.json: P(rug before the exit) - P(+50% win)), sold at pool minute 6
     launch_rw_book: bool = False
+    launch_rw24_book: bool = False  # 11-05: twin rw books on the earlier rule (24 h ranking, nightly 14-day model)
     # One-off fresh start for some books (comma list): their history is kept as '<book>@<reset_books_id>' and
     # their cash goes back to the starting amount. Runs once per reset_books_id, at engine start.
     reset_books: str = ""
