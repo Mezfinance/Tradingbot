@@ -163,3 +163,22 @@ def test_bogus_jupiter_impact_is_replaced_by_our_own_size_probe(sim):
     thin = pool(1000, impact_per_full=0.20)
     ex = sim([thin, thin])
     assert ex.buy("T", 50, 0.001) is None and "price impact 19" in ex.last_note
+
+
+def test_launch_book_sells_quote_with_their_own_slippage(sim):
+    """A book with sell_slippage_bps set (the launch books, 1000) asks Jupiter for that tolerance on sells only."""
+    seen = []
+
+    class Recording(FakeJupiter):
+        def quote(self, in_mint, out_mint, in_raw, slippage_bps=None):
+            seen.append(slippage_bps)
+            return super().quote(in_mint, out_mint, in_raw)
+
+    ex = sim([])
+    ex.jup = Recording([q(1_000_000, 900_000), q(950_000, 900_000)])
+    ex.sell_slippage_bps = 1000
+    assert ex.sell("T", 1, 1).ok  # 950k landed stays above the 10% floor of 900k: no revert
+    assert seen == [1000, 1000]
+    seen.clear()
+    ex.jup.quotes = [q(1_000_000, 970_000), q(990_000, 960_000)]
+    assert ex.buy("T", 50, 1).ok and seen == [None, None]  # buys keep the default

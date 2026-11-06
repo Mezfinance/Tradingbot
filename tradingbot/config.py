@@ -256,6 +256,9 @@ class Config:
     priority_fee_sol: float = 0.001  # base + priority fee per transaction
     ata_rent_sol: float = 0.00203928  # new token account; live executor does not reclaim it
     sim_latency_s: float = 3.0  # decision -> landed transaction
+    # launch books sell like the real canary (launch_canary_sell_slippage_bps): with 3% the simulator reverted 139
+    # minute-6 sales on fast pools (11-06), retried them 10-40 s late and gave up ~1 pt/trade, mostly on big winners
+    launch_sell_slippage_bps: int = 1000
     sim_fill_mode: str = "midpoint"  # expected | midpoint | pessimistic (see SimExecutor)
 
     # --- live -----------------------------------------------------------

@@ -31,6 +31,7 @@ class SimExecutor:
         self.jup = jupiter
         self.latency_s = cfg.sim_latency_s if latency_s is None else latency_s
         self.sleep = sleep
+        self.sell_slippage_bps: int | None = None  # None = Jupiter's default (cfg.slippage_bps); launch books 1000
 
     # --- costs ---------------------------------------------------------------
     def _sol_usd(self, sol: float) -> float:
@@ -42,14 +43,14 @@ class SimExecutor:
 
     # --- fills ----------------------------------------------------------------
     def _execute(self, in_mint: str, out_mint: str, in_raw: int, cap_impact: bool,
-                 estimate_impact=None) -> tuple[int | None, str]:
+                 estimate_impact=None, slippage_bps: int | None = None) -> tuple[int | None, str]:
         """Returns (filled output raw amount, note). None output = reverted / no route.
 
         Exits pass cap_impact=False: a stop must go through even on a thin pool. Jupiter reports 100% impact
         when it can't value a token yet (seconds-old pools; measured 11-02: reported 100%, real 1.5-1.8%);
         then `estimate_impact(quote)` gives the impact from the quote's price vs the trigger price.
         """
-        first = self.jup.quote(in_mint, out_mint, in_raw)
+        first = self._quote(in_mint, out_mint, in_raw, slippage_bps)
         if first is None:
             return None, self._why_none("no route")
         impact = first.price_impact_pct
@@ -59,12 +60,17 @@ class SimExecutor:
             return None, f"price impact {impact:.2f}%"
         if self.latency_s > 0:
             self.sleep(self.latency_s)
-        landed = self.jup.quote(in_mint, out_mint, in_raw)
+        landed = self._quote(in_mint, out_mint, in_raw, slippage_bps)
         if landed is None:
             return None, self._why_none("route vanished")
         if landed.out_raw < first.min_out_raw:
             return None, "slippage exceeded (reverted)"
         return self._fill_amount(first, landed), "ok"
+
+    def _quote(self, in_mint: str, out_mint: str, in_raw: int, slippage_bps: int | None):
+        if slippage_bps is None:
+            return self.jup.quote(in_mint, out_mint, in_raw)
+        return self.jup.quote(in_mint, out_mint, in_raw, slippage_bps=slippage_bps)
 
     def _own_impact(self, in_mint: str, out_mint: str, in_raw: int, first: Quote, estimate_impact) -> float:
         return own_impact(self.jup, in_mint, out_mint, in_raw, first, estimate_impact)
@@ -111,7 +117,8 @@ class SimExecutor:
         if decimals is None or qty <= 0:
             return None
         fee = self.tx_fee_usd()
-        out_raw, note = self._execute(token, USDC_MINT, int(qty * 10**decimals), cap_impact=False)
+        out_raw, note = self._execute(token, USDC_MINT, int(qty * 10**decimals), cap_impact=False,
+                                      slippage_bps=self.sell_slippage_bps)
         if out_raw is None:
             # A reverted exit burns its fee. With no route nothing is sent, but the
             # position is stuck, which is exactly what happens when liquidity is pulled.

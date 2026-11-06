@@ -44,6 +44,7 @@ RECHECK_REJECTED_S = 30 * 60
 DUST_QTY = 1e-12
 EQUITY_SNAPSHOT_S = 60
 EXIT_RETRY_S = 120  # a sell with no route is retried this often
+SELL_REVERT_RETRIES = 2  # a reverted pool-minute exit is tried again at once this many times
 STUCK_AFTER_S = 0  # a position with no route out is valued at zero from its first blocked sale (11-05, was 1800);
 # a later sale that finds a route closes it and brings the money back
 BUY_WORKERS = 16  # every book that wants a signal starts its buy at once (up to 17 books run)
@@ -86,6 +87,7 @@ class Engine:
         if canary_executor is not None and cfg.canary_every_n > 0:
             self.books[CANARY] = self._open_book(CANARY, canary_executor, cfg.canary_budget_usd, cfg.canary_usd)
         self.model_book = None
+        self._pool_minute_books: set[str] = set()
         if model_executor is not None and cfg.model_book:
             from tradingbot import model_book as mb
             for name in mb.active_books(cfg):  # same signals, separate cash and ledgers
@@ -98,10 +100,13 @@ class Engine:
                     self.books[name] = book
                     continue
                 ex = model_executor if name == mb.NAME else copy.copy(model_executor)
+                if name in mb.LAUNCH_CUT and hasattr(ex, "sell_slippage_bps"):
+                    ex.sell_slippage_bps = cfg.launch_sell_slippage_bps  # a minute-6 exit must go through
                 book = self._open_book(name, ex, cfg.model_book_cash_usd, cfg.model_book_usd)
                 book.exit_cfg = mb.exit_config(cfg, name)
                 self.books[name] = book
             self.model_book = mb.ModelBook(cfg)
+            self._pool_minute_books = set(mb.POOL_MINUTE_EXIT)
         self._rng = random.Random(cfg.shadow_seed)
         self.lock = threading.RLock()  # guards book cash and position state
         self.tracker = Tracker(journal, dex, jupiter)
@@ -846,6 +851,14 @@ class Engine:
 
     def _sell(self, book: Book, pos: Position, qty: float, price: float, reason: str) -> bool:
         fill = book.executor.sell(pos.token_address, min(qty, pos.qty), price)
+        # a pool-minute exit that reverts is retried at once (each try costs its fee), not at the next monitor pass:
+        # waiting 10-40 s on a fast pool cost the launch books ~1 pt/trade (11-06 fill-gap study)
+        tries = SELL_REVERT_RETRIES if book.name in self._pool_minute_books else 0
+        while tries and fill is not None and not fill.ok and "reverted" in (fill.note or ""):
+            self._charge_failed(book, pos.token_address, fill)
+            log.info("[%s] sell %s (%s) reverted; retrying now", book.name, pos.symbol, reason)
+            fill = book.executor.sell(pos.token_address, min(qty, pos.qty), price)
+            tries -= 1
         if fill is not None and not fill.ok and (RATE_LIMITED in (fill.note or "")
                                                  or (fill.note or "").startswith("not sent:")):
             log.info("[%s] sell %s (%s) postponed: %s", book.name, pos.symbol, reason, fill.note)

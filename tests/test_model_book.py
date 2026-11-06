@@ -887,3 +887,29 @@ def test_unlisted_tokens_are_priced_in_turn(cfg, good_pair):
     eng.current_prices(mints, held)
     eng.current_prices(mints, held)
     assert set(jup.asked) == mints  # two passes reach every token, not the same first ten twice
+
+
+def test_a_reverted_pool_minute_exit_is_retried_at_once(cfg, good_pair):
+    """A minute-6 sale that reverts is tried again in the same pass (each try pays its fee); other books wait."""
+    from tradingbot.execution.base import Fill, failed
+    eng, j, pos = _held_position(cfg, good_pair, None)
+    book = eng.books[mb.NAME]
+
+    class Flaky:
+        def __init__(self, reverts):
+            self.reverts, self.calls = reverts, 0
+
+        def sell(self, token, qty, ref):
+            self.calls += 1
+            if self.calls <= self.reverts:
+                return failed(0.1, "slippage exceeded (reverted)")
+            return Fill(qty=qty, price=3e-5, usd=qty * 3e-5, fee_usd=0.1, tx="sim", note="ok")
+
+    book.executor = Flaky(reverts=1)
+    assert not eng._sell(book, pos, pos.qty, 3e-5, "pool_age_exit")  # not a pool-minute book: no retry
+    assert book.executor.calls == 1
+    eng._pool_minute_books = {mb.NAME}
+    book.executor = Flaky(reverts=2)
+    assert eng._sell(book, pos, pos.qty, 3e-5, "pool_age_exit")
+    assert book.executor.calls == 3 and pos.closed_at is not None
+    assert len(j.query("SELECT 1 FROM events WHERE kind='tx_failed'")) == 3  # every revert charged
