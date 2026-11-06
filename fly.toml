@@ -26,6 +26,7 @@ primary_region = "iad"
   TB_LAUNCH_M5_BOOK = "1"  # launch4_2m5: launch4_2's picks sold at pool minute 5 (11-04)
   # REAL MONEY canary of launchrw50_sz (11-06): ON since the 11-06 smoke test passed; canary-stop to halt (DEPLOY.md).
   TB_LAUNCH_CANARY = "1"  # REAL MONEY: canary_rw50_sz, launchrw50_sz's thin-pool picks at $10 (DEPLOY.md)
+  TB_LAUNCH_CANARY_BUDGET_USD = "20"  # the USDC left in the canary wallet (11-06 reset)
   TB_LAUNCH_CANARY_EVERY_N = "4"  # 1 in 4 thin-pool picks: ~60 real round trips a day, ~0.06 SOL in fees
   TB_LAUNCH_RW_BOOK = "1"  # launchrw50 / launchd12rw50: skip the riskiest half by rug-vs-win odds (11-04)
   TB_LAUNCH_SIZED_BOOK = "1"  # launchrw50_sz: launchrw50's signals sized by liquidity band ($250 < $15k, $25 at $15-25k, $100 above), from size-study (11-06)
@@ -36,8 +37,8 @@ primary_region = "iad"
   TB_LAUNCH_LIVE_DAILY_CREDITS = "10000000"  # scorer uncapped (11-05): the 28k/day pro-rata budget idled every book ~25 min of each UTC hour (0 would mean off)
   TB_DISABLED_BOOKS = "launchd12_s10,launchd12_s20,launchd12_s30,launchd12_s50,early7,early7r"  # 11-05: skip books lose more the more they skip (s10 -5% .. s50 -14%); minute-7 exits -14%, 28% rugged (low-decile rug-vs-win books back on 11-05 at the user's request)
   TB_MODEL_BOOK_DAILY_LOSS_PCT = "0"  # 11-05: no daily loss limit on the paper books (launch4_5 skipped 68 signals on it): every signal is traded and measured
-  TB_RESET_BOOKS = "launchrw50,launchd12rw50"  # fresh start on the study's rule (6 h ranking, 6-hourly retrain on all pools); once per id; earlier: 2026-11-02-drift launch4_2/5, 2026-11-04-impact-probe launchd12 books, 2026-11-05-dashboard-lag these two
-  TB_RESET_BOOKS_ID = "2026-11-05-study-rule"
+  TB_RESET_BOOKS = "canary_rw50_sz"  # canary restarts at the $20 left in the wallet after 4 rugs; once per id; earlier: 2026-11-02-drift launch4_2/5, 2026-11-04-impact-probe launchd12 books, 2026-11-05-dashboard-lag + 2026-11-05-study-rule launchrw50/launchd12rw50
+  TB_RESET_BOOKS_ID = "2026-11-06-canary-20"
   TB_HELIUS_DAILY_CREDITS = "0"  # early-buyer lookups off: their credits go to the launch scorer
   TB_OPERATOR_DAILY_CREDITS = "0"  # rug-catcher operator lookups off (ops books are off)
 
