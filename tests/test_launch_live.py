@@ -917,3 +917,35 @@ def test_fill_gap_study_finds_where_real_fills_fall_short():
     bands = {b["band"]: b for b in out["by sale second (pool age at sale)"]}
     assert bands["420 s+"]["n"] == 1 and bands["420 s+"]["share_of_total_gap_pct"] > 40
     assert out["price-only gap (swap move vs scorer's gross move), mean / median"][2] == 2
+
+
+def test_size_study_keeps_real_results_at_real_size_and_charges_impact_on_bigger_trades():
+    from tradingbot.journal import Journal
+    st = WatchStore(":memory:")
+    ll.ensure_schema(st)
+    j = Journal(":memory:")
+    t0 = 1_700_000_000.0
+    # token, liquidity at second 4 (USD), SOL in pool at fill / exit, price move, real $ back on $100
+    cases = [("THIN", 10_000.0, 25.0, 40.0, 0.6, 150.0), ("DEEP", 100_000.0, 250.0, 300.0, 0.2, 117.0),
+             ("RUG", 20_000.0, 50.0, 1.0, -1.0, 0.0)]
+    for i, (tok, liq, fsol, esol, move, back) in enumerate(cases):
+        c = t0 + i * 1000
+        st.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, liquid, ret, status, liq_usd, "
+                   "sol_at_decide, fill_sol, exit_sol, fill_px, exit_px) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                   (f"P{tok}", tok, c, 1, max(-1.0, move - 0.06), "done", liq, fsol, fsol, esol, 1.0, 1.0 + move))
+        pid = j.execute("INSERT INTO positions(token, symbol, cost_usd, opened_at, closed_at, realized_usd, strategy) "
+                        "VALUES (?,?,?,?,?,?,?)", (tok, tok, 100.0, c + 9, c + 365, back, "launchrw50"))
+        j.execute("INSERT INTO fills(position_id, side, price, usd, fee_usd, ts) VALUES (?,?,?,?,?,?)",
+                  (pid, "buy", 1.0, -100.0, 0.3, c + 9))
+    out = ll.size_study(st, j, now=t0 + 10_000)
+    assert out["trades"] == 3 and out["rugs"] == 1
+    p = out["policies"]
+    assert p["fixed $100"]["total_usd"] == round((150 - 100) + (117 - 100) - 100)  # the real result, unchanged
+    assert p["fixed $100"]["rugs_usd"] == -100 and p["fixed $1000"]["rugs_usd"] == -1000
+    # $1000 costs more per $ in the thin pool than in the deep one
+    thin10 = p["fixed $1000"]["by liquidity"]["< 15k"] / 1000
+    assert thin10 < p["fixed $100"]["by liquidity"]["< 15k"] / 100
+    deep_drop = p["fixed $100"]["by liquidity"]["50k+"] / 100 - p["fixed $1000"]["by liquidity"]["50k+"] / 1000
+    thin_drop = p["fixed $100"]["by liquidity"]["< 15k"] / 100 - thin10
+    assert thin_drop > deep_drop > 0
+    assert out["calibration by liquidity"][0]["band"] == "< 15k"

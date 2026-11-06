@@ -2122,3 +2122,95 @@ def fill_gap_study(store, journal, books=GAP_BOOKS, hours: float | None = None, 
                    "in, minute 6 out, flat 6% cost, capped +300%, rug = -100%; price-only gap leaves out rugged and "
                    "capped pools and both sides' costs (real fees, the scorer's 6%)")
     return out
+
+
+# --- size study (11-06): would sizing by pool liquidity earn more, without giving up the big winners? ------------
+SIZE_FIXED = (25, 50, 100, 250, 500, 1000)
+SIZE_SHARES = (0.0025, 0.005, 0.01, 0.02)  # trade size as a share of the pool's liquidity at second 4
+SIZE_MIN, SIZE_MAX = 20.0, 2000.0
+SIZE_BIG = 0.5  # ideal +50% or more = a big winner
+SIZE_LIQ_BANDS = (("< 15k", 0, 1.5e4), ("15-25k", 1.5e4, 2.5e4), ("25-50k", 2.5e4, 5e4), ("50k+", 5e4, 1e12))
+
+
+def _amm_keep(size: float, r_in: float, gross: float, r_out: float) -> float:
+    """Share of spot value kept on a constant-product round trip: buy `size` USD into a pool holding `r_in` USD of
+    SOL, the price moves by `gross`, then sell into `r_out` USD of SOL. Pool fees and timing are in the real trade."""
+    buy = 1 / (1 + size / r_in) if r_in > 0 else 1.0
+    value = size * (1 + gross) * buy
+    sell = 1 / (1 + value / r_out) if r_out > 0 else 1.0
+    return buy * sell
+
+
+def size_study(store, journal, book: str = "launchrw50", hours: float | None = None, now: float | None = None) -> dict:
+    """Each real trade of `book` re-sized: its real result at its real size, with only the price impact changed
+    (constant-product pool, reserves at the fill and at minute 6 from the scorer's vault reads). Rugs stay -100%.
+    Compares fixed sizes with sizes scaled to liquidity: total $, $ from big winners and rugs, $ by liquidity band."""
+    now = now if now is not None else time.time()
+    ensure_schema(store)
+    since = now - hours * 3600 if hours else 0.0
+    trades = []
+    for p in journal.query("SELECT id, token, opened_at, closed_at, cost_usd, realized_usd FROM positions "
+                           "WHERE strategy=? AND opened_at >= ? AND closed_at IS NOT NULL", (book, since)):
+        s = store.query("SELECT ret, liq_usd, sol_at_decide, fill_sol, exit_sol, fill_px, exit_px FROM watch_launch_live "
+                        "WHERE token_mint=? AND status='done' AND create_ts <= ? ORDER BY create_ts DESC LIMIT 1",
+                        (p["token"], p["opened_at"]))
+        if not s or not p["cost_usd"] or not s[0]["liq_usd"] or not s[0]["sol_at_decide"] or not s[0]["fill_sol"]:
+            continue
+        s = s[0]
+        sol_usd = s["liq_usd"] / (2 * s["sol_at_decide"])
+        fees = sum((f["fee_usd"] or 0) for f in journal.query("SELECT fee_usd FROM fills WHERE position_id=?", (p["id"],)))
+        gross = (s["exit_px"] / s["fill_px"] - 1) if s["exit_px"] and s["fill_px"] else 0.0
+        trades.append({"s0": p["cost_usd"], "proceeds0": p["realized_usd"] + fees, "fees": fees,
+                       "liq": s["liq_usd"], "r_in": s["fill_sol"] * sol_usd,
+                       "r_out": (s["exit_sol"] or 0) * sol_usd, "gross": gross,
+                       "ideal": s["ret"], "rug": p["realized_usd"] <= 0.01 * p["cost_usd"]})
+    if not trades:
+        return {"book": book, "trades": 0}
+
+    def result(t, size):
+        if t["rug"]:
+            return -size  # nothing comes back
+        keep0 = _amm_keep(t["s0"], t["r_in"], t["gross"], t["r_out"])
+        keep = _amm_keep(size, t["r_in"], t["gross"], t["r_out"])
+        proceeds = size * (t["proceeds0"] / t["s0"]) * keep / keep0
+        return proceeds - t["fees"] - size
+
+    def policy(sizer):
+        rows = [(t, sizer(t)) for t in trades]
+        pnl = [result(t, s) for t, s in rows]
+        big = [x for (t, _), x in zip(rows, pnl) if (t["ideal"] or 0) >= SIZE_BIG]
+        rug = [x for (t, _), x in zip(rows, pnl) if t["rug"]]
+        sizes = [s for _, s in rows]
+        out = {"total_usd": round(sum(pnl)), "avg_size_usd": round(float(np.mean(sizes))),
+               "per_100_deployed_usd": round(100 * sum(pnl) / sum(sizes), 2),
+               "big_winners_usd": round(sum(big)), "rugs_usd": round(sum(rug)),
+               "worst_trade_usd": round(min(pnl))}
+        out["by liquidity"] = {name: round(sum(x for (t, _), x in zip(rows, pnl) if lo <= t["liq"] < hi))
+                               for name, lo, hi in SIZE_LIQ_BANDS}
+        return out
+
+    clip = lambda x: min(SIZE_MAX, max(SIZE_MIN, x))
+    mean_liq = float(np.mean([t["liq"] for t in trades]))
+    policies = {f"fixed ${a}": policy(lambda t, a=a: float(a)) for a in SIZE_FIXED}
+    for f in SIZE_SHARES:
+        policies[f"{100 * f:g}% of liquidity"] = policy(lambda t, f=f: clip(f * t["liq"]))
+    policies["liquidity-scaled, same average size as $100"] = policy(lambda t: clip(100 * t["liq"] / mean_liq))
+    # calibration: the model's own impact at $100 by band vs the books' measured real-minus-ideal gap
+    calib = []
+    for name, lo, hi in SIZE_LIQ_BANDS:
+        g = [t for t in trades if lo <= t["liq"] < hi and not t["rug"]]
+        if g:
+            calib.append({"band": name, "n": len(g),
+                          "model round-trip impact at $100 (%)": round(100 * float(np.median(
+                              [1 - _amm_keep(100, t["r_in"], t["gross"], t["r_out"]) for t in g])), 2),
+                          "measured gap real - ideal (median pts)": round(100 * float(np.median(
+                              [t["proceeds0"] / t["s0"] - 1 - t["fees"] / t["s0"] - (t["ideal"] or 0) for t in g])), 1),
+                          "big winners %": round(100 * sum((t["ideal"] or 0) >= SIZE_BIG for t in g) / len(g))})
+    return {"book": book, "trades": len(trades), "rugs": sum(t["rug"] for t in trades),
+            "big winners (ideal +50% or more)": sum((t["ideal"] or 0) >= SIZE_BIG for t in trades),
+            "mean liquidity at second 4 (USD)": round(mean_liq),
+            "calibration by liquidity": calib, "policies": policies,
+            "note": ("each trade keeps its real result at its real size; only the constant-product price impact "
+                     "changes with size (reserves at the scorer's fill and minute-6 reads); rugs lose the whole "
+                     "stake at any size; bigger sizes also move the pool for other traders and may be harder to fill, "
+                     "which this ignores, so the larger sizes are optimistic")}
