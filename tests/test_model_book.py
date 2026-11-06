@@ -856,3 +856,34 @@ def test_disabled_books_and_no_daily_loss_limit(cfg):
     book = eng.books[mb.EARLY5]
     j.realized_since = lambda since, name: -1e9  # a huge loss today
     assert eng._model_skip_reason(book, {"token": "X", "ts": time.time()}) != "daily loss limit"
+
+
+def test_a_position_nothing_can_price_still_sells_at_its_deadline(cfg, good_pair):
+    """11-06: early6t held two unpriced trades for a day: no price meant no deadline exit, no block, valued at cost."""
+    eng, j, pos = _held_position(cfg, good_pair, RuggedJupiter())
+    eng.current_prices = lambda tokens, held=None: {}
+    eng.manage_positions()
+    assert not j.query("SELECT 1 FROM fills WHERE side='sell'")  # no price is no reason to stop out
+    eng._deadlines[pos.id] = time.time() - 1
+    eng.manage_positions()
+    assert [r for (r,) in j.query("SELECT reason FROM fills WHERE side='sell'")] == ["pool_age_exit"]
+
+
+def test_unlisted_tokens_are_priced_in_turn(cfg, good_pair):
+    import tradingbot.engine as engine_mod
+
+    class Counting(RuggedJupiter):
+        def __init__(self):
+            super().__init__(sell=1e-6)
+            self.asked = []
+
+        def sell_price(self, mint, qty):
+            self.asked.append(mint)
+            return self.sell
+    jup = Counting()
+    eng, j, pos = _held_position(cfg, good_pair, jup)
+    mints = {f"M{i:02d}" for i in range(engine_mod.QUOTE_PRICE_MAX + 5)}
+    held = {m: 1.0 for m in mints}
+    eng.current_prices(mints, held)
+    eng.current_prices(mints, held)
+    assert set(jup.asked) == mints  # two passes reach every token, not the same first ten twice

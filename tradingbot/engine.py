@@ -108,6 +108,7 @@ class Engine:
         self.backups = DailyBackup(journal, cfg)
         self._cooldown: dict[str, float] = journal.load_cooldowns()  # token -> time it may be re-screened
         self._last_prices: dict[str, float] = {}
+        self._quote_cursor = 0  # rotates which unlisted tokens get a sell-quote price each pass
         self._blocked: dict[int, dict] = {}  # position id -> exit blocked (no route): since, next try, note
         self._deadlines = self._load_deadlines()  # position id -> sell by this time (pool-age exit)
         self._climbs = self._load_climbs()  # position id -> [check time, price to reach, best price seen]
@@ -280,7 +281,12 @@ class Engine:
                     prices[snap.token_address] = snap.price_usd
         missing = tokens - prices.keys()
         if missing and self.jupiter is not None and hasattr(self.jupiter, "quote_price"):
-            for mint in sorted(missing)[:QUOTE_PRICE_MAX]:  # brand-new (or rugged) tokens neither feed lists
+            # Brand-new (or rugged) tokens neither feed lists, QUOTE_PRICE_MAX per pass in turn: always taking the
+            # first few alphabetically left later ones (early6t's Green Cat, ARMCHIP) unpriced for a day (11-06).
+            order = sorted(missing)
+            start = self._quote_cursor % len(order)
+            self._quote_cursor += QUOTE_PRICE_MAX
+            for mint in (order[start:] + order[:start])[:QUOTE_PRICE_MAX]:
                 if held and mint in held and hasattr(self.jupiter, "sell_price"):
                     p = self.jupiter.sell_price(mint, held[mint])
                     limited = getattr(self.jupiter, "last_failure", lambda: "")() == RATE_LIMITED
@@ -316,18 +322,24 @@ class Engine:
                 # and fire the stop (a launch4_5 trade was sold at pool second 17). These books only ever sell
                 # at their pool minute, so plan with the entry price; a real rug shows as no route at the exit.
                 price = pos.entry_price
-            if price is None or book is None:
-                if price is None:
-                    log.warning("no price for open position %s (%s)", pos.symbol, pos.strategy)
+            if book is None:
                 continue
+            no_price = price is None
+            if no_price:
+                # No feed and no quote priced it this pass. It used to be skipped outright, so its deadline or hold
+                # never sold it, it was never marked exit-blocked ($0) and equity kept it at cost: early6t held two
+                # such trades for a day (11-06). Plan with the entry price for the time exits only; the sale itself
+                # quotes for real and either fills or marks the exit blocked.
+                price = pos.entry_price
             blocked = self._blocked.get(pos.id)
             if blocked and now < blocked["next"]:
                 continue  # no route out last time: retry every EXIT_RETRY_S, not every pass
             before = (pos.tp_hits, pos.stop_price)
             exit_cfg = book.exit_cfg or self.cfg
             exits = risk.plan_exits(pos, price, now, exit_cfg)
-            if hold_only:  # no stop, as in their backtest: a bogus low feed price must not sell early
-                exits = [(q, r) for q, r in exits if r not in ("stop_loss", "breakeven_stop")]
+            if hold_only or no_price:  # no stop on a made-up price (and none for launch books, as in their backtest)
+                exits = [(q, r) for q, r in exits if r not in ("stop_loss", "breakeven_stop")
+                         and not (no_price and r.startswith("take_profit"))]
             if not exits and now >= self._deadlines.get(pos.id, float("inf")):
                 exits = [(pos.qty, "pool_age_exit")]  # hand-made pool: out before its creator usually pulls it
             if not exits and self._climb_failed(pos.id, price, now):
