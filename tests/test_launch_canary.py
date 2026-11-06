@@ -262,3 +262,18 @@ def test_keypair_loads_from_json_array_or_base58():
     assert jx.load_keypair(str(list(bytes(kp)))).pubkey() == kp.pubkey()
     assert jx.load_keypair(f"  {kp}\n").pubkey() == kp.pubkey()  # base58, as Phantom exports it
     assert jx.load_keypair(f'"{kp}"').pubkey() == kp.pubkey()
+
+
+def test_keypair_is_found_without_the_entrypoint(tmp_path, monkeypatch):
+    """`fly machine exec` skips the entrypoint: no TB_KEYPAIR_PATH, but the secret file or the secret itself."""
+    kp = Keypair()
+    cfg = Config(db_path=":memory:", keypair_path=str(tmp_path / "missing.json"))
+    monkeypatch.setattr(jx, "SECRET_KEYPAIR_PATH", str(tmp_path / "secret.json"))
+    monkeypatch.delenv("TB_KEYPAIR_JSON", raising=False)
+    with pytest.raises(FileNotFoundError):
+        jx.read_keypair(cfg)
+    monkeypatch.setenv("TB_KEYPAIR_JSON", str(kp))
+    assert jx.read_keypair(cfg).pubkey() == kp.pubkey()
+    other = Keypair()
+    (tmp_path / "secret.json").write_text(str(list(bytes(other))))
+    assert jx.read_keypair(cfg).pubkey() == other.pubkey()  # the entrypoint's copy comes first

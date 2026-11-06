@@ -62,13 +62,29 @@ def load_keypair(text: str):
     return Keypair.from_base58_string(text)
 
 
+SECRET_KEYPAIR_PATH = "/run/secrets/keypair.json"  # written by deploy/entrypoint.sh, never on the volume
+
+
+def read_keypair(cfg: Config):
+    """The wallet key: the configured file, else the entrypoint's in-memory copy, else the TB_KEYPAIR_JSON secret
+    itself. A `fly machine exec` command doesn't pass through the entrypoint, so it has neither TB_KEYPAIR_PATH
+    nor (if the machine wasn't restarted after the secret was set) the file, but it does see the secret."""
+    for path in (cfg.keypair_path, SECRET_KEYPAIR_PATH):
+        if path and os.path.exists(path):
+            with open(path) as fh:
+                return load_keypair(fh.read())
+    if os.environ.get("TB_KEYPAIR_JSON"):
+        return load_keypair(os.environ["TB_KEYPAIR_JSON"])
+    raise FileNotFoundError(f"no wallet key: {cfg.keypair_path} and {SECRET_KEYPAIR_PATH} are missing and the "
+                            "TB_KEYPAIR_JSON secret is not set (fly secrets import -a supermeme)")
+
+
 class JupiterExecutor:
     def __init__(self, cfg: Config, jupiter: Jupiter, http: httpx.Client | None = None, keypair=None,
                  priority_fee_sol: float | None = None, sell_slippage_bps: int | None = None,
                  sleep=time.sleep):
         if keypair is None:
-            with open(cfg.keypair_path) as fh:
-                keypair = load_keypair(fh.read())
+            keypair = read_keypair(cfg)
         self.keypair = keypair
         self.owner = str(keypair.pubkey())
         self.cfg = cfg
