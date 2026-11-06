@@ -25,7 +25,7 @@ primary_region = "iad"
   TB_LAUNCH_HIST_BOOK = "0"  # launch4h_2/5 off (11-04): history model worse every exit minute (launch-exit-study)
   TB_LAUNCH_M5_BOOK = "1"  # launch4_2m5: launch4_2's picks sold at pool minute 5 (11-04)
   # REAL MONEY canary of launchrw50_sz (11-06): ON since the 11-06 smoke test passed; canary-stop to halt (DEPLOY.md).
-  TB_LAUNCH_CANARY = "1"  # REAL MONEY: canary_rw50_sz, every launchrw50_sz pick at $0.01 (DEPLOY.md)
+  TB_LAUNCH_CANARY = "0"  # REAL MONEY canary OFF (user, 11-06); "1" = canary_rw50_sz, every other launchrw50_sz pick at $0.01 (DEPLOY.md)
   TB_LAUNCH_CANARY_USD = "5"  # fallback size; trades follow model_book.CANARY_SIZE_BANDS ($5 / $0.50 / $2)
   TB_LAUNCH_CANARY_MAX_LIQ_USD = "0"  # every pool, not only thin ones (11-06)
   TB_LAUNCH_CANARY_FLAT_USD = "0.01"  # every canary buy is 1 cent: does any real buy set the operators off? (11-06)
