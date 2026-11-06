@@ -92,11 +92,12 @@ LAUNCH_SIZED = "launchrw50_sz"
 LAUNCH_SIZED_CUT = {LAUNCH_SIZED: "rw50"}
 SIZE_BANDS = ((15_000.0, 250.0), (25_000.0, 25.0), (float("inf"), 100.0))  # (liquidity below, trade size $)
 # Real-money canary (11-06; was canary_rw50_24h, never switched on): copies the size-by-band book (`CANARY_TWIN`),
-# same signals and minute-6 exit, filled by the live Jupiter executor; thin pools only (`launch_canary_max_liq_usd`),
-# where the sized book makes its money, at a fixed small size.
+# same signals and minute-6 exit, filled by the live Jupiter executor; every pool (fly.toml sets
+# `launch_canary_max_liq_usd` 0), sized like the twin's bands in the same order: $250 / $25 / $100 -> $5 / $0.50 / $2 (1/50).
 CANARY4 = "canary_rw50_sz"
 CANARY_TWIN = LAUNCH_SIZED
 CANARY_BOOKS = (CANARY4,)
+CANARY_SIZE_BANDS = ((15_000.0, 5.0), (25_000.0, 0.5), (float("inf"), 2.0))  # (liquidity below, $)
 LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
               **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT}
 LAUNCH_CUT[CANARY4] = LAUNCH_CUT[CANARY_TWIN]  # the canary takes its twin's signals
@@ -149,10 +150,12 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
 
 
 def band_usd(name: str, liq: float | None) -> float | None:
-    """Trade size of a size-by-band book for a pool with this liquidity (None for every other book)."""
-    if name not in LAUNCH_SIZED_CUT or liq is None:
+    """Trade size of a size-by-band book (the sized twin, or the canary at its small sizes) for a pool with this
+    liquidity; None for every other book."""
+    bands = SIZE_BANDS if name in LAUNCH_SIZED_CUT else CANARY_SIZE_BANDS if name in CANARY_BOOKS else None
+    if bands is None or liq is None:
         return None
-    return next(usd for below, usd in SIZE_BANDS if liq < below)
+    return next(usd for below, usd in bands if liq < below)
 
 
 def active_books(cfg: Config) -> list[str]:

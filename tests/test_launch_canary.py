@@ -247,7 +247,7 @@ def test_canary_book_takes_top2_picks_at_its_own_size_and_limits(cfg, good_pair)
         eng.buy_model_signals()
         assert [p.token_address for p in j.open_positions(mb.CANARY4)] == ["A"]  # the twin's thin-pool picks only
         assert eng._model_skip_reason(book, sig("E", liq=20_000.0)) == "canary trades thin pools only (< $15,000)"
-        assert live.sizes == [cfg.launch_canary_usd]
+        assert live.sizes == [mb.band_usd(mb.CANARY4, 10_000.0)] == [5.0]  # band size, not the fixed fallback
         assert eng._deadlines[j.open_positions(mb.CANARY4)[0].id] == created + 360
         j.set_state(CANARY_HALT, "1")  # kill switch
         assert eng._model_skip_reason(book, sig("C")) == "canary halted (kill switch)"

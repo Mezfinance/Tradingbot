@@ -943,3 +943,10 @@ def test_a_reverted_pool_minute_exit_is_retried_at_once(cfg, good_pair):
     assert eng._sell(book, pos, pos.qty, 3e-5, "pool_age_exit")
     assert book.executor.calls == 3 and pos.closed_at is not None
     assert len(j.query("SELECT 1 FROM events WHERE kind='tx_failed'")) == 3  # every revert charged
+
+
+def test_canary_sizes_follow_the_twins_bands_in_the_same_order():
+    # the twin's $250 / $25 / $100 (thin / middle / deep) become $5 / $0.50 / $2 for the real-money canary
+    assert [mb.band_usd(mb.CANARY4, liq) for liq in (10_000, 20_000, 60_000)] == [5.0, 0.5, 2.0]
+    assert [mb.band_usd(mb.CANARY_TWIN, liq) for liq in (10_000, 20_000, 60_000)] == [250.0, 25.0, 100.0]
+    assert mb.band_usd("launchrw50", 10_000) is None and mb.band_usd(mb.CANARY4, None) is None

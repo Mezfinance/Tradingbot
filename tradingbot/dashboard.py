@@ -256,7 +256,7 @@ STUCK_AFTER_S = 0  # as engine.STUCK_AFTER_S: a position with no route out count
 
 
 FAMILIES = (  # book families for the dashboard's family view, in display order
-    ("Canary", "real money: launchrw50_sz's thin-pool picks bought and sold for real, to measure the simulator's error"),
+    ("Canary", "real money: every launchrw50_sz pick bought and sold for real at $5 / $0.50 / $2, to measure the simulator's error"),
     ("Launch picks", "the second-4 launch scorer's top 2% / 5% picks"),
     ("Low decile", "the history model's bottom 20% (D1-D2), minus the riskiest early pullers"),
     ("Rug-vs-win", "skip the riskiest half by P(rug before the exit) - P(+50% win); study rule, 24 h rule and a size-by-band twin"),
