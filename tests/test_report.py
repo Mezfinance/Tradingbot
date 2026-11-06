@@ -68,3 +68,16 @@ def test_model_book_exit_slippage_leaves_out_rugs_and_bad_trigger_prices(tmp_pat
     out = report._model_book_report(j, cfg, "launchd12")
     assert out["book"]["median_exit_slippage_excl_rugs_pct"] == pytest.approx(2.0)
     assert out["book"]["exits_with_bad_trigger"] == 1
+
+
+def test_mean_trade_is_weighted_by_size():
+    # 11-06: launchrw50_sz's many +2% $25 trades made a plain average read +3% while the book made +14 per $100
+    from tradingbot.journal import Journal
+    from tradingbot.report import strategy_stats
+    j = Journal(":memory:")
+    for cost, realized in ((250.0, 500.0), (25.0, 25.5), (25.0, 25.5), (25.0, 0.0)):  # +100%, +2%, +2%, -100%
+        j.execute("INSERT INTO positions(token, symbol, cost_usd, realized_usd, qty, opened_at, closed_at, strategy) "
+                  "VALUES ('T', 'T', ?, ?, 0, 1, 2, 'b')", (cost, realized))
+    s = strategy_stats(j, "b", 10_000.0)
+    assert round(s["mean_trade_return_equal_pct"], 1) == 1.0  # (100 + 2 + 2 - 100) / 4
+    assert round(s["mean_trade_return_pct"], 1) == round(100 * (250 + 0.5 + 0.5 - 25) / 325, 1)  # +69.5 per $100

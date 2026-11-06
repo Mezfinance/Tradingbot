@@ -139,7 +139,10 @@ def strategy_stats(j: Journal, name: str, start_cash: float) -> dict:
         "stuck_trades": len(stuck),
         "win_rate": sum(p > 0 for p in pnls) / len(pnls) if pnls else None,
         "median_trade_return_pct": _median(rets),
-        "mean_trade_return_pct": _mean(rets),
+        # weighted by size (total P&L / total cost): with mixed trade sizes a plain average of % results
+        # counts a $25 trade like a $250 one; for equal-sized books the two are the same
+        "mean_trade_return_pct": (sum(pnls) / cost * 100) if (cost := sum(r["cost_usd"] or 0 for r in closed)) else None,
+        "mean_trade_return_equal_pct": _mean(rets),
         "best_trade_pct": max(rets) if rets else None,
         "worst_trade_pct": min(rets) if rets else None,
         "profit_factor": gross_win / gross_loss if gross_loss else None,

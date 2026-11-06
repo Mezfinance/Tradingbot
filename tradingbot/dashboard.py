@@ -664,6 +664,8 @@ const sgn=(v,d=1,s="%")=>v==null||Number.isNaN(v)?"-":(v>0?"+":v<0?"−":"")+Mat
 const cls=v=>v==null?"":v>0?"pos":v<0?"neg":"";
 const esc=t=>String(t??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
 const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
+/* mean trade weighted by size: total P&L / total cost (a plain average counts a $25 trade like a $250 one) */
+const wmean=tr=>{const c=tr.reduce((a,x)=>a+(x.cost||0),0);return c?100*tr.reduce((a,x)=>a+x.pnl,0)/c:null};
 const median=a=>{if(!a.length)return null;const b=[...a].sort((x,y)=>x-y),m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2};
 const S={shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null};
 let sortKey="return_pct",sortDir=-1,win=21600,pending=false;
@@ -691,14 +693,14 @@ return out.sort((a,b)=>b.opened-a.opened)}
 function bookStats(b){const t=now(),c=b.cash||S.cash;let equity=c,open=0,started=null;const tr=[];
 for(const p of S.pos.values()){if(p.strategy!==b.name)continue;started=started==null?p.opened_at:Math.min(started,p.opened_at);
 const x=trade(p,t);
-if(x.end!=null){tr.push({t:x.end,ret:x.cost?x.pnl/x.cost:0,pnl:x.pnl});equity+=x.pnl}
+if(x.end!=null){tr.push({t:x.end,ret:x.cost?x.pnl/x.cost:0,pnl:x.pnl,cost:x.cost});equity+=x.pnl}
 else{open++;equity+=x.real+(p.qty||0)*(p.entry_price||0)-x.cost}}
 tr.sort((x,y)=>x.t-y.t);let eq=c,peak=c,dd=0;const pts=started==null?[]:[[started,c]];
 for(const x of tr){eq+=x.pnl;peak=Math.max(peak,eq);dd=Math.max(dd,(peak-eq)/peak);pts.push([x.t,eq])}
 const rets=tr.map(x=>x.ret*100),gain=tr.filter(x=>x.pnl>0).reduce((a,x)=>a+x.pnl,0),loss=-tr.filter(x=>x.pnl<0).reduce((a,x)=>a+x.pnl,0);
 const rugs=tr.filter(x=>x.ret<=-0.8).length;
 return{name:b.name,family:b.family,hold_min:b.hold_min,cash:c,started,equity,return_pct:(equity/c-1)*100,trades:tr.length,open,
-win_rate:tr.length?tr.filter(x=>x.ret>0).length/tr.length:null,median_pct:median(rets),mean_pct:mean(rets),
+win_rate:tr.length?tr.filter(x=>x.ret>0).length/tr.length:null,median_pct:median(rets),mean_pct:wmean(tr),eq_mean_pct:mean(rets),
 profit_factor:loss>0?gain/loss:null,rug_pct:tr.length?100*rugs/tr.length:null,max_drawdown_pct:100*dd,
 last_hour:tr.filter(x=>x.t>t-3600).length,tr,pts,gain,loss,rugs}}
 const COLS=[["name","Book",0],["hold_min","Hold",0],["equity","Equity $",0],["return_pct","Return",2],["trades","Trades",0],["open","Open",0],["win_rate","Win",2],["median_pct","Median",1],["mean_pct","Mean",1],["profit_factor","PF",2],["rug_pct","Rugged",0],["max_drawdown_pct","Max DD",1]];
@@ -765,7 +767,7 @@ g+="</svg>";if(series.length>1)g+='<div class="legend">'+series.map((s,i)=>{cons
 $(id).innerHTML=g}
 /* families index, family view, book view */
 function famStats(list){const tr=list.flatMap(b=>b.tr),rets=tr.map(x=>x.ret*100),pnl=list.reduce((a,b)=>a+b.equity-b.cash,0);
-return{pnl,trades:tr.length,open:list.reduce((a,b)=>a+b.open,0),win:tr.length?100*tr.filter(x=>x.ret>0).length/tr.length:null,mean:mean(rets),median:median(rets),
+return{pnl,trades:tr.length,open:list.reduce((a,b)=>a+b.open,0),win:tr.length?100*tr.filter(x=>x.ret>0).length/tr.length:null,mean:wmean(tr),median:median(rets),
 rug:tr.length?100*tr.filter(x=>x.ret<=-0.8).length/tr.length:null,best:[...list].filter(b=>b.trades).sort((a,b)=>b.return_pct-a.return_pct)[0]}}
 function renderFams(){const all=S.books.map(bookStats);
 $("fams").innerHTML=S.fams.map(f=>{const list=all.filter(b=>b.family===f.name);if(!list.length)return"";const s=famStats(list);
@@ -787,7 +789,7 @@ const s=bookStats(b),exp=(S.extra&&S.extra.expected)||{};$("b-name").textContent
 $("b-about").textContent=exp[name]||`Hold ${fmt(b.hold_min,0)} min.`;
 tiles("b-stats",[["Equity",fmt(s.equity,0),`return <b>${sgn(s.return_pct,2)}</b> · max drawdown ${fmt(s.max_drawdown_pct,1,"%")}`,true],
 ["Closed trades",fmt(s.trades,0),`${s.open} open now · ${s.last_hour} in the past hour`],
-["Mean trade",`<span class="${cls(s.mean_pct)}">${sgn(s.mean_pct)}</span>`,`median ${sgn(s.median_pct)} · win ${fmt(s.win_rate==null?null:100*s.win_rate,0,"%")}`],
+["Mean trade",`<span class="${cls(s.mean_pct)}">${sgn(s.mean_pct)}</span>`,`per $ traded · equal-weight ${sgn(s.eq_mean_pct)} · median ${sgn(s.median_pct)} · win ${fmt(s.win_rate==null?null:100*s.win_rate,0,"%")}`],
 ["Profit factor",fmt(s.profit_factor,2),`won ${fmt(s.gain,0)} $ · lost ${fmt(s.loss,0)} $`],["Rugged",fmt(s.rug_pct,0,"%"),`${s.rugs} trade${s.rugs===1?"":"s"} at −80% or worse`]]);
 chart("b-chart",[{name,pts:s.pts,ret:s.return_pct}],s.cash);
 if(b.flag){$("b-gap-card").hidden=false;$("b-lh").textContent=win>=86400?"24":String(win/3600);$("b-gap").innerHTML=GAPHEAD+(gapRow(b,doneIn())||'<tr><td class="muted">No finished trades in the window.</td></tr>')}else $("b-gap-card").hidden=true;
@@ -809,7 +811,7 @@ tiles("b-swap-stats",[["Canary swap",`<span class="${cls(mean(sw))}">${sgn(mean(
 $("b-swap").innerHTML=rows.length?h:'<tr><td class="muted">No sold canary trades yet.</td></tr>'}
 /* programs: Supermeme (all books) and MZF Short Only (the shortbook app's feed) */
 function memeTotals(){const all=S.books.map(bookStats),tr=all.flatMap(b=>b.tr),pnl=all.reduce((a,b)=>a+b.equity-b.cash,0);
-return{all,pnl,cap:all.reduce((a,b)=>a+b.cash,0),trades:tr.length,open:all.reduce((a,b)=>a+b.open,0),mean:mean(tr.map(x=>x.ret*100)),last_hour:all.reduce((a,b)=>a+b.last_hour,0)}}
+return{all,pnl,cap:all.reduce((a,b)=>a+b.cash,0),trades:tr.length,open:all.reduce((a,b)=>a+b.open,0),mean:wmean(tr),last_hour:all.reduce((a,b)=>a+b.last_hour,0)}}
 function shortsState(){if(!S.shortsEnabled)return["off","Not connected: set TB_SHORTBOOK_FEED_URL on the Supermeme app."];
 if(!S.shorts||S.shorts.nav_usd==null)return["wait",S.shorts&&S.shorts.error?`Short book unreachable: ${S.shorts.error}`:"Waiting for the short book's first update."];
 if(S.shorts.stale)return["stale",`Showing the last update from ${when(S.shorts.fetched_ts||S.shorts.built_ts)} UTC: the short book is unreachable (${S.shorts.error||"no answer"}).`];
