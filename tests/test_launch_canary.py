@@ -61,6 +61,7 @@ class FakeRpc:
         self.owner, self.bal, self.sol = owner, {USDC_MINT: usdc, TOKEN: token}, sol
         self.txs, self.sent, self.status, self.send_error = {}, [], {}, None
         self.next_meta = None
+        self.raw_sig, self.held, self.resends, self.land_on_resend, self.height = {}, {}, 0, False, None
 
     def post(self, url, json=None):
         m, p = json["method"], json["params"]
@@ -73,13 +74,23 @@ class FakeRpc:
         elif m == "getBalance":
             result = {"value": self.sol}
         elif m == "sendTransaction":
-            if self.send_error:
+            if p[0] in self.raw_sig:  # the same signed bytes again: same signature
+                self.resends += 1
+                result = self.raw_sig[p[0]]
+                if self.land_on_resend:
+                    self.txs[result] = self.held.pop(result, self.txs.get(result))
+            elif self.send_error:
                 error = {"message": self.send_error}
             else:
                 sig = f"sig{len(self.sent)}"
                 self.sent.append(sig)
                 self.txs[sig] = self.next_meta.pop(0) if isinstance(self.next_meta, list) else self.next_meta
+                self.raw_sig[p[0]] = sig
+                if self.land_on_resend:  # the first send is lost; it lands only once sent again
+                    self.held[sig], self.txs[sig] = self.txs[sig], None
                 result = sig
+        elif m == "getBlockHeight":
+            result = self.height
         elif m == "getSignatureStatuses":
             sig = p[0][0]
             meta = self.txs.get(sig)
@@ -143,6 +154,26 @@ def test_dropped_transaction_costs_nothing(monkeypatch):
     rpc.next_meta = None  # never lands
     fill = ex.buy(TOKEN, 10.0, 0.5)
     assert not fill.ok and "dropped" in fill.note and fill.usd == 0
+
+
+def test_a_lost_send_is_sent_again_until_it_lands(monkeypatch):
+    monkeypatch.setattr(jx, "RESEND_S", 0)
+    ex, rpc = executor()
+    rpc.land_on_resend = True
+    rpc.next_meta = meta(ex.owner, (50_000_000, 40_100_000), (0, 19_000_000))
+    fill = ex.buy(TOKEN, 10.0, 0.5)
+    assert fill.ok and rpc.resends >= 1 and rpc.sent == ["sig0"]  # one signature, so it can only land once
+
+
+def test_expired_blockhash_stops_the_resends(monkeypatch):
+    monkeypatch.setattr(jx, "RESEND_S", 0)
+    ex, rpc = executor()
+    rpc.next_meta, rpc.height = None, 10**12  # never lands; the chain is past any last valid height
+    orig = ex.jup.post
+    ex.jup.post = lambda path, json=None: SimpleNamespace(
+        status_code=200, text="", json=lambda: {**orig(path, json).json(), "lastValidBlockHeight": 5})
+    fill = ex.buy(TOKEN, 10.0, 0.5)
+    assert not fill.ok and fill.note == "not confirmed (dropped) sig0" and rpc.resends == 0
 
 
 def test_sell_uses_wide_slippage_and_closes_the_empty_account():

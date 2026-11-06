@@ -34,6 +34,7 @@ log = logging.getLogger(__name__)
 
 CONFIRM_TIMEOUT_S = 75
 CONFIRM_POLL_S = 0.4
+RESEND_S = 2.0  # send the same signed transaction again this often until it lands or its blockhash expires
 TX_FETCH_TRIES = 8  # getTransaction can lag the status by a moment
 TX_FETCH_WAIT_S = 0.5
 TX_VERSION = 1
@@ -94,6 +95,7 @@ class JupiterExecutor:
         self.priority_fee_sol = cfg.priority_fee_sol if priority_fee_sol is None else priority_fee_sol
         self.sell_slippage_bps = sell_slippage_bps
         self.sleep = sleep
+        self._pending: dict[str, tuple] = {}  # signature -> (signed bytes, last valid block height) until settled
         self.last_note = ""
 
     # --- public -------------------------------------------------------------
@@ -248,14 +250,18 @@ class JupiterExecutor:
         if swap.status_code != 200:
             log.error("swap build failed: %s", swap.text[:300])
             return f"not sent: swap build HTTP {swap.status_code}"
-        unsigned = VersionedTransaction.from_bytes(base64.b64decode(swap.json()["swapTransaction"]))
+        body = swap.json()
+        unsigned = VersionedTransaction.from_bytes(base64.b64decode(body["swapTransaction"]))
         signed = VersionedTransaction(unsigned.message, [self.keypair])
-        sig, err = self._rpc_err("sendTransaction", [
-            base64.b64encode(bytes(signed)).decode(),
-            {"encoding": "base64", "skipPreflight": False, "maxRetries": 3},
-        ])
+        raw = base64.b64encode(bytes(signed)).decode()
+        sig, err = self._rpc_err("sendTransaction", [raw, {"encoding": "base64", "skipPreflight": False, "maxRetries": 0}])
         if not sig:  # preflight simulation refused it (e.g. slippage): nothing landed, nothing paid
             return f"not sent: {str(err)[:120] if err else 'send failed'}"
+        # An unstaked send is often dropped when Solana is busy (11-06: 3 of 4 smoke buys never landed), so _await
+        # sends the same signed bytes again every RESEND_S until it lands or its blockhash expires. The same
+        # signature can only land once, so resending never buys twice.
+        self._pending[sig] = (raw, body.get("lastValidBlockHeight"))
+        log.info("swap sent %s", sig)
         return sig
 
     def _settle(self, sig: str, mint: str | None) -> dict:
@@ -264,7 +270,7 @@ class JupiterExecutor:
         status = self._await(sig)
         tx = self._fetch_tx(sig) if status != "dropped" else None
         if tx is None:
-            note = "not confirmed (dropped)" if status == "dropped" else "confirmed but transaction not readable"
+            note = f"not confirmed (dropped) {sig}" if status == "dropped" else "confirmed but transaction not readable"
             if status != "dropped":
                 log.error("tx %s confirmed but unreadable: balances may be off", sig)
             return {"ok": False, "note": note, "token": 0, "usdc": 0,
@@ -279,14 +285,26 @@ class JupiterExecutor:
 
     def _await(self, sig: str) -> str:
         """'landed' (seen with confirmed status or an error), or 'dropped' after the timeout and one last look."""
+        raw, last_valid = self._pending.pop(sig, (None, None))
         deadline = time.time() + CONFIRM_TIMEOUT_S
+        next_send = time.time() + RESEND_S
+        sends = 1
         while True:
             res = self._rpc("getSignatureStatuses", [[sig], {"searchTransactionHistory": time.time() >= deadline}]) or {}
             status = (res.get("value") or [None])[0]
             if status and (status.get("err") or status.get("confirmationStatus") in ("confirmed", "finalized")):
                 return "landed"
             if time.time() >= deadline:
+                log.warning("swap %s not seen after %d sends", sig, sends)
                 return "dropped"
+            if raw and time.time() >= next_send:
+                height = self._rpc("getBlockHeight", [{"commitment": "confirmed"}])
+                if last_valid and isinstance(height, int) and height > last_valid:
+                    deadline = time.time()  # blockhash expired: it can never land; one last history look
+                else:
+                    self._rpc("sendTransaction", [raw, {"encoding": "base64", "skipPreflight": True, "maxRetries": 0}])
+                    sends += 1
+                next_send = time.time() + RESEND_S
             self.sleep(CONFIRM_POLL_S)
 
     def _fetch_tx(self, sig: str) -> dict | None:
