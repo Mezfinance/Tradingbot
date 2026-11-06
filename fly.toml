@@ -26,6 +26,7 @@ primary_region = "iad"
   TB_LAUNCH_M5_BOOK = "1"  # launch4_2m5: launch4_2's picks sold at pool minute 5 (11-04)
   # REAL MONEY canary of launchrw50_sz (11-06): ON since the 11-06 smoke test passed; canary-stop to halt (DEPLOY.md).
   TB_LAUNCH_CANARY = "1"  # REAL MONEY: canary_rw50_sz, launchrw50_sz's thin-pool picks at $10 (DEPLOY.md)
+  TB_LAUNCH_CANARY_USD = "5"  # real trade size (11-06; was $10)
   TB_LAUNCH_CANARY_BUDGET_USD = "20"  # the USDC left in the canary wallet (11-06 reset)
   TB_LAUNCH_CANARY_EVERY_N = "4"  # 1 in 4 thin-pool picks: ~60 real round trips a day, ~0.06 SOL in fees
   TB_LAUNCH_RW_BOOK = "1"  # launchrw50 / launchd12rw50: skip the riskiest half by rug-vs-win odds (11-04)
