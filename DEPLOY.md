@@ -237,13 +237,16 @@ The first pass records every existing market as a baseline; only markets that ap
 Settings are `SB_*` env vars (`shortbook/config.py`), e.g. `SB_CASH_USD`, `SB_GROUPS`, `SB_TRADE_PCT`, `SB_OI_CAP_PCT`.
 
 
-## Real-money launch canary (canary_rw50_24h)
+## Real-money launch canary (canary_rw50_sz)
 
-Buys launchrw50_24h's picks (rug-vs-win, 24 h rule) for real ($10 a trade, $50 book budget, $50 daily loss stop, at
-most 5 open) and sells them at pool minute 6, so its fills can be compared with launchrw50_24h's simulated trade on
-the same token. That book signals ~30 pools an hour; each real round trip costs ~0.001 SOL in fees, so buying all of
-them burns ~0.7 SOL a day. `TB_LAUNCH_CANARY_EVERY_N=N` buys only 1 in N signals (N=5: ~140 trades and ~0.15 SOL a
-day). Buys stop by themselves when the wallet holds under 0.01 SOL.
+Buys launchrw50_sz's thin-pool picks (rug-vs-win picks with under $15k liquidity at second 4, the band the sized
+book trades at $250 and makes its money in) for real at $10 a trade ($50 book budget, $50 daily loss stop, at most
+5 open) and sells them at pool minute 6, so its fills can be compared with launchrw50_sz's simulated trade on the
+same token. Pools at $15k and above are skipped (`TB_LAUNCH_CANARY_MAX_LIQ_USD`, 0 = trade them all). The gap to the
+twin is the simulator's error plus the size difference: the twin paid impact on $250, the canary on $10, so a canary
+doing worse than its twin is a real warning. The sized book saw ~10 thin-pool picks an hour on 11-06; each real round
+trip costs ~0.001 SOL, so buying all of them burns ~0.25 SOL a day. `TB_LAUNCH_CANARY_EVERY_N=4` buys 1 in 4 (~60
+trades and ~0.06 SOL a day). Buys stop by themselves when the wallet holds under 0.01 SOL.
 
 1. Make a **new wallet used for nothing else** (e.g. `solana-keygen new -o canary.json`; never commit it).
    Fund it with about $50 USDC and ~0.05 SOL (fees and token-account rent; rent comes back after each sale).

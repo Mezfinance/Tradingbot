@@ -79,13 +79,14 @@ class Config:
     launch_rw_book: bool = False
     launch_sized_book: bool = False  # 11-06: launchrw50_sz, launchrw50's signals sized by liquidity band
     launch_rw24_book: bool = False  # 11-05: twin rw books on the earlier rule (24 h ranking, nightly 14-day model)
-    # canary_rw50_24h (11-05): REAL MONEY. launchrw50_24h's picks bought and sold for real through Jupiter (live
-    # executor), to measure how real fills differ from the simulated ones. Needs the live keypair and TB_LIVE_CONFIRM.
+    # canary_rw50_sz (11-06): REAL MONEY. launchrw50_sz's thin-pool picks bought and sold for real through Jupiter
+    # (live executor), to measure how real fills differ from the simulated ones. Needs the keypair and TB_LIVE_CONFIRM.
     launch_canary: bool = False
     launch_canary_usd: float = 10.0  # per trade
     launch_canary_budget_usd: float = 50.0  # the book's starting cash; keep about this much USDC in the wallet
     launch_canary_daily_loss_usd: float = 50.0  # no new buys once today's realized loss reaches this
     launch_canary_max_open: int = 5
+    launch_canary_max_liq_usd: float = 15_000.0  # only pools below this liquidity at second 4 (the $250 band); 0 = all
     launch_canary_every_n: int = 1  # buy 1 in N of the twin's signals (1 = all; each round trip costs ~0.001 SOL)
     launch_canary_priority_fee_sol: float = 0.0005  # cap on the priority fee per transaction
     launch_canary_sell_slippage_bps: int = 1000  # sells must go through on a fast pool

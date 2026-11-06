@@ -1,6 +1,6 @@
-"""The real-money launch canary (canary_rw50_24h): status, calibration against its simulated twin, smoke test.
+"""The real-money launch canary (canary_rw50_sz): status, calibration against its simulated twin, smoke test.
 
-The canary buys launchrw50_24h's picks (`mb.CANARY_TWIN`) for real and sells them at pool minute 6. Each of its
+The canary buys launchrw50_sz's thin-pool picks (`mb.CANARY_TWIN`) for real and sells them at pool minute 6. Each of its
 trades is paired with the twin's simulated trade on the same token, so the gap between the two is the simulator's error:
 entry price, exit price, fees, and how many picks the real book missed or couldn't sell.
 """
@@ -98,7 +98,8 @@ def status(journal, cfg) -> dict:
         "realized_today": round(journal.realized_since(day_start, mb.CANARY4), 2),
         "limits": {"usd": cfg.launch_canary_usd, "budget": cfg.launch_canary_budget_usd,
                    "daily_loss": cfg.launch_canary_daily_loss_usd, "max_open": cfg.launch_canary_max_open,
-                   "every_n": cfg.launch_canary_every_n, "twin": SIM_TWIN},
+                   "every_n": cfg.launch_canary_every_n, "max_liq_usd": cfg.launch_canary_max_liq_usd,
+                   "twin": SIM_TWIN},
         "failed_tx_today": {"n": failed["n"], "usd": round(failed["usd"], 4)},
         "skips_today": {r["detail"]: r["n"] for r in skips},
     }

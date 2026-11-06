@@ -206,14 +206,16 @@ def test_canary_book_takes_top2_picks_at_its_own_size_and_limits(cfg, good_pair)
         assert book.executor is live and book.cash == cfg.launch_canary_budget_usd
         created = time.time() - 6
 
-        def sig(mint, top2=True):  # the canary follows launchrw50_24h's flag
+        def sig(mint, top2=True, liq=12_000.0):  # the canary follows launchrw50_sz's flag, thin pools only
             return {"pool": "P" + mint, "mint": mint, "dex": "pumpswap", "created_ts": created, "name": "", "price": 1e-5,
-                    "liq": 30_000.0, "score": 1.0, "ts": time.time(), "decided_ts": time.time(), "kind": "launch",
-                    "rw50_24": top2, "top2": not top2, "top5": True}
+                    "liq": liq, "score": 1.0, "ts": time.time(), "decided_ts": time.time(), "kind": "launch",
+                    "rw50": top2, "rw50_24": not top2, "top2": not top2, "top5": True}
         eng.model_book.signals.put(sig("A"))
         eng.model_book.signals.put(sig("B", top2=False))
+        eng.model_book.signals.put(sig("D", liq=20_000.0))
         eng.buy_model_signals()
-        assert [p.token_address for p in j.open_positions(mb.CANARY4)] == ["A"]  # the twin's picks only
+        assert [p.token_address for p in j.open_positions(mb.CANARY4)] == ["A"]  # the twin's thin-pool picks only
+        assert eng._model_skip_reason(book, sig("E", liq=20_000.0)) == "canary trades thin pools only (< $15,000)"
         assert live.sizes == [cfg.launch_canary_usd]
         assert eng._deadlines[j.open_positions(mb.CANARY4)[0].id] == created + 360
         j.set_state(CANARY_HALT, "1")  # kill switch

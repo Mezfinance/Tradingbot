@@ -73,11 +73,6 @@ LAUNCH2M5 = "launch4_2m5"
 # fell from ~8-10% of pools to ~2%, so launch4_5 is now the nearest to the wider group launch4_2m5 traded at first).
 LAUNCH5M5 = "launch4_5m5"
 LAUNCH_M5 = (LAUNCH2M5, LAUNCH5M5)
-# Real-money canary (11-05): copies the rug-vs-win 24 h book (`CANARY_TWIN`, user's pick after rw-check: its kept half
-# beat the skipped half by ~11 pts), same signals and minute-6 exit, filled by the live Jupiter executor
-CANARY4 = "canary_rw50_24h"
-CANARY_TWIN = "launchrw50_24h"
-CANARY_BOOKS = (CANARY4,)
 # Low-decile books (11-04): the history model's bottom 20% (rolling 24 h; D1-D2 held the most big wins and the most
 # early pulls), with the riskiest 0/10/20/30/50% by the early-pull model skipped. launch-early-pulls walk-forward on
 # 188 D1-D2 pools: keep all +2.9%, skip 10% +6.6%, 20% +5.5%, 30% +12.0% (98% of random skips worse), 50% +12.8%.
@@ -96,6 +91,12 @@ LAUNCH_RW24_CUT = {"launchrw50_24h": "rw50_24", "launchd12rw50_24h": "d12rw50_24
 LAUNCH_SIZED = "launchrw50_sz"
 LAUNCH_SIZED_CUT = {LAUNCH_SIZED: "rw50"}
 SIZE_BANDS = ((15_000.0, 250.0), (25_000.0, 25.0), (float("inf"), 100.0))  # (liquidity below, trade size $)
+# Real-money canary (11-06; was canary_rw50_24h, never switched on): copies the size-by-band book (`CANARY_TWIN`),
+# same signals and minute-6 exit, filled by the live Jupiter executor; thin pools only (`launch_canary_max_liq_usd`),
+# where the sized book makes its money, at a fixed small size.
+CANARY4 = "canary_rw50_sz"
+CANARY_TWIN = LAUNCH_SIZED
+CANARY_BOOKS = (CANARY4,)
 LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
               **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT}
 LAUNCH_CUT[CANARY4] = LAUNCH_CUT[CANARY_TWIN]  # the canary takes its twin's signals

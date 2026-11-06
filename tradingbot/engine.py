@@ -38,7 +38,7 @@ log = logging.getLogger(__name__)
 MAIN = "claude"
 CANARY = "canary"
 CANARY_HALT = "launch_canary:halted"  # state key: set = the real-money launch canary buys nothing (kill switch)
-BOOK_PRIORITY = {MAIN: 0, CANARY: 1, "canary_rw50_24h": 1}  # real-money books are exited before simulated baselines
+BOOK_PRIORITY = {MAIN: 0, CANARY: 1, "canary_rw50_sz": 1}  # real-money books are exited before simulated baselines
 REANALYSE_AFTER_S = 6 * 3600
 RECHECK_REJECTED_S = 30 * 60
 DUST_QTY = 1e-12
@@ -705,6 +705,8 @@ class Engine:
         if book.name in mb.CANARY_BOOKS:  # real money: hard limits of its own
             if self.journal.get_state(CANARY_HALT):
                 return "canary halted (kill switch)"
+            if c.launch_canary_max_liq_usd > 0 and (sig.get("liq") or 0) >= c.launch_canary_max_liq_usd:
+                return f"canary trades thin pools only (< ${c.launch_canary_max_liq_usd:,.0f})"
             if c.launch_canary_every_n > 1:  # real fees: a sample of the twin's ~700 signals a day is enough to calibrate
                 n = int(self.journal.get_state("launch_canary:count") or 0) + 1
                 self.journal.set_state("launch_canary:count", str(n))
