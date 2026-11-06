@@ -69,7 +69,7 @@ def test_stream_sends_rows_then_deltas_and_new_trades(cfg, monkeypatch):
     rows = [dict(zip(init["pos_cols"], r)) for r in init["positions"]]
     assert [r["symbol"] for r in rows if r["strategy"] == "launchrw50"] == ["A"]
     assert {"name": "launchrw50", "hold_min": dash.Live(cfg).holds["launchrw50"], "flag": "rw50",
-            "family": "Rug-vs-win"} in init["books"]
+            "family": "Rug-vs-win", "cash": cfg.model_book_cash_usd} in init["books"]
     assert [f["name"] for f in init["families"]] == [n for n, _ in dash.FAMILIES]
 
 
@@ -168,3 +168,11 @@ def test_short_book_feed_is_streamed_and_kept_stale_when_unreachable(cfg, monkey
     assert "event: shorts" in events and json.loads(out[0].split("data: ", 1)[1])["shorts_enabled"]
     cfg.shortbook_feed_url = ""
     assert not dash.Dashboard(Journal(":memory:"), cfg).live.snapshot()[1]["shorts_enabled"]
+
+
+def test_the_canary_starts_from_its_own_budget():
+    from tradingbot import model_book as mb
+    from tradingbot.config import Config
+    cfg = Config()
+    assert dash.start_cash(cfg, mb.CANARY4) == cfg.launch_canary_budget_usd == 50.0
+    assert dash.start_cash(cfg, "launchrw50_sz") == cfg.model_book_cash_usd
