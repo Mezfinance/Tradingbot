@@ -470,9 +470,10 @@ ROLLING_WINDOW_S = 24 * 3600  # the rolling cut-off ranks a pool against the eli
 ROLLING_MIN_SCORES = 50  # fewer eligible pools than this in the window: no rolling cut-off yet
 
 
-def early_candidates(store, cfg: Config, model: Model, since: float, until: float) -> list[dict]:
+def early_candidates(store, cfg: Config, model: Model | None, since: float, until: float) -> list[dict]:
     """Hand-made pools first seen in [since, until) within EARLY_MAX_SEEN_MIN, with enough liquidity, scored by
-    `model`, oldest first; with their 5-minute snapshot outcome when it exists (as the model was trained)."""
+    `model` (None: score None), oldest first; with their 5-minute snapshot outcome when it exists (as the model
+    was trained)."""
     out = []
     for p in store.query(
             "SELECT w.pool, w.mint, w.dex, w.name, w.created_ts, w.seen_ts, w.first, s.data AS snap5 FROM watch_pools w "
@@ -492,7 +493,8 @@ def early_candidates(store, cfg: Config, model: Model, since: float, until: floa
             pulled = (wa._f(s5.get("liq")) or 0.0) < wa.RUG_LIQ_SHARE * lf
             ret = -1.0 if pulled else min(wa._f(s5["price"]) / pf - 1 - wa.ROUND_TRIP_COST, 3.0)
         out.append({"pool": p["pool"], "name": (p["name"] or "").split(" / ")[0], "seen_ts": p["seen_ts"],
-                    "score": model.score(early_features(dict(p), first, p["seen_ts"])), "ret": ret})
+                    "score": model.score(early_features(dict(p), first, p["seen_ts"])) if model else None,
+                    "ret": ret})
     return out
 
 

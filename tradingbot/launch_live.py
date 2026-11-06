@@ -1918,3 +1918,81 @@ def rw_check(store, journal=None, hours: float | None = None, now: float | None 
                 w[name]["real fills"] = {b: fill_gap(store, journal, b, wrows[0]["create_ts"], rng) for b in books}
         out[wname] = w
     return out
+
+
+EARLY_STUCK_S = 1800  # an early-book position still open this long after its buy can't have sold: counts as -100%
+
+
+def _rw_lookup(store) -> tuple[dict, dict]:
+    """The scorer's rug-vs-win scores by pool and by token mint (mint -> rows sorted by creation)."""
+    by_pool, by_mint = {}, {}
+    for r in store.query("SELECT pool, token_mint, create_ts, rw, rw_pct, rw24, rw24_pct FROM watch_launch_live "
+                         "WHERE rw_pct IS NOT NULL OR rw24_pct IS NOT NULL ORDER BY create_ts"):
+        d = dict(r)
+        by_pool[d["pool"]] = d
+        if d["token_mint"]:
+            by_mint.setdefault(d["token_mint"], []).append(d)
+    return by_pool, by_mint
+
+
+def early_rw_check(store, journal, cfg, hours: float | None = None, now: float | None = None) -> dict:
+    """Would the rug-vs-win filter help the early books? Every pool the early books could buy (hand-made, seen
+    within 4 min, liquid at first sight; outcome = 5-minute snapshot vs first sight, 6% round trip, emptied = -100%)
+    and the early books' real trades, each matched to the launch scorer's second-4 rug-vs-win score for the same
+    pool (trades by token), then split kept / skipped by each rule (riskiest half skipped) as rw-check does."""
+    from tradingbot import model_book as mb
+    now = now if now is not None else time.time()
+    ensure_schema(store)
+    by_pool, by_mint = _rw_lookup(store)
+    since = now - hours * 3600 if hours else 0.0
+    path = mb.early_model_path(cfg)
+    model = mb.Model.from_json(json.loads(path.read_text())) if path.exists() else None
+    cands = [c for c in mb.early_candidates(store, cfg, model, since, now) if c["ret"] is not None]
+    pools = []
+    for c in cands:
+        s = by_pool.get(c["pool"])
+        pools.append({"ret": c["ret"], "create_ts": c["seen_ts"], "score": c["score"],
+                      **({k: s[k] for k in ("rw", "rw_pct", "rw24", "rw24_pct")} if s else
+                         {"rw": None, "rw_pct": None, "rw24": None, "rw24_pct": None})})
+    picks = [p for p in pools if model is not None and p["score"] is not None and p["score"] >= model.threshold]
+
+    trades: dict = {}
+    for book in mb.EARLY_BOOKS:
+        rows = []
+        for p in journal.query("SELECT token, opened_at, closed_at, cost_usd, realized_usd FROM positions "
+                               "WHERE strategy=? AND opened_at >= ? ORDER BY opened_at", (book, since)):
+            if p["closed_at"] and p["cost_usd"]:
+                ret = p["realized_usd"] / p["cost_usd"] - 1
+            elif not p["closed_at"] and now - p["opened_at"] >= EARLY_STUCK_S:
+                ret = -1.0  # never sold: worth $0
+            else:
+                continue
+            match = [s for s in by_mint.get(p["token"], []) if s["create_ts"] <= p["opened_at"]]
+            s = match[-1] if match else None
+            rows.append({"ret": ret, "create_ts": p["opened_at"],
+                         **({k: s[k] for k in ("rw", "rw_pct", "rw24", "rw24_pct")} if s else
+                            {"rw": None, "rw_pct": None, "rw24": None, "rw24_pct": None})})
+        if rows:
+            trades[book] = rows
+
+    keep = 100 - RW_SKIP
+    rules = (("study rule (6 h)", "rw", lambda r: None if r["rw_pct"] is None else r["rw_pct"] < keep),
+             ("24 h rule", "rw24", lambda r: None if r["rw24_pct"] is None else r["rw24_pct"] < keep))
+
+    def section(rows):
+        rng = np.random.default_rng(0)
+        scored = [r for r in rows if r["rw_pct"] is not None or r["rw24_pct"] is not None]
+        out = {"n": len(rows), "with a rug-vs-win score": len(scored), "all": _group(rows, rng),
+               "unscored (not liquid at second 4, or missed by the scorer)":
+                   _group([r for r in rows if r["rw_pct"] is None and r["rw24_pct"] is None], rng)}
+        for name, col, fn in rules:
+            out[name] = _keep_test(rows, fn, col, rng)
+        return out
+
+    return {"window": f"last {hours:g} h" if hours else "whole life",
+            "every eligible early pool (snapshot yardstick)": section(pools),
+            "early model picks (fixed cut-off, snapshot yardstick)": section(picks),
+            "early books' real trades": {b: section(r) for b, r in trades.items()},
+            "note": f"kept = rug-vs-win percentile < {keep} (the riskiest half skipped); pool outcomes are the "
+                    "5-minute snapshot (~pool minute 6) vs first sight; trades still open "
+                    f"{EARLY_STUCK_S // 60} min after the buy count as -100%"}

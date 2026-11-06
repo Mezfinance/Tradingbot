@@ -841,3 +841,42 @@ def test_rw_check_tells_a_working_rule_from_chance():
     assert abs(other["kept minus skipped (pts)"]["mean"]) < study["kept minus skipped (pts)"]["mean"]
     assert life["study rule (6 h)"]["history bottom 20% minus the riskiest half"]["pools"] == 0
     assert out["last 6 h"]["pools"] == 72
+
+
+def test_early_rw_check_splits_early_pools_and_trades_by_the_rw_score(tmp_path):
+    """Early pools that rose carry a low rug-vs-win percentile and those that faded a high one: the 6 h rule's kept
+    half wins; an early-book trade is matched by token, a stuck one counts as -100%."""
+    import random
+    from tradingbot.journal import Journal
+    from tests.test_model_book import snap, T0
+    rng = random.Random(2)
+    st = WatchStore(":memory:")
+    ll.ensure_schema(st)
+    for i in range(120):
+        created = T0 + i * 600
+        up = rng.random() < 0.4
+        st.execute("INSERT INTO watch_pools(pool, mint, dex, name, created_ts, seen_ts, first) VALUES(?,?,?,?,?,?,?)",
+                   (f"P{i}", f"M{i}", "pumpswap", f"P{i} / SOL", created, created + 120,
+                    json.dumps(snap(1.0, liq=20_000.0))))
+        st.execute("INSERT INTO watch_snaps(pool, age_min, ts, data) VALUES(?,?,?,?)",
+                   (f"P{i}", 5, created + 360, json.dumps(snap(1.5 if up else 0.8, liq=20_000.0))))
+        if i % 10:  # every tenth pool unscored (not liquid at second 4)
+            st.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, liquid, rw, rw_pct, rw24, rw24_pct, "
+                       "status) VALUES (?,?,?,?,?,?,?,?,?)",
+                       (f"P{i}", f"M{i}", created, 1, -0.5 if up else 0.5, 20.0 if up else 80.0, rng.random(),
+                        rng.uniform(0, 100), "done"))
+    j = Journal(":memory:")
+    j.execute("INSERT INTO positions(token, cost_usd, opened_at, closed_at, realized_usd, strategy) VALUES (?,?,?,?,?,?)",
+              ("M1", 100.0, T0 + 600 + 130, T0 + 600 + 400, 130.0, "early6"))
+    j.execute("INSERT INTO positions(token, cost_usd, opened_at, strategy) VALUES (?,?,?,?)",
+              ("M2", 100.0, T0 + 1200 + 130, "early6"))
+    cfg = Config(db_path=str(tmp_path / "bot.db"))
+    out = ll.early_rw_check(st, j, cfg, now=T0 + 121 * 600)
+    pools = out["every eligible early pool (snapshot yardstick)"]
+    assert pools["n"] == 120 and pools["with a rug-vs-win score"] == 108
+    study = pools["study rule (6 h)"]
+    assert study["kept minus skipped (pts)"]["mean"] > 40
+    assert study["random keeps of the same size"]["share worse than kept"] > 0.99
+    trades = out["early books' real trades"]["early6"]
+    assert trades["n"] == 2 and trades["with a rug-vs-win score"] == 2
+    assert trades["all"]["mean_pct"] == -35.0  # +30% and a stuck -100%
