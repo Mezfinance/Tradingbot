@@ -259,7 +259,7 @@ FAMILIES = (  # book families for the dashboard's family view, in display order
     ("Canary", "real money: launchrw50_24h's picks bought and sold for real, to measure the simulator's error"),
     ("Launch picks", "the second-4 launch scorer's top 2% / 5% picks"),
     ("Low decile", "the history model's bottom 20% (D1-D2), minus the riskiest early pullers"),
-    ("Rug-vs-win", "skip the riskiest half by P(rug before the exit) - P(+50% win); study rule and 24 h rule"),
+    ("Rug-vs-win", "skip the riskiest half by P(rug before the exit) - P(+50% win); study rule, 24 h rule and a size-by-band twin"),
     ("Early", "hand-made pools at first sight, out by pool minute 5-7"),
     ("model5", "the 5-minute snapshot model's short-hold books"))
 
@@ -268,7 +268,7 @@ def family_of(name: str) -> str:
     from tradingbot import model_book as mb
     if name in mb.CANARY_BOOKS:
         return "Canary"
-    if name in mb.LAUNCH_RW_CUT or name in mb.LAUNCH_RW24_CUT:
+    if name in mb.LAUNCH_RW_CUT or name in mb.LAUNCH_RW24_CUT or name in mb.LAUNCH_SIZED_CUT:
         return "Rug-vs-win"
     if name in mb.LAUNCH_LOW_CUT:
         return "Low decile"

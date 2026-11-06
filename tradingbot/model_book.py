@@ -90,8 +90,14 @@ LAUNCH_RW_CUT = {"launchrw50": "rw50", "launchd12rw50": "d12rw50"}
 # Twins on the earlier live rule (11-05; the books above moved to the study's 6 h rule): nightly 14-day model,
 # ranked against the past 24 h, bottom 20% = low_h. Run side by side so a good spell under either isn't missed.
 LAUNCH_RW24_CUT = {"launchrw50_24h": "rw50_24", "launchd12rw50_24h": "d12rw50_24"}
+# Size-by-band twin (11-06, size-study on 1,039 launchrw50 trades): launchrw50's signals, sized by the pool's
+# liquidity at second 4. The edge sat in thin pools (< $15k: 48% big winners, best at $250), $15-25k lost at every
+# size (so it gets a token $25 to keep measuring it), deeper pools stay at $100. Chosen after looking: this is the test.
+LAUNCH_SIZED = "launchrw50_sz"
+LAUNCH_SIZED_CUT = {LAUNCH_SIZED: "rw50"}
+SIZE_BANDS = ((15_000.0, 250.0), (25_000.0, 25.0), (float("inf"), 100.0))  # (liquidity below, trade size $)
 LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
-              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT}
+              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT}
 LAUNCH_CUT[CANARY4] = LAUNCH_CUT[CANARY_TWIN]  # the canary takes its twin's signals
 LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 6.0 for b in LAUNCH_CUT}
 POOL_MINUTE_EXIT = {**EARLY_EXIT_MIN, **LAUNCH_EXIT_MIN}  # books that sell every position by a pool minute
@@ -141,6 +147,13 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
     return sig["created_ts"] + age * 60
 
 
+def band_usd(name: str, liq: float | None) -> float | None:
+    """Trade size of a size-by-band book for a pool with this liquidity (None for every other book)."""
+    if name not in LAUNCH_SIZED_CUT or liq is None:
+        return None
+    return next(usd for below, usd in SIZE_BANDS if liq < below)
+
+
 def active_books(cfg: Config) -> list[str]:
     off = {b.strip() for b in (cfg.disabled_books or "").split(",") if b.strip()}
     return [b for b in _family_books(cfg) if b not in off]
@@ -157,6 +170,7 @@ def _family_books(cfg: Config) -> list[str]:
         + (list(LAUNCH_LOW_CUT) if cfg.launch_low_book and cfg.launch_live else []) \
         + (list(LAUNCH_RW_CUT) if cfg.launch_rw_book and cfg.launch_live else [])\
         + (list(LAUNCH_RW24_CUT) if cfg.launch_rw24_book and cfg.launch_live else []) \
+        + (list(LAUNCH_SIZED_CUT) if cfg.launch_sized_book and cfg.launch_live else []) \
         + ([CANARY4] if cfg.launch_canary and cfg.launch_live else [])
 
 
@@ -697,7 +711,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
                                       EARLY5R: 26.0, EARLY6R: 26.0, EARLY7R: 26.0, EARLY6W: 25.0, EARLY6T: 27.0,
                                       "launchd12": 30.0, "launchd12_s10": 27.0, "launchd12_s20": 24.0,
                                       "launchd12_s30": 18.0, "launchd12_s50": 11.0,
-                                      "launchrw50": 21.0, "launchd12rw50": 17.0}.get(name, 76.0),  # backtests
+                                      "launchrw50": 21.0, "launchd12rw50": 17.0, LAUNCH_SIZED: 23.0}.get(name, 76.0),  # backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 

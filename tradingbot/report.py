@@ -523,6 +523,9 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
                       "n=1,179): kept +17.7%/trade vs every pool +3.9%, 17% rugged vs 31% skipped",
     "launchd12rw50_24h": "rug-vs-win within the past 24 h's history bottom 20%, earlier live rule. Replay: kept "
                          "+14.7%/trade (n=112), 12% rugged, 89% of random keeps worse",
+    "launchrw50_sz": "launchrw50's picks sized by liquidity at second 4: $250 below $15k, $25 at $15-25k, $100 above "
+                     "(capped at 2% of the pool). size-study on 1,039 launchrw50 trades: ~+$12.9k vs +$2.6k at a flat "
+                     "$100, in-sample and optimistic at the big sizes; compare $ per $100 deployed with launchrw50",
 }
 
 

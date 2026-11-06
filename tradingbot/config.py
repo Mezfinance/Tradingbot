@@ -77,6 +77,7 @@ class Config:
     # launchrw50 / launchd12rw50 (11-04): every liquid pool / the history model's bottom 20%, minus the riskiest
     # half by the rug-vs-win model (model/rw.json: P(rug before the exit) - P(+50% win)), sold at pool minute 6
     launch_rw_book: bool = False
+    launch_sized_book: bool = False  # 11-06: launchrw50_sz, launchrw50's signals sized by liquidity band
     launch_rw24_book: bool = False  # 11-05: twin rw books on the earlier rule (24 h ranking, nightly 14-day model)
     # canary_rw50_24h (11-05): REAL MONEY. launchrw50_24h's picks bought and sold for real through Jupiter (live
     # executor), to measure how real fills differ from the simulated ones. Needs the live keypair and TB_LIVE_CONFIRM.

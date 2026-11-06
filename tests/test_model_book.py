@@ -819,6 +819,36 @@ def test_minute_5_twin_takes_launch4_2s_picks_and_sells_at_pool_minute_5(cfg, go
         cfg.launch_book = cfg.launch_m5_book = cfg.launch_live = False
 
 
+def test_size_by_band_twin_sizes_launchrw50s_picks_by_pool_liquidity(cfg, good_pair):
+    assert [mb.band_usd(mb.LAUNCH_SIZED, liq) for liq in (9_000, 14_999, 15_000, 24_999, 25_000, 80_000)] == \
+        [250.0, 250.0, 25.0, 25.0, 100.0, 100.0]
+    assert mb.band_usd("launchrw50", 9_000) is None
+    cfg.launch_rw_book = cfg.launch_sized_book = cfg.launch_live = True
+    try:
+        j = Journal(":memory:")
+        eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                     model_executor=PaperExecutor(cfg))
+        assert mb.LAUNCH_SIZED in mb.active_books(cfg)
+        created = time.time() - 6
+        base = {"pool": "PL", "dex": "pumpswap", "created_ts": created, "name": "", "price": 2.5e-5, "score": 1.0,
+                "ts": time.time(), "decided_ts": time.time(), "kind": "launch", "rw50": True}
+        for mint, liq in (("THIN", 14_000.0), ("MID", 20_000.0), ("DEEP", 40_000.0), ("TINY", 10_000.0)):
+            eng.model_book.signals.put(dict(base, mint=mint, liq=liq))
+        eng.model_book.signals.put(dict(base, mint="NOFLAG", liq=14_000.0, rw50=False))
+        eng.buy_model_signals()
+        cost = {p.token_address: p.cost_usd for p in j.open_positions(mb.LAUNCH_SIZED)}
+        flat = {p.token_address: p.cost_usd for p in j.open_positions("launchrw50")}
+        assert set(cost) == set(flat) == {"THIN", "MID", "DEEP", "TINY"}  # the same picks as launchrw50
+        assert cost["THIN"] == pytest.approx(250.0, rel=0.05)
+        assert cost["MID"] == pytest.approx(25.0, rel=0.05)
+        assert cost["DEEP"] == pytest.approx(100.0, rel=0.05)
+        assert cost["TINY"] == pytest.approx(200.0, rel=0.05)  # still capped at 2% of the pool
+        assert all(v == pytest.approx(100.0, rel=0.05) for k, v in flat.items() if k != "TINY")
+        assert eng._deadlines[next(p.id for p in j.open_positions(mb.LAUNCH_SIZED))] == created + 360
+    finally:
+        cfg.launch_rw_book = cfg.launch_sized_book = cfg.launch_live = False
+
+
 def test_reset_books_archives_history_once(cfg, good_pair):
     from tradingbot.models import Position
     j = Journal(":memory:")

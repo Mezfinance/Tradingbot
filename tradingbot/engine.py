@@ -725,7 +725,9 @@ class Engine:
     def _buy_model(self, book: Book, sig: dict) -> str | None:
         c = self.cfg
         started = time.time()
-        usd = min(book.fixed_usd or c.model_book_usd, c.model_book_liq_share * sig["liq"], book.cash)
+        from tradingbot import model_book as mb
+        base = mb.band_usd(book.name, sig["liq"]) or book.fixed_usd or c.model_book_usd
+        usd = min(base, c.model_book_liq_share * sig["liq"], book.cash)
         if usd < 5:
             return "size too small (cash or liquidity)"
         trigger = sig["price"]
@@ -755,7 +757,6 @@ class Engine:
             return "transaction failed"
         symbol = (sig["name"].split(" / ")[0] or sig["mint"][:6])[:16]
         pos = self._open_position(book, sig["mint"], symbol, fill, trigger, None)
-        from tradingbot import model_book as mb
         deadline = mb.exit_deadline(self.cfg, book.name, sig)
         if deadline is not None:
             self._deadlines[pos.id] = deadline
