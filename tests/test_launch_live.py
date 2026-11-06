@@ -880,3 +880,40 @@ def test_early_rw_check_splits_early_pools_and_trades_by_the_rw_score(tmp_path):
     trades = out["early books' real trades"]["early6"]
     assert trades["n"] == 2 and trades["with a rug-vs-win score"] == 2
     assert trades["all"]["mean_pct"] == -35.0  # +30% and a stuck -100%
+
+
+def test_fill_gap_study_finds_where_real_fills_fall_short():
+    """Two trades fill like the scorer; one was sold after the LP pull (-100% vs ideal +20%); one never sold."""
+    from tradingbot.journal import Journal
+    st = WatchStore(":memory:")
+    ll.ensure_schema(st)
+    j = Journal(":memory:")
+    t0 = 1_700_000_000.0
+    cases = [  # token, ideal, real, buy px, sell px, sold at pool second, pulled at, closed
+        ("A", 0.10, 0.09, 1.0, 1.15, 362, None, True),
+        ("B", -0.20, -0.21, 1.0, 0.85, 362, None, True),
+        ("C", 0.20, -1.0, 1.0, None, 430, 400, True),
+        ("D", 0.05, None, 1.0, None, None, None, False),
+    ]
+    for i, (tok, ideal, real, bpx, spx, out_s, pulled, closed) in enumerate(cases):
+        c = t0 + i * 1000
+        st.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, liquid, ret, status, liq_usd, pulled_ts) "
+                   "VALUES (?,?,?,?,?,?,?,?)", (f"P{tok}", tok, c, 1, ideal, "done", 20_000.0,
+                                                 c + pulled if pulled else None))
+        pid = j.execute("INSERT INTO positions(token, symbol, cost_usd, opened_at, closed_at, realized_usd, "
+                        "exit_reason, strategy) VALUES (?,?,?,?,?,?,?,?)",
+                        (tok, tok, 100.0, c + 9, c + out_s if closed else None,
+                         100 * (1 + real) if closed else 0, "time_stop" if closed else None, "launchrw50"))
+        j.execute("INSERT INTO fills(position_id, side, price, usd, fee_usd, ts) VALUES (?,?,?,?,?,?)",
+                  (pid, "buy", bpx, -100.0, 0.2, c + 9))
+        if spx:
+            j.execute("INSERT INTO fills(position_id, side, price, usd, fee_usd, ts) VALUES (?,?,?,?,?,?)",
+                      (pid, "sell", spx, 100 * (1 + real), 0.2, c + out_s))
+    out = ll.fill_gap_study(st, j, books=("launchrw50",), now=t0 + 10_000)["launchrw50"]
+    assert out["trades"] == 4
+    assert out["sold after the LP was pulled"] == 1
+    worst = out["worst trades"]
+    assert worst[0]["symbol"] == "C" and worst[1]["symbol"] == "D" and worst[1]["exit"] == "never sold"
+    bands = {b["band"]: b for b in out["by sale second (pool age at sale)"]}
+    assert bands["420 s+"]["n"] == 1 and bands["420 s+"]["share_of_total_gap_pct"] > 40
+    assert out["price-only gap (swap move vs scorer's gross move), mean / median"][2] == 2

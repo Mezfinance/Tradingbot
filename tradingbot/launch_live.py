@@ -1996,3 +1996,129 @@ def early_rw_check(store, journal, cfg, hours: float | None = None, now: float |
             "note": f"kept = rug-vs-win percentile < {keep} (the riskiest half skipped); pool outcomes are the "
                     "5-minute snapshot (~pool minute 6) vs first sight; trades still open "
                     f"{EARLY_STUCK_S // 60} min after the buy count as -100%"}
+
+
+# --- fill-gap study (11-06): where do real fills fall short of the scorer's ideal trade? -------------------------
+GAP_BOOKS = ("launchrw50", "launchrw50_24h")
+GAP_NEVER_SOLD_S = 1800  # still open this long after the buy: never sold, counts as -100%
+GAP_WORST = 25
+
+
+def _gap_bucket(rows, key, edges) -> list:
+    """Trades grouped by `key` into `edges` bands: n, mean / median gap, and each band's share of the total gap."""
+    total = sum(r["gap"] for r in rows) or 1e-9
+    out = []
+    for name, lo, hi in edges:
+        g = [r for r in rows if r[key] is not None and lo <= r[key] < hi]
+        if not g:
+            continue
+        gaps = [r["gap"] for r in g]
+        out.append({"band": name, "n": len(g), "mean_gap_pct": _pct(gaps),
+                    "median_gap_pct": round(100 * float(np.median(gaps)), 1),
+                    "share_of_total_gap_pct": round(100 * sum(gaps) / total)})
+    return out
+
+
+def fill_gap_study(store, journal, books=GAP_BOOKS, hours: float | None = None, now: float | None = None) -> dict:
+    """Each launch-book trade (closed, or still open GAP_NEVER_SOLD_S after the buy = -100%) against the scorer's
+    ideal trade on the same pool (vault price at second ~6.5 in, minute 6 out, flat 6% cost, capped +300%, rug =
+    -100%). Splits the gap by what the ideal trade did, when the book filled and sold, pool liquidity, exit reason,
+    swap-only return vs fees, and lists the worst trades."""
+    now = now if now is not None else time.time()
+    ensure_schema(store)
+    since = now - hours * 3600 if hours else 0.0
+    out: dict = {"window": f"last {hours:g} h" if hours else "whole life"}
+    for book in books:
+        rows = []
+        for p in journal.query("SELECT id, token, symbol, opened_at, closed_at, cost_usd, realized_usd, exit_reason "
+                               "FROM positions WHERE strategy=? AND opened_at >= ?", (book, since)):
+            if not p["cost_usd"]:
+                continue
+            if p["closed_at"]:
+                real = p["realized_usd"] / p["cost_usd"] - 1
+            elif now - p["opened_at"] >= GAP_NEVER_SOLD_S:
+                real = -1.0
+            else:
+                continue
+            s = store.query("SELECT create_ts, ret, liq_usd, fill_ts, exit_ts, pulled_ts FROM watch_launch_live "
+                            "WHERE token_mint=? AND status='done' AND create_ts <= ? ORDER BY create_ts DESC LIMIT 1",
+                            (p["token"], p["opened_at"]))
+            if not s or s[0]["ret"] is None:
+                continue
+            s = s[0]
+            fills = journal.query("SELECT side, price, usd, fee_usd FROM fills WHERE position_id=? ORDER BY ts",
+                                  (p["id"],))
+            buys = [f for f in fills if f["side"] == "buy"]
+            sells = [f for f in fills if f["side"] == "sell" and (f["usd"] or 0) > 0]
+            sold = sum(f["usd"] for f in sells)
+            swap = (sum(f["price"] * f["usd"] for f in sells) / sold / buys[0]["price"] - 1
+                    if buys and buys[0]["price"] and sold > 0 else None)
+            ideal = s["ret"]
+            capped, rugged = ideal >= 2.999, ideal <= -0.999
+            rows.append({
+                "token": p["token"], "symbol": p["symbol"], "real": real, "ideal": ideal, "gap": real - ideal,
+                "in_s": p["opened_at"] - s["create_ts"],
+                "out_s": (p["closed_at"] - s["create_ts"]) if p["closed_at"] else None,
+                "liq_usd": s["liq_usd"], "exit": p["exit_reason"] if p["closed_at"] else "never sold",
+                "fee_pct": sum((f["fee_usd"] or 0) for f in fills) / p["cost_usd"],
+                "swap": swap, "capped": capped, "rugged": rugged,
+                # the scorer's gross move (its 6% cost added back) vs the book's swap-only move: price, not fees
+                "swap_gap": (swap - (ideal + 0.06)) if swap is not None and not capped and not rugged else None,
+                "pulled_before_sale": bool(s["pulled_ts"] and p["closed_at"] and s["pulled_ts"] < p["closed_at"]),
+            })
+        if not rows:
+            out[book] = {"trades": 0}
+            continue
+        gaps = np.array([r["gap"] for r in rows])
+        sg = [r["swap_gap"] for r in rows if r["swap_gap"] is not None]
+        ideal_band = lambda r: ("ideal rugged (-100%)" if r["rugged"] else "ideal capped (+300%)" if r["capped"]
+                                else "ideal < 0" if r["ideal"] < 0 else "ideal 0..+50%" if r["ideal"] < 0.5
+                                else "ideal +50%..+300%")
+        for r in rows:
+            r["ideal_band"] = ideal_band(r)
+        by_ideal = []
+        total = float(gaps.sum()) or 1e-9
+        for band in ("ideal rugged (-100%)", "ideal < 0", "ideal 0..+50%", "ideal +50%..+300%", "ideal capped (+300%)"):
+            g = [r["gap"] for r in rows if r["ideal_band"] == band]
+            if g:
+                by_ideal.append({"band": band, "n": len(g), "mean_gap_pct": _pct(g),
+                                 "median_gap_pct": round(100 * float(np.median(g)), 1),
+                                 "share_of_total_gap_pct": round(100 * sum(g) / total)})
+        by_exit: dict = {}
+        for r in rows:
+            by_exit.setdefault(r["exit"] or "unknown", []).append(r["gap"])
+        out[book] = {
+            "trades": len(rows),
+            "real mean / median %": [_pct(list(r["real"] for r in rows)),
+                                      round(100 * float(np.median([r["real"] for r in rows])), 1)],
+            "ideal mean / median %": [_pct(list(r["ideal"] for r in rows)),
+                                       round(100 * float(np.median([r["ideal"] for r in rows])), 1)],
+            "gap mean / median (pts)": [round(100 * float(gaps.mean()), 1), round(100 * float(np.median(gaps)), 1)],
+            "gap mean without the worst 2% of trades": round(100 * float(np.sort(gaps)[max(1, len(gaps) // 50):].mean()), 1),
+            "fees mean % of cost": _pct([r["fee_pct"] for r in rows]),
+            "price-only gap (swap move vs scorer's gross move), mean / median": (
+                [round(100 * float(np.mean(sg)), 1), round(100 * float(np.median(sg)), 1), len(sg)] if sg else None),
+            "sold after the LP was pulled": sum(r["pulled_before_sale"] for r in rows),
+            "by what the ideal trade did": by_ideal,
+            "by fill second (pool age at buy)": _gap_bucket(rows, "in_s", (
+                ("< 8 s", 0, 8), ("8-10 s", 8, 10), ("10-15 s", 10, 15), ("15-30 s", 15, 30), ("30 s+", 30, 1e9))),
+            "by sale second (pool age at sale)": _gap_bucket(rows, "out_s", (
+                ("< 355 s", 0, 355), ("355-375 s", 355, 375), ("375-420 s", 375, 420), ("420 s+", 420, 1e12))),
+            "by liquidity at second 4 (USD)": _gap_bucket(rows, "liq_usd", (
+                ("< 10k", 0, 1e4), ("10-15k", 1e4, 1.5e4), ("15-25k", 1.5e4, 2.5e4), ("25-50k", 2.5e4, 5e4),
+                ("50k+", 5e4, 1e12))),
+            "by exit reason": [{"exit": k, "n": len(v), "mean_gap_pct": _pct(v),
+                                "share_of_total_gap_pct": round(100 * sum(v) / total)}
+                               for k, v in sorted(by_exit.items(), key=lambda kv: sum(kv[1]))],
+            "worst trades": [{"symbol": r["symbol"], "token": r["token"][:8], "real_pct": round(100 * r["real"], 1),
+                              "ideal_pct": round(100 * r["ideal"], 1), "gap": round(100 * r["gap"], 1),
+                              "swap_pct": None if r["swap"] is None else round(100 * r["swap"], 1),
+                              "in_s": round(r["in_s"], 1), "out_s": None if r["out_s"] is None else round(r["out_s"]),
+                              "liq_usd": None if r["liq_usd"] is None else round(r["liq_usd"]), "exit": r["exit"],
+                              "pulled_before_sale": r["pulled_before_sale"]}
+                             for r in sorted(rows, key=lambda r: r["gap"])[:GAP_WORST]],
+        }
+    out["note"] = ("gap = real return - scorer's ideal return on the same pool; ideal = vault price at second ~6.5 "
+                   "in, minute 6 out, flat 6% cost, capped +300%, rug = -100%; price-only gap leaves out rugged and "
+                   "capped pools and both sides' costs (real fees, the scorer's 6%)")
+    return out

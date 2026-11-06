@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -427,6 +427,14 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore, watch_db_path
         print(json.dumps(launch_live.rw_check(WatchStore(watch_db_path(cfg)), Journal(cfg.db_path),
                                               args.hours or 12), indent=2, default=str))
+        return
+
+    if args.command == "fill-gap-study":  # where real launch fills fall short of the scorer's ideal trade
+        from tradingbot import launch_live
+        from tradingbot.journal import Journal
+        from tradingbot.watcher import WatchStore, watch_db_path
+        print(json.dumps(launch_live.fill_gap_study(WatchStore(watch_db_path(cfg)), Journal(cfg.db_path),
+                                                    hours=args.hours), indent=2, default=str))
         return
 
     if args.command == "early-rw-study":  # a rug-vs-win score trained on the early books' own entries
