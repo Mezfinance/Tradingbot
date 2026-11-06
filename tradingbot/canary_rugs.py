@@ -20,7 +20,7 @@ from tradingbot import launch_live
 from tradingbot import model_book as mb
 
 RUG_RET = -0.999  # the scorer's rugged: pool SOL < 10% of its peak or LP supply 0 by minute 6 (ret -100%)
-SWAP_RUG = -0.99  # a sale at 1% or less of the buy price (swap prices, fees left out) = rugged
+SWAP_RUG = -0.8  # a sale at 20% or less of the buy price (swap prices, fees left out) = rugged, as the dashboard
 STUCK_S = 1800  # an open trade older than this counts as rugged (exit blocked, written off)
 TOP_STREAKS = 5
 
@@ -63,24 +63,31 @@ def _fisher_greater(a: int, b: int, c: int, d: int) -> float:
     return sum(math.comb(n1, x) * math.comb(n2, k - x) for x in range(a, min(n1, k) + 1)) / total if total else 1.0
 
 
+def swap_return(fills) -> float | None:
+    """A trade's result from its fill prices alone (sell price over buy price - 1, sells weighted by quantity),
+    leaving out fees and account rent. None until something was sold."""
+    buys = [f for f in fills if f["side"] == "buy" and f["price"]]
+    sells = [f for f in fills if f["side"] == "sell" and f["price"]]
+    if not buys or not sells:
+        return None
+    w = [abs(f["qty"] or 0) or 1.0 for f in sells]  # a fill without a quantity counts once
+    return sum(f["price"] * x for f, x in zip(sells, w)) / sum(w) / buys[0]["price"] - 1
+
+
 def _trades(journal, like: str, since: float = 0.0) -> list[dict]:
     out = []
     now = time.time()
     for p in journal.query("SELECT id, strategy, token, symbol, opened_at, closed_at, cost_usd, realized_usd, "
                            "exit_reason FROM positions WHERE strategy LIKE ? AND opened_at >= ? ORDER BY opened_at",
                            (like, since)):
-        fills = journal.query("SELECT side, price, usd, ts FROM fills WHERE position_id=? ORDER BY ts", (p["id"],))
+        fills = journal.query("SELECT side, price, usd, qty, ts FROM fills WHERE position_id=? ORDER BY ts", (p["id"],))
         buys = [f for f in fills if f["side"] == "buy"]
-        sells = [f for f in fills if f["side"] == "sell" and f["price"]]
-        buy_px = buys[0]["price"] if buys else None
-        sold = sum(abs(f["usd"] or 0) for f in sells)
-        sell_px = (sum(f["price"] * abs(f["usd"] or 0) for f in sells) / sold) if sold else None
         # swap only (fill prices, fees left out): a 1-cent canary trade always loses its network fees, so judge
         # rugs on what the pool paid back, not on the book's net result
-        swap = (sell_px / buy_px - 1) if buy_px and sell_px else None
+        swap = swap_return(fills)
         if p["closed_at"]:
             ret = (p["realized_usd"] / p["cost_usd"] - 1) if p["cost_usd"] else None
-            rug = swap is None or swap <= SWAP_RUG  # sold for 1% or less of the buy price, or nothing sold
+            rug = swap is None or swap <= SWAP_RUG  # sold for 20% or less of the buy price, or nothing sold
         else:
             ret, rug = None, now - p["opened_at"] > STUCK_S
         out.append({**dict(p), "fill_ts": buys[0]["ts"] if buys else p["opened_at"], "ret": ret, "swap": swap,

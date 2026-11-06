@@ -69,7 +69,7 @@ def test_stream_sends_rows_then_deltas_and_new_trades(cfg, monkeypatch):
     rows = [dict(zip(init["pos_cols"], r)) for r in init["positions"]]
     assert [r["symbol"] for r in rows if r["strategy"] == "launchrw50"] == ["A"]
     assert {"name": "launchrw50", "hold_min": dash.Live(cfg).holds["launchrw50"], "flag": "rw50",
-            "family": "Rug-vs-win", "cash": cfg.model_book_cash_usd} in init["books"]
+            "family": "Rug-vs-win", "cash": cfg.model_book_cash_usd, "twin": None} in init["books"]
     assert [f["name"] for f in init["families"]] == [n for n, _ in dash.FAMILIES]
 
 
@@ -176,3 +176,19 @@ def test_the_canary_starts_from_its_own_budget():
     cfg = Config()
     assert dash.start_cash(cfg, mb.CANARY4) == cfg.launch_canary_budget_usd == 50.0
     assert dash.start_cash(cfg, "launchrw50_sz") == cfg.model_book_cash_usd
+
+
+def test_canary_positions_carry_their_swap_result_and_the_twin(cfg):
+    from tradingbot import model_book as mb
+    cfg.launch_book = cfg.launch_live = cfg.launch_canary = cfg.launch_sized_book = True
+    j = Journal(":memory:")
+    pid = j.execute("INSERT INTO positions(token, symbol, cost_usd, realized_usd, qty, opened_at, closed_at, strategy) "
+                    "VALUES ('T', 'T', 0.31, 0.0115, 0, 1.0, 400.0, ?)", (mb.CANARY4,))
+    j.execute("INSERT INTO fills(position_id, side, qty, price, usd, ts) VALUES (?, 'buy', 474.7, 2.1065e-5, 0.31, 10)", (pid,))
+    j.execute("INSERT INTO fills(position_id, side, qty, price, usd, ts) VALUES (?, 'sell', 474.7, 2.8922e-5, 0.0115, 370)", (pid,))
+    live = dash.Live(cfg, j)
+    live.poll()
+    _, snap = live.snapshot()
+    rows = [dict(zip(snap["pos_cols"], r)) for r in snap["positions"]]
+    assert round(rows[0]["swap_ret"], 3) == 0.373  # the 11-06 GKRs7p trade: -96% net, +37% on the swap
+    assert {b["name"]: b["twin"] for b in snap["books"]}[mb.CANARY4] == mb.CANARY_TWIN

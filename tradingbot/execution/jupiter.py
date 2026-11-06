@@ -12,7 +12,11 @@ journal records what happened on-chain. Built for the launch canary (11-05):
   - buys are refused before sending when the wallet's USDC or SOL is short,
   - Jupiter's impact figure is replaced by our own probe on seconds-old tokens (as the simulator),
   - sells use a wider slippage (an exit must go through), and an emptied token account is closed
-    afterwards so its rent (~0.002 SOL) comes back; the reclaimed SOL counts in the sale's proceeds.
+    afterwards so its rent (~0.0015 SOL) comes back; the reclaimed SOL counts in the sale's proceeds.
+    A dropped close is built again (CLOSE_TRIES), and `sweep` closes every empty account left behind
+    (11-06 on-chain: 3 of 6 one-cent trades' closes never landed, and routes leave wSOL / fee-token
+    accounts open). Not recoverable: on a fresh pumpswap pool the first buyers also pay the rent of the
+    coin creator's fee account (~0.0015 SOL), so a buy costs ~0.003 SOL of SOL however small it is.
 """
 
 from __future__ import annotations
@@ -40,6 +44,10 @@ TX_FETCH_WAIT_S = 0.5
 TX_VERSION = 1
 MIN_SOL = 0.01  # keep this much SOL for fees and token-account rent, or refuse to buy
 CLOSE_ACCOUNT = bytes([9])  # SPL Token / Token-2022 CloseAccount instruction
+TOKEN_PROGRAMS = ("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
+CLOSE_TRIES = 3  # a close whose transaction was dropped is built again with a fresh blockhash
+CLOSE_BATCH = 8  # empty accounts closed per transaction by the sweep
+DUST_SHARE = 1e-6  # a sale leaving at most this share of the balance sells the rest too
 NOT_SENT = "not sent:"  # note prefix: nothing went out (preflight refused, build failed); retry soon
 DEFAULT_PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
 
@@ -63,7 +71,15 @@ def load_keypair(text: str):
     return Keypair.from_base58_string(text)
 
 
-SECRET_KEYPAIR_PATH = "/run/secrets/keypair.json"  # written by deploy/entrypoint.sh, never on the volume
+def _amount(acct: dict) -> int:
+    return int(acct["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"])
+
+
+def _mint(acct: dict) -> str:
+    return acct["account"]["data"]["parsed"]["info"].get("mint", "")
+
+
+SECRET_KEYPAIR_PATH ="/run/secrets/keypair.json"  # written by deploy/entrypoint.sh, never on the volume
 
 
 def read_keypair(cfg: Config):
@@ -151,7 +167,9 @@ class JupiterExecutor:
         if decimals is None:
             return failed(0.0, "token decimals unknown")
         held = self.token_balance(token)
-        raw_in = min(int(qty * 10**decimals), held)
+        raw_in = min(round(qty * 10**decimals), held)
+        if held - raw_in <= max(1, held * DUST_SHARE):  # sell the float-rounding dust too, or the account can't be closed
+            raw_in = held
         if raw_in <= 0:
             log.warning("no %s balance to sell", token)
             return failed(0.0, "no balance")
@@ -181,11 +199,7 @@ class JupiterExecutor:
         return res.get("value") or []
 
     def token_balance(self, mint: str) -> int:
-        total = 0
-        for acct in self.token_accounts(mint):
-            info = acct["account"]["data"]["parsed"]["info"]
-            total += int(info["tokenAmount"]["amount"])
-        return total
+        return sum(_amount(a) for a in self.token_accounts(mint))
 
     def sol_balance(self) -> float | None:
         res = self._rpc("getBalance", [self.owner, {"commitment": "confirmed"}])
@@ -193,36 +207,77 @@ class JupiterExecutor:
 
     def close_empty(self, mint: str) -> float:
         """Close this wallet's empty token accounts for `mint`; returns the USD value of the SOL that came back
-        (rent minus the fee), 0 if nothing was closed. Best effort: a failure only leaves the rent locked."""
+        (rent minus the fee), 0 if nothing was closed. Best effort: a failure only leaves the rent locked (the
+        sweep, CLI `canary-sweep`, gets it back later)."""
         try:
-            from solders.hash import Hash
-            from solders.instruction import AccountMeta, Instruction
-            from solders.message import MessageV0
-            from solders.pubkey import Pubkey
-            from solders.transaction import VersionedTransaction
-
-            accounts = [a for a in self.token_accounts(mint)
-                        if int(a["account"]["data"]["parsed"]["info"]["tokenAmount"]["amount"]) == 0]
-            if not accounts:
-                return 0.0
-            me = self.keypair.pubkey()
-            ixs = [Instruction(Pubkey.from_string(a["account"]["owner"]), CLOSE_ACCOUNT,
-                               [AccountMeta(Pubkey.from_string(a["pubkey"]), False, True),
-                                AccountMeta(me, False, True), AccountMeta(me, True, False)]) for a in accounts]
-            bh = (self._rpc("getLatestBlockhash", [{"commitment": "confirmed"}]) or {}).get("value", {}).get("blockhash")
-            if not bh:
-                return 0.0
-            msg = MessageV0.try_compile(me, ixs, [], Hash.from_string(bh))
-            tx = VersionedTransaction(msg, [self.keypair])
-            sig = self._rpc("sendTransaction", [base64.b64encode(bytes(tx)).decode(),
-                                                {"encoding": "base64", "skipPreflight": False, "maxRetries": 3}])
-            if not sig:
-                return 0.0
-            res = self._settle(sig, None)
-            return -res["fee_usd"] if res["ok"] else 0.0  # negative cost = SOL came back
+            accounts = [a for a in self.token_accounts(mint) if _amount(a) == 0]
+            return self._close(accounts)[1] if accounts else 0.0
         except Exception:  # noqa: BLE001 (closing an account must never break a sale)
             log.warning("closing the empty %s account failed", mint, exc_info=True)
             return 0.0
+
+    def all_token_accounts(self) -> list[dict]:
+        """Every token account this wallet owns, under both token programs."""
+        out = []
+        for program in TOKEN_PROGRAMS:
+            res = self._rpc("getTokenAccountsByOwner", [self.owner, {"programId": program},
+                                                        {"encoding": "jsonParsed", "commitment": "confirmed"}]) or {}
+            out += res.get("value") or []
+        return out
+
+    def sweep(self, keep: set[str] = frozenset(), apply: bool = True) -> dict:
+        """Close every empty token account except USDC's and those of mints in `keep` (open positions), to get
+        their rent back. Jupiter routes and pumpswap leave empty accounts behind (wSOL, fee tokens, a sale whose
+        close was dropped). Accounts still holding tokens are only listed: closing them would need a burn."""
+        accounts = self.all_token_accounts()
+        empty = [a for a in accounts if _amount(a) == 0 and _mint(a) != USDC_MINT and _mint(a) not in keep]
+        held = [{"account": a["pubkey"], "mint": _mint(a), "amount": _amount(a)} for a in accounts
+                if _amount(a) > 0 and _mint(a) != USDC_MINT]
+        rent = sum(int(a["account"].get("lamports") or 0) for a in empty) / 1e9
+        out = {"empty_accounts": len(empty), "rent_sol": round(rent, 6), "holding_tokens": held, "closed": 0,
+               "usd_back": 0.0}
+        if not apply:
+            return out
+        for i in range(0, len(empty), CLOSE_BATCH):
+            batch = empty[i:i + CLOSE_BATCH]
+            ok, usd = self._close(batch)
+            if ok:
+                out["closed"] += len(batch)
+                out["usd_back"] += usd
+        out["usd_back"] = round(out["usd_back"], 4)
+        return out
+
+    def _close(self, accounts: list[dict]) -> tuple[bool, float]:
+        """Close these empty accounts in one transaction, built again up to CLOSE_TRIES times if it is dropped
+        (resent every RESEND_S while its blockhash lives, as swaps). (landed, USD of SOL back net of the fee)."""
+        from solders.hash import Hash
+        from solders.instruction import AccountMeta, Instruction
+        from solders.message import MessageV0
+        from solders.pubkey import Pubkey
+        from solders.transaction import VersionedTransaction
+
+        me = self.keypair.pubkey()
+        ixs = [Instruction(Pubkey.from_string(a["account"]["owner"]), CLOSE_ACCOUNT,
+                           [AccountMeta(Pubkey.from_string(a["pubkey"]), False, True),
+                            AccountMeta(me, False, True), AccountMeta(me, True, False)]) for a in accounts]
+        for _ in range(CLOSE_TRIES):
+            latest = (self._rpc("getLatestBlockhash", [{"commitment": "confirmed"}]) or {}).get("value") or {}
+            if not latest.get("blockhash"):
+                continue
+            tx = VersionedTransaction(MessageV0.try_compile(me, ixs, [], Hash.from_string(latest["blockhash"])),
+                                      [self.keypair])
+            raw = base64.b64encode(bytes(tx)).decode()
+            sig = self._rpc("sendTransaction", [raw, {"encoding": "base64", "skipPreflight": False, "maxRetries": 0}])
+            if not sig:  # preflight refused (e.g. already closed by an earlier try that landed late)
+                return False, 0.0
+            self._pending[sig] = (raw, latest.get("lastValidBlockHeight"))
+            res = self._settle(sig, None)
+            if res["ok"]:
+                return True, -res["fee_usd"]  # negative cost = SOL came back
+            if not res["note"].startswith("not confirmed"):  # reverted: trying again won't help
+                return False, 0.0
+            log.warning("account close %s dropped; building it again", sig)
+        return False, 0.0
 
     # --- internals ------------------------------------------------------------
     def _why_none(self, default: str) -> str:

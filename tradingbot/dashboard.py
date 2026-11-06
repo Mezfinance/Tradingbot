@@ -256,7 +256,7 @@ STUCK_AFTER_S = 0  # as engine.STUCK_AFTER_S: a position with no route out count
 
 
 FAMILIES = (  # book families for the dashboard's family view, in display order
-    ("Canary", "real money: every launchrw50_sz pick bought and sold for real at $5 / $0.50 / $2, to measure the simulator's error"),
+    ("Canary", "real money: launchrw50_sz picks bought and sold for real at a cent, judged on swap prices against the twin"),
     ("Launch picks", "the second-4 launch scorer's top 2% / 5% picks"),
     ("Low decile", "the history model's bottom 20% (D1-D2), minus the riskiest early pullers"),
     ("Rug-vs-win", "skip the riskiest half by P(rug before the exit) - P(+50% win); study rule, 24 h rule and a size-by-band twin"),
@@ -295,6 +295,8 @@ class Live:
         self.cfg = cfg
         self.books = list(mb.active_books(cfg))
         self.flag_of = {b: mb.LAUNCH_CUT.get(b) for b in self.books}
+        self.canary = set(mb.CANARY_BOOKS)
+        self.twin = {b: mb.CANARY_TWIN if b in mb.CANARY_BOOKS else None for b in self.books}
         self.holds = {b: mb.hold_min(cfg, b) for b in self.books}
         self.journal = journal
         self.jdb = self._open(cfg.db_path) if cfg.db_path != ":memory:" else None
@@ -383,7 +385,14 @@ class Live:
             row = [r[c] for c in POS_COLS]
             row.append(self._blocked_since(r["strategy"], r["token"], r["opened_at"]) if r["closed_at"] is None
                        else None)
+            row.append(self._swap(r["id"]) if r["strategy"] in self.canary else None)
             self._bump(self.pos, r["id"], row)
+
+    def _swap(self, pid: int) -> float | None:
+        """The canary's result from its fill prices alone: a 1-cent trade's net result is all fees and rent."""
+        from tradingbot.canary_rugs import swap_return
+        ret = swap_return(self._q("SELECT side, price, qty FROM fills WHERE position_id=? ORDER BY ts", (pid,)))
+        return None if ret is None else round(ret, 5)
 
     def _poll_fills(self) -> None:
         if not self.fills and not self.last_fill:
@@ -427,10 +436,10 @@ class Live:
                 "now": time.time(), "cash": self.cfg.model_book_cash_usd, "stuck_after_s": STUCK_AFTER_S,
                 "shorts_enabled": bool(self.cfg.shortbook_feed_url),
                 "books": [{"name": b, "hold_min": self.holds[b], "flag": self.flag_of[b], "family": family_of(b),
-                           "cash": start_cash(self.cfg, b)}
+                           "cash": start_cash(self.cfg, b), "twin": self.twin[b]}
                           for b in self.books],
                 "families": [{"name": n, "about": a} for n, a in FAMILIES],
-                "pos_cols": [*POS_COLS, "blocked_since"], "positions": [row for _, row in self.pos.values()],
+                "pos_cols": [*POS_COLS, "blocked_since", "swap_ret"], "positions": [row for _, row in self.pos.values()],
                 "launch_cols": ["pool", "token", "create_ts", "decided_ts", "liquid", "ret", "status",
                                 "pulled_ts", "liq_usd", "flags"],
                 "launch": [row for _, row in self.launch.values()], "launch_keep_s": LAUNCH_KEEP_S,
@@ -641,6 +650,9 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <section class="card chart"><p class="label eyebrow">Equity</p><h2>Equity curve</h2><p class="sub">Equity after every closed trade, from $10,000. Dashed: the starting $10,000.</p><div id="b-chart"></div></section>
 <section class="card" id="b-gap-card"><p class="label eyebrow">Execution · last <span id="b-lh">6</span> h (launch window on the overview)</p><h2>Real against ideal</h2>
 <p class="sub">This book's fills against the scorer's ideal trade on the same pools, and the flagged pools it did not buy.</p><div class="scroll"><table id="b-gap"></table></div></section>
+<section class="card" id="b-swap-card" hidden><p class="label eyebrow">Real money · fill prices only</p><h2>Swap result against the twin</h2>
+<p class="sub">At a cent a trade the net result is all fees and account rent, so the canary is judged on what the pool paid: sell price over buy price. The twin is the paper book it copies, on the same tokens.</p>
+<div class="stats" id="b-swap-stats"></div><div class="scroll"><table id="b-swap"></table></div></section>
 <section class="card"><p class="label eyebrow">Trades</p><h2>Book ledger</h2><div class="scroll"><table id="b-ledger"></table></div>
 <p class="more"><button id="b-more">Show 200 more</button><span id="b-count" class="label muted"></span></p></section>
 </main>
@@ -727,7 +739,7 @@ const STAG={"Open":"lime","Exit blocked":"warn","Exit blocked ($0)":"neg","Won":
 function ledgerTable(id,rows,limit,showBook){let h=`<tr><th>Bought (UTC)</th>${showBook?'<th class="l">Book</th>':""}<th class="l">Token</th><th class="l">Status</th><th>Result</th><th>Result $</th><th>Held</th><th>Cost $</th><th>Exit</th></tr>`;
 for(const x of rows.slice(0,limit)){const tok=x.token?`<a class="lk" href="https://dexscreener.com/solana/${encodeURIComponent(x.token)}" target="_blank" rel="noopener" title="${esc(x.token)}">${esc(x.sym)}</a>`:esc(x.sym);
 h+=`<tr><td class="mono">${when(x.opened)}</td>${showBook?`<td class="l">${bookLink(x.book)}</td>`:""}<td class="l">${tok}</td><td class="l"><span class="tag sm ${STAG[x.st]}">${esc(x.st)}</span></td>`+
-`<td class="${cls(x.pct)}">${sgn(x.pct)}</td><td class="${cls(x.pnl)}">${x.pnl==null?"-":sgn(x.pnl,2,"")}</td><td>${dur(x.held)}</td><td>${fmt(x.cost,2)}</td><td class="muted">${esc((x.reason||"").replace(/_/g," "))}</td></tr>`}
+`<td class="${cls(x.pct)}">${sgn(x.pct)}${x.p.swap_ret==null?"":`<br><span class="muted" title="fill prices only, fees and rent left out">swap ${sgn(100*x.p.swap_ret)}</span>`}</td><td class="${cls(x.pnl)}">${x.pnl==null?"-":sgn(x.pnl,2,"")}</td><td>${dur(x.held)}</td><td>${fmt(x.cost,2)}</td><td class="muted">${esc((x.reason||"").replace(/_/g," "))}</td></tr>`}
 $(id).innerHTML=h;return rows.length}
 const STATUS_OK=(x,st)=>!st||x.st===st;
 function fillSelects(){const fs=$("lf-fam"),bs=$("lf-book"),fv=fs.value,bv=bs.value;
@@ -779,7 +791,22 @@ tiles("b-stats",[["Equity",fmt(s.equity,0),`return <b>${sgn(s.return_pct,2)}</b>
 ["Profit factor",fmt(s.profit_factor,2),`won ${fmt(s.gain,0)} $ · lost ${fmt(s.loss,0)} $`],["Rugged",fmt(s.rug_pct,0,"%"),`${s.rugs} trade${s.rugs===1?"":"s"} at −80% or worse`]]);
 chart("b-chart",[{name,pts:s.pts,ret:s.return_pct}],s.cash);
 if(b.flag){$("b-gap-card").hidden=false;$("b-lh").textContent=win>=86400?"24":String(win/3600);$("b-gap").innerHTML=GAPHEAD+(gapRow(b,doneIn())||'<tr><td class="muted">No finished trades in the window.</td></tr>')}else $("b-gap-card").hidden=true;
+$("b-swap-card").hidden=!b.twin;if(b.twin)swapCard(b);
 const rows=trades(x=>x.book===name);const n=ledgerTable("b-ledger",rows,LIM.b,false);$("b-count").textContent=`${Math.min(n,LIM.b)} of ${n} trades`;$("b-more").hidden=n<=LIM.b}
+/* the canary judged on fill prices against its paper twin on the same tokens */
+function swapCard(b){const t=now(),tw=new Map();
+for(const p of S.pos.values())if(p.strategy===b.twin){const x=trade(p,t);if(x.pct!=null)tw.set(p.token,x)}
+const rows=trades(x=>x.book===b.name&&x.p.swap_ret!=null);const sw=[],tv=[],gap=[];
+let h=`<tr><th>Bought (UTC)</th><th class="l">Token</th><th>Canary swap</th><th>Twin result</th><th>Gap</th><th>Canary net</th><th>Net $</th></tr>`;
+for(const x of rows){const s=100*x.p.swap_ret,w=tw.get(x.token),wp=w?w.pct:null;sw.push(s);if(wp!=null){tv.push(wp);gap.push(s-wp)}
+if(sw.length>LIM.b)continue;
+h+=`<tr><td class="mono">${when(x.opened)}</td><td class="l">${esc(x.sym)}</td><td class="${cls(s)}">${sgn(s)}</td><td class="${cls(wp)}">${sgn(wp)}</td><td class="${cls(wp==null?null:s-wp)}">${wp==null?"-":sgn(s-wp)}</td><td class="muted">${sgn(x.pct)}</td><td class="muted">${x.pnl==null?"-":sgn(x.pnl,2,"")}</td></tr>`}
+const rug=sw.filter(v=>v<=-80).length;
+tiles("b-swap-stats",[["Canary swap",`<span class="${cls(mean(sw))}">${sgn(mean(sw))}</span>`,`mean of ${sw.length} sold · median ${sgn(median(sw))}`],
+["Twin, same tokens",`<span class="${cls(mean(tv))}">${sgn(mean(tv))}</span>`,`${tv.length} matched`],
+["Gap",`<span class="${cls(mean(gap))}">${sgn(mean(gap))}</span>`,`canary swap minus twin · median ${sgn(median(gap))}`],
+["Rugged (swap)",fmt(sw.length?100*rug/sw.length:null,0,"%"),`${rug} sold at −80% or worse`]]);
+$("b-swap").innerHTML=rows.length?h:'<tr><td class="muted">No sold canary trades yet.</td></tr>'}
 /* programs: Supermeme (all books) and MZF Short Only (the shortbook app's feed) */
 function memeTotals(){const all=S.books.map(bookStats),tr=all.flatMap(b=>b.tr),pnl=all.reduce((a,b)=>a+b.equity-b.cash,0);
 return{all,pnl,cap:all.reduce((a,b)=>a+b.cash,0),trades:tr.length,open:all.reduce((a,b)=>a+b.open,0),mean:mean(tr.map(x=>x.ret*100)),last_hour:all.reduce((a,b)=>a+b.last_hour,0)}}

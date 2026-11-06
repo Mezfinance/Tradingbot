@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -119,6 +119,7 @@ def main(argv: list[str] | None = None) -> None:
                         help="Helius credit cap (defaults: backfills 60000, launch-exit-study 10000, "
                              "launch-late-entry 12000)")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
+    parser.add_argument("--apply", action="store_true", help="canary-sweep: close the empty accounts (default: list)")
     parser.add_argument("--idea", help="propose: what to build")
     parser.add_argument("--problem", default="", help="propose: what it should fix or improve")
     parser.add_argument("--priority", type=int, default=1, help="propose: 1 (first) to 5 (last)")
@@ -314,6 +315,19 @@ def main(argv: list[str] | None = None) -> None:
         ex = JupiterExecutor(cfg, Jupiter(cfg.slippage_bps), priority_fee_sol=cfg.launch_canary_priority_fee_sol,
                              sell_slippage_bps=cfg.launch_canary_sell_slippage_bps)
         print(json.dumps(launch_canary.smoke(ex, args.path or launch_canary.SMOKE_MINT, args.usd), indent=2, default=str))
+        return
+
+    if args.command == "canary-sweep":  # get the rent back from the wallet's empty token accounts
+        from tradingbot import model_book as mb
+        from tradingbot.data.jupiter import Jupiter
+        from tradingbot.execution.jupiter import JupiterExecutor
+        from tradingbot.journal import Journal
+        if args.apply and cfg.live_confirm != LIVE_CONFIRM_PHRASE:
+            raise SystemExit(f"canary-sweep --apply signs transactions; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+        journal = Journal(cfg.db_path)
+        keep = {p.token_address for b in mb.CANARY_BOOKS for p in journal.open_positions(b)}
+        ex = JupiterExecutor(cfg, Jupiter(cfg.slippage_bps))
+        print(json.dumps(ex.sweep(keep, apply=args.apply), indent=2, default=str))
         return
 
     if args.command == "launch-rw24-train":  # the earlier rule's rug-vs-win model (rw24 twin books)

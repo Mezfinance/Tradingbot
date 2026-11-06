@@ -195,6 +195,59 @@ def test_sell_uses_wide_slippage_and_closes_the_empty_account():
     assert fill.usd == pytest.approx(12.0 - 0.1 + 0.4)  # proceeds - sale fee + rent back
 
 
+def test_sell_takes_the_rounding_dust_too():
+    ex, rpc = executor(token=12_345_678_901)
+    rpc.next_meta = [meta(ex.owner, (0, 12_000_000), (12_345_678_901, 0)), meta(ex.owner, (0, 0), (0, 0))]
+    sent = []
+    orig = ex.jup.quote
+    ex.jup.quote = lambda a, b, raw, slip=None: (sent.append(raw), orig(a, b, raw, slip))[1]
+    ex.sell(TOKEN, 12_345_678_900 / 1e6, 0.6)  # one raw unit short of the balance (rounding): sell it all
+    assert sent == [12_345_678_901]  # a single unit left would have kept the account (and its rent) open
+
+
+def test_a_dropped_account_close_is_built_again(monkeypatch):
+    monkeypatch.setattr(jx, "CONFIRM_TIMEOUT_S", 0)
+    ex, rpc = executor()
+    rpc.next_meta = [None, meta(ex.owner, (0, 0), (0, 0), lamports_spent=-0.002e9)]  # dropped, then lands
+    orig = rpc.post
+
+    def post(url, json=None):  # a fresh blockhash each time, so the rebuilt close is a new transaction
+        if json["method"] == "getLatestBlockhash":
+            return SimpleNamespace(json=lambda: {"result": {"value": {"blockhash": str(Hash.new_unique()),
+                                                                       "lastValidBlockHeight": 99}}})
+        return orig(url, json)
+    rpc.post = post
+    rpc.bal[TOKEN] = 0
+    assert ex.close_empty(TOKEN) == pytest.approx(0.4)  # 0.002 SOL rent back at $200
+    assert len(rpc.sent) == 2
+
+
+def test_sweep_closes_empty_accounts_but_not_usdc_or_open_positions():
+    ex, rpc = executor()
+    def acct(key, mint, amount, program=jx.TOKEN_PROGRAMS[0]):
+        return {"pubkey": key, "account": {"owner": program, "lamports": 1_500_000, "data": {"parsed": {"info": {
+            "mint": mint, "tokenAmount": {"amount": str(amount)}}}}}}
+    keys = [str(Keypair().pubkey()) for _ in range(12)]
+    wallet = {jx.TOKEN_PROGRAMS[0]: [acct(keys[0], USDC_MINT, 0), acct(keys[1], "WsolMint", 0)],
+              jx.TOKEN_PROGRAMS[1]: [acct(keys[2 + i], f"Dead{i}", 0, jx.TOKEN_PROGRAMS[1]) for i in range(8)]
+              + [acct(keys[10], "OpenMint", 0, jx.TOKEN_PROGRAMS[1]), acct(keys[11], "Left", 5, jx.TOKEN_PROGRAMS[1])]}
+    rpc.next_meta = [meta(ex.owner, (0, 0), (0, 0), lamports_spent=-0.012e9),
+                     meta(ex.owner, (0, 0), (0, 0), lamports_spent=-0.0015e9)]
+    orig = rpc.post
+
+    def post(url, json=None):
+        if json["method"] == "getTokenAccountsByOwner":
+            return SimpleNamespace(json=lambda: {"result": {"value": wallet[json["params"][1]["programId"]]}})
+        return orig(url, json)
+    rpc.post = post
+    listed = ex.sweep({"OpenMint"}, apply=False)
+    assert listed["empty_accounts"] == 9 and listed["rent_sol"] == pytest.approx(0.0135) and not rpc.sent
+    assert listed["holding_tokens"] == [{"account": keys[11], "mint": "Left", "amount": 5}]
+    res = ex.sweep({"OpenMint"})
+    assert res["closed"] == 9 and len(rpc.sent) == 2  # 8 per transaction
+    assert res["usd_back"] == pytest.approx(2.7)
+
+
 def test_sell_not_sent_is_retried_next_pass(cfg, good_pair):
     j = Journal(":memory:")
     eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j)
@@ -334,3 +387,19 @@ def test_canary_goes_below_the_paper_books_five_dollar_floor(cfg, good_pair):
     assert live.sizes[-1] == 0.01
     # the paper twin keeps its own sizes and the $5 floor
     assert eng._buy_model(eng.books[mb.LAUNCH_SIZED], sig("X", 100.0)) == "size too small (cash or liquidity)"
+
+
+def test_engine_sweeps_the_canary_wallet_hourly_keeping_open_positions(cfg, good_pair):
+    cfg.launch_book = cfg.launch_live = cfg.launch_canary = True
+    j = Journal(":memory:")
+    live = Recorder(cfg)
+    swept = []
+    live.sweep = lambda keep: swept.append(set(keep)) or {"closed": 2, "usd_back": 0.6}
+    eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                 model_executor=PaperExecutor(cfg), launch_canary_executor=live)
+    from tradingbot.models import Position
+    j.save_position(Position(None, "HELD", "H", 1.0, 1.0, 1.0, 0.3, time.time(), 0.0, 1.0, strategy=mb.CANARY4))
+    eng.sweep_canary_wallet_if_due(wait=True)
+    eng.sweep_canary_wallet_if_due(wait=True)  # not due again for an hour
+    assert swept == [{"HELD"}]
+    assert j.query("SELECT kind FROM events WHERE kind='wallet_sweep'")

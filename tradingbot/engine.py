@@ -50,6 +50,7 @@ STUCK_AFTER_S = 0  # a position with no route out is valued at zero from its fir
 BUY_WORKERS = 16  # every book that wants a signal starts its buy at once (up to 17 books run)
 SELL_WORKERS = 16  # exits due in the same monitor pass are sold in parallel
 MODEL_MIN_USD = 5.0  # paper model books: no trade below this
+WALLET_SWEEP_S = 3600  # how often the canary's wallet closes empty token accounts a sale's own close missed
 CANARY_MIN_USD = 0.01  # the real-money canary may go down to a cent (Jupiter routes $0.001 USDC swaps)
 NO_LIQUIDITY_MULT = 10.0  # model entry: a live price this many times the snapshot means an empty pool
 DEAD_LIQ_USD = 100.0  # a DexScreener pool with less liquidity than this is treated as emptied (rugged)
@@ -83,6 +84,7 @@ class Engine:
         self.journal = journal
         self.jupiter = jupiter  # None: no round-trip preflight, prices from DexScreener (tests)
         self._reset_books()
+        self._last_sweep, self._sweeper = 0.0, None
         self.books: dict[str, Book] = {MAIN: self._open_book(MAIN, executor)}
         for name, ex in (shadow_executors or {}).items():
             self.books[name] = self._open_book(name, ex)
@@ -248,7 +250,36 @@ class Engine:
         if self.analyst is not None or any(n in self.books for n in shadows.KNOWN):
             self.scan_and_enter()  # nothing uses the screened candidates when Claude and the baselines are off
         self.backups.run_if_due()
+        self.sweep_canary_wallet_if_due()
         self.journal.set_state("scan_heartbeat", repr(time.time()))
+
+    def sweep_canary_wallet_if_due(self, wait: bool = False) -> None:
+        """Every WALLET_SWEEP_S, close the real-money wallet's empty token accounts (rent ~0.0015 SOL each) that a
+        sale's own close missed, on a thread of its own (a close can take a minute to confirm)."""
+        from tradingbot import model_book as mb
+        books = [b for n, b in self.books.items() if n in mb.CANARY_BOOKS]
+        ex = books[0].executor if books else None
+        if ex is None or not hasattr(ex, "sweep") or time.time() - self._last_sweep < WALLET_SWEEP_S:
+            return
+        if self._sweeper is not None and self._sweeper.is_alive():
+            return
+        self._last_sweep = time.time()
+        keep = {p.token_address for b in books for p in self.journal.open_positions(b.name)}
+
+        def run():
+            try:
+                res = ex.sweep(keep)
+                if res["closed"]:
+                    log.info("wallet sweep: closed %d empty token accounts, $%.2f back", res["closed"], res["usd_back"])
+                    self.journal.log_event("wallet_sweep", None, json.dumps(res, default=str)[:2000],
+                                           strategy=books[0].name)
+            except Exception:  # noqa: BLE001 (the sweep must never disturb trading)
+                log.warning("wallet sweep failed", exc_info=True)
+
+        self._sweeper = threading.Thread(target=run, name="wallet-sweep", daemon=True)
+        self._sweeper.start()
+        if wait:
+            self._sweeper.join()
 
     def _loop(self, interval: float, fn) -> None:
         while not self._stop.is_set():
