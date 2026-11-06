@@ -177,8 +177,10 @@ def test_launch_book_sells_quote_with_their_own_slippage(sim):
     ex = sim([])
     ex.jup = Recording([q(1_000_000, 900_000), q(950_000, 900_000)])
     ex.sell_slippage_bps = 1000
-    assert ex.sell("T", 1, 1).ok  # 950k landed stays above the 10% floor of 900k: no revert
-    assert seen == [1000, 1000]
+    fill = ex.sell("T", 1, 1)  # 950k landed stays above the 10% floor of 900k: no revert
+    assert fill.ok and seen == [1000, 1000]
+    # the leak stays at the default 3% model: midpoint of 950k and 921.5k, not of 950k and the 900k floor
+    assert fill.usd + fill.fee_usd == pytest.approx((950_000 + 921_500) // 2 / 1e6)
     seen.clear()
     ex.jup.quotes = [q(1_000_000, 970_000), q(990_000, 960_000)]
     assert ex.buy("T", 50, 1).ok and seen == [None, None]  # buys keep the default

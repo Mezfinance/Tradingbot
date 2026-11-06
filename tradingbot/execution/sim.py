@@ -65,7 +65,7 @@ class SimExecutor:
             return None, self._why_none("route vanished")
         if landed.out_raw < first.min_out_raw:
             return None, "slippage exceeded (reverted)"
-        return self._fill_amount(first, landed), "ok"
+        return self._fill_amount(first, landed, wide=slippage_bps is not None), "ok"
 
     def _quote(self, in_mint: str, out_mint: str, in_raw: int, slippage_bps: int | None):
         if slippage_bps is None:
@@ -80,13 +80,19 @@ class SimExecutor:
         why = getattr(self.jup, "last_failure", lambda: default)()
         return why if why == RATE_LIMITED else default
 
-    def _fill_amount(self, first: Quote, landed: Quote) -> int:
+    def _fill_amount(self, first: Quote, landed: Quote, wide: bool = False) -> int:
+        """`midpoint` leaks half the room down to the slippage floor (sandwich/MEV). With a wider tolerance that only
+        stops reverts (launch-book sells), the leak is still measured against the default `slippage_bps` from the
+        landed quote, so widening the tolerance never adds cost of its own (11-06: at 10% it took ~5% a sale)."""
+        floor = first.min_out_raw
+        if wide:
+            floor = max(floor, int(landed.out_raw * (1 - self.cfg.slippage_bps / 10_000)))
         mode = self.cfg.sim_fill_mode
         if mode == "expected":
             return landed.out_raw
         if mode == "pessimistic":
-            return first.min_out_raw
-        return (landed.out_raw + first.min_out_raw) // 2
+            return min(floor, landed.out_raw)
+        return (landed.out_raw + min(floor, landed.out_raw)) // 2
 
     def buy(self, token: str, usd: float, ref_price: float) -> Fill | None:
         """None = declined before sending (reason in `last_note`); a Fill with ok=False = reverted."""
