@@ -308,3 +308,29 @@ def test_keypair_is_found_without_the_entrypoint(tmp_path, monkeypatch):
     other = Keypair()
     (tmp_path / "secret.json").write_text(str(list(bytes(other))))
     assert jx.read_keypair(cfg).pubkey() == other.pubkey()  # the entrypoint's copy comes first
+
+
+def test_canary_goes_below_the_paper_books_five_dollar_floor(cfg, good_pair):
+    # 11-06: `_buy_model` refused anything under $5, so the $0.50 / $2 bands never traded; the canary may go to a cent
+    cfg.launch_book = cfg.launch_live = cfg.launch_canary = cfg.launch_sized_book = True
+    cfg.launch_canary_max_liq_usd = 0.0
+    j = Journal(":memory:")
+    args = (cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j)
+    live = Recorder(cfg)
+    eng = Engine(*args, model_executor=PaperExecutor(cfg), launch_canary_executor=live)
+    created = time.time() - 6
+
+    def sig(mint, liq):
+        return {"pool": "P" + mint, "mint": mint, "dex": "pumpswap", "created_ts": created, "name": "", "price": 1e-5,
+                "liq": liq, "score": 1.0, "ts": time.time(), "decided_ts": time.time(), "kind": "launch",
+                "rw50": True, "rw50_24": False, "top2": False, "top5": True}
+    eng.model_book.signals.put(sig("MID", 20_000.0))  # $0.50 band
+    eng.model_book.signals.put(sig("DEEP", 60_000.0))  # $2 band
+    eng.buy_model_signals()
+    assert sorted(live.sizes) == [0.5, 2.0]
+    cfg.launch_canary_flat_usd = 0.01  # one minimum size for every pick
+    eng.model_book.signals.put(sig("THIN", 10_000.0))
+    eng.buy_model_signals()
+    assert live.sizes[-1] == 0.01
+    # the paper twin keeps its own sizes and the $5 floor
+    assert eng._buy_model(eng.books[mb.LAUNCH_SIZED], sig("X", 100.0)) == "size too small (cash or liquidity)"

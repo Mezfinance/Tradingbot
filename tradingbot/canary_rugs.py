@@ -20,6 +20,7 @@ from tradingbot import launch_live
 from tradingbot import model_book as mb
 
 RUG_RET = -0.999  # the scorer's rugged: pool SOL < 10% of its peak or LP supply 0 by minute 6 (ret -100%)
+SWAP_RUG = -0.99  # a sale at 1% or less of the buy price (swap prices, fees left out) = rugged
 STUCK_S = 1800  # an open trade older than this counts as rugged (exit blocked, written off)
 TOP_STREAKS = 5
 
@@ -68,25 +69,35 @@ def _trades(journal, like: str, since: float = 0.0) -> list[dict]:
     for p in journal.query("SELECT id, strategy, token, symbol, opened_at, closed_at, cost_usd, realized_usd, "
                            "exit_reason FROM positions WHERE strategy LIKE ? AND opened_at >= ? ORDER BY opened_at",
                            (like, since)):
-        buy = journal.query("SELECT ts FROM fills WHERE position_id=? AND side='buy' ORDER BY ts LIMIT 1", (p["id"],))
+        fills = journal.query("SELECT side, price, usd, ts FROM fills WHERE position_id=? ORDER BY ts", (p["id"],))
+        buys = [f for f in fills if f["side"] == "buy"]
+        sells = [f for f in fills if f["side"] == "sell" and f["price"]]
+        buy_px = buys[0]["price"] if buys else None
+        sold = sum(abs(f["usd"] or 0) for f in sells)
+        sell_px = (sum(f["price"] * abs(f["usd"] or 0) for f in sells) / sold) if sold else None
+        # swap only (fill prices, fees left out): a 1-cent canary trade always loses its network fees, so judge
+        # rugs on what the pool paid back, not on the book's net result
+        swap = (sell_px / buy_px - 1) if buy_px and sell_px else None
         if p["closed_at"]:
             ret = (p["realized_usd"] / p["cost_usd"] - 1) if p["cost_usd"] else None
-            rug = bool(p["cost_usd"]) and p["realized_usd"] <= 0.01 * p["cost_usd"]
+            rug = swap is None or swap <= SWAP_RUG  # sold for 1% or less of the buy price, or nothing sold
         else:
             ret, rug = None, now - p["opened_at"] > STUCK_S
-        out.append({**dict(p), "fill_ts": buy[0]["ts"] if buy else p["opened_at"], "ret": ret, "rug": rug})
+        out.append({**dict(p), "fill_ts": buys[0]["ts"] if buys else p["opened_at"], "ret": ret, "swap": swap,
+                    "rug": rug})
     return out
 
 
 def rug_check(store, journal, cfg, hours: float | None = None) -> dict:
     launch_live.ensure_schema(store)
-    max_liq = cfg.launch_canary_max_liq_usd or 15_000.0
+    max_liq = cfg.launch_canary_max_liq_usd or float("inf")  # 0 = the canary buys every pool
     since = time.time() - hours * 3600 if hours else 0.0
     rows = store.query("SELECT pool, token_mint, create_ts, fill_ts, pulled_ts, ret, liq_usd, rw_pct FROM "
                        "watch_launch_live WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND liq_usd < ? "
                        "AND rw_pct IS NOT NULL AND create_ts >= ? ORDER BY create_ts", (max_liq, since))
     picks = [r for r in rows if launch_live.rw_flags(False, r["rw_pct"], None)["rw50"]]
-    out = {"universe": f"scorer's rw50 picks with liquidity < ${max_liq:,.0f} at second 4 (ideal trades, minute-6 exit)",
+    span = f"liquidity < ${max_liq:,.0f} at second 4" if max_liq < float("inf") else "every liquidity"
+    out = {"universe": f"scorer's rw50 picks, {span} (ideal trades, minute-6 exit)",
            "thin picks": _summary([(r["create_ts"], r["ret"] <= RUG_RET) for r in picks])}
 
     # the paper book's own thin trades (its real simulated fills), matched to the scorer's liquidity
@@ -138,6 +149,8 @@ def rug_check(store, journal, cfg, hours: float | None = None) -> dict:
             "scorer ideal %": round(100 * r["ret"], 1) if r and r["ret"] is not None else None,
             "twin %": round(100 * t["ret"], 1) if t and t["ret"] is not None else None,
             "canary %": round(100 * c["ret"], 1) if c["ret"] is not None else ("open" if not c["rug"] else "stuck"),
+            "canary swap %": round(100 * c["swap"], 1) if c["swap"] is not None else None,
+            "canary rugged": c["rug"],
             "canary exit": c["exit_reason"],
         })
     out["canary trades"] = table

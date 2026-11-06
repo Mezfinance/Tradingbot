@@ -49,6 +49,8 @@ STUCK_AFTER_S = 0  # a position with no route out is valued at zero from its fir
 # a later sale that finds a route closes it and brings the money back
 BUY_WORKERS = 16  # every book that wants a signal starts its buy at once (up to 17 books run)
 SELL_WORKERS = 16  # exits due in the same monitor pass are sold in parallel
+MODEL_MIN_USD = 5.0  # paper model books: no trade below this
+CANARY_MIN_USD = 0.01  # the real-money canary may go down to a cent (Jupiter routes $0.001 USDC swaps)
 NO_LIQUIDITY_MULT = 10.0  # model entry: a live price this many times the snapshot means an empty pool
 DEAD_LIQ_USD = 100.0  # a DexScreener pool with less liquidity than this is treated as emptied (rugged)
 QUOTE_PRICE_MAX = 10  # positions per monitor pass priced from a swap quote when no feed lists the token
@@ -728,9 +730,13 @@ class Engine:
         c = self.cfg
         started = time.time()
         from tradingbot import model_book as mb
-        base = mb.band_usd(book.name, sig["liq"]) or book.fixed_usd or c.model_book_usd
+        canary = book.name in mb.CANARY_BOOKS
+        if canary and c.launch_canary_flat_usd > 0:
+            base = c.launch_canary_flat_usd  # one tiny size for every pick: does any real buy set the operators off?
+        else:
+            base = mb.band_usd(book.name, sig["liq"]) or book.fixed_usd or c.model_book_usd
         usd = min(base, c.model_book_liq_share * sig["liq"], book.cash)
-        if usd < 5:
+        if usd < (CANARY_MIN_USD if canary else MODEL_MIN_USD):
             return "size too small (cash or liquidity)"
         trigger = sig["price"]
         if self.jupiter is not None:

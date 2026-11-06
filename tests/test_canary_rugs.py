@@ -51,3 +51,17 @@ def test_streaks_count_back_to_back_rugs_in_time_order():
     runs = canary_rugs._streaks([(1, True), (2, True), (3, False), (4, True), (5, True), (6, True)])
     assert [r["length"] for r in runs] == [3, 2]
     assert canary_rugs._fisher_greater(0, 4, 0, 16) == 1.0
+
+
+def test_a_cent_trade_that_lost_only_its_fees_is_not_a_rug():
+    j = Journal(":memory:")
+    for tok, sell_px in (("OK", 0.9), ("RUG", 0.002)):
+        pid = j.execute("INSERT INTO positions(token, symbol, cost_usd, opened_at, closed_at, realized_usd, strategy) "
+                        "VALUES (?,?,?,?,?,?,?)", (tok, tok, 0.01, 1.0, 400.0, -0.14, "canary_rw50_sz"))  # fees > the cent
+        j.execute("INSERT INTO fills(position_id, side, price, usd, fee_usd, ts) VALUES (?,?,?,?,?,?)",
+                  (pid, "buy", 1.0, -0.08, 0.07, 10.0))
+        j.execute("INSERT INTO fills(position_id, side, price, usd, fee_usd, ts) VALUES (?,?,?,?,?,?)",
+                  (pid, "sell", sell_px, 0.009, 0.07, 370.0))
+    rows = {t["token"]: t for t in canary_rugs._trades(j, "canary_rw50_sz%")}
+    assert rows["OK"]["rug"] is False and round(rows["OK"]["swap"], 2) == -0.1
+    assert rows["RUG"]["rug"] is True

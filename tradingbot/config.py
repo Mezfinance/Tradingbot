@@ -83,6 +83,7 @@ class Config:
     # (live executor), to measure how real fills differ from the simulated ones. Needs the keypair and TB_LIVE_CONFIRM.
     launch_canary: bool = False
     launch_canary_usd: float = 10.0  # per trade
+    launch_canary_flat_usd: float = 0.0  # > 0: every canary trade at this size (e.g. 0.01, the smallest useful swap), not the bands
     launch_canary_budget_usd: float = 50.0  # the book's starting cash; keep about this much USDC in the wallet
     launch_canary_daily_loss_usd: float = 50.0  # no new buys once today's realized loss reaches this
     launch_canary_max_open: int = 5
