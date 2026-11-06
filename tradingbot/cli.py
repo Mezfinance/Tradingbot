@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -427,6 +427,12 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore, watch_db_path
         print(json.dumps(launch_live.rw_check(WatchStore(watch_db_path(cfg)), Journal(cfg.db_path),
                                               args.hours or 12), indent=2, default=str))
+        return
+
+    if args.command == "early-rw-study":  # a rug-vs-win score trained on the early books' own entries
+        from tradingbot import early_rw
+        from tradingbot.watcher import WatchStore, watch_db_path
+        print(json.dumps(early_rw.study(WatchStore(watch_db_path(cfg)), cfg, args.hours), indent=2, default=str))
         return
 
     if args.command == "early-rw-check":  # would the rug-vs-win filter help the early books?
