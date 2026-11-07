@@ -99,3 +99,60 @@ def test_baseline_skips_early_hours_and_sz_before_its_first_trade():
     assert fixed["liquid"]["baseline"] > 30 and abs(fixed["liquid"]["z"]) < 2 and fixed["sz_trades"]["baseline"] > 30
     only_sz = mm.compare(rows)["sz_trades"]  # sz measures skip the hours before its first trade even without since
     assert only_sz["baseline"] > 30 and abs(only_sz["z"]) < 2
+
+
+def _cmp(**zs):
+    return {k: {"z": z, "now": 1.0, "baseline": 0.5} for k, z in zs.items()}
+
+
+def test_flag_opens_after_two_hot_hours_and_closes_when_it_cools():
+    st = {}
+    assert mm.advance_flags(st, T0, _cmp(rug_pct=2.5)) == []  # one hot hour: no flag yet
+    ev = mm.advance_flags(st, T0 + H, _cmp(rug_pct=2.2))
+    assert [e["kind"] for e in ev] == ["open"] and ev[0]["hour"] == T0 and ev[0]["direction"] == "up"
+    assert [e["kind"] for e in mm.advance_flags(st, T0 + 2 * H, _cmp(rug_pct=1.7))] == ["update"]  # above close
+    assert [e["kind"] for e in mm.advance_flags(st, T0 + 3 * H, _cmp(rug_pct=None))] == []  # no z keeps it open
+    ev = mm.advance_flags(st, T0 + 4 * H, _cmp(rug_pct=1.2))
+    assert [e["kind"] for e in ev] == ["close"] and ev[0]["hour"] == T0 + 4 * H
+    # a direction flip resets the streak; sz's own trade count never flags
+    assert mm.advance_flags(st, T0 + 5 * H, _cmp(rug_pct=2.5, sz_trades=9)) == []
+    assert mm.advance_flags(st, T0 + 6 * H, _cmp(rug_pct=-2.5, sz_trades=9, btc_usd=5.0)) == []
+    assert [e["direction"] for e in mm.advance_flags(st, T0 + 7 * H, _cmp(rug_pct=-3.0))] == ["down"]
+    s2 = {}  # price levels and fear & greed never flag
+    for k in range(3):
+        assert mm.advance_flags(s2, T0 + k * H, _cmp(btc_usd=5.0, sol_usd=-5.0, fear_greed=4.0)) == []
+
+
+def test_flags_are_saved_with_szs_result_in_their_hours(cfg):
+    st = _store()
+    st.execute(mm.SCHEMA)
+    rows = []
+    for i in range(40):  # quiet week, then 4 hours of fast rugs while sz loses
+        hot = i >= 34 and i < 38
+        rows.append({"v": mm.VERSION, "liquid": 30, "rug_pct": (60.0 if hot else 20.0 + i % 4),
+                     "market_mean": -10.0 if hot else 2.0, "sz_trades": 5, "sz_pnl": -50.0 if hot else 10.0,
+                     "sz_cost": 500.0})
+    for i, d in enumerate(rows):
+        st.execute("INSERT INTO market_hours(hour, data, ts) VALUES (?,?,0)", (T0 + i * H, json.dumps(d)))
+    m = mm.MarketMonitor(st, None, cfg)
+    events = m.update_flags()
+    assert any(e["kind"] == "open" and e["metric"] == "rug_pct" for e in events)
+    flags = mm.read_flags(st.query)
+    rug = [f for f in flags if f["metric"] == "rug_pct"]
+    assert len(rug) == 1 and rug[0]["direction"] == "up" and rug[0]["opened_hour"] == T0 + 34 * H
+    assert rug[0]["closed_hour"] is None  # still hot at the last stored hour
+    summ = mm.flag_summary(mm.load(st), flags, now=T0 + 41 * H)
+    o = next(f for f in summ["open"] if f["metric"] == "rug_pct")
+    assert o["hours"] == 6 and o["sz_pct"] == round(100 * (-50 * 4 + 10 * 2) / 3000, 1)
+    g = next(x for x in summ["by_metric"] if x["metric"] == "rug_pct")
+    assert g["in"]["sz_pct"] < 0 < g["out"]["sz_pct"] and g["sz_gap"] < 0
+    # quiet hours close it; running again does not double count
+    for i in range(40, 46):
+        st.execute("INSERT INTO market_hours(hour, data, ts) VALUES (?,?,0)",
+                   (T0 + i * H, json.dumps({**rows[0], "rug_pct": 21.0})))
+    m.update_flags()
+    m.update_flags()
+    rug = [f for f in mm.read_flags(st.query) if f["metric"] == "rug_pct"]
+    assert len(rug) == 1 and rug[0]["closed_hour"] is not None
+    text = mm.render({**mm.status(st, hours=24, now=T0 + 47 * H), "rows": []})
+    assert "WHAT THE FLAGS MEANT FOR SZ" in text and "rugged by minute 6" in text

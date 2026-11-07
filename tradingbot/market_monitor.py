@@ -40,7 +40,7 @@ TOP_OPERATORS = 5
 BATCH_HOURS = 24  # hours built per read on a backfill
 SZ_STUCK_S = 1800  # a sized-book trade still open this long counts as -100% (as block-compare)
 
-VERSION = 2  # stored rows from an older version are rebuilt (2: liquidity bands)
+VERSION = 3  # stored rows from an older version are rebuilt (2: liquidity bands, 3: sz $ P&L and cost)
 BANDS = (("thin", 0.0, 15_000.0), ("mid", 15_000.0, 25_000.0), ("thick", 25_000.0, float("inf")))  # sz's bands
 
 SCHEMA = "CREATE TABLE IF NOT EXISTS market_hours (hour REAL PRIMARY KEY, data TEXT NOT NULL, ts REAL)"
@@ -188,7 +188,8 @@ def hour_metrics(pools: list[dict], trades: list[dict], prices: dict, now: float
             real.append(((t["realized_usd"] - t["cost_usd"]) / t["cost_usd"], t["cost_usd"]))
         elif now - t["opened_at"] >= SZ_STUCK_S:
             real.append((-1.0, t["cost_usd"]))
-    out.update(sz_trades=len(real), sz_real=_wpct(real))
+    out.update(sz_trades=len(real), sz_real=_wpct(real), sz_pnl=round(sum(r * c for r, c in real), 2),
+               sz_cost=round(sum(c for _, c in real), 2))
     out["sz_fill_gap"] = round(out["sz_real"] - out["sz_picks_ideal"], 1) \
         if out["sz_real"] is not None and out["sz_picks_ideal"] is not None else None
 
@@ -237,6 +238,55 @@ def compare(rows: list[dict], recent_h: int = RECENT_H, baseline_h: int = BASELI
     return out
 
 
+# Flags (step 3): a measure whose last RECENT_H hours sit FLAG_Z+ standard deviations from the baseline for FLAG_HOURS
+# hours in a row (same direction) opens a flag; it closes once |z| < CLOSE_Z or the direction flips. Each flag keeps
+# what the sized book did in its hours, so over time the flags say which market shifts actually hurt it.
+FLAG_Z = 2.0
+FLAG_HOURS = 2
+CLOSE_Z = 1.5
+FLAG_SKIP = ("sz_trades",  # a count of our own trades, not the market
+             "sol_usd", "btc_usd", "fear_greed")  # slow levels (a daily index, trending prices) sit away from a weekly
+# mean for days on end; their hourly changes (sol_chg_pct, btc_chg_pct) still flag
+FLAG_SCHEMA = ("CREATE TABLE IF NOT EXISTS market_flags (id INTEGER PRIMARY KEY, metric TEXT NOT NULL, "
+               "direction TEXT NOT NULL, opened_hour REAL NOT NULL, closed_hour REAL, peak_z REAL, data TEXT)")
+
+
+def advance_flags(state: dict, hour: float, cmp: dict) -> list[dict]:
+    """One finished hour through the flag rules. `state` (per metric: streak, sign, first, open) is updated in
+    place; returns events {'kind': 'open'|'update'|'close', 'metric', ...}. A missing z keeps an open flag open."""
+    events = []
+    for key, _, _ in METRICS:
+        if key in FLAG_SKIP:
+            continue
+        c = cmp.get(key) or {}
+        z = c.get("z")
+        st = state.setdefault(key, {"streak": 0, "sign": 0, "first": None, "open": False})
+        if z is None:
+            if not st["open"]:
+                st["streak"] = 0
+            continue
+        sign = 1 if z > 0 else -1
+        if st["open"]:
+            if abs(z) < CLOSE_Z or sign != st["sign"]:
+                events.append({"kind": "close", "metric": key, "hour": hour, "z": z, "now": c.get("now")})
+                st.update(open=False, streak=0)
+            else:
+                events.append({"kind": "update", "metric": key, "hour": hour, "z": z, "now": c.get("now")})
+            continue
+        if abs(z) >= FLAG_Z:
+            if st["streak"] and sign == st["sign"]:
+                st["streak"] += 1
+            else:
+                st.update(streak=1, sign=sign, first=hour)
+            if st["streak"] >= FLAG_HOURS:
+                st["open"] = True
+                events.append({"kind": "open", "metric": key, "hour": st["first"], "z": z, "now": c.get("now"),
+                               "baseline": c.get("baseline"), "direction": "up" if sign > 0 else "down"})
+        else:
+            st["streak"] = 0
+    return events
+
+
 class MarketMonitor:
     """Writes one `market_hours` row per finished hour. `store` = a WatchStore (its own connection is best, as the
     dashboard does); `journal` = the trading journal, read only."""
@@ -244,6 +294,8 @@ class MarketMonitor:
     def __init__(self, store, journal, cfg):
         self.store, self.journal, self.cfg = store, journal, cfg
         store.execute(SCHEMA)
+        store.execute(FLAG_SCHEMA)
+        self.events: list[dict] = []  # flag opens/closes from the last step (the Telegram step sends these)
 
     def build_many(self, hours: list[float], now: float) -> dict:
         """Rows for many hours from one read of each table (an hour at a time scanned whole tables: the first
@@ -308,7 +360,59 @@ class MarketMonitor:
             n += len(rows)
         if n:
             log.info("market monitor: %d hour(s) stored", n)
+        self.events = self.update_flags()
         return n
+
+    def update_flags(self) -> list[dict]:
+        """Run every stored hour not yet seen through `advance_flags` and save opens, updates and closes in
+        `market_flags`. Starts over when the row VERSION or the baseline start changes."""
+        since = getattr(self.cfg, "market_monitor_since", 0.0) or 0.0
+        key = f"{VERSION}:{since}"
+        if self.store.get_state("market_flags:key") != key:
+            self.store.execute("DELETE FROM market_flags")
+            self.store.set_state("market_flags:state", "{}")
+            self.store.set_state("market_flags:last", "0")
+            self.store.set_state("market_flags:key", key)
+        last = float(self.store.get_state("market_flags:last") or 0)
+        state = json.loads(self.store.get_state("market_flags:state") or "{}")
+        rows = load(self.store, last - (BASELINE_H + RECENT_H + 1) * HOUR_S if last else 0.0)
+        rows = [r for r in rows if r.get("v", 1) >= VERSION]
+        open_ids = {r[0]: r[1] for r in self.store.query(
+            "SELECT metric, id FROM market_flags WHERE closed_hour IS NULL")}
+        out = []
+        span = BASELINE_H + RECENT_H
+        for i, r in enumerate(rows):
+            if r["hour"] <= last:
+                continue
+            for ev in advance_flags(state, r["hour"], compare(rows[max(0, i - span + 1):i + 1], since=since)):
+                m = ev["metric"]
+                if ev["kind"] == "open":
+                    cur = self.store.execute(
+                        "INSERT INTO market_flags(metric, direction, opened_hour, peak_z, data) VALUES(?,?,?,?,?)",
+                        (m, ev["direction"], ev["hour"], ev["z"],
+                         json.dumps({"open_value": ev["now"], "baseline": ev["baseline"], "last_value": ev["now"],
+                                     "last_z": ev["z"], "seen_hour": r["hour"]})))
+                    open_ids[m] = cur.lastrowid
+                    out.append({**ev, "id": cur.lastrowid, "label": LABELS.get(m, m)})
+                elif m in open_ids:
+                    fid = open_ids[m]
+                    row = self.store.query("SELECT peak_z, data FROM market_flags WHERE id=?", (fid,))
+                    if not row:
+                        continue
+                    data = {**json.loads(row[0]["data"] or "{}"), "last_value": ev["now"], "last_z": ev["z"]}
+                    peak = row[0]["peak_z"] if abs(row[0]["peak_z"] or 0) >= abs(ev["z"]) else ev["z"]
+                    closed = ev["hour"] if ev["kind"] == "close" else None
+                    self.store.execute("UPDATE market_flags SET peak_z=?, data=?, closed_hour=? WHERE id=?",
+                                       (peak, json.dumps(data), closed, fid))
+                    if closed is not None:
+                        del open_ids[m]
+                        out.append({**ev, "id": fid, "label": LABELS.get(m, m)})
+            last = r["hour"]
+        self.store.set_state("market_flags:last", repr(last))
+        self.store.set_state("market_flags:state", json.dumps(state))
+        for ev in out:
+            log.info("market flag %s: %s %s (z %+.1f)", ev["kind"], ev["label"], ev.get("direction", ""), ev["z"])
+        return out
 
 
 def read(query, since: float = 0.0) -> list[dict]:
@@ -322,14 +426,73 @@ def read(query, since: float = 0.0) -> list[dict]:
 
 
 PAGE_HOURS = 72  # hourly rows sent to the dashboard
+FLAG_DAYS = 7  # closed flags shown
 
 
-def payload(rows: list[dict], now: float | None = None, since: float = 0.0) -> dict:
+def read_flags(query) -> list[dict]:
+    import sqlite3
+    try:
+        rows = query("SELECT id, metric, direction, opened_hour, closed_hour, peak_z, data FROM market_flags "
+                     "ORDER BY opened_hour", ())
+    except sqlite3.OperationalError:
+        return []
+    return [{"id": r[0], "metric": r[1], "direction": r[2], "opened_hour": r[3], "closed_hour": r[4],
+             "peak_z": r[5], **json.loads(r[6] or "{}")} for r in rows]
+
+
+def _sz_market(rows: list[dict]) -> dict:
+    """sz (size-weighted, $ P&L / $ traded) and the market (ideal mean weighted by liquid pools) over hour rows."""
+    cost = sum(r.get("sz_cost") or 0 for r in rows)
+    pnl = sum(r.get("sz_pnl") or 0 for r in rows)
+    n_liq = sum(r.get("liquid") or 0 for r in rows if r.get("market_mean") is not None)
+    mkt = sum((r.get("market_mean") or 0) * (r.get("liquid") or 0) for r in rows if r.get("market_mean") is not None)
+    return {"hours": len(rows), "sz_trades": sum(r.get("sz_trades") or 0 for r in rows),
+            "sz_pct": round(100 * pnl / cost, 1) if cost else None, "sz_pnl": round(pnl, 2),
+            "market_pct": round(mkt / n_liq, 1) if n_liq else None}
+
+
+def flag_summary(rows: list[dict], flags: list[dict], now: float | None = None, days: float = FLAG_DAYS) -> dict:
+    """Open flags, flags closed in the last `days`, and per measure and direction: sz and the market in flagged
+    hours vs every other hour since sz's first trade. `rows` = market_hours rows (with sz_pnl / sz_cost)."""
+    now = now if now is not None else time.time()
+    sz_from = next((r["hour"] for r in rows if r.get("sz_trades")), None)
+    by_hour = {r["hour"]: r for r in rows}
+
+    def hours_of(f):
+        end = f["closed_hour"] if f["closed_hour"] is not None else float("inf")
+        return [r for h, r in by_hour.items() if f["opened_hour"] <= h < end]
+
+    def view(f):
+        return {**f, "label": LABELS.get(f["metric"], f["metric"]), **_sz_market(hours_of(f))}
+    out = {"open": [view(f) for f in flags if f["closed_hour"] is None],
+           "recent": [view(f) for f in reversed(flags) if f["closed_hour"] is not None
+                      and f["closed_hour"] >= now - days * 86400],
+           "by_metric": []}
+    groups = collections.defaultdict(list)
+    for f in flags:
+        groups[(f["metric"], f["direction"])].append(f)
+    live = [r for r in rows if sz_from is not None and r["hour"] >= sz_from]
+    for (metric, direction), fs in groups.items():
+        flagged = {r["hour"] for f in fs for r in hours_of(f)}
+        inside = [r for r in live if r["hour"] in flagged]
+        outside = [r for r in live if r["hour"] not in flagged]
+        a, b = _sz_market(inside), _sz_market(outside)
+        out["by_metric"].append({"metric": metric, "label": LABELS.get(metric, metric), "direction": direction,
+                                 "flags": len(fs), "hours": len(flagged), "in": a, "out": b,
+                                 "sz_gap": round(a["sz_pct"] - b["sz_pct"], 1)
+                                 if a["sz_pct"] is not None and b["sz_pct"] is not None else None})
+    out["by_metric"].sort(key=lambda g: -(g["hours"]))
+    return out
+
+
+def payload(rows: list[dict], now: float | None = None, since: float = 0.0, flags: list[dict] | None = None) -> dict:
     """What the dashboard's Market tab needs: the last PAGE_HOURS rows, the comparison and the metric list."""
     now = now if now is not None else time.time()
     return {"built_ts": now, "rows": [r for r in rows if r["hour"] >= now - PAGE_HOURS * HOUR_S],
             "compare": compare(rows, since=since), "baseline_since": since, "metrics": [list(m) for m in METRICS],
-            "recent_h": RECENT_H, "baseline_h": BASELINE_H, "last_hour": rows[-1]["hour"] if rows else None}
+            "recent_h": RECENT_H, "baseline_h": BASELINE_H, "last_hour": rows[-1]["hour"] if rows else None,
+            "flags": flag_summary(rows, flags or [], now), "flag_rule": {"z": FLAG_Z, "hours": FLAG_HOURS,
+                                                                         "close_z": CLOSE_Z}}
 
 
 def load(store, since: float = 0.0) -> list[dict]:
@@ -348,10 +511,13 @@ SHORT = {"pools": "pools", "liquid": "liq", "thin_pct": "<15k%", "mid_pct": "15-
 
 
 def status(store, hours: float = 24, now: float | None = None, since: float = 0.0) -> dict:
+    store.execute(FLAG_SCHEMA)
     now = now if now is not None else time.time()
     rows = load(store, now - (hours + BASELINE_H + RECENT_H) * HOUR_S)
     shown = [r for r in rows if r["hour"] >= now - hours * HOUR_S]
+    all_rows = load(store, 0.0)
     return {"hours": hours, "rows": shown, "compare": compare(rows, since=since), "baseline_since": since,
+            "flags": flag_summary(all_rows, read_flags(store.query), now),
             "recent_h": RECENT_H, "baseline_h": BASELINE_H}
 
 
@@ -381,6 +547,29 @@ def render(out: dict) -> str:
         mark = " *" if z is not None and abs(z) >= 2 else ""
         lines.append(f"    {label:38s} {fmt(c['now']):>10s}  vs {fmt(c['baseline']):>10s}  "
                      f"z {'-' if z is None else f'{z:+.1f}'}{mark}")
+    fl = out.get("flags") or {}
+    when = lambda h: datetime.fromtimestamp(h, timezone.utc).strftime("%m-%d %H:00")
+    pct = lambda v: "-" if v is None else f"{v:+.1f}%"
+
+    def flag_line(f, closed):
+        end = f"to {when(f['closed_hour'])}" if closed else "open"
+        return (f"    {f['direction']:>4s}  {f['label']:34s} {when(f['opened_hour'])} {end:14s} {f['hours']:>3d} h  "
+                f"peak z {f['peak_z']:+.1f}  value {fmt(f.get('open_value'))} vs {fmt(f.get('baseline'))}  "
+                f"sz {pct(f['sz_pct'])} ({f['sz_trades']})  market {pct(f['market_pct'])}")
+    lines += ["", f"OPEN FLAGS  (|z| >= {FLAG_Z:g} for {FLAG_HOURS}+ hours; close below {CLOSE_Z:g})"]
+    lines += [flag_line(f, False) for f in fl.get("open", [])] or ["    none"]
+    lines += ["", f"FLAGS CLOSED IN THE LAST {FLAG_DAYS} DAYS"]
+    lines += [flag_line(f, True) for f in fl.get("recent", [])[:30]] or ["    none"]
+    if fl.get("by_metric"):
+        lines += ["", "WHAT THE FLAGS MEANT FOR SZ  (since its first trade: sz size-weighted, market ideal mean; "
+                  "flagged hours vs every other hour)",
+                  f"    {'':4s}  {'measure':34s} {'flags':>5s} {'hours':>5s}  {'sz in':>7s} {'sz out':>7s} {'gap':>7s}  "
+                  f"{'mkt in':>7s} {'mkt out':>7s}"]
+        for g in fl["by_metric"][:25]:
+            gap = "-" if g["sz_gap"] is None else f"{g['sz_gap']:+.1f}"
+            lines.append(f"    {g['direction']:>4s}  {g['label']:34s} {g['flags']:>5d} {g['hours']:>5d}  "
+                         f"{pct(g['in']['sz_pct']):>7s} {pct(g['out']['sz_pct']):>7s} {gap:>7s}  "
+                         f"{pct(g['in']['market_pct']):>7s} {pct(g['out']['market_pct']):>7s}")
     lines += ["", "ops = distinct creators; tmpl% = pools on a seed size shared by 3+ pools that hour (copy-paste "
               "launches); <15k% etc = share of liquid pools by liquidity at second 4 (sz's bands), <15k mkt% = ideal mean of "
               "the thin band; rw gap = rug-vs-win kept minus skipped half (ideal); sz% = launchrw50_sz real, "

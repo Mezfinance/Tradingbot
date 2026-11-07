@@ -207,8 +207,8 @@ class Dashboard:
             else:
                 query = self.store.query
             now = time.time()
-            data = mm.payload(mm.read(query, now - (mm.PAGE_HOURS + mm.BASELINE_H + mm.RECENT_H) * mm.HOUR_S), now,
-                              since=self.cfg.market_monitor_since)
+            data = mm.payload(mm.read(query, 0.0), now, since=self.cfg.market_monitor_since,
+                              flags=mm.read_flags(query))
         except Exception:  # noqa: BLE001 (keep the last good data)
             log.exception("dashboard: market monitor read failed")
             return
@@ -666,6 +666,8 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div id="mk-note"></div>
 <div class="stats" id="mk-stats"></div>
 <section class="card"><p class="label eyebrow">Shifts</p><h2>Moved away from the past week</h2><p class="sub" id="mk-shift-sub"></p><div class="scroll"><table id="mk-shifts"></table></div></section>
+<section class="card"><p class="label eyebrow">Flags</p><h2>Saved flags</h2><p class="sub" id="mk-flag-sub"></p><div class="scroll"><table id="mk-flags"></table></div>
+<h2 style="margin-top:24px">What the flags meant for sz</h2><p class="sub">Since sz's first trade: sz (size-weighted) and the market (ideal mean) in each measure's flagged hours against every other hour. A big negative gap means that kind of shift hurts sz.</p><div class="scroll"><table id="mk-flagsum"></table></div></section>
 <div class="two" id="mk-charts"></div>
 <section class="card"><p class="label eyebrow">Every measure</p><h2>Last hours against the past week</h2><p class="sub" id="mk-cmp-sub"></p><div class="scroll"><table id="mk-cmp"></table></div></section>
 <section class="card"><p class="label eyebrow">Hourly</p><h2>Hour by hour</h2><p class="sub">Newest first, UTC. Liquid pools by liquidity at second 4 in sz's bands; sz = launchrw50_sz's real trades, size-weighted.</p><div class="scroll"><table id="mk-hours"></table></div></section>
@@ -921,7 +923,7 @@ function marketState(){if(!S.marketEnabled)return["off","The market monitor is o
 const m=S.market;if(!m||!m.rows.length)return["wait","Waiting for the monitor's first hours (it stores each hour about 15 minutes after it ends; the first run backfills)."];
 if(now()-m.last_hour>3*3600+900)return["stale",`The newest stored hour is ${when(m.last_hour).slice(0,11)}:00 UTC: the monitor looks stalled.`];return["ok",""]}
 function renderMarket(){const[st,msg]=marketState();$("mk-note").innerHTML=st==="ok"?"":`<p class="note">${esc(msg)}</p>`;const m=S.market;
-if(!m||!m.rows.length){["mk-stats","mk-shifts","mk-charts","mk-cmp","mk-hours"].forEach(i=>$(i).innerHTML="");return}
+if(!m||!m.rows.length){["mk-stats","mk-shifts","mk-charts","mk-cmp","mk-hours","mk-flags","mk-flagsum"].forEach(i=>$(i).innerHTML="");return}
 const c=m.compare||{},rh=m.recent_h,wk=Math.round(m.baseline_h/24);
 const tile=(k,l)=>{const x=c[k]||{};return[l,mkVal(k,x.now),`week ${mkVal(k,x.baseline)} · z ${x.z==null?"-":(x.z>0?"+":"−")+Math.abs(x.z).toFixed(1)}`]};
 const shifts=Object.entries(c).filter(([,x])=>x.z!=null&&Math.abs(x.z)>=2).sort((a,b)=>Math.abs(b[1].z)-Math.abs(a[1].z));
@@ -932,6 +934,11 @@ $("mk-shift-sub").textContent=`The last ${rh} hours against the ${wk} days befor
 $("mk-shifts").innerHTML=shifts.length?"<tr><th class=\"l\">Measure</th><th class=\"l\">Group</th><th>Last "+rh+" h</th><th>Past week</th><th>z</th></tr>"+
 shifts.map(([k,x])=>`<tr><td class="l book">${esc(mkLabel(k))}</td><td class="l muted">${esc(x.group)}</td><td>${mkVal(k,x.now)}</td><td>${mkVal(k,x.baseline)}</td><td>${zTag(x.z)}</td></tr>`).join("")
 :'<tr><td class="muted">Nothing is 2+ standard deviations from the past week.</td></tr>';
+const F=m.flags||{open:[],recent:[],by_metric:[]},fr=m.flag_rule||{},hr=h=>when(h).slice(0,8)+"h";
+$("mk-flag-sub").textContent=`A flag opens when a measure stays ${fr.z||2}+ standard deviations from the past week for ${fr.hours||2}+ hours in a row, and closes below ${fr.close_z||1.5}. Open flags first, then those closed in the past 7 days.`;
+const fl=(f,open)=>`<tr><td class="l"><span class="tag sm ${open?"warn":""}">${open?"Open":"Closed"}</span></td><td class="l book">${esc(f.label)}</td><td class="l">${f.direction==="up"?"↑ up":"↓ down"}</td><td class="mono">${hr(f.opened_hour)}</td><td class="mono">${open?"-":hr(f.closed_hour)}</td><td>${f.hours}</td><td>${zTag(f.peak_z)}</td><td>${mkVal(f.metric,f.open_value)} vs ${mkVal(f.metric,f.baseline)}</td><td class="${cls(f.sz_pct)}">${f.sz_pct==null?"-":sgn(f.sz_pct)}</td><td>${f.sz_trades}</td><td class="${cls(f.market_pct)}">${f.market_pct==null?"-":sgn(f.market_pct)}</td></tr>`;
+$("mk-flags").innerHTML=(F.open.length||F.recent.length)?'<tr><th class="l">State</th><th class="l">Measure</th><th class="l">Direction</th><th>From</th><th>To</th><th>Hours</th><th>Peak z</th><th>Value vs week</th><th>sz</th><th>sz trades</th><th>Market</th></tr>'+F.open.map(f=>fl(f,true)).join("")+F.recent.map(f=>fl(f,false)).join(""):'<tr><td class="muted">No flags yet.</td></tr>';
+$("mk-flagsum").innerHTML=F.by_metric.length?'<tr><th class="l">Measure</th><th class="l">Direction</th><th>Flags</th><th>Hours</th><th>sz in</th><th>sz other</th><th>Gap</th><th>Market in</th><th>Market other</th></tr>'+F.by_metric.map(g=>`<tr><td class="l book">${esc(g.label)}</td><td class="l">${g.direction==="up"?"↑ up":"↓ down"}</td><td>${g.flags}</td><td>${g.hours}</td><td class="${cls(g.in.sz_pct)}">${g.in.sz_pct==null?"-":sgn(g.in.sz_pct)}</td><td class="${cls(g.out.sz_pct)}">${g.out.sz_pct==null?"-":sgn(g.out.sz_pct)}</td><td class="${cls(g.sz_gap)}">${g.sz_gap==null?"-":sgn(g.sz_gap,1," pts")}</td><td class="${cls(g.in.market_pct)}">${g.in.market_pct==null?"-":sgn(g.in.market_pct)}</td><td class="${cls(g.out.market_pct)}">${g.out.market_pct==null?"-":sgn(g.out.market_pct)}</td></tr>`).join(""):'<tr><td class="muted">No flags yet.</td></tr>';
 const rows=m.rows,pts=k=>rows.filter(r=>r[k]!=null).map(r=>[r.hour+1800,r[k]]);
 const CH=[["Liquid pools per hour",[["liquid","pools"]],"liquid"],["Thin pools (under $15k), % of liquid",[["thin_pct","under $15k"]],"thin_pct"],
 ["Rugged by minute 6, %",[["rug_pct","rugged"]],"rug_pct"],["Median LP pull, seconds after creation",[["med_pull_s","pull second"]],"med_pull_s"],
