@@ -949,3 +949,42 @@ def test_size_study_keeps_real_results_at_real_size_and_charges_impact_on_bigger
     thin_drop = p["fixed $100"]["by liquidity"]["< 15k"] / 100 - thin10
     assert thin_drop > deep_drop > 0
     assert out["calibration by liquidity"][0]["band"] == "< 15k"
+
+
+def test_block_compare_scores_each_book_per_block_against_the_market(cfg):
+    """Two 6 h blocks: the market loses in both, the sized book wins in both, launch4_5 loses more than the market
+    in the second; the sized book's mean is weighted by money traded and a never-sold trade counts as -100%."""
+    from tradingbot.journal import Journal
+    cfg.launch_book = cfg.launch_live = cfg.launch_sized_book = True
+    st = WatchStore(":memory:")
+    ll.ensure_schema(st)
+    j = Journal(":memory:")
+    t0 = 1_700_006_400.0  # a UTC 6 h boundary (00:00 + 6 h multiple)
+    t0 -= t0 % 21600
+    for blk in range(2):
+        for i in range(10):
+            st.execute("INSERT INTO watch_launch_live(pool, create_ts, liquid, rw_pct, low_h, ret, status, liq_usd) "
+                       "VALUES (?,?,?,?,?,?,?,?)", (f"P{blk}{i}", t0 + blk * 21600 + i * 60, 1, 20.0 if i < 5 else 80.0,
+                                                    0, 0.4 if i < 5 else -0.6, "done", 10_000.0))
+
+    def pos(book, ts, cost, realized, closed=True):
+        j.execute("INSERT INTO positions(token, symbol, cost_usd, realized_usd, qty, opened_at, closed_at, strategy) "
+                  "VALUES ('T','T',?,?,0,?,?,?)", (cost, realized, ts, ts + 360 if closed else None, book))
+    for blk in range(2):
+        base = t0 + blk * 21600
+        for i in range(5):
+            pos("launchrw50_sz", base + i, 250.0, 300.0)  # +20% on $250
+            pos("launchrw50_sz", base + 10 + i, 25.0, 20.0)  # -20% on $25
+            pos("launch4_5", base + i, 100.0, 90.0 if blk == 0 else 20.0)
+    pos("launchrw50_sz", t0 + 21600 + 100, 25.0, 0.0, closed=False)  # never sold: -$25
+    out = ll.block_compare(st, j, cfg, now=t0 + 2 * 21600)
+    b0, b1 = out["blocks"]
+    assert b0["market ideal %"] == -10.0 and b0["sz picks ideal %"] == 40.0
+    assert b0["books"]["launchrw50_sz"]["mean %"] == round(100 * (250 - 25) / 1375, 1)
+    assert b1["books"]["launchrw50_sz"]["n"] == 11
+    s = out["summary"]["launchrw50_sz"]
+    assert s["vs market ideal"]["won"] == 2 and s["vs market ideal"]["blocks"] == 2
+    head = out["launchrw50_sz vs each book (blocks where both traded 5+)"]["launch4_5"]
+    assert head["won"] == 2
+    text = ll.render_block_compare(out)
+    assert "launchrw50_sz" in text and "BLOCK COMPARE" in text

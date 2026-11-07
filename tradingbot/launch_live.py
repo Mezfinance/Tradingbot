@@ -2214,3 +2214,144 @@ def size_study(store, journal, book: str = "launchrw50", hours: float | None = N
                      "changes with size (reserves at the scorer's fill and minute-6 reads); rugs lose the whole "
                      "stake at any size; bigger sizes also move the pool for other traders and may be harder to fill, "
                      "which this ignores, so the larger sizes are optimistic")}
+
+
+BLOCK_H = 6  # block-compare: UTC blocks 00/06/12/18
+BLOCK_STUCK_S = 1800  # a position still open this long after its buy never sold: counts as -100%
+BLOCK_MIN_TRADES = 5  # a book's block counts in the head-to-head only with this many trades
+
+
+def _binom_tail(k: int, n: int) -> float:
+    """One-sided chance of k or more wins out of n if each block were a coin flip."""
+    return sum(math.comb(n, i) for i in range(k, n + 1)) / 2 ** n if n else 1.0
+
+
+def block_compare(store, journal, cfg: Config, book: str = "launchrw50_sz", hours: float | None = None,
+                  block_h: float = BLOCK_H, now: float | None = None) -> dict:
+    """Is `book` ahead in every kind of market? Per UTC block of `block_h` hours: every running book's real result
+    (size-weighted: P&L / money traded; open > BLOCK_STUCK_S = -100%), against the scorer's ideal trade on every
+    liquid pool ('the market', equal-weighted) and the same pools sized like the sized book (bands on second-4
+    liquidity), plus the sized book's own picks at ideal fills. Ideal fills ran ~2.4 pts/trade above real fills
+    on 11-06, so beating the ideal market is the harder test."""
+    from tradingbot import model_book as mb
+    now = now if now is not None else time.time()
+    ensure_schema(store)
+    since = now - hours * 3600 if hours else 0.0
+    bs = block_h * 3600
+    blk = lambda ts: int(ts // bs)
+
+    market: dict = collections.defaultdict(lambda: {"n": 0, "sum": 0.0, "sized_pnl": 0.0, "sized_cost": 0.0,
+                                                    "picks_pnl": 0.0, "picks_cost": 0.0})
+    for r in store.query("SELECT * FROM watch_launch_live WHERE status='done' AND liquid=1 AND ret IS NOT NULL "
+                         "AND create_ts >= ?", (since,)):
+        m = market[blk(r["create_ts"])]
+        m["n"] += 1
+        m["sum"] += r["ret"]
+        size = mb.band_usd(mb.LAUNCH_SIZED, r["liq_usd"]) if r["liq_usd"] else None
+        if size:
+            m["sized_pnl"] += r["ret"] * size
+            m["sized_cost"] += size
+            if rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"])["rw50"]:
+                m["picks_pnl"] += r["ret"] * size
+                m["picks_cost"] += size
+
+    books = [b for b in mb.active_books(cfg) if b not in mb.CANARY_BOOKS]
+    res: dict = collections.defaultdict(lambda: collections.defaultdict(lambda: [0, 0.0, 0.0]))  # n, pnl, cost
+    marks = ",".join("?" * len(books))
+    for p in journal.query(f"SELECT strategy, opened_at, closed_at, cost_usd, realized_usd FROM positions "
+                           f"WHERE strategy IN ({marks}) AND opened_at >= ?", (*books, since)):
+        if not p["cost_usd"]:
+            continue
+        if p["closed_at"]:
+            pnl = p["realized_usd"] - p["cost_usd"]
+        elif now - p["opened_at"] >= BLOCK_STUCK_S:
+            pnl = -p["cost_usd"]
+        else:
+            continue
+        cell = res[p["strategy"]][blk(p["opened_at"])]
+        cell[0] += 1
+        cell[1] += pnl
+        cell[2] += p["cost_usd"]
+
+    pct = lambda pnl, cost: round(100 * pnl / cost, 1) if cost else None
+    keys = sorted(set(market) | {k for b in res.values() for k in b})
+    rows = []
+    for k in keys:
+        m = market.get(k)
+        row = {"block (UTC)": datetime.fromtimestamp(k * bs, timezone.utc).strftime("%m-%d %H:%M"),
+               "market pools": m["n"] if m else 0,
+               "market ideal %": round(100 * m["sum"] / m["n"], 1) if m and m["n"] else None,
+               "market sized ideal %": pct(m["sized_pnl"], m["sized_cost"]) if m else None,
+               "sz picks ideal %": pct(m["picks_pnl"], m["picks_cost"]) if m else None,
+               "books": {}}
+        for b in books:
+            c = res.get(b, {}).get(k)
+            if c and c[0]:
+                row["books"][b] = {"n": c[0], "mean %": pct(c[1], c[2]), "pnl $": round(c[1])}
+        rows.append(row)
+
+    def versus(b: str, ref) -> dict:
+        wins = n = 0
+        gaps = []
+        for row in rows:
+            mine = row["books"].get(b)
+            other = ref(row)
+            if not mine or mine["n"] < BLOCK_MIN_TRADES or other is None:
+                continue
+            n += 1
+            gap = mine["mean %"] - other
+            gaps.append(gap)
+            wins += gap > 0
+        return {"blocks": n, "won": wins, "mean gap pts": round(float(np.mean(gaps)), 1) if gaps else None,
+                "chance by luck": round(_binom_tail(wins, n), 4) if n else None}
+
+    summary = {}
+    for b in books:
+        tot = [sum(c[i] for c in res.get(b, {}).values()) for i in range(3)]
+        if not tot[0]:
+            continue
+        summary[b] = {"trades": tot[0], "pnl $": round(tot[1]), "mean %": pct(tot[1], tot[2]),
+                      "vs market ideal": versus(b, lambda r: r["market ideal %"]),
+                      "vs market sized like sz": versus(b, lambda r: r["market sized ideal %"])}
+    head = {}
+    if book in summary:
+        for b in summary:
+            if b == book:
+                continue
+            head[b] = versus(book, lambda r, b=b: (r["books"].get(b) or {}).get("mean %")
+                             if (r["books"].get(b) or {}).get("n", 0) >= BLOCK_MIN_TRADES else None)
+    return {"window": f"last {hours:g} h" if hours else "whole life", "block_h": block_h, "book": book,
+            "blocks": rows, "summary": dict(sorted(summary.items(), key=lambda kv: -(kv[1]["mean %"] or -999))),
+            f"{book} vs each book (blocks where both traded {BLOCK_MIN_TRADES}+)": head,
+            "note": "market = the scorer's ideal trade on every liquid pool (vault prices, flat 6% cost, minute-6 "
+                    "exit), which ran ~2.4 pts/trade above real fills; 'sized like sz' weights the same pools by "
+                    "sz's liquidity bands; 'sz picks ideal' = sz's own rw50 picks at ideal fills, sized. "
+                    "'chance by luck' = probability of winning that many blocks if each were a coin flip."}
+
+
+def render_block_compare(out: dict, focus: tuple = ("launchrw50_sz", "launchrw50", "launchrw50_24h",
+                                                     "launch4_2", "launch4_5")) -> str:
+    """Text tables: per block the market and the focus books; then every book's head-to-head summary."""
+    lines = [f"BLOCK COMPARE ({out['window']}, {out['block_h']:g} h blocks; mean = P&L / money traded)", ""]
+    cols = ["market ideal %", "market sized ideal %", "sz picks ideal %"]
+    shown = [b for b in focus if b in out["summary"]]
+    head = f"{'block (UTC)':12}{'pools':>6}{'mkt':>8}{'mkt sz':>8}{'sz pick':>8}" + "".join(f"{b[:14]:>16}" for b in shown)
+    lines += [head, "-" * len(head)]
+    f = lambda v: "-" if v is None else f"{v:+.1f}"
+    for r in out["blocks"]:
+        cells = "".join(f"{(f(r['books'][b]['mean %']) + ' (' + str(r['books'][b]['n']) + ')') if b in r['books'] else '-':>16}"
+                        for b in shown)
+        lines.append(f"{r['block (UTC)']:12}{r['market pools']:>6}" + "".join(f"{f(r[c]):>8}" for c in cols) + cells)
+    lines += ["", f"{'book':22}{'trades':>7}{'P&L $':>9}{'mean':>7}   {'beat market (blocks)':>22}   {'beat sized market':>18}"]
+    for b, s in out["summary"].items():
+        vm, vs = s["vs market ideal"], s["vs market sized like sz"]
+        lines.append(f"{b:22}{s['trades']:>7}{s['pnl $']:>9}{f(s['mean %']):>7}   "
+                     f"{str(vm['won']) + '/' + str(vm['blocks']) + ' (' + f(vm['mean gap pts']) + ' pts)':>22}   "
+                     f"{str(vs['won']) + '/' + str(vs['blocks']) + ' (' + f(vs['mean gap pts']) + ' pts)':>18}")
+    key = next((k for k in out if k.endswith("traded 5+)")), None)
+    if key and out[key]:
+        lines += ["", f"{out['book']} head to head (blocks won / blocks both traded, mean gap, chance by luck)"]
+        for b, v in out[key].items():
+            lines.append(f"  vs {b:22} {v['won']}/{v['blocks']}  {f(v['mean gap pts'])} pts  p={v['chance by luck']}")
+    lines += ["", out["note"]]
+    return "\n".join(lines)
