@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -458,6 +458,13 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore, watch_db_path
         out = launch_live.block_compare(WatchStore(watch_db_path(cfg)), Journal(cfg.db_path), cfg, hours=args.hours)
         print(json.dumps(out, indent=2, default=str) if args.json else launch_live.render_block_compare(out))
+        return
+
+    if args.command == "band-rw-study":  # rug-vs-win trained per pool-size band, walk-forward (default whole life)
+        from tradingbot import band_rw
+        from tradingbot.watcher import WatchStore, watch_db_path
+        out = band_rw.study(WatchStore(watch_db_path(cfg)), hours=args.hours)
+        print(json.dumps(out, indent=2, default=str) if args.json else band_rw.render(out))
         return
 
     if args.command == "rw-bands":  # rug-vs-win and sz by pool size, 8 liquidity bands (default whole life)
