@@ -228,6 +228,12 @@ class Engine:
                 enricher = Enricher.from_config(self.cfg, watcher.store, watcher)
                 threading.Thread(target=self._loop, name="enricher", daemon=True,
                                  args=(self.cfg.enrich_poll_s, enricher.step)).start()
+            if self.cfg.market_monitor and self.cfg.launch_live:  # hourly meme-market measures, read only
+                from tradingbot import market_monitor as mm
+                from tradingbot.watcher import WatchStore, watch_db_path
+                monitor = mm.MarketMonitor(WatchStore(watch_db_path(self.cfg)), self.journal, self.cfg)
+                threading.Thread(target=self._loop, name="market-monitor", daemon=True,
+                                 args=(mm.MONITOR_POLL_S, monitor.step)).start()
         # Own thread: sampling after each scan cycle left ~18-minute gaps while Claude was busy.
         threading.Thread(target=self._loop, name="tracker", daemon=True,
                          args=(self.cfg.track_interval_s, self.update_outcomes)).start()

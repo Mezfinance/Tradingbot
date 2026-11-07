@@ -61,6 +61,7 @@ class Config:
     # its first 4 seconds come from Helius, the launch4 model scores it and the would-be fill / minute-6 exit
     # are read from the pool's vaults (table watch_launch_live, CLI launch-status).
     launch_live: bool = False
+    market_monitor: bool = False  # hourly meme-market measures in watch.db (market_monitor.py), read only
     launch_live_daily_credits: int = 20_000
     launch_live_decide_delay_s: float = 4.0  # after the websocket notification (~1 s after creation)
     launch_train_days: float = 14.0
