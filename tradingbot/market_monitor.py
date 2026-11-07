@@ -37,6 +37,7 @@ EARLY_PULL_S = 90
 SEED_ROUND = 1.0  # seed SOL rounded to this for the copy-paste template count
 TEMPLATE_MIN = 3  # a seed size shared by this many pools in the hour = a template
 TOP_OPERATORS = 5
+BATCH_HOURS = 24  # hours built per read on a backfill
 SZ_STUCK_S = 1800  # a sized-book trade still open this long counts as -100% (as block-compare)
 
 VERSION = 2  # stored rows from an older version are rebuilt (2: liquidity bands)
@@ -239,29 +240,46 @@ class MarketMonitor:
         self.store, self.journal, self.cfg = store, journal, cfg
         store.execute(SCHEMA)
 
-    def _prices(self, start: float, end: float) -> dict:
-        sol = self.store.query("SELECT sol_usd FROM watch_market WHERE ts >= ? AND ts < ? AND sol_usd IS NOT NULL "
-                               "ORDER BY ts", (start, end))
-        def macro(key):
-            return [r[0] for r in self.store.query("SELECT value FROM watch_macro WHERE key=? AND ts >= ? AND ts < ? "
-                                                   "ORDER BY ts", (key, start, end))]
-        btc, fg = macro("btc_usd"), macro("fear_greed")
-        return {"sol_open": sol[0][0] if sol else None, "sol_close": sol[-1][0] if sol else None,
-                "btc_open": btc[0] if btc else None, "btc_close": btc[-1] if btc else None,
-                "fear_greed": fg[-1] if fg else None}
-
-    def build(self, hour: float, now: float) -> dict:
+    def build_many(self, hours: list[float], now: float) -> dict:
+        """Rows for many hours from one read of each table (an hour at a time scanned whole tables: the first
+        backfill of ~120 hours took many minutes), bucketed by hour in memory."""
         from tradingbot import launch_live as ll
         from tradingbot import model_book as mb
+        if not hours:
+            return {}
         ll.ensure_schema(self.store)
-        end = hour + HOUR_S
-        pools = [dict(r) for r in self.store.query(
-            "SELECT pool, creator, create_ts, liquid, status, ret, pulled_ts, liq_usd, feat, rw_pct "
-            "FROM watch_launch_live WHERE create_ts >= ? AND create_ts < ?", (hour, end))]
-        trades = [dict(r) for r in self.journal.query(
-            "SELECT opened_at, closed_at, cost_usd, realized_usd FROM positions WHERE strategy=? "
-            "AND opened_at >= ? AND opened_at < ?", (mb.LAUNCH_SIZED, hour, end))] if self.journal else []
-        return hour_metrics(pools, trades, self._prices(hour, end), now)
+        lo, hi = min(hours), max(hours) + HOUR_S
+        want = set(hours)
+        bucket = lambda ts: ts // HOUR_S * HOUR_S
+        pools, trades = collections.defaultdict(list), collections.defaultdict(list)
+        for r in self.store.query(
+                "SELECT pool, creator, create_ts, liquid, status, ret, pulled_ts, liq_usd, feat, rw_pct "
+                "FROM watch_launch_live WHERE create_ts >= ? AND create_ts < ?", (lo, hi)):
+            pools[bucket(r["create_ts"])].append(dict(r))
+        if self.journal:
+            for r in self.journal.query("SELECT opened_at, closed_at, cost_usd, realized_usd FROM positions "
+                                        "WHERE strategy=? AND opened_at >= ? AND opened_at < ?",
+                                        (mb.LAUNCH_SIZED, lo, hi)):
+                trades[bucket(r["opened_at"])].append(dict(r))
+        series = collections.defaultdict(lambda: collections.defaultdict(list))
+        for ts, v in self.store.query("SELECT ts, sol_usd FROM watch_market WHERE ts >= ? AND ts < ? "
+                                      "AND sol_usd IS NOT NULL ORDER BY ts", (lo, hi)):
+            series["sol"][bucket(ts)].append(v)
+        for key, name in (("btc_usd", "btc"), ("fear_greed", "fg")):
+            for ts, v in self.store.query("SELECT ts, value FROM watch_macro WHERE key=? AND ts >= ? AND ts < ? "
+                                          "ORDER BY ts", (key, lo, hi)):
+                series[name][bucket(ts)].append(v)
+        out = {}
+        for h in sorted(want):
+            sol, btc, fg = series["sol"].get(h, []), series["btc"].get(h, []), series["fg"].get(h, [])
+            prices = {"sol_open": sol[0] if sol else None, "sol_close": sol[-1] if sol else None,
+                      "btc_open": btc[0] if btc else None, "btc_close": btc[-1] if btc else None,
+                      "fear_greed": fg[-1] if fg else None}
+            out[h] = hour_metrics(pools.get(h, []), trades.get(h, []), prices, now)
+        return out
+
+    def build(self, hour: float, now: float) -> dict:
+        return self.build_many([hour], now)[hour]
 
     def step(self, now: float | None = None) -> int:
         """Store every finished hour without a row (the first run backfills from the scorer's first pool)."""
@@ -272,14 +290,17 @@ class MarketMonitor:
         first = self.store.query("SELECT MIN(create_ts) FROM watch_launch_live")
         if not first or first[0][0] is None:
             return 0
-        hour, n = first[0][0] // HOUR_S * HOUR_S, 0
+        hour, missing = first[0][0] // HOUR_S * HOUR_S, []
         while hour <= last_done:
             if hour not in have:
-                data = self.build(hour, now)
-                self.store.execute("INSERT OR REPLACE INTO market_hours(hour, data, ts) VALUES(?,?,?)",
-                                   (hour, json.dumps(data), now))
-                n += 1
+                missing.append(hour)
             hour += HOUR_S
+        n = 0
+        for i in range(0, len(missing), BATCH_HOURS):  # a day at a time keeps memory flat on long backfills
+            rows = self.build_many(missing[i:i + BATCH_HOURS], now)
+            self.store.executemany("INSERT OR REPLACE INTO market_hours(hour, data, ts) VALUES(?,?,?)",
+                                   [(h, json.dumps(d), now) for h, d in rows.items()])
+            n += len(rows)
         if n:
             log.info("market monitor: %d hour(s) stored", n)
         return n
