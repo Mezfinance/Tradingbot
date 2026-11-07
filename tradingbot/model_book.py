@@ -91,6 +91,14 @@ LAUNCH_RW24_CUT = {"launchrw50_24h": "rw50_24", "launchd12rw50_24h": "d12rw50_24
 LAUNCH_SIZED = "launchrw50_sz"
 LAUNCH_SIZED_CUT = {LAUNCH_SIZED: "rw50"}
 SIZE_BANDS = ((15_000.0, 250.0), (25_000.0, 25.0), (float("inf"), 100.0))  # (liquidity below, trade size $)
+# By-band twins (11-08, `band-rw-study`): the live rug-vs-win model ranked within each liquidity band (flag
+# `rwband`, launch_live.BAND_RULES): $5-15k skip the riskiest 20%, $15-25k skip 70%, $25-40k the live rule, nothing
+# above $40k. Same rule in both books; only the thin band's size differs ($100 vs $250), to measure price impact.
+LAUNCH_BAND = "launchrwband"
+LAUNCH_BAND_SZ = "launchrwband_sz"
+LAUNCH_BAND_CUT = {LAUNCH_BAND: "rwband", LAUNCH_BAND_SZ: "rwband"}
+BAND_SIZE_BANDS = {LAUNCH_BAND: ((15_000.0, 100.0), (float("inf"), 100.0)),
+                   LAUNCH_BAND_SZ: ((15_000.0, 250.0), (float("inf"), 100.0))}  # (liquidity below, trade size $)
 # Real-money canary (11-06; was canary_rw50_24h, never switched on): copies the size-by-band book (`CANARY_TWIN`),
 # same signals and minute-6 exit, filled by the live Jupiter executor; every pool (fly.toml sets
 # `launch_canary_max_liq_usd` 0), sized like the twin's bands in the same order: $250 / $25 / $100 -> $5 / $0.50 / $2 (1/50).
@@ -99,7 +107,7 @@ CANARY_TWIN = LAUNCH_SIZED
 CANARY_BOOKS = (CANARY4,)
 CANARY_SIZE_BANDS = ((15_000.0, 5.0), (25_000.0, 0.5), (float("inf"), 2.0))  # (liquidity below, $)
 LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
-              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT}
+              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_BAND_CUT}
 LAUNCH_CUT[CANARY4] = LAUNCH_CUT[CANARY_TWIN]  # the canary takes its twin's signals
 LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 6.0 for b in LAUNCH_CUT}
 POOL_MINUTE_EXIT = {**EARLY_EXIT_MIN, **LAUNCH_EXIT_MIN}  # books that sell every position by a pool minute
@@ -152,7 +160,8 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
 def band_usd(name: str, liq: float | None) -> float | None:
     """Trade size of a size-by-band book (the sized twin, or the canary at its small sizes) for a pool with this
     liquidity; None for every other book."""
-    bands = SIZE_BANDS if name in LAUNCH_SIZED_CUT else CANARY_SIZE_BANDS if name in CANARY_BOOKS else None
+    bands = SIZE_BANDS if name in LAUNCH_SIZED_CUT else CANARY_SIZE_BANDS if name in CANARY_BOOKS \
+        else BAND_SIZE_BANDS.get(name)
     if bands is None or liq is None:
         return None
     return next(usd for below, usd in bands if liq < below)
@@ -175,6 +184,7 @@ def _family_books(cfg: Config) -> list[str]:
         + (list(LAUNCH_RW_CUT) if cfg.launch_rw_book and cfg.launch_live else [])\
         + (list(LAUNCH_RW24_CUT) if cfg.launch_rw24_book and cfg.launch_live else []) \
         + (list(LAUNCH_SIZED_CUT) if cfg.launch_sized_book and cfg.launch_live else []) \
+        + (list(LAUNCH_BAND_CUT) if cfg.launch_band_book and cfg.launch_live else []) \
         + ([CANARY4] if cfg.launch_canary and cfg.launch_live else [])
 
 
@@ -715,7 +725,8 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
                                       EARLY5R: 26.0, EARLY6R: 26.0, EARLY7R: 26.0, EARLY6W: 25.0, EARLY6T: 27.0,
                                       "launchd12": 30.0, "launchd12_s10": 27.0, "launchd12_s20": 24.0,
                                       "launchd12_s30": 18.0, "launchd12_s50": 11.0,
-                                      "launchrw50": 21.0, "launchd12rw50": 17.0, LAUNCH_SIZED: 23.0}.get(name, 76.0),  # backtests
+                                      "launchrw50": 21.0, "launchd12rw50": 17.0, LAUNCH_SIZED: 23.0,
+                                      LAUNCH_BAND: 25.0, LAUNCH_BAND_SZ: 25.0}.get(name, 76.0),  # backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 

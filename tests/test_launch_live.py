@@ -1021,3 +1021,54 @@ def test_thin_tracking_can_be_switched_off(setup):
     clock.t += cfg.launch_live_decide_delay_s
     live.step()
     assert live._row(HAND_POOL)["status"] == "skipped"
+
+
+def test_band_flags_follow_each_bands_rule():
+    """11-08 band-rw-study: thin pools skip the riskiest 20% of their band, $15-25k the riskiest 70%, $25-40k keep
+    the live rule (all bands ranked together), nothing above $40k or below $5k."""
+    f = lambda liq, rw, rwb: ll.band_flags(liq, rw, rwb)["rwband"]
+    assert f(10_000, 90.0, 79.0) and not f(10_000, 10.0, 81.0)     # thin: band rank < 80, the live rank ignored
+    assert f(20_000, 90.0, 29.0) and not f(20_000, 10.0, 31.0)     # $15-25k: band rank < 30
+    assert f(30_000, 49.0, 99.0) and not f(30_000, 51.0, 1.0)      # $25-40k: live rank < 50
+    assert not f(50_000, 1.0, 1.0) and not f(4_000, 1.0, 1.0) and not f(None, 1.0, 1.0)
+    assert not f(10_000, 1.0, None)                                # no band rank yet: no flag
+    assert ll.band_of(14_999) == "$5-15k" and ll.band_of(40_000) is None
+
+
+def test_rug_vs_win_ranks_each_pool_within_its_band_and_feeds_the_band_books(setup):
+    import random
+    from tradingbot import model_book as mb
+    cfg, st, hel, clock, live, p, create = setup
+    _rw_done_rows(st, 600, clock.t - 2 * 86400, random.Random(8))
+    assert ll.train_rw_and_save(st, cfg) is not None and live._load_rw_model() is not None
+    win_like = {"creator_buys": 0.5, "log_buyers": 2.5}
+    rug_like = {"creator_buys": 2.5, "log_buyers": 0.5}
+    model = live._load_rw_model()
+    with live.lock:  # the thin band's past day: every pool safer than rug_like, riskier than win_like
+        live.rw_band["$5-15k"].clear()
+        mid = (model.score(win_like) + model.score(rug_like)) / 2
+        live.rw_band["$5-15k"].extend((clock.t - 3600, mid) for _ in range(ll.ROLLING_MIN))
+        live.rw_band["$15-25k"].clear()
+    thin_safe = live._rw_verdict(win_like, "N", clock.t, clock.t, low=False, liq=10_000)
+    thin_risky = live._rw_verdict(rug_like, "N", clock.t, clock.t, low=False, liq=10_000)
+    assert thin_safe["rwb_pct"] == 0.0 and thin_risky["rwb_pct"] == 100.0
+    assert live._rw_verdict(win_like, "N", clock.t, clock.t, low=False, liq=20_000)["rwb_pct"] is None  # too few yet
+    assert "rwb_pct" not in live._rw_verdict(win_like, "N", clock.t, clock.t, low=False, liq=60_000)
+    assert len(live.rw_band["$5-15k"]) == ll.ROLLING_MIN + 2
+    # a newly loaded model rebuilds the band windows from the stored liquid pools of the past day
+    st.execute("UPDATE watch_launch_live SET decided_ts=?, liq_usd=12000", (clock.t - 3600,))
+    live.rw_mtime, live.rw_checked = None, 0.0
+    live._load_rw_model()
+    assert len(live.rw_band["$5-15k"]) >= 600 and not live.rw_band["$15-25k"]
+    # the twin books: same signals, thin size $100 vs $250, $100 elsewhere, minute-6 exit
+    cfg.launch_band_book, cfg.launch_live = True, True
+    try:
+        assert set(mb.LAUNCH_BAND_CUT) <= set(mb.active_books(cfg))
+        sig = {"rwband": True, "rw50": False, "mint": "M", "created_ts": 100.0}
+        assert mb.wants(mb.LAUNCH_BAND, sig) and mb.wants(mb.LAUNCH_BAND_SZ, sig)
+        assert not mb.wants(mb.LAUNCH_BAND, dict(sig, rwband=False)) and not mb.wants(mb.LAUNCH_SIZED, sig)
+        assert mb.band_usd(mb.LAUNCH_BAND, 10_000) == 100.0 and mb.band_usd(mb.LAUNCH_BAND_SZ, 10_000) == 250.0
+        assert mb.band_usd(mb.LAUNCH_BAND, 20_000) == 100.0 == mb.band_usd(mb.LAUNCH_BAND_SZ, 30_000)
+        assert mb.exit_deadline(cfg, mb.LAUNCH_BAND_SZ, sig) == 100.0 + 360
+    finally:
+        cfg.launch_band_book, cfg.launch_live = False, False

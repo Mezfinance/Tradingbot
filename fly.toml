@@ -38,6 +38,7 @@ primary_region = "iad"
   TB_LAUNCH_CANARY_MAX_OPEN = "20"  # ~30 picks/h held ~6 min: open slots should never cause a skip (was 5)
   TB_LAUNCH_RW_BOOK = "1"  # launchrw50 / launchd12rw50: skip the riskiest half by rug-vs-win odds (11-04)
   TB_LAUNCH_SIZED_BOOK = "1"  # launchrw50_sz: launchrw50's signals sized by liquidity band ($250 < $15k, $25 at $15-25k, $100 above), from size-study (11-06)
+  TB_LAUNCH_BAND_BOOK = "1"  # launchrwband / launchrwband_sz: rug-vs-win ranked within each liquidity band ($5-15k skip 20%, $15-25k skip 70%, $25-40k live rule), $100 / $250 in thin pools (11-08)
   TB_LAUNCH_RW24_BOOK = "1"  # launchrw50_24h / launchd12rw50_24h: the same filter on the earlier rule (24 h ranking, daily 14-day model), beside the study-rule books (11-05)
   TB_SHORTBOOK_FEED_URL = "http://shortbook-paper.internal:8080/api/feed"  # MZF Short Only on the dashboard (Fly private network, read-only)
   TB_LAUNCH_LOW_BOOK = "1"  # launchd12 + _s10/_s20/_s30/_s50: history-model bottom 20% minus the riskiest k% early pullers (11-04)

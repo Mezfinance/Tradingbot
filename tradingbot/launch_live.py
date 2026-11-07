@@ -92,7 +92,9 @@ def ensure_schema(store) -> None:
                 # 11-05: the history model's bottom 20% of the past 6 h (the rug-vs-win books' D1-D2, as the study)
                 "rw_low6 INTEGER",
                 # 11-05: the earlier live rule's score and ranks, kept for the rw24 twin books
-                "rw24 REAL", "rw24_pct REAL", "rw24_low_pct REAL"):
+                "rw24 REAL", "rw24_pct REAL", "rw24_low_pct REAL",
+                # 11-08: the rug-vs-win score's rank among the past day's liquid pools of the same band
+                "rwb_pct REAL"):
         try:
             store.execute(f"ALTER TABLE watch_launch_live ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -311,6 +313,33 @@ def rw_flags(low, rw_pct, rw_low_pct) -> dict:
             "d12rw50": bool(low) and rw_low_pct is not None and rw_low_pct < keep}
 
 
+# Rug-vs-win by band (11-08, `band-rw-study`): the live model ranked against the past BAND_WINDOW_S's liquid pools of
+# the same liquidity band at second 4 (`rwb_pct`) works where ranking every band together does not. Rules, chosen
+# after looking at the study (24 cells per band), so the twin books are the test:
+# (band name, liquidity from, to, ranking, keep below percentile)
+BAND_WINDOW_S = 86400
+BAND_RULES = (("$5-15k", 5_000.0, 15_000.0, "band", 80.0),    # skip the riskiest 20% (+27.4% vs +20.2% every pool)
+              ("$15-25k", 15_000.0, 25_000.0, "band", 30.0),  # skip the riskiest 70% (+8.0% vs -7.5%)
+              ("$25-40k", 25_000.0, 40_000.0, "live", 50.0))  # the live rule (rw_pct < 50): +2.9% vs -9.5%
+# pools above $40k are never kept (nothing robust in the study)
+
+
+def band_of(liq) -> str | None:
+    """The BAND_RULES band of a pool's liquidity at second 4 (None outside the traded bands)."""
+    if liq is None:
+        return None
+    return next((name for name, lo, hi, _, _ in BAND_RULES if lo <= liq < hi), None)
+
+
+def band_flags(liq_usd, rw_pct, rwb_pct) -> dict:
+    """Signal flag of the by-band books: `rwband` = kept by its band's rule in BAND_RULES."""
+    rule = next((r for r in BAND_RULES if liq_usd is not None and r[1] <= liq_usd < r[2]), None)
+    if rule is None:
+        return {"rwband": False}
+    pct = rwb_pct if rule[3] == "band" else rw_pct
+    return {"rwband": pct is not None and pct < rule[4]}
+
+
 class RugWinModel:
     """Two logistics on the early-pull inputs (second-4 features + creator record): rugged before the exit, and
     +50% or more. Score = P(rug) - P(win); higher = riskier."""
@@ -456,6 +485,8 @@ class LaunchLive:
         self.rw24_model, self.rw24_mtime, self.rw24_checked = None, None, 0.0
         self.rw24_all: collections.deque = collections.deque()
         self.rw24_low: collections.deque = collections.deque()
+        # (decided_ts, rw) of liquid pools per BAND_RULES band, past BAND_WINDOW_S (rebuilt with the rw model)
+        self.rw_band: dict = {b[0]: collections.deque() for b in BAND_RULES}
         self.pool = ThreadPoolExecutor(workers, thread_name_prefix="launch-live") if workers else None
         self.saved_at = 0.0
         self.tries: dict[str, int] = {}
@@ -660,7 +691,18 @@ class LaunchLive:
                 every.append((r["decided_ts"], sc))
                 if is_low(r):
                     low.append((r["decided_ts"], sc))
+            bands = {b[0]: collections.deque() for b in BAND_RULES}
+            if track == "rw":
+                for r in self.store.query("SELECT creator, create_ts, decided_ts, feat, liq_usd FROM watch_launch_live "
+                                          "WHERE liquid=1 AND feat IS NOT NULL AND decided_ts >= ? ORDER BY decided_ts",
+                                          (now - BAND_WINDOW_S,)):
+                    b = band_of(r["liq_usd"])
+                    if b:
+                        bands[b].append((r["decided_ts"], new.score(
+                            pull_inputs(json.loads(r["feat"]), self._op_live(r["creator"], r["create_ts"])))))
             with self.lock:
+                if track == "rw":
+                    self.rw_band = bands
                 setattr(self, f"{track}_model", new)
                 setattr(self, f"{track}_mtime", mtime)
                 setattr(self, f"{track}_all", collections.deque(every))
@@ -669,7 +711,7 @@ class LaunchLive:
         return model
 
     def _rw_verdict(self, feat: dict, creator: str | None, create_ts: float, now: float, low: bool,
-                    track: str = "rw") -> dict:
+                    track: str = "rw", liq: float | None = None) -> dict:
         """Rug-vs-win score of a liquid pool and its percentile among the ranking window's liquid pools (and, for
         a pool in that rule's bottom 20%, among those). Columns `<track>`, `<track>_pct`, `<track>_low_pct`."""
         model = self._load_rw_model(track)
@@ -689,6 +731,15 @@ class LaunchLive:
         out = {track: rw, f"{track}_pct": _rank_pct(past_all, rw, model.meta.get("quantiles"))}
         if low:
             out[f"{track}_low_pct"] = _rank_pct(past_low, rw, model.meta.get("low_quantiles"))
+        band = band_of(liq) if track == "rw" else None
+        if band:
+            with self.lock:
+                dq = self.rw_band[band]
+                while dq and dq[0][0] < now - BAND_WINDOW_S:
+                    dq.popleft()
+                past_band = [v for _, v in dq]
+                dq.append((now, rw))
+            out["rwb_pct"] = _rank_pct(past_band, rw, None)  # None (no flag) until ROLLING_MIN pools in the band
         return out
 
     def _hist_verdict(self, feat: dict, now: float) -> dict:
@@ -882,16 +933,18 @@ class LaunchLive:
         cols.update(self._hist_verdict(feat, now))
         if cols.get("low_h"):
             cols.update(self._risk_verdict(feat, rec.get("creator"), create, now))
-        cols.update(self._rw_verdict(feat, rec.get("creator"), create, now, bool(cols.get("rw_low6"))))
+        cols.update(self._rw_verdict(feat, rec.get("creator"), create, now, bool(cols.get("rw_low6")),
+                                     liq=cols.get("liq_usd")))
         if self.cfg.launch_rw24_book:
             cols.update(self._rw_verdict(feat, rec.get("creator"), create, now, bool(cols.get("low_h")), track="rw24"))
         flags = {**low_flags(cols.get("low_h"), cols.get("risk_pct")),
                  **rw_flags(cols.get("rw_low6"), cols.get("rw_pct"), cols.get("rw_low_pct")),
-                 **rw24_flags(cols.get("low_h"), cols.get("rw24_pct"), cols.get("rw24_low_pct"))}
+                 **rw24_flags(cols.get("low_h"), cols.get("rw24_pct"), cols.get("rw24_low_pct")),
+                 **band_flags(cols.get("liq_usd"), cols.get("rw_pct"), cols.get("rwb_pct"))}
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
         if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")
                                          or flags["d12"] or flags["rw50"] or flags["d12rw50"]
-                                         or flags["rw50_24"] or flags["d12rw50_24"]):
+                                         or flags["rw50_24"] or flags["d12rw50_24"] or flags["rwband"]):
             px = la.chain_price(rows, DECIDE_S)  # SOL per whole token (vault UI amounts)
             if sol_usd and px:
                 self.signals.put_nowait({
@@ -1681,12 +1734,13 @@ def fill_gap(store, journal, book: str, since: float, rng) -> dict:
                                                 (book, since - 600))}
     missed = []
     if flag:
-        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct, rw_pct, rw_low_pct, rw_low6, rw24_pct, rw24_low_pct "
+        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct, rw_pct, rw_low_pct, rw_low6, rw24_pct, rw24_low_pct, liq_usd, rwb_pct "
                              "FROM watch_launch_live "
                              "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND create_ts >= ?", (since,)):
             hit = r[flag] if flag in ("top2", "top5", "top2h", "top5h") else {
                 **low_flags(r["low_h"], r["risk_pct"]), **rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"]),
-                **rw24_flags(r["low_h"], r["rw24_pct"], r["rw24_low_pct"])}[flag]
+                **rw24_flags(r["low_h"], r["rw24_pct"], r["rw24_low_pct"]),
+                **band_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"])}[flag]
             if hit and r["token_mint"] not in bought:
                 missed.append({"ret": r["ret"]})
     if not pairs:
