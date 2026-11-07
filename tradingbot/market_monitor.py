@@ -39,6 +39,9 @@ TEMPLATE_MIN = 3  # a seed size shared by this many pools in the hour = a templa
 TOP_OPERATORS = 5
 SZ_STUCK_S = 1800  # a sized-book trade still open this long counts as -100% (as block-compare)
 
+VERSION = 2  # stored rows from an older version are rebuilt (2: liquidity bands)
+BANDS = (("thin", 0.0, 15_000.0), ("mid", 15_000.0, 25_000.0), ("thick", 25_000.0, float("inf")))  # sz's bands
+
 SCHEMA = "CREATE TABLE IF NOT EXISTS market_hours (hour REAL PRIMARY KEY, data TEXT NOT NULL, ts REAL)"
 
 # (key, label, group); every key is a number in an hour row (None when the hour has no data for it)
@@ -48,6 +51,14 @@ METRICS = (
     ("liquid_pct", "liquid share %", "supply"),
     ("med_liq_usd", "median liquidity at s4 $", "supply"),
     ("med_seed_sol", "median seed SOL", "supply"),
+    ("thin_pct", "liquid pools under $15k %", "liquidity"),
+    ("mid_pct", "liquid pools $15-25k %", "liquidity"),
+    ("thick_pct", "liquid pools $25k+ %", "liquidity"),
+    ("thin_mean", "under $15k: ideal mean %", "liquidity"),
+    ("mid_mean", "$15-25k: ideal mean %", "liquidity"),
+    ("thick_mean", "$25k+: ideal mean %", "liquidity"),
+    ("thin_rug_pct", "under $15k: rugged %", "liquidity"),
+    ("thin_sz_mean", "under $15k: sz picks ideal %", "liquidity"),
     ("creators", "distinct creators", "operators"),
     ("top5_pct", f"top {TOP_OPERATORS} creators' share %", "operators"),
     ("repeat_pct", "repeat creators %", "operators"),
@@ -77,7 +88,9 @@ METRICS = (
 )
 LABELS = {k: lbl for k, lbl, _ in METRICS}
 # metrics pooled over pools in the hour; their RECENT_H value is a weighted mean of hours (weight = the count)
-WEIGHT = {"liquid_pct": "pools", "top5_pct": "liquid", "repeat_pct": "liquid", "template_pct": "liquid",
+WEIGHT = {"liquid_pct": "pools", "top5_pct": "liquid", "thin_pct": "liquid", "mid_pct": "liquid", "thick_pct": "liquid",
+          "thin_mean": "thin_n", "mid_mean": "mid_n", "thick_mean": "thick_n", "thin_rug_pct": "thin_n",
+          "thin_sz_mean": "thin_sz_n", "repeat_pct": "liquid", "template_pct": "liquid",
           "rug_pct": "liquid", "early_pull_pct": "liquid", "late_rug_pct": "liquid", "big_win_pct": "liquid",
           "market_mean": "liquid", "rw_kept": "liquid", "rw_skipped": "liquid", "sz_real": "sz_trades"}
 
@@ -116,7 +129,7 @@ def hour_metrics(pools: list[dict], trades: list[dict], prices: dict, now: float
     done = [p for p in liquid if p.get("status") == "done" and p.get("ret") is not None]
     f = lambda p, k: feat[p["pool"]].get(k)
     unlog = lambda v: math.expm1(v) if v is not None else None
-    out: dict = {"pools": len(pools), "liquid": len(liquid), "liquid_pct": _pct(len(liquid), len(pools)),
+    out: dict = {"v": VERSION, "pools": len(pools), "liquid": len(liquid), "liquid_pct": _pct(len(liquid), len(pools)),
                  "done": len(done), "med_liq_usd": _med([p.get("liq_usd") for p in liquid]),
                  "med_seed_sol": _med([unlog(f(p, "log_seed_sol")) for p in liquid])}
 
@@ -140,6 +153,19 @@ def hour_metrics(pools: list[dict], trades: list[dict], prices: dict, now: float
                med_buyers=_med([unlog(f(p, "log_buyers")) for p in liquid]),
                big_win_pct=_pct(sum(r >= BIG_WIN for r in rets), len(done)),
                market_mean=_mean_pct(rets), market_median=round(100 * statistics.median(rets), 1) if rets else None)
+
+    for name, lo, hi in BANDS:
+        inband = [p for p in liquid if p.get("liq_usd") is not None and lo <= p["liq_usd"] < hi]
+        dn = [p["ret"] for p in done if p.get("liq_usd") is not None and lo <= p["liq_usd"] < hi]
+        out[f"{name}_pct"] = _pct(len(inband), len(liquid))
+        out[f"{name}_n"] = len(dn)
+        out[f"{name}_mean"] = _mean_pct(dn)
+        if name == "thin":
+            out["thin_rug_pct"] = _pct(sum(r <= RUG for r in dn), len(dn))
+            picks_thin = [p["ret"] for p in done if p.get("liq_usd") is not None and p["liq_usd"] < hi
+                          and p.get("rw_pct") is not None and p["rw_pct"] < 100 - ll.RW_SKIP]
+            out["thin_sz_n"] = len(picks_thin)
+            out["thin_sz_mean"] = _mean_pct(picks_thin)
 
     sized = [(p["ret"], mb.band_usd(mb.LAUNCH_SIZED, p["liq_usd"])) for p in done if p.get("liq_usd")]
     sized = [(r, s) for r, s in sized if s]
@@ -241,7 +267,8 @@ class MarketMonitor:
         """Store every finished hour without a row (the first run backfills from the scorer's first pool)."""
         now = now if now is not None else time.time()
         last_done = (now - HOUR_DELAY_S) // HOUR_S * HOUR_S - HOUR_S  # start of the newest finished hour
-        have = {r[0] for r in self.store.query("SELECT hour FROM market_hours")}
+        have = {r[0] for r in self.store.query("SELECT hour, data FROM market_hours")
+                if json.loads(r[1]).get("v", 1) >= VERSION}
         first = self.store.query("SELECT MIN(create_ts) FROM watch_launch_live")
         if not first or first[0][0] is None:
             return 0
@@ -264,9 +291,10 @@ def load(store, since: float = 0.0) -> list[dict]:
             for r in store.query("SELECT hour, data FROM market_hours WHERE hour >= ? ORDER BY hour", (since,))]
 
 
-SHOW = ("pools", "liquid", "creators", "top5_pct", "template_pct", "rug_pct", "med_pull_s", "big_win_pct",
+SHOW = ("pools", "liquid", "thin_pct", "mid_pct", "thick_pct", "thin_mean", "creators", "top5_pct", "template_pct", "rug_pct", "med_pull_s", "big_win_pct",
         "market_mean", "market_sized", "rw_gap", "sz_trades", "sz_real", "btc_chg_pct")
-SHORT = {"pools": "pools", "liquid": "liq", "creators": "ops", "top5_pct": "top5%", "template_pct": "tmpl%",
+SHORT = {"pools": "pools", "liquid": "liq", "thin_pct": "<15k%", "mid_pct": "15-25k%", "thick_pct": "25k+%",
+         "thin_mean": "<15k mkt%", "creators": "ops", "top5_pct": "top5%", "template_pct": "tmpl%",
          "rug_pct": "rug%", "med_pull_s": "pull s", "big_win_pct": "+50%", "market_mean": "mkt%",
          "market_sized": "mkt sz%", "rw_gap": "rw gap", "sz_trades": "sz n", "sz_real": "sz%",
          "btc_chg_pct": "btc%"}
@@ -304,6 +332,7 @@ def render(out: dict) -> str:
         lines.append(f"    {label:38s} {fmt(c['now']):>10s}  vs {fmt(c['baseline']):>10s}  "
                      f"z {'-' if z is None else f'{z:+.1f}'}{mark}")
     lines += ["", "ops = distinct creators; tmpl% = pools on a seed size shared by 3+ pools that hour (copy-paste "
-              "launches); rw gap = rug-vs-win kept minus skipped half (ideal); sz% = launchrw50_sz real, "
+              "launches); <15k% etc = share of liquid pools by liquidity at second 4 (sz's bands), <15k mkt% = ideal mean of "
+              "the thin band; rw gap = rug-vs-win kept minus skipped half (ideal); sz% = launchrw50_sz real, "
               "size-weighted; z = (last 3 h - baseline mean of 3-hour windows) / their spread"]
     return "\n".join(lines)

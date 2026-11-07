@@ -55,7 +55,15 @@ def test_hour_row_measures_supply_operators_rugs_and_the_sized_book(cfg):
     assert row["sz_picks_ideal"] == round(100 * (0.6 * 250 * 2 + 0.1 * 100) / 600, 1)
     assert row["sz_trades"] == 2 and row["sz_real"] == round(100 * (50 - 100) / 350, 1)
     assert row["sol_chg_pct"] == -2.0 and row["btc_chg_pct"] == 1.0 and row["fear_greed"] == 30.0
+    # liquidity bands (sz's): five pools at $10k, one at $30k
+    assert row["thin_pct"] == round(100 * 5 / 6, 1) and row["mid_pct"] == 0.0 and row["thick_pct"] == round(100 / 6, 1)
+    assert row["thin_mean"] == -36.0 and row["thin_rug_pct"] == 60.0 and row["thick_mean"] == 10.0
+    assert row["thin_sz_mean"] == 60.0 and row["mid_mean"] is None
     assert m.step(now=T0 + H + mm.HOUR_DELAY_S + 2) == 0  # stored once
+    # a row stored by an older version is rebuilt
+    old = {k: v for k, v in row.items() if k not in ("hour", "v", "thin_pct")}
+    st.execute("UPDATE market_hours SET data=? WHERE hour=?", (json.dumps(old), T0))
+    assert m.step(now=T0 + H + mm.HOUR_DELAY_S + 3) == 1 and mm.load(st)[0]["thin_pct"] == row["thin_pct"]
 
 
 def test_compare_flags_a_shift_against_the_trailing_week():
