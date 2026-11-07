@@ -85,3 +85,17 @@ def test_status_renders(cfg):
     assert len(out["rows"]) == 5
     text = mm.render(out)
     assert "MEME MARKET MONITOR" in text and "rug%" in text
+
+
+def test_baseline_skips_early_hours_and_sz_before_its_first_trade():
+    """11-07: hours before the Helius budget was uncapped saw half the pools, and sz read 0 trades before it
+    existed; neither may count as a quiet market."""
+    rows = [{"hour": T0 + i * H, "liquid": 15 + i % 3, "sz_trades": 0} for i in range(40)]
+    rows += [{"hour": T0 + (40 + i) * H, "liquid": 30 + i % 4, "sz_trades": 30 + i % 5} for i in range(40)]
+    rows += [{"hour": T0 + (80 + i) * H, "liquid": 31, "sz_trades": 32} for i in range(3)]
+    plain = mm.compare(rows)
+    assert plain["liquid"]["baseline"] < 25  # half-blind hours drag the baseline down
+    fixed = mm.compare(rows, since=T0 + 40 * H)
+    assert fixed["liquid"]["baseline"] > 30 and abs(fixed["liquid"]["z"]) < 2 and fixed["sz_trades"]["baseline"] > 30
+    only_sz = mm.compare(rows)["sz_trades"]  # sz measures skip the hours before its first trade even without since
+    assert only_sz["baseline"] > 30 and abs(only_sz["z"]) < 2

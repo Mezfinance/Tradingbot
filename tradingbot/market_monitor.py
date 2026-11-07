@@ -209,17 +209,22 @@ def _window(rows: list[dict], key: str):
     return sum(v * x for v, x in vals) / tot if tot else None
 
 
-def compare(rows: list[dict], recent_h: int = RECENT_H, baseline_h: int = BASELINE_H) -> dict:
+def compare(rows: list[dict], recent_h: int = RECENT_H, baseline_h: int = BASELINE_H, since: float = 0.0) -> dict:
     """Each metric: the last `recent_h` hour rows vs the `baseline_h` hours before them. z = (recent - baseline
     mean of `recent_h`-hour windows) / their standard deviation; None until MIN_BASELINE_WINDOWS windows exist.
-    `rows` sorted by hour, each with 'hour'."""
+    `rows` sorted by hour, each with 'hour'. The baseline starts no earlier than `since` (cfg
+    `market_monitor_since`: hours before the Helius budget was uncapped saw only part of the pools), and the
+    sized book's measures (`sz_*`) only from its first trade (earlier hours read 0 trades, not a quiet market)."""
     if not rows:
         return {}
     recent = rows[-recent_h:]
-    base = [r for r in rows[:-recent_h] if r["hour"] >= recent[0]["hour"] - baseline_h * HOUR_S]
+    base_all = [r for r in rows[:-recent_h] if r["hour"] >= max(since, recent[0]["hour"] - baseline_h * HOUR_S)]
+    sz_from = next((r["hour"] for r in rows if r.get("sz_trades")), None)
     out = {}
     for key, _, group in METRICS:
         now_v = _window(recent, key)
+        base = base_all if not key.startswith("sz_") else \
+            [r for r in base_all if sz_from is not None and r["hour"] >= sz_from]
         wins = [_window(base[i:i + recent_h], key) for i in range(0, max(0, len(base) - recent_h + 1))]
         wins = [w for w in wins if w is not None]
         mean = statistics.fmean(wins) if wins else None
@@ -319,11 +324,11 @@ def read(query, since: float = 0.0) -> list[dict]:
 PAGE_HOURS = 72  # hourly rows sent to the dashboard
 
 
-def payload(rows: list[dict], now: float | None = None) -> dict:
+def payload(rows: list[dict], now: float | None = None, since: float = 0.0) -> dict:
     """What the dashboard's Market tab needs: the last PAGE_HOURS rows, the comparison and the metric list."""
     now = now if now is not None else time.time()
     return {"built_ts": now, "rows": [r for r in rows if r["hour"] >= now - PAGE_HOURS * HOUR_S],
-            "compare": compare(rows), "metrics": [list(m) for m in METRICS],
+            "compare": compare(rows, since=since), "baseline_since": since, "metrics": [list(m) for m in METRICS],
             "recent_h": RECENT_H, "baseline_h": BASELINE_H, "last_hour": rows[-1]["hour"] if rows else None}
 
 
@@ -342,11 +347,11 @@ SHORT = {"pools": "pools", "liquid": "liq", "thin_pct": "<15k%", "mid_pct": "15-
          "btc_chg_pct": "btc%"}
 
 
-def status(store, hours: float = 24, now: float | None = None) -> dict:
+def status(store, hours: float = 24, now: float | None = None, since: float = 0.0) -> dict:
     now = now if now is not None else time.time()
     rows = load(store, now - (hours + BASELINE_H + RECENT_H) * HOUR_S)
     shown = [r for r in rows if r["hour"] >= now - hours * HOUR_S]
-    return {"hours": hours, "rows": shown, "compare": compare(rows),
+    return {"hours": hours, "rows": shown, "compare": compare(rows, since=since), "baseline_since": since,
             "recent_h": RECENT_H, "baseline_h": BASELINE_H}
 
 
@@ -360,7 +365,10 @@ def render(out: dict) -> str:
     widths = [max(len(row[i]) for row in table) for i in range(len(cols))]
     for row in table:
         lines.append("  ".join(c.rjust(w) for c, w in zip(row, widths)))
-    lines += ["", f"LAST {out['recent_h']} H VS THE {out['baseline_h'] // 24} DAYS BEFORE  (|z| >= 2 marked *)"]
+    since = out.get("baseline_since") or 0
+    start = f", baseline from {datetime.fromtimestamp(since, timezone.utc):%m-%d %H:%M} UTC" if since else ""
+    lines += ["", f"LAST {out['recent_h']} H VS THE {out['baseline_h'] // 24} DAYS BEFORE{start}  (|z| >= 2 marked *; "
+              "sz measures only from its first trade)"]
     group = None
     for key, label, g in METRICS:
         c = out["compare"].get(key)

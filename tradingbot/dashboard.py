@@ -207,7 +207,8 @@ class Dashboard:
             else:
                 query = self.store.query
             now = time.time()
-            data = mm.payload(mm.read(query, now - (mm.PAGE_HOURS + mm.BASELINE_H + mm.RECENT_H) * mm.HOUR_S), now)
+            data = mm.payload(mm.read(query, now - (mm.PAGE_HOURS + mm.BASELINE_H + mm.RECENT_H) * mm.HOUR_S), now,
+                              since=self.cfg.market_monitor_since)
         except Exception:  # noqa: BLE001 (keep the last good data)
             log.exception("dashboard: market monitor read failed")
             return
@@ -927,7 +928,7 @@ const shifts=Object.entries(c).filter(([,x])=>x.z!=null&&Math.abs(x.z)>=2).sort(
 tiles("mk-stats",[["Shifts now",fmt(shifts.length,0),`measures 2+ standard deviations from the past ${wk} days`],
 tile("liquid","Liquid pools per hour"),tile("thin_pct","Thin pools (under $15k)"),tile("rug_pct","Rugged by minute 6"),
 tile("market_mean","Market, ideal mean"),tile("rw_gap","Rug-vs-win gap"),tile("sz_real","sz real result")]);
-$("mk-shift-sub").textContent=`The last ${rh} hours against the ${wk} days before. z = how many standard deviations of ${rh}-hour windows the last ${rh} hours sit from the weekly mean.`;
+$("mk-shift-sub").textContent=`The last ${rh} hours against the ${wk} days before${m.baseline_since?` (from ${when(m.baseline_since).slice(0,11)} UTC at the earliest)`:""}; sz measures count only from its first trade. z = how many standard deviations of ${rh}-hour windows the last ${rh} hours sit from the weekly mean.`;
 $("mk-shifts").innerHTML=shifts.length?"<tr><th class=\"l\">Measure</th><th class=\"l\">Group</th><th>Last "+rh+" h</th><th>Past week</th><th>z</th></tr>"+
 shifts.map(([k,x])=>`<tr><td class="l book">${esc(mkLabel(k))}</td><td class="l muted">${esc(x.group)}</td><td>${mkVal(k,x.now)}</td><td>${mkVal(k,x.baseline)}</td><td>${zTag(x.z)}</td></tr>`).join("")
 :'<tr><td class="muted">Nothing is 2+ standard deviations from the past week.</td></tr>';

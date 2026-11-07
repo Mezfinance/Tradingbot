@@ -62,6 +62,7 @@ class Config:
     # are read from the pool's vaults (table watch_launch_live, CLI launch-status).
     launch_live: bool = False
     market_monitor: bool = False  # hourly meme-market measures in watch.db (market_monitor.py), read only
+    market_monitor_since: float = 0.0  # unix time: the monitor's baseline starts no earlier (hours before it are kept, not compared)
     launch_live_daily_credits: int = 20_000
     launch_live_decide_delay_s: float = 4.0  # after the websocket notification (~1 s after creation)
     launch_train_days: float = 14.0

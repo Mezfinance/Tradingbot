@@ -449,7 +449,7 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore, watch_db_path
         store = WatchStore(watch_db_path(cfg))
         mm.MarketMonitor(store, Journal(cfg.db_path), cfg).step()  # fill any missing finished hours first
-        out = mm.status(store, hours=args.hours or 24)
+        out = mm.status(store, hours=args.hours or 24, since=cfg.market_monitor_since)
         print(json.dumps(out, indent=2, default=str) if args.json else mm.render(out))
         return
     if args.command == "block-compare":  # is the sized book ahead in every kind of market?
