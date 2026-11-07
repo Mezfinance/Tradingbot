@@ -43,7 +43,7 @@ BATCH_HOURS = 24  # hours built per read on a backfill
 STATUS_KEY = "market_monitor:status"  # last step: ran, ok_ts, took, stored, error
 SZ_STUCK_S = 1800  # a sized-book trade still open this long counts as -100% (as block-compare)
 
-VERSION = 4  # stored rows from an older version are rebuilt (2: liquidity bands, 3: sz $ P&L and cost, 4: 8 bands)
+VERSION = 5  # older rows are rebuilt (2: liquidity bands, 3: sz $ P&L and cost, 4: 8 bands, 5: band win/rug counts)
 BANDS = (("thin", 0.0, 15_000.0), ("mid", 15_000.0, 25_000.0), ("thick", 25_000.0, float("inf")))  # sz's bands
 
 SCHEMA = "CREATE TABLE IF NOT EXISTS market_hours (hour REAL PRIMARY KEY, data TEXT NOT NULL, ts REAL)"
@@ -569,24 +569,28 @@ def band_windows(rows: list[dict], now: float) -> dict:
 
 
 def render_bands(bands: dict) -> list[str]:
-    lines = ["", "RUG-VS-WIN BY POOL SIZE  (liquidity at second 4; ideal = scorer prices; kept = rug-vs-win keeps it; "
-             "sz = launchrw50_sz real, size-weighted; $100 = running total of the ideal trade at $100 a pool)"]
+    lines = ["", "RUG-VS-WIN BY POOL SIZE  (liquidity at second 4; ideal = scorer prices, minute-6 exit, 6% cost; every "
+             "pool = no filter; kept = the rug-vs-win kept half; $100 = running total at $100 a pool; sz = "
+             "launchrw50_sz real, size-weighted)"]
     f = lambda v: "-" if v is None else f"{v:+.1f}"
+    p = lambda v: "-" if v is None else f"{v:g}"
     for name, rows in bands.items():
         if not any(r["pools"] for r in rows):
             continue
-        lines += ["", f"  {name}", "  " + f"{'band':<11}{'pools':>6}{'share':>7}{'all':>8}{'rug%':>6}{'+50%':>6}"
-                  f"{'kept%':>7}{'kept':>8}{'skip':>8}{'gap':>8}{'all $100':>10}{'kept $100':>10}{'sz n':>6}{'sz':>8}{'sz $':>9}"]
+        lines += ["", f"  {name}", "  " + f"{'':<11}{'':>6}{'':>7} | {'EVERY POOL':<38} | {'RUG-VS-WIN KEPT':<46} | "
+                  f"{'':<16} | SZ REAL",
+                  "  " + f"{'band':<11}{'pools':>6}{'share':>7} | {'mean':>7}{'win%':>6}{'rug%':>6}{'+50%':>6}"
+                  f"{'$ @100':>13} | {'n':>6}{'mean':>7}{'win%':>6}{'rug%':>6}{'+50%':>6}{'$ @100':>9}{'vs all':>7}"
+                  f" | {'skip':>7}{'gap':>9} | {'n':>6}{'sz':>7}{'sz $':>9}"]
         for r in rows:
-            if not r["pools"] and not r["sz_n"]:
+            if not r["pools"] and not r["sz_n"] and r["band"] != pool_bands.TOTAL:
                 continue
-            lines.append("  " + f"{r['band']:<11}{r['pools']:>6}{(r['share_pct'] if r['share_pct'] is not None else '-'):>7}"
-                         f"{f(r['mean_pct']):>8}{(r['rugged_pct'] if r['rugged_pct'] is not None else '-'):>6}"
-                         f"{(r['big_pct'] if r['big_pct'] is not None else '-'):>6}"
-                         f"{(r['kept_share_pct'] if r['kept_share_pct'] is not None else '-'):>7}"
-                         f"{f(r['kept_pct']):>8}{f(r['skipped_pct']):>8}{f(r['gap']):>8}"
-                         f"{r['all_100_usd']:>10,}{r['kept_100_usd']:>10,}{r['sz_n']:>6}"
-                         f"{f(r['sz_pct']):>8}{r['sz_pnl']:>9,.0f}")
+            lines.append("  " + f"{r['band']:<11}{r['pools']:>6}{p(r['share_pct']):>7} | "
+                         f"{f(r['mean_pct']):>7}{p(r['win_pct']):>6}{p(r['rugged_pct']):>6}{p(r['big_pct']):>6}"
+                         f"{r['all_100_usd']:>13,} | {r['kept_n']:>6}{f(r['kept_pct']):>7}{p(r['kept_win_pct']):>6}"
+                         f"{p(r['kept_rugged_pct']):>6}{p(r['kept_big_pct']):>6}{r['kept_100_usd']:>9,}"
+                         f"{f(r['kept_vs_all']):>7} | {f(r['skipped_pct']):>7}{f(r['gap']):>9} | "
+                         f"{r['sz_n']:>6}{f(r['sz_pct']):>7}{r['sz_pnl']:>9,.0f}")
     return lines
 
 

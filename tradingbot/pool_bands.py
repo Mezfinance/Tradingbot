@@ -26,7 +26,8 @@ BIG_WIN = 0.5
 STUCK_S = 1800  # a real trade still open this long after its buy never sold: -100%
 BOOKS = ("launchrw50_sz", "launchrw50")  # real trades shown per band (sz sized by band, launchrw50 flat $100)
 TOTAL = "All bands"  # the running tally row aggregate() adds after the eight bands
-KEYS = ("n", "ret_sum", "rugs", "big", "kept_n", "kept_sum", "skip_n", "skip_sum", "sz_n", "sz_pnl", "sz_cost")
+KEYS = ("n", "ret_sum", "rugs", "big", "wins", "kept_n", "kept_sum", "kept_rugs", "kept_big", "kept_wins", "skip_n",
+        "skip_sum", "sz_n", "sz_pnl", "sz_cost")
 
 
 def band_of(liq: float | None) -> str | None:
@@ -58,9 +59,13 @@ def hour_bands(done: list[dict], trades: list[tuple[float, float, float | None]]
         s["ret_sum"] += r
         s["rugs"] += r <= RUG
         s["big"] += r >= BIG_WIN
+        s["wins"] += r > 0
         k = _kept(p, skip)
         if k is True:
             s["kept_n"] += 1
+            s["kept_rugs"] += r <= RUG
+            s["kept_big"] += r >= BIG_WIN
+            s["kept_wins"] += r > 0
             s["kept_sum"] += r
         elif k is False:
             s["skip_n"] += 1
@@ -98,12 +103,19 @@ def aggregate(rows: list[dict]) -> list[dict]:
         mean = lambda s, c: round(100 * s / c, 1) if c else None
         kept, skipped = mean(t["kept_sum"], t["kept_n"]), mean(t["skip_sum"], t["skip_n"])
         out.append({"band": name, "pools": n, "share_pct": round(100 * n / pools, 1) if pools else None,
-                    "mean_pct": mean(t["ret_sum"], n), "rugged_pct": mean(t["rugs"], n), "big_pct": mean(t["big"], n),
-                    "kept_share_pct": mean(t["kept_n"], t["kept_n"] + t["skip_n"]), "kept_pct": kept,
+                    # every pool in the band (no filter), the ideal trade
+                    "mean_pct": mean(t["ret_sum"], n), "win_pct": mean(t["wins"], n), "rugged_pct": mean(t["rugs"], n),
+                    "big_pct": mean(t["big"], n), "all_100_usd": round(100 * t["ret_sum"]),
+                    # the rug-vs-win kept half, same measures
+                    "kept_n": int(t["kept_n"]), "kept_share_pct": mean(t["kept_n"], t["kept_n"] + t["skip_n"]),
+                    "kept_pct": kept, "kept_win_pct": mean(t["kept_wins"], t["kept_n"]),
+                    "kept_rugged_pct": mean(t["kept_rugs"], t["kept_n"]), "kept_big_pct": mean(t["kept_big"], t["kept_n"]),
+                    "kept_100_usd": round(100 * t["kept_sum"]),
+                    "kept_vs_all": round(kept - mean(t["ret_sum"], n), 1) if kept is not None and n else None,
                     "skipped_pct": skipped, "gap": round(kept - skipped, 1) if kept is not None and skipped is not None
-                    else None, "sz_n": int(t["sz_n"]), "sz_pct": mean(t["sz_pnl"], t["sz_cost"]),
-                    "sz_pnl": round(t["sz_pnl"], 2), "sz_cost": round(t["sz_cost"], 2),
-                    "all_100_usd": round(100 * t["ret_sum"]), "kept_100_usd": round(100 * t["kept_sum"])})
+                    else None,
+                    "sz_n": int(t["sz_n"]), "sz_pct": mean(t["sz_pnl"], t["sz_cost"]),
+                    "sz_pnl": round(t["sz_pnl"], 2), "sz_cost": round(t["sz_cost"], 2)})
     return out
 
 
@@ -160,23 +172,24 @@ def study(store, journal, hours: float | None = None, now: float | None = None) 
     real = {b: _real_trades(store, journal, b, since, now) for b in BOOKS} if journal is not None else {}
     total = sum(1 for r in rows if band_of(r["liq_usd"]))
     bands = []
-    for name, lo, hi in BANDS:
+    for name in NAMES + (TOTAL,):
         rng = np.random.default_rng(0)
-        g = [r for r in rows if band_of(r["liq_usd"]) == name]
+        g = [r for r in rows if band_of(r["liq_usd"]) == name or (name == TOTAL and band_of(r["liq_usd"]))]
         entry: dict = {"band": name, "pools": len(g), "share_pct": round(100 * len(g) / total, 1) if total else None}
         if g:
             scored = [r for r in g if keep(r) is not None]
             entry["every pool"] = ll._group(g, rng)
             entry["kept share of scored %"] = round(100 * sum(keep(r) for r in scored) / len(scored)) if scored else None
             test = ll._keep_test(g, keep, "rw", rng)
-            for k in ("kept", "skipped", "kept minus skipped (pts)", "random keeps of the same size",
+            for k in ("kept", "skipped", "kept minus skipped (pts)", "kept minus every pool (pts)", "random keeps of the same size",
                       "AUC (score = riskiness)", "blocks where kept beat skipped", "note"):
                 if k in test:
                     entry[k] = test[k]
             entry["launch4 top 2%"] = ll._group([r for r in g if r.get("top2")], rng)
             entry["launch4 top 5%"] = ll._group([r for r in g if r.get("top5")], rng)
         for b, ts in real.items():
-            entry[f"{b} real"] = _real_summary([t for t in ts if band_of(t["liq"]) == name], rng)
+            entry[f"{b} real"] = _real_summary([t for t in ts if band_of(t["liq"]) == name
+                                                or (name == TOTAL and band_of(t["liq"]))], rng)
         bands.append(entry)
     return {"window": f"last {hours:g} h" if hours else "whole life",
             "from": datetime.fromtimestamp(rows[0]["create_ts"], timezone.utc).strftime("%m-%d %H:%M") if rows else None,
@@ -192,25 +205,28 @@ def render(out: dict) -> str:
     def f(v, unit="%"):
         return "-" if v is None else f"{v:+.1f}{unit}" if unit in ("%", " pts") else f"{v}"
     lines = [f"RUG-VS-WIN BY POOL SIZE ({out['window']}, from {out['from']}, {out['pools']} finished liquid pools)", ""]
-    hdr = (f"{'band':<10}{'pools':>6}{'share':>7}{'all':>8}{'rug%':>6}{'+50%':>6}{'kept%':>7}{'kept':>8}"
-           f"{'skip':>8}{'gap':>8}{'gap 90%':>15}{'rand<':>7}{'sz n':>6}{'sz':>8}{'sz $':>8}{'rw50 n':>8}{'rw50':>8}")
+    hdr = (f"{'band':<10}{'pools':>6}{'share':>7} | {'every pool: mean':>16}{'median':>8}{'win%':>6}{'rug%':>6}"
+           f"{'+50%':>6} | {'kept: n':>8}{'mean':>8}{'median':>8}{'win%':>6}{'rug%':>6}{'+50%':>6}{'vs all':>8}"
+           f" | {'skip':>8}{'gap':>8}{'gap 90%':>15}{'rand<':>7} | {'sz n':>6}{'sz':>8}{'sz $':>8}{'rw50 n':>8}{'rw50':>8}")
     lines.append(hdr)
     for b in out["bands"]:
-        e = b.get("every pool", {})
+        e, k = b.get("every pool", {}), b.get("kept", {})
         g = b.get("kept minus skipped (pts)", {})
         ci = g.get("ci90")
         sz, r5 = b.get("launchrw50_sz real", {}), b.get("launchrw50 real", {})
+        big = lambda x: (x.get("returns (% of trades)") or {}).get("+50% or more", "-")
         lines.append(
-            f"{b['band']:<10}{b['pools']:>6}{(str(b['share_pct']) + '%') if b['share_pct'] is not None else '-':>7}"
-            f"{f(e.get('mean_pct')):>8}{e.get('rugged_pct', '-'):>6}"
-            f"{(e.get('returns (% of trades)') or {}).get('+50% or more', '-'):>6}"
-            f"{b.get('kept share of scored %', '-') if b.get('kept share of scored %') is not None else '-':>7}"
-            f"{f(b.get('kept', {}).get('mean_pct')):>8}{f(b.get('skipped', {}).get('mean_pct')):>8}"
+            f"{b['band']:<10}{b['pools']:>6}{(str(b['share_pct']) + '%') if b['share_pct'] is not None else '-':>7} | "
+            f"{f(e.get('mean_pct')):>16}{f(e.get('median_pct')):>8}{e.get('win_pct', '-'):>6}{e.get('rugged_pct', '-'):>6}"
+            f"{big(e):>6} | {k.get('n', 0):>8}{f(k.get('mean_pct')):>8}{f(k.get('median_pct')):>8}"
+            f"{k.get('win_pct', '-'):>6}{k.get('rugged_pct', '-'):>6}{big(k):>6}"
+            f"{f(b.get('kept minus every pool (pts)'), ' pts') if b.get('kept minus every pool (pts)') is not None else '-':>8} | "
+            f"{f(b.get('skipped', {}).get('mean_pct')):>8}"
             f"{f(g.get('mean'), ' pts') if g else '-':>8}{(f'{ci[0]:+.1f}..{ci[1]:+.1f}' if ci else '-'):>15}"
-            f"{b.get('random keeps of the same size', {}).get('share worse than kept', '-'):>7}"
+            f"{b.get('random keeps of the same size', {}).get('share worse than kept', '-'):>7} | "
             f"{sz.get('n', 0):>6}{f(sz.get('size_weighted_pct')):>8}{sz.get('pnl_usd', '-'):>8}"
             f"{r5.get('n', 0):>8}{f(r5.get('size_weighted_pct')):>8}")
-    lines += ["", "all = every pool's ideal mean; kept% = share of the band the filter keeps; gap = kept - skipped "
+    lines += ["", "every pool = no filter, the ideal trade on every liquid pool in the band; kept = the rug-vs-win kept half; vs all = kept mean - every-pool mean; gap = kept - skipped "
               "(ideal); rand< = share of random keeps of the same size that did worse than kept; sz / rw50 = real "
               "trades, size-weighted (P&L / money traded)", out["note"]]
     return "\n".join(lines)

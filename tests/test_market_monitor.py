@@ -200,10 +200,13 @@ def test_hour_rows_carry_eight_pool_size_bands(cfg):
     tot = agg["All bands"]
     assert tot["pools"] == 5 and tot["all_100_usd"] == round(100 * (0.5 - 1.0 + 0.1 - 0.2 + 0.05)) and tot["sz_pnl"] == 100.0
     assert agg["$5-15k"]["kept_100_usd"] == 50
+    assert agg["$5-15k"]["win_pct"] == 50.0 and agg["$5-15k"]["kept_n"] == 1 and agg["$5-15k"]["kept_win_pct"] == 100.0
+    assert agg["$5-15k"]["kept_vs_all"] == 75.0 and agg["$5-15k"]["kept_rugged_pct"] == 0.0
+    assert pb.study(st, j, now=T0 + 2 * H)["bands"][-1]["band"] == "All bands"
     s = mm.status(st, hours=24, now=T0 + 2 * H)
     assert "whole life" in s["bands"] and "RUG-VS-WIN BY POOL SIZE" in mm.render(s)
     assert pb.band_of(4_999) is None and pb.band_of(150_000) == "$150-300k" and pb.band_of(10**7) == "$600k+"
     out = pb.study(st, j, now=T0 + 2 * H)
-    assert [x["band"] for x in out["bands"]] == list(pb.NAMES)
+    assert [x["band"] for x in out["bands"]] == [*pb.NAMES, pb.TOTAL]
     assert out["bands"][0]["launchrw50_sz real"]["pnl_usd"] == 100
     assert "RUG-VS-WIN BY POOL SIZE" in pb.render(out)
