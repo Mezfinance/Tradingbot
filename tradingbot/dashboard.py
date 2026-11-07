@@ -38,6 +38,7 @@ SUMMARY_FILE = "dashboard-summary.json"
 KEEPALIVE_S = 15
 SHORTS_POLL_S = 30  # MZF Short Only feed (another Fly app) is read this often
 SHORTS_TIMEOUT_S = 8
+MARKET_POLL_S = 60  # the market monitor's hourly rows (watch.db market_hours) are re-read this often
 FEED_BACKLOG = 60  # fills sent when a page connects
 COOKIE = "tb_dash"
 
@@ -112,6 +113,9 @@ class Dashboard:
         self._external = True  # streams poll for themselves until start() runs the shared poller
         self.shorts: dict | None = None  # MZF Short Only (the shortbook app's feed), refreshed every SHORTS_POLL_S
         self.shorts_ver = 0
+        self.market: dict | None = None  # the meme market monitor (market_monitor.payload), every MARKET_POLL_S
+        self.market_ver = 0
+        self._mdb = None
 
     def _build_in_child(self) -> dict:
         path = os.path.join(os.path.dirname(os.path.abspath(self.cfg.db_path)), SUMMARY_FILE)
@@ -157,7 +161,13 @@ class Dashboard:
             while not self._stop.is_set():
                 self.fetch_shorts()
                 self._stop.wait(SHORTS_POLL_S)
+        def market_loop():
+            while not self._stop.is_set():
+                self.fetch_market()
+                self._stop.wait(MARKET_POLL_S)
         self._external = False
+        if self.cfg.market_monitor and self.store is not None:
+            threading.Thread(target=market_loop, name="dashboard-market", daemon=True).start()
         threading.Thread(target=loop, name="dashboard", daemon=True).start()
         threading.Thread(target=live_loop, name="dashboard-live", daemon=True).start()
         if self.cfg.shortbook_feed_url:
@@ -184,6 +194,25 @@ class Dashboard:
             data = {**(self.shorts or {}), "stale": True, "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
         with self._lock:
             self.shorts, self.shorts_ver = data, self.shorts_ver + 1
+
+    def fetch_market(self) -> None:
+        """The market monitor's hourly rows on a read-only connection of its own (an in-memory store in tests)."""
+        from tradingbot import market_monitor as mm
+        try:
+            path = getattr(self.store, "path", None)
+            if path and path != ":memory:":
+                if self._mdb is None:
+                    self._mdb = Live._open(path)
+                query = lambda sql, p: self._mdb.execute(sql, p).fetchall()
+            else:
+                query = self.store.query
+            now = time.time()
+            data = mm.payload(mm.read(query, now - (mm.PAGE_HOURS + mm.BASELINE_H + mm.RECENT_H) * mm.HOUR_S), now)
+        except Exception:  # noqa: BLE001 (keep the last good data)
+            log.exception("dashboard: market monitor read failed")
+            return
+        with self._lock:
+            self.market, self.market_ver = data, self.market_ver + 1
 
     def current(self) -> tuple[int, dict | None]:
         with self._lock:
@@ -214,6 +243,10 @@ class Dashboard:
         if self.cfg.shortbook_feed_url and self.shorts is not None:
             send("shorts", self.shorts)
             shorts_ver = self.shorts_ver
+        market_ver = 0
+        if self.market is not None:
+            send("market", self.market)
+            market_ver = self.market_ver
         last_fill = backlog[-1]["id"] if backlog else live.last_fill
         quiet = time.time()
         while not stop.is_set():
@@ -237,6 +270,10 @@ class Dashboard:
             if self.shorts_ver != shorts_ver and self.shorts is not None:
                 send("shorts", self.shorts)
                 shorts_ver = self.shorts_ver
+                sent = True
+            if self.market_ver != market_ver and self.market is not None:
+                send("market", self.market)
+                market_ver = self.market_ver
                 sent = True
             if sent:
                 quiet = time.time()
@@ -435,6 +472,7 @@ class Live:
             return self.ver, {
                 "now": time.time(), "cash": self.cfg.model_book_cash_usd, "stuck_after_s": STUCK_AFTER_S,
                 "shorts_enabled": bool(self.cfg.shortbook_feed_url),
+                "market_enabled": bool(self.cfg.market_monitor),
                 "books": [{"name": b, "hold_min": self.holds[b], "flag": self.flag_of[b], "family": family_of(b),
                            "cash": start_cash(self.cfg, b), "twin": self.twin[b]}
                           for b in self.books],
@@ -577,7 +615,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <span id="built" class="label muted"></span></div>
 </header>
 <nav class="tabs" aria-label="Programs"><a href="#/" data-v="programs">MZFq</a><a href="#/supermeme" data-v="supermeme" id="tab-meme">Supermeme</a><a href="#/shorts" data-v="shorts">MZF Short Only</a></nav>
-<nav class="tabs sub" id="subtabs" aria-label="Supermeme"><a href="#/supermeme" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a></nav>
+<nav class="tabs sub" id="subtabs" aria-label="Supermeme"><a href="#/supermeme" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a><a href="#/market" data-v="market">Market</a></nav>
 <main id="v-programs" hidden>
 <div><p class="label eyebrow">Quant programs · paper trading</p><h1>MZFq</h1>
 <p class="lead">Each program holds its strategies; Supermeme's are grouped into families of books. Everything here is paper trading.</p></div>
@@ -620,6 +658,16 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <p class="sub">Each book's fills against the ideal trade on the same pools, and the signals it did not fill.</p>
 <div class="scroll"><table id="gaps"></table></div></section>
 </div>
+</main>
+<main id="v-market" hidden>
+<div><p class="label eyebrow"><a class="lk" href="#/supermeme">Supermeme</a> · meme market monitor · hand-made pumpswap pools</p><h1>Market</h1>
+<p class="lead">How the launch market is behaving, hour by hour, against the past week: who is launching, how fast they pull, how much buying arrives, and whether our edge is holding. Ideal = the scorer's prices (second ~6.5 in, minute 6 out, 6% cost).</p></div>
+<div id="mk-note"></div>
+<div class="stats" id="mk-stats"></div>
+<section class="card"><p class="label eyebrow">Shifts</p><h2>Moved away from the past week</h2><p class="sub" id="mk-shift-sub"></p><div class="scroll"><table id="mk-shifts"></table></div></section>
+<div class="two" id="mk-charts"></div>
+<section class="card"><p class="label eyebrow">Every measure</p><h2>Last hours against the past week</h2><p class="sub" id="mk-cmp-sub"></p><div class="scroll"><table id="mk-cmp"></table></div></section>
+<section class="card"><p class="label eyebrow">Hourly</p><h2>Hour by hour</h2><p class="sub">Newest first, UTC. Liquid pools by liquidity at second 4 in sz's bands; sz = launchrw50_sz's real trades, size-weighted.</p><div class="scroll"><table id="mk-hours"></table></div></section>
 </main>
 <main id="v-ledger" hidden>
 <div><p class="label eyebrow">Every trade of the running books</p><h1>Trade ledger</h1>
@@ -667,7 +715,7 @@ const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
 /* mean trade weighted by size: total P&L / total cost (a plain average counts a $25 trade like a $250 one) */
 const wmean=tr=>{const c=tr.reduce((a,x)=>a+(x.cost||0),0);return c?100*tr.reduce((a,x)=>a+x.pnl,0)/c:null};
 const median=a=>{if(!a.length)return null;const b=[...a].sort((x,y)=>x-y),m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2};
-const S={shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null};
+const S={market:null,marketEnabled:false,shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null};
 let sortKey="return_pct",sortDir=-1,win=21600,pending=false;
 const R={v:"overview",arg:null},LIM={ledger:200,b:200,f:200};
 const now=()=>Date.now()/1000-S.skew;
@@ -752,7 +800,7 @@ const rows=trades(x=>(!f||famOf(x.book)===f)&&(!b||x.book===b)&&STATUS_OK(x,st)&
 const n=ledgerTable("ledger",rows,LIM.ledger,true);$("ledger-count").textContent=`${Math.min(n,LIM.ledger)} of ${n} trades`;$("ledger-more").hidden=n<=LIM.ledger}
 /* equity chart: one line per series, inline SVG, ink tones and dash patterns (lime is never a line) */
 const STY=[["var(--ink)",""],["var(--ink)","6 4"],["var(--ink-2)",""],["var(--ink-2)","6 4"],["var(--ink-3)",""],["var(--ink-3)","2 3"],["var(--ink-2)","2 3"],["var(--ink)","2 3"]];
-function chart(id,series,base=S.cash){series=series.filter(s=>s.pts.length>1);if(!series.length){$(id).innerHTML='<p class="sub">No closed trades yet.</p>';return}
+function chart(id,series,base=S.cash,empty="No closed trades yet."){series=series.filter(s=>s.pts.length>1);if(!series.length){$(id).innerHTML=`<p class="sub">${esc(empty)}</p>`;return}
 const W=800,H=260,L=72,Rr=12,T=12,B=28;let x0=Infinity,x1=-Infinity,y0=base,y1=base;
 for(const s of series)for(const[x,y]of s.pts){x0=Math.min(x0,x);x1=Math.max(x1,x);y0=Math.min(y0,y);y1=Math.max(y1,y)}
 if(x1<=x0)x1=x0+1;const pad=(y1-y0)*0.08||50;y0-=pad;y1+=pad;
@@ -763,7 +811,7 @@ g+=`<line x1="${L}" x2="${L}" y1="${T}" y2="${H-B}" style="stroke:var(--rule);st
 const ys=[];for(const v of[base,y1-pad,y0+pad]){if(ys.some(y=>Math.abs(y-Y(v))<14))continue;ys.push(Y(v));g+=`<text class="ax" x="${L-6}" y="${Y(v)+4}" text-anchor="end">${fmt(v,0)}</text>`}
 g+=`<text class="ax" x="${L}" y="${H-8}">${when(x0).slice(0,11)}</text><text class="ax" x="${W-Rr}" y="${H-8}" text-anchor="end">${when(x1).slice(0,11)}</text>`;
 series.forEach((s,i)=>{const[c,d]=STY[i%STY.length];g+=`<polyline fill="none" style="stroke:${c};stroke-width:2" ${d?`stroke-dasharray="${d}"`:""} vector-effect="non-scaling-stroke" points="${s.pts.map(([x,y])=>X(x).toFixed(1)+","+Y(y).toFixed(1)).join(" ")}"><title>${esc(s.name)}</title></polyline>`});
-g+="</svg>";if(series.length>1)g+='<div class="legend">'+series.map((s,i)=>{const[c,d]=STY[i%STY.length];return`<span><svg viewBox="0 0 28 8"><line x1="0" x2="28" y1="4" y2="4" style="stroke:${c};stroke-width:2" ${d?`stroke-dasharray="${d}"`:""}/></svg>${esc(s.name)} ${sgn(s.ret,1)}</span>`}).join("")+"</div>";
+g+="</svg>";if(series.length>1)g+='<div class="legend">'+series.map((s,i)=>{const[c,d]=STY[i%STY.length];return`<span><svg viewBox="0 0 28 8"><line x1="0" x2="28" y1="4" y2="4" style="stroke:${c};stroke-width:2" ${d?`stroke-dasharray="${d}"`:""}/></svg>${esc(s.name)}${s.ret==null?"":" "+sgn(s.ret,1)}</span>`}).join("")+"</div>";
 $(id).innerHTML=g}
 /* families index, family view, book view */
 function famStats(list){const tr=list.flatMap(b=>b.tr),rets=tr.map(x=>x.ret*100),pnl=list.reduce((a,b)=>a+b.equity-b.cash,0);
@@ -861,11 +909,47 @@ $("sh-closed").innerHTML=(f.closed||[]).length?head+"Covered (UTC)</th></tr>"+f.
 $("sh-lcount").textContent=Object.entries(f.listing_counts||{}).map(([k,n])=>`${k} ${n}`).join(" · ");
 $("sh-listings").innerHTML="<tr><th>Seen (UTC)</th><th class=\"l\">Venue</th><th class=\"l\">Token</th><th class=\"l\">Kind</th><th class=\"l\">Status</th><th class=\"l\">Reason</th></tr>"+
 (f.listings||[]).map(r=>`<tr><td class="mono">${r.seen_ts?when(r.seen_ts):"-"}</td><td class="l">${esc(r.venue)}</td><td class="l book">${esc(r.base)}</td><td class="l">${esc(r.kind||"")}</td><td class="l"><span class="tag sm ${r.status==="entered"?"lime":r.status==="pending"?"warn":""}">${esc(r.status)}</span></td><td class="l muted">${esc(r.reason||"")}</td></tr>`).join("")}
+/* meme market monitor: hourly rows + last 3 h against the past week, built by market_monitor.py */
+const MK_RET=new Set(["market_mean","market_median","market_sized","rw_kept","rw_skipped","rw_gap","sz_picks_ideal","sz_real","sz_fill_gap","thin_mean","mid_mean","thick_mean","thin_sz_mean","sol_chg_pct","btc_chg_pct"]);
+const MK_USD=new Set(["med_liq_usd","sol_usd","btc_usd"]);
+const mkLabel=k=>((S.market&&S.market.metrics)||[]).find(m=>m[0]===k)?.[1]||k;
+function mkVal(k,v){if(v==null)return"-";if(MK_RET.has(k))return`<span class="${cls(v)}">${sgn(v,1,k.endsWith("gap")?" pts":"%")}</span>`;
+if(MK_USD.has(k))return fmt(v,0);if(k.endsWith("_pct"))return fmt(v,1,"%");return Math.abs(v)>=100?fmt(v,0):fmt(v,1)}
+const zTag=z=>z==null?'<span class="muted">-</span>':`<span class="tag sm ${Math.abs(z)>=2?"warn":""}">${z>0?"+":"−"}${Math.abs(z).toFixed(1)}</span>`;
+function marketState(){if(!S.marketEnabled)return["off","The market monitor is off: set TB_MARKET_MONITOR=1 on the Supermeme app."];
+const m=S.market;if(!m||!m.rows.length)return["wait","Waiting for the monitor's first hours (it stores each hour about 15 minutes after it ends; the first run backfills)."];
+if(now()-m.last_hour>3*3600+900)return["stale",`The newest stored hour is ${when(m.last_hour).slice(0,11)}:00 UTC: the monitor looks stalled.`];return["ok",""]}
+function renderMarket(){const[st,msg]=marketState();$("mk-note").innerHTML=st==="ok"?"":`<p class="note">${esc(msg)}</p>`;const m=S.market;
+if(!m||!m.rows.length){["mk-stats","mk-shifts","mk-charts","mk-cmp","mk-hours"].forEach(i=>$(i).innerHTML="");return}
+const c=m.compare||{},rh=m.recent_h,wk=Math.round(m.baseline_h/24);
+const tile=(k,l)=>{const x=c[k]||{};return[l,mkVal(k,x.now),`week ${mkVal(k,x.baseline)} · z ${x.z==null?"-":(x.z>0?"+":"−")+Math.abs(x.z).toFixed(1)}`]};
+const shifts=Object.entries(c).filter(([,x])=>x.z!=null&&Math.abs(x.z)>=2).sort((a,b)=>Math.abs(b[1].z)-Math.abs(a[1].z));
+tiles("mk-stats",[["Shifts now",fmt(shifts.length,0),`measures 2+ standard deviations from the past ${wk} days`],
+tile("liquid","Liquid pools per hour"),tile("thin_pct","Thin pools (under $15k)"),tile("rug_pct","Rugged by minute 6"),
+tile("market_mean","Market, ideal mean"),tile("rw_gap","Rug-vs-win gap"),tile("sz_real","sz real result")]);
+$("mk-shift-sub").textContent=`The last ${rh} hours against the ${wk} days before. z = how many standard deviations of ${rh}-hour windows the last ${rh} hours sit from the weekly mean.`;
+$("mk-shifts").innerHTML=shifts.length?"<tr><th class=\"l\">Measure</th><th class=\"l\">Group</th><th>Last "+rh+" h</th><th>Past week</th><th>z</th></tr>"+
+shifts.map(([k,x])=>`<tr><td class="l book">${esc(mkLabel(k))}</td><td class="l muted">${esc(x.group)}</td><td>${mkVal(k,x.now)}</td><td>${mkVal(k,x.baseline)}</td><td>${zTag(x.z)}</td></tr>`).join("")
+:'<tr><td class="muted">Nothing is 2+ standard deviations from the past week.</td></tr>';
+const rows=m.rows,pts=k=>rows.filter(r=>r[k]!=null).map(r=>[r.hour+1800,r[k]]);
+const CH=[["Liquid pools per hour",[["liquid","pools"]],"liquid"],["Thin pools (under $15k), % of liquid",[["thin_pct","under $15k"]],"thin_pct"],
+["Rugged by minute 6, %",[["rug_pct","rugged"]],"rug_pct"],["Median LP pull, seconds after creation",[["med_pull_s","pull second"]],"med_pull_s"],
+["Ideal mean: every pool vs the sized market, %",[["market_mean","every pool"],["market_sized","sized like sz"]],"market_mean"],["sz real vs its picks at ideal, %",[["sz_real","sz real"],["sz_picks_ideal","sz picks, ideal"]],"sz_real"]];
+$("mk-charts").innerHTML=CH.map((ch,i)=>`<section class="card chart"><p class="label eyebrow">Last ${Math.round((m.rows.length))} h</p><h2>${esc(ch[0])}</h2><p class="sub">Dashed: the past-week mean.</p><div id="mk-ch${i}"></div></section>`).join("");
+CH.forEach((ch,i)=>{const base=(c[ch[2]]||{}).baseline;chart("mk-ch"+i,ch[1].map(([k,n])=>({name:n,pts:pts(k),ret:null})),base==null?0:base,"Not enough hours yet.")});
+$("mk-cmp-sub").textContent=`Last ${rh} hours against the ${wk} days before; |z| of 2 or more is marked. Pooled measures (shares, means) weight each hour by its pools.`;
+let h=`<tr><th class="l">Measure</th><th>Last ${rh} h</th><th>Past week</th><th>z</th></tr>`,g=null;
+for(const[k,l,grp]of m.metrics){const x=c[k];if(!x||x.now==null)continue;if(grp!==g){g=grp;h+=`<tr><td class="l label muted" colspan="4">${esc(grp)}</td></tr>`}
+h+=`<tr><td class="l">${esc(l)}</td><td>${mkVal(k,x.now)}</td><td>${mkVal(k,x.baseline)}</td><td>${zTag(x.z)}</td></tr>`}
+$("mk-cmp").innerHTML=h;
+const HC=[["pools","Pools"],["liquid","Liquid"],["thin_pct","<15k"],["mid_pct","15-25k"],["thick_pct","25k+"],["creators","Creators"],["top5_pct","Top 5"],["template_pct","Template"],["rug_pct","Rugged"],["med_pull_s","Pull s"],["big_win_pct","+50%"],["market_mean","Market"],["market_sized","Mkt sized"],["thin_mean","<15k mkt"],["rw_gap","RvW gap"],["sz_trades","sz n"],["sz_real","sz"],["btc_chg_pct","BTC"]];
+$("mk-hours").innerHTML="<tr><th>Hour</th>"+HC.map(([,l])=>`<th>${l}</th>`).join("")+"</tr>"+
+[...rows].reverse().slice(0,48).map(r=>`<tr><td class="mono">${when(r.hour).slice(0,8)}h</td>`+HC.map(([k])=>`<td>${mkVal(k,r[k])}</td>`).join("")+"</tr>").join("")}
 /* router */
 function route(){const h=decodeURIComponent(location.hash.replace(/^#\/?/,"")),[v,...rest]=h.split("/");const arg=rest.join("/");
-R.v=({supermeme:"overview",ledger:"ledger",books:"books",book:"book",family:"family",shorts:"shorts"})[v]||"programs";R.arg=arg||null;LIM.b=LIM.f=200;
+R.v=({supermeme:"overview",ledger:"ledger",books:"books",book:"book",family:"family",shorts:"shorts",market:"market"})[v]||"programs";R.arg=arg||null;LIM.b=LIM.f=200;
 for(const m of document.querySelectorAll("main"))m.hidden=m.id!=="v-"+R.v;
-const meme=["overview","ledger","books","book","family"].includes(R.v);$("subtabs").hidden=!meme;
+const meme=["overview","ledger","books","book","family","market"].includes(R.v);$("subtabs").hidden=!meme;
 document.querySelectorAll(".tabs:not(.sub) a").forEach(a=>a.classList.toggle("on",a.dataset.v===(meme?"supermeme":R.v)));
 document.querySelectorAll(".tabs.sub a").forEach(a=>a.classList.toggle("on",a.dataset.v===R.v||(a.dataset.v==="books"&&(R.v==="book"||R.v==="family"))));
 alignSub();window.scrollTo(0,0);render()}
@@ -876,7 +960,7 @@ const cs=getComputedStyle(s);if(x>parseFloat(cs.paddingLeft)&&x+w<=s.clientWidth
 function renderHealth(){const ok=S.health?Object.values(S.health).every(x=>x.ok):null;
 $("health").innerHTML=`<span class="dot"></span>${ok==null?"Bot":ok?"Bot healthy":"Bot stalled"}`;$("health").className="tag "+(ok==null?"":ok?"ink":"neg")}
 function render(){renderHealth();if(!S.books.length)return;
-if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
+if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="market")renderMarket();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
 $("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false})}
 function schedule(){if(!pending){pending=true;setTimeout(()=>{pending=false;render()},300)}}
 function fill(f,isNew){const li=document.createElement("li");if(isNew)li.className="new";
@@ -897,8 +981,9 @@ function connect(){const es=new EventSource("api/stream");
 es.onopen=()=>{$("conn").innerHTML='<span class="dot"></span>Live';$("conn").className="tag lime"};
 es.onerror=()=>{$("conn").innerHTML='<span class="dot"></span>Reconnecting';$("conn").className="tag neg"};
 es.addEventListener("init",e=>{const d=JSON.parse(e.data);S.books=d.books;S.fams=d.families||[];S.cash=d.cash;S.stuck=d.stuck_after_s;S.pc=d.pos_cols;S.lc=d.launch_cols;
-S.shortsEnabled=!!d.shorts_enabled;S.pos.clear();S.launch.clear();S.health=d.health;merge(d);fillSelects();render()});
+S.shortsEnabled=!!d.shorts_enabled;S.marketEnabled=!!d.market_enabled;S.pos.clear();S.launch.clear();S.health=d.health;merge(d);fillSelects();render()});
 es.addEventListener("shorts",e=>{S.shorts=JSON.parse(e.data);schedule()});
+es.addEventListener("market",e=>{S.market=JSON.parse(e.data);schedule()});
 es.addEventListener("delta",e=>{merge(JSON.parse(e.data));schedule()});
 es.addEventListener("summary",e=>{S.extra=JSON.parse(e.data);const d=S.extra.downtime;$("foot").textContent=d?`${d.outages} outages, ${fmt(d.hours_offline,1)} h offline since start`:"";schedule()});
 es.addEventListener("backlog",e=>{$("feed").innerHTML="";JSON.parse(e.data).forEach(f=>fill(f,false))});

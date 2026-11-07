@@ -170,6 +170,37 @@ def test_short_book_feed_is_streamed_and_kept_stale_when_unreachable(cfg, monkey
     assert not dash.Dashboard(Journal(":memory:"), cfg).live.snapshot()[1]["shorts_enabled"]
 
 
+def test_market_monitor_rows_are_streamed(cfg, monkeypatch):
+    """11-07: the Market tab reads the monitor's hourly rows (read only) and gets them as a `market` event."""
+    import time as _t
+    from tradingbot import market_monitor as mm
+    from tradingbot.watcher import WatchStore
+    monkeypatch.setattr(dash, "POLL_S", 0.01)
+    cfg.market_monitor = True
+    store = WatchStore(":memory:")
+    board = dash.Dashboard(Journal(":memory:"), cfg, store)
+    board.fetch_market()  # no table yet: an empty payload, no error
+    assert board.market["rows"] == [] and board.market["last_hour"] is None
+    store.execute(mm.SCHEMA)
+    hour = _t.time() // 3600 * 3600 - 3600
+    for i in range(30):
+        store.execute("INSERT INTO market_hours(hour, data, ts) VALUES (?,?,?)",
+                      (hour - i * 3600, json.dumps({"v": mm.VERSION, "liquid": 30, "rug_pct": 20.0 + i % 4}), 0))
+    board.fetch_market()
+    m = board.market
+    assert len(m["rows"]) == 30 and m["last_hour"] == hour and m["compare"]["rug_pct"]["now"] is not None
+    assert ["rug_pct", mm.LABELS["rug_pct"], "rugs"] in m["metrics"]
+    out, stop = [], threading.Event()
+
+    def write(data):
+        out.append(data.decode())
+        if len(out) >= 4:
+            stop.set()
+    board.stream(write, stop)
+    assert "event: market" in [o.split("\n")[0] for o in out]
+    assert json.loads(out[0].split("data: ", 1)[1])["market_enabled"]
+
+
 def test_the_canary_starts_from_its_own_budget():
     from tradingbot import model_book as mb
     from tradingbot.config import Config

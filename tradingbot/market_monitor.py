@@ -285,6 +285,27 @@ class MarketMonitor:
         return n
 
 
+def read(query, since: float = 0.0) -> list[dict]:
+    """`market_hours` rows through any read function (a read-only connection: never creates the table)."""
+    import sqlite3
+    try:
+        rows = query("SELECT hour, data FROM market_hours WHERE hour >= ? ORDER BY hour", (since,))
+    except sqlite3.OperationalError:  # no table yet (the monitor hasn't run)
+        return []
+    return [{"hour": r[0], **json.loads(r[1])} for r in rows]
+
+
+PAGE_HOURS = 72  # hourly rows sent to the dashboard
+
+
+def payload(rows: list[dict], now: float | None = None) -> dict:
+    """What the dashboard's Market tab needs: the last PAGE_HOURS rows, the comparison and the metric list."""
+    now = now if now is not None else time.time()
+    return {"built_ts": now, "rows": [r for r in rows if r["hour"] >= now - PAGE_HOURS * HOUR_S],
+            "compare": compare(rows), "metrics": [list(m) for m in METRICS],
+            "recent_h": RECENT_H, "baseline_h": BASELINE_H, "last_hour": rows[-1]["hour"] if rows else None}
+
+
 def load(store, since: float = 0.0) -> list[dict]:
     store.execute(SCHEMA)
     return [{"hour": r["hour"], **json.loads(r["data"])}
