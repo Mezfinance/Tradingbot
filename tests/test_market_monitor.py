@@ -156,3 +156,24 @@ def test_flags_are_saved_with_szs_result_in_their_hours(cfg):
     assert len(rug) == 1 and rug[0]["closed_hour"] is not None
     text = mm.render({**mm.status(st, hours=24, now=T0 + 47 * H), "rows": []})
     assert "WHAT THE FLAGS MEANT FOR SZ" in text and "rugged by minute 6" in text
+
+
+def test_step_records_its_status_and_errors(cfg, monkeypatch):
+    st = _store()
+    _pool(st, "P", T0 + 60, "X", 50.0, 0.2, rw_pct=30.0)
+    m = mm.MarketMonitor(st, None, cfg)
+    m.step(now=T0 + 3 * H)
+    s = mm.read_status(st.query)
+    assert s["error"] is None and s["stored"] >= 1 and s["ok_ts"] == s["ran"]
+    assert mm.payload(mm.load(st), now=T0 + 3 * H, status=s)["status"] == s
+
+    def boom(*a, **k):
+        raise RuntimeError("table gone")
+    monkeypatch.setattr(m, "_step", boom)
+    try:
+        m.step(now=T0 + 4 * H)
+    except RuntimeError:
+        pass
+    s2 = mm.read_status(st.query)
+    assert "table gone" in s2["error"] and s2["ok_ts"] == s["ok_ts"]  # the last success is kept
+    assert mm.read_status(WatchStore(":memory:").query) == {}

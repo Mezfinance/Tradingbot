@@ -38,6 +38,7 @@ SEED_ROUND = 1.0  # seed SOL rounded to this for the copy-paste template count
 TEMPLATE_MIN = 3  # a seed size shared by this many pools in the hour = a template
 TOP_OPERATORS = 5
 BATCH_HOURS = 24  # hours built per read on a backfill
+STATUS_KEY = "market_monitor:status"  # last step: ran, ok_ts, took, stored, error
 SZ_STUCK_S = 1800  # a sized-book trade still open this long counts as -100% (as block-compare)
 
 VERSION = 3  # stored rows from an older version are rebuilt (2: liquidity bands, 3: sz $ P&L and cost)
@@ -339,6 +340,23 @@ class MarketMonitor:
         return self.build_many([hour], now)[hour]
 
     def step(self, now: float | None = None) -> int:
+        """`_step` plus its outcome in watch_state `STATUS_KEY` (last run, seconds taken, hours stored, last
+        error), so the dashboard can tell a failing or stopped monitor from a stale page."""
+        started = time.time()
+        prev = json.loads(self.store.get_state(STATUS_KEY) or "{}")
+        try:
+            n = self._step(now)
+        except Exception as exc:
+            self.store.set_state(STATUS_KEY, json.dumps({
+                **prev, "ran": started, "took": round(time.time() - started, 1), "error": f"{type(exc).__name__}: {exc}"[:300],
+                "error_ts": started}))
+            raise
+        self.store.set_state(STATUS_KEY, json.dumps({"ran": started, "ok_ts": started, "took": round(time.time() - started, 1),
+                                                     "stored": n, "error": None}))
+        log.info("market monitor step: %d hour(s) stored in %.1f s", n, time.time() - started)
+        return n
+
+    def _step(self, now: float | None = None) -> int:
         """Store every finished hour without a row (the first run backfills from the scorer's first pool)."""
         now = now if now is not None else time.time()
         last_done = (now - HOUR_DELAY_S) // HOUR_S * HOUR_S - HOUR_S  # start of the newest finished hour
@@ -429,6 +447,16 @@ PAGE_HOURS = 72  # hourly rows sent to the dashboard
 FLAG_DAYS = 7  # closed flags shown
 
 
+def read_status(query) -> dict:
+    """The monitor's last step (see `MarketMonitor.step`) through any read function; {} before its first run."""
+    import sqlite3
+    try:
+        rows = query("SELECT value FROM watch_state WHERE key=?", (STATUS_KEY,))
+    except sqlite3.OperationalError:
+        return {}
+    return json.loads(rows[0][0]) if rows and rows[0][0] else {}
+
+
 def read_flags(query) -> list[dict]:
     import sqlite3
     try:
@@ -485,12 +513,14 @@ def flag_summary(rows: list[dict], flags: list[dict], now: float | None = None, 
     return out
 
 
-def payload(rows: list[dict], now: float | None = None, since: float = 0.0, flags: list[dict] | None = None) -> dict:
+def payload(rows: list[dict], now: float | None = None, since: float = 0.0, flags: list[dict] | None = None,
+            status: dict | None = None) -> dict:
     """What the dashboard's Market tab needs: the last PAGE_HOURS rows, the comparison and the metric list."""
     now = now if now is not None else time.time()
     return {"built_ts": now, "rows": [r for r in rows if r["hour"] >= now - PAGE_HOURS * HOUR_S],
             "compare": compare(rows, since=since), "baseline_since": since, "metrics": [list(m) for m in METRICS],
             "recent_h": RECENT_H, "baseline_h": BASELINE_H, "last_hour": rows[-1]["hour"] if rows else None,
+            "status": status or {}, "poll_s": MONITOR_POLL_S,
             "flags": flag_summary(rows, flags or [], now), "flag_rule": {"z": FLAG_Z, "hours": FLAG_HOURS,
                                                                          "close_z": CLOSE_Z}}
 

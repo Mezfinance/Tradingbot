@@ -208,7 +208,7 @@ class Dashboard:
                 query = self.store.query
             now = time.time()
             data = mm.payload(mm.read(query, 0.0), now, since=self.cfg.market_monitor_since,
-                              flags=mm.read_flags(query))
+                              flags=mm.read_flags(query), status=mm.read_status(query))
         except Exception:  # noqa: BLE001 (keep the last good data)
             log.exception("dashboard: market monitor read failed")
             return
@@ -921,7 +921,13 @@ if(MK_USD.has(k))return fmt(v,0);if(k.endsWith("_pct"))return fmt(v,1,"%");retur
 const zTag=z=>z==null?'<span class="muted">-</span>':`<span class="tag sm ${Math.abs(z)>=2?"warn":""}">${z>0?"+":"−"}${Math.abs(z).toFixed(1)}</span>`;
 function marketState(){if(!S.marketEnabled)return["off","The market monitor is off: set TB_MARKET_MONITOR=1 on the Supermeme app."];
 const m=S.market;if(!m||!m.rows.length)return["wait","Waiting for the monitor's first hours (it stores each hour about 15 minutes after it ends; the first run backfills)."];
-if(now()-m.last_hour>3*3600+900)return["stale",`The newest stored hour is ${when(m.last_hour).slice(0,11)}:00 UTC: the monitor looks stalled.`];return["ok",""]}
+if(now()-m.built_ts>600)return["stale",`The dashboard has not read the monitor's table since ${when(m.built_ts)} UTC (its read keeps failing; check the logs for "market monitor read failed"). The monitor itself may be fine.`];
+if(now()-m.last_hour>3*3600+900){const s=m.status||{},hr=`The newest stored hour is ${when(m.last_hour).slice(0,11)}:00 UTC.`;
+if(!s.ran)return["stale",`${hr} The monitor has no recorded run: its thread is not running (needs TB_MARKET_MONITOR=1 and the launch scorer, then a restart).`];
+if(now()-s.ran>3*(m.poll_s||600))return["stale",`${hr} The monitor last ran at ${when(s.ran)} UTC and has not run since: its thread has stopped or is stuck. A restart brings it back.`];
+if(s.error)return["stale",`${hr} The monitor runs but fails: ${s.error} (last success ${s.ok_ts?when(s.ok_ts)+" UTC":"never"}).`];
+return["stale",`${hr} The monitor ran at ${when(s.ran)} UTC without error but stored nothing new: the launch scorer may have no new pools.`]}
+return["ok",""]}
 function renderMarket(){const[st,msg]=marketState();$("mk-note").innerHTML=st==="ok"?"":`<p class="note">${esc(msg)}</p>`;const m=S.market;
 if(!m||!m.rows.length){["mk-stats","mk-shifts","mk-charts","mk-cmp","mk-hours","mk-flags","mk-flagsum"].forEach(i=>$(i).innerHTML="");return}
 const c=m.compare||{},rh=m.recent_h,wk=Math.round(m.baseline_h/24);
