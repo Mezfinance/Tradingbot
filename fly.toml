@@ -24,13 +24,15 @@ primary_region = "iad"
   TB_LAUNCH_BOOK = "1"  # launch4_2 / launch4_5 paper books trade its top 2% / 5% picks
   TB_LAUNCH_HIST_BOOK = "0"  # launch4h_2/5 off (11-04): history model worse every exit minute (launch-exit-study)
   TB_LAUNCH_M5_BOOK = "1"  # launch4_2m5: launch4_2's picks sold at pool minute 5 (11-04)
-  # REAL MONEY canary of launchrw50_sz (11-06): ON since the 11-06 smoke test passed; canary-stop to halt (DEPLOY.md).
-  TB_LAUNCH_CANARY = "0"  # REAL MONEY canary OFF (user, 11-06); "1" = canary_rw50_sz, every other launchrw50_sz pick at $0.01 (DEPLOY.md)
-  TB_LAUNCH_CANARY_USD = "5"  # fallback size; trades follow model_book.CANARY_SIZE_BANDS ($5 / $0.50 / $2)
-  TB_LAUNCH_CANARY_MAX_LIQ_USD = "0"  # every pool, not only thin ones (11-06)
-  TB_LAUNCH_CANARY_FLAT_USD = "0.01"  # every canary buy is 1 cent: does any real buy set the operators off? (11-06)
-  TB_LAUNCH_CANARY_BUDGET_USD = "45"  # the USDC in the canary wallet (11-06 second reset; was 20)
-  TB_LAUNCH_CANARY_EVERY_N = "2"  # every other pick at 1 cent; the skipped half is the control for canary-rug-check (11-06)
+  # REAL MONEY canary of launchrw50_sz: canary-stop to halt, canary-start to clear the kill switch (DEPLOY.md).
+  TB_LAUNCH_CANARY = "0"  # REAL MONEY canary OFF until the wallet is funded; "1" = canary_rw50_sz at 1/25 of launchrw50_sz's sizes, every pick, every pool (user, 11-07; DEPLOY.md)
+  TB_LAUNCH_CANARY_USD = "5"  # fallback size when a signal has no liquidity
+  TB_LAUNCH_CANARY_MAX_LIQ_USD = "0"  # every pool, all three bands (user, 11-07)
+  TB_LAUNCH_CANARY_FLAT_USD = "0"  # off: sizes follow the twin's bands (was 0.01, the 1-cent test)
+  TB_LAUNCH_CANARY_BAND_SCALE = "0.04"  # 1/25 of the twin: $10 below $15k, $1 at $15-25k, $4 above (11-07)
+  TB_LAUNCH_CANARY_BUDGET_USD = "600"  # the USDC in the canary wallet (11-07; was 45)
+  TB_LAUNCH_CANARY_DAILY_LOSS_USD = "300"  # no new buys once today's net realized loss reaches $300 (11-07)
+  TB_LAUNCH_CANARY_EVERY_N = "1"  # every pick (11-07; 2 = every other, which gives canary-rug-check a skipped control)
   TB_LAUNCH_CANARY_MAX_OPEN = "20"  # ~30 picks/h held ~6 min: open slots should never cause a skip (was 5)
   TB_LAUNCH_RW_BOOK = "1"  # launchrw50 / launchd12rw50: skip the riskiest half by rug-vs-win odds (11-04)
   TB_LAUNCH_SIZED_BOOK = "1"  # launchrw50_sz: launchrw50's signals sized by liquidity band ($250 < $15k, $25 at $15-25k, $100 above), from size-study (11-06)
@@ -41,8 +43,8 @@ primary_region = "iad"
   TB_LAUNCH_LIVE_DAILY_CREDITS = "10000000"  # scorer uncapped (11-05): the 28k/day pro-rata budget idled every book ~25 min of each UTC hour (0 would mean off)
   TB_DISABLED_BOOKS = "launchd12_s10,launchd12_s20,launchd12_s30,launchd12_s50,early7,early7r"  # 11-05: skip books lose more the more they skip (s10 -5% .. s50 -14%); minute-7 exits -14%, 28% rugged (low-decile rug-vs-win books back on 11-05 at the user's request)
   TB_MODEL_BOOK_DAILY_LOSS_PCT = "0"  # 11-05: no daily loss limit on the paper books (launch4_5 skipped 68 signals on it): every signal is traded and measured
-  TB_RESET_BOOKS = "canary_rw50_sz"  # canary restarts at $45 (wallet topped up); once per id; earlier: 2026-11-06-canary-20 canary, 2026-11-02-drift launch4_2/5, 2026-11-04-impact-probe launchd12 books, 2026-11-05-dashboard-lag + 2026-11-05-study-rule launchrw50/launchd12rw50
-  TB_RESET_BOOKS_ID = "2026-11-06-canary-45"
+  TB_RESET_BOOKS = "canary_rw50_sz"  # canary restarts at $600 (11-07); once per id; earlier: 2026-11-06-canary-20 + 2026-11-06-canary-45 canary, 2026-11-02-drift launch4_2/5, 2026-11-04-impact-probe launchd12 books, 2026-11-05-dashboard-lag + 2026-11-05-study-rule launchrw50/launchd12rw50
+  TB_RESET_BOOKS_ID = "2026-11-07-canary-600"
   TB_HELIUS_DAILY_CREDITS = "0"  # early-buyer lookups off: their credits go to the launch scorer
   TB_OPERATOR_DAILY_CREDITS = "0"  # rug-catcher operator lookups off (ops books are off)
 

@@ -764,6 +764,9 @@ class Engine:
         canary = book.name in mb.CANARY_BOOKS
         if canary and c.launch_canary_flat_usd > 0:
             base = c.launch_canary_flat_usd  # one tiny size for every pick: does any real buy set the operators off?
+        elif canary and c.launch_canary_band_scale > 0 and sig.get("liq") is not None:
+            # the twin's own sizes scaled down (11-07: 1/25 = $10 thin / $1 at $15-25k / $4 above), same ratios
+            base = mb.band_usd(mb.CANARY_TWIN, sig["liq"]) * c.launch_canary_band_scale
         else:
             base = mb.band_usd(book.name, sig["liq"]) or book.fixed_usd or c.model_book_usd
         usd = min(base, c.model_book_liq_share * sig["liq"], book.cash)

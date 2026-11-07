@@ -403,3 +403,24 @@ def test_engine_sweeps_the_canary_wallet_hourly_keeping_open_positions(cfg, good
     eng.sweep_canary_wallet_if_due(wait=True)  # not due again for an hour
     assert swept == [{"HELD"}]
     assert j.query("SELECT kind FROM events WHERE kind='wallet_sweep'")
+
+
+def test_canary_can_trade_a_fraction_of_the_twins_band_sizes(cfg, good_pair):
+    # 11-07: user's live setup = 1/25 of launchrw50_sz's $250 / $25 / $100, every pool
+    cfg.launch_book = cfg.launch_live = cfg.launch_canary = cfg.launch_sized_book = True
+    cfg.launch_canary_max_liq_usd, cfg.launch_canary_band_scale, cfg.launch_canary_budget_usd = 0.0, 0.04, 600.0
+    cfg.launch_canary_max_open = 20
+    j = Journal(":memory:")
+    live = Recorder(cfg)
+    eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                 model_executor=PaperExecutor(cfg), launch_canary_executor=live)
+    created = time.time() - 6
+
+    def sig(mint, liq):
+        return {"pool": "P" + mint, "mint": mint, "dex": "pumpswap", "created_ts": created, "name": "", "price": 1e-5,
+                "liq": liq, "score": 1.0, "ts": time.time(), "decided_ts": time.time(), "kind": "launch",
+                "rw50": True, "rw50_24": False, "top2": False, "top5": True}
+    for mint, liq in (("THIN", 14_000.0), ("MID", 20_000.0), ("DEEP", 60_000.0)):
+        eng.model_book.signals.put(sig(mint, liq))
+    eng.buy_model_signals()
+    assert sorted(round(x, 2) for x in live.sizes) == [1.0, 4.0, 10.0]
