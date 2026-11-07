@@ -23,6 +23,8 @@ import statistics
 import time
 from datetime import datetime, timezone
 
+from tradingbot import pool_bands
+
 log = logging.getLogger(__name__)
 
 HOUR_S = 3600
@@ -41,7 +43,7 @@ BATCH_HOURS = 24  # hours built per read on a backfill
 STATUS_KEY = "market_monitor:status"  # last step: ran, ok_ts, took, stored, error
 SZ_STUCK_S = 1800  # a sized-book trade still open this long counts as -100% (as block-compare)
 
-VERSION = 3  # stored rows from an older version are rebuilt (2: liquidity bands, 3: sz $ P&L and cost)
+VERSION = 4  # stored rows from an older version are rebuilt (2: liquidity bands, 3: sz $ P&L and cost, 4: 8 bands)
 BANDS = (("thin", 0.0, 15_000.0), ("mid", 15_000.0, 25_000.0), ("thick", 25_000.0, float("inf")))  # sz's bands
 
 SCHEMA = "CREATE TABLE IF NOT EXISTS market_hours (hour REAL PRIMARY KEY, data TEXT NOT NULL, ts REAL)"
@@ -181,7 +183,7 @@ def hour_metrics(pools: list[dict], trades: list[dict], prices: dict, now: float
     out["rw_gap"] = round(out["rw_kept"] - out["rw_skipped"], 1) \
         if out["rw_kept"] is not None and out["rw_skipped"] is not None else None
 
-    real = []
+    real, real_liq = [], []
     for t in trades:
         if not t.get("cost_usd"):
             continue
@@ -189,6 +191,10 @@ def hour_metrics(pools: list[dict], trades: list[dict], prices: dict, now: float
             real.append(((t["realized_usd"] - t["cost_usd"]) / t["cost_usd"], t["cost_usd"]))
         elif now - t["opened_at"] >= SZ_STUCK_S:
             real.append((-1.0, t["cost_usd"]))
+        else:
+            continue
+        real_liq.append((*real[-1], t.get("liq")))
+    out["bands"] = pool_bands.hour_bands(done, real_liq, ll.RW_SKIP)  # 8 pool-size bands (sums; not a METRIC)
     out.update(sz_trades=len(real), sz_real=_wpct(real), sz_pnl=round(sum(r * c for r, c in real), 2),
                sz_cost=round(sum(c for _, c in real), 2))
     out["sz_fill_gap"] = round(out["sz_real"] - out["sz_picks_ideal"], 1) \
@@ -311,14 +317,16 @@ class MarketMonitor:
         bucket = lambda ts: ts // HOUR_S * HOUR_S
         pools, trades = collections.defaultdict(list), collections.defaultdict(list)
         for r in self.store.query(
-                "SELECT pool, creator, create_ts, liquid, status, ret, pulled_ts, liq_usd, feat, rw_pct "
+                "SELECT pool, token_mint, creator, create_ts, liquid, status, ret, pulled_ts, liq_usd, feat, rw_pct "
                 "FROM watch_launch_live WHERE create_ts >= ? AND create_ts < ?", (lo, hi)):
             pools[bucket(r["create_ts"])].append(dict(r))
         if self.journal:
-            for r in self.journal.query("SELECT opened_at, closed_at, cost_usd, realized_usd FROM positions "
+            liq_by_mint = {p["token_mint"]: p["liq_usd"] for ps in pools.values() for p in ps
+                           if p.get("token_mint") and p.get("liq_usd") is not None}
+            for r in self.journal.query("SELECT token, opened_at, closed_at, cost_usd, realized_usd FROM positions "
                                         "WHERE strategy=? AND opened_at >= ? AND opened_at < ?",
                                         (mb.LAUNCH_SIZED, lo, hi)):
-                trades[bucket(r["opened_at"])].append(dict(r))
+                trades[bucket(r["opened_at"])].append({**dict(r), "liq": liq_by_mint.get(r["token"])})
         series = collections.defaultdict(lambda: collections.defaultdict(list))
         for ts, v in self.store.query("SELECT ts, sol_usd FROM watch_market WHERE ts >= ? AND ts < ? "
                                       "AND sol_usd IS NOT NULL ORDER BY ts", (lo, hi)):
@@ -520,7 +528,7 @@ def payload(rows: list[dict], now: float | None = None, since: float = 0.0, flag
     return {"built_ts": now, "rows": [r for r in rows if r["hour"] >= now - PAGE_HOURS * HOUR_S],
             "compare": compare(rows, since=since), "baseline_since": since, "metrics": [list(m) for m in METRICS],
             "recent_h": RECENT_H, "baseline_h": BASELINE_H, "last_hour": rows[-1]["hour"] if rows else None,
-            "status": status or {}, "poll_s": MONITOR_POLL_S,
+            "status": status or {}, "poll_s": MONITOR_POLL_S, "bands": band_windows(rows, now),
             "flags": flag_summary(rows, flags or [], now), "flag_rule": {"z": FLAG_Z, "hours": FLAG_HOURS,
                                                                          "close_z": CLOSE_Z}}
 
@@ -548,7 +556,38 @@ def status(store, hours: float = 24, now: float | None = None, since: float = 0.
     all_rows = load(store, 0.0)
     return {"hours": hours, "rows": shown, "compare": compare(rows, since=since), "baseline_since": since,
             "flags": flag_summary(all_rows, read_flags(store.query), now),
-            "recent_h": RECENT_H, "baseline_h": BASELINE_H}
+            "bands": band_windows(all_rows, now), "recent_h": RECENT_H, "baseline_h": BASELINE_H}
+
+
+BAND_WINDOWS = (("last 6 h", 6), ("last 24 h", 24), ("last 7 days", 168), ("whole life", None))
+
+
+def band_windows(rows: list[dict], now: float) -> dict:
+    """`pool_bands.aggregate` over the windows in BAND_WINDOWS (hours whose row carries `bands`)."""
+    return {name: pool_bands.aggregate([r for r in rows if h is None or r["hour"] >= now - h * HOUR_S])
+            for name, h in BAND_WINDOWS}
+
+
+def render_bands(bands: dict) -> list[str]:
+    lines = ["", "RUG-VS-WIN BY POOL SIZE  (liquidity at second 4; ideal = scorer prices; kept = rug-vs-win keeps it; "
+             "sz = launchrw50_sz real, size-weighted; $100 = running total of the ideal trade at $100 a pool)"]
+    f = lambda v: "-" if v is None else f"{v:+.1f}"
+    for name, rows in bands.items():
+        if not any(r["pools"] for r in rows):
+            continue
+        lines += ["", f"  {name}", "  " + f"{'band':<11}{'pools':>6}{'share':>7}{'all':>8}{'rug%':>6}{'+50%':>6}"
+                  f"{'kept%':>7}{'kept':>8}{'skip':>8}{'gap':>8}{'all $100':>10}{'kept $100':>10}{'sz n':>6}{'sz':>8}{'sz $':>9}"]
+        for r in rows:
+            if not r["pools"] and not r["sz_n"]:
+                continue
+            lines.append("  " + f"{r['band']:<11}{r['pools']:>6}{(r['share_pct'] if r['share_pct'] is not None else '-'):>7}"
+                         f"{f(r['mean_pct']):>8}{(r['rugged_pct'] if r['rugged_pct'] is not None else '-'):>6}"
+                         f"{(r['big_pct'] if r['big_pct'] is not None else '-'):>6}"
+                         f"{(r['kept_share_pct'] if r['kept_share_pct'] is not None else '-'):>7}"
+                         f"{f(r['kept_pct']):>8}{f(r['skipped_pct']):>8}{f(r['gap']):>8}"
+                         f"{r['all_100_usd']:>10,}{r['kept_100_usd']:>10,}{r['sz_n']:>6}"
+                         f"{f(r['sz_pct']):>8}{r['sz_pnl']:>9,.0f}")
+    return lines
 
 
 def render(out: dict) -> str:
@@ -604,4 +643,6 @@ def render(out: dict) -> str:
               "launches); <15k% etc = share of liquid pools by liquidity at second 4 (sz's bands), <15k mkt% = ideal mean of "
               "the thin band; rw gap = rug-vs-win kept minus skipped half (ideal); sz% = launchrw50_sz real, "
               "size-weighted; z = (last 3 h - baseline mean of 3-hour windows) / their spread"]
+    if out.get("bands"):
+        lines += render_bands(out["bands"])
     return "\n".join(lines)

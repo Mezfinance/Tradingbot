@@ -177,3 +177,33 @@ def test_step_records_its_status_and_errors(cfg, monkeypatch):
     s2 = mm.read_status(st.query)
     assert "table gone" in s2["error"] and s2["ok_ts"] == s["ok_ts"]  # the last success is kept
     assert mm.read_status(WatchStore(":memory:").query) == {}
+
+
+def test_hour_rows_carry_eight_pool_size_bands(cfg):
+    from tradingbot import pool_bands as pb
+    st, j = _store(), Journal(":memory:")
+    for i, (liq, ret, rw) in enumerate([(10_000, 0.5, 20.0), (12_000, -1.0, 80.0), (30_000, 0.1, 30.0),
+                                        (30_000, -0.2, 70.0), (700_000, 0.05, 10.0)]):
+        _pool(st, f"P{i}", T0 + 60 * i, f"C{i}", 50.0, ret, rw_pct=rw, liq=liq)
+    st.execute("UPDATE watch_launch_live SET token_mint='M0' WHERE pool='P0'")
+    j.execute("INSERT INTO positions(token, symbol, cost_usd, realized_usd, qty, opened_at, closed_at, strategy) "
+              "VALUES ('M0','M0',250,350,0,?,?, 'launchrw50_sz')", (T0 + 10, T0 + 400))
+    mm.MarketMonitor(st, j, cfg).step(now=T0 + H + mm.HOUR_DELAY_S + 1)
+    b = mm.load(st)[0]["bands"]
+    assert set(b) == {"$5-15k", "$25-40k", "$600k+"}
+    assert b["$5-15k"]["n"] == 2 and b["$5-15k"]["rugs"] == 1 and b["$5-15k"]["kept_n"] == 1
+    assert b["$5-15k"]["sz_n"] == 1 and b["$5-15k"]["sz_pnl"] == 100.0
+    agg = {r["band"]: r for r in pb.aggregate(mm.load(st))}
+    assert agg["$5-15k"]["mean_pct"] == -25.0 and agg["$5-15k"]["gap"] == 150.0 and agg["$5-15k"]["sz_pct"] == 40.0
+    assert agg["$25-40k"]["kept_pct"] == 10.0 and agg["$25-40k"]["skipped_pct"] == -20.0
+    assert agg["$15-25k"]["pools"] == 0 and agg["$15-25k"]["mean_pct"] is None
+    tot = agg["All bands"]
+    assert tot["pools"] == 5 and tot["all_100_usd"] == round(100 * (0.5 - 1.0 + 0.1 - 0.2 + 0.05)) and tot["sz_pnl"] == 100.0
+    assert agg["$5-15k"]["kept_100_usd"] == 50
+    s = mm.status(st, hours=24, now=T0 + 2 * H)
+    assert "whole life" in s["bands"] and "RUG-VS-WIN BY POOL SIZE" in mm.render(s)
+    assert pb.band_of(4_999) is None and pb.band_of(150_000) == "$150-300k" and pb.band_of(10**7) == "$600k+"
+    out = pb.study(st, j, now=T0 + 2 * H)
+    assert [x["band"] for x in out["bands"]] == list(pb.NAMES)
+    assert out["bands"][0]["launchrw50_sz real"]["pnl_usd"] == 100
+    assert "RUG-VS-WIN BY POOL SIZE" in pb.render(out)
