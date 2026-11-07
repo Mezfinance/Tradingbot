@@ -49,6 +49,8 @@ log = logging.getLogger(__name__)
 
 DECIDE_S = 4  # features from the chain up to this second after creation
 FILL_S = 6  # the would-be fill is read at this second (the backtest's edge held for fills at 4-7)
+OUTCOME_STATUSES = {"scored": "done", "thin": "thin_done"}  # awaiting fill/exit -> finished; thin = under
+# the liquidity minimum, outcome tracked for the pool-size bands only (no flags, never in training or creator records)
 EXIT_S = 360  # pool minute 6
 TOO_LATE_S = 20  # a decision later than this after creation is not an entry at second 5
 HISTORY_PAGES = 2
@@ -491,7 +493,7 @@ class LaunchLive:
             self.seen[r["lp_mint"]] = True
             if r["status"] == "pending":
                 self._update(r["pool"], status="lost", reason="restart before the decision")
-            elif r["status"] == "scored":
+            elif r["status"] in OUTCOME_STATUSES:
                 if now < (r["create_ts"] or 0) + EXIT_S:
                     self.lp_pool[r["lp_mint"]] = r["pool"]
                     if r["fill_ts"] is None:
@@ -867,6 +869,14 @@ class LaunchLive:
                     feat=json.dumps(feat), sol_at_decide=sol4, peak_sol=max(t[6] for t in upto),
                     liq_usd=2 * sol4 * sol_usd if sol_usd else None)
         if not liquid:
+            if (self.cfg.launch_live_track_thin and sol_usd and sol4 > 0
+                    and not la.pulled_by(rows, DECIDE_S)):  # outcome only, for the pool-size bands
+                self._update(pool, status="thin", reason="not liquid at second 4 (outcome tracked)", **cols)
+                with self.lock:
+                    self.lp_pool[r["lp_mint"]] = pool
+                self._schedule(max(now, create + FILL_S + 0.5), "fill", pool)
+                self._schedule(create + EXIT_S, "exit", pool)
+                return
             self._update(pool, status="skipped", reason="not liquid at second 4", **cols)
             return
         cols.update(self._hist_verdict(feat, now))
@@ -911,7 +921,7 @@ class LaunchLive:
 
     def _fill(self, pool: str) -> None:
         r = self._row(pool)
-        if r is None or r["status"] != "scored" or r["fill_ts"] is not None:
+        if r is None or r["status"] not in OUTCOME_STATUSES or r["fill_ts"] is not None:
             return
         v = self._vaults(r)
         now = self.clock()
@@ -924,8 +934,9 @@ class LaunchLive:
 
     def _exit(self, pool: str) -> None:
         r = self._row(pool)
-        if r is None or r["status"] != "scored":
+        if r is None or r["status"] not in OUTCOME_STATUSES:
             return
+        done = OUTCOME_STATUSES[r["status"]]
         with self.lock:
             self.lp_pool.pop(r["lp_mint"], None)
         v = self._vaults(r)
@@ -941,7 +952,7 @@ class LaunchLive:
             return
         pulled = r["pulled_ts"] is not None or (peak > 0 and sol < la.PULLED_SHARE * peak) or not px
         ret = -1.0 if pulled else min(px / r["fill_px"] - 1 - la.COST, 3.0)
-        self._update(pool, status="done", exit_ts=now, exit_sol=sol, exit_px=px, ret=ret)
+        self._update(pool, status=done, exit_ts=now, exit_sol=sol, exit_px=px, ret=ret)
 
     # websocket ------------------------------------------------------------------------------------
     def ws_url(self) -> str:

@@ -197,16 +197,27 @@ def test_hour_rows_carry_eight_pool_size_bands(cfg):
     assert agg["$5-15k"]["mean_pct"] == -25.0 and agg["$5-15k"]["gap"] == 150.0 and agg["$5-15k"]["sz_pct"] == 40.0
     assert agg["$25-40k"]["kept_pct"] == 10.0 and agg["$25-40k"]["skipped_pct"] == -20.0
     assert agg["$15-25k"]["pools"] == 0 and agg["$15-25k"]["mean_pct"] is None
-    tot = agg["All bands"]
+    tot = agg[pb.TOTAL]
     assert tot["pools"] == 5 and tot["all_100_usd"] == round(100 * (0.5 - 1.0 + 0.1 - 0.2 + 0.05)) and tot["sz_pnl"] == 100.0
     assert agg["$5-15k"]["kept_100_usd"] == 50
     assert agg["$5-15k"]["win_pct"] == 50.0 and agg["$5-15k"]["kept_n"] == 1 and agg["$5-15k"]["kept_win_pct"] == 100.0
     assert agg["$5-15k"]["kept_vs_all"] == 75.0 and agg["$5-15k"]["kept_rugged_pct"] == 0.0
-    assert pb.study(st, j, now=T0 + 2 * H)["bands"][-1]["band"] == "All bands"
+    assert pb.study(st, j, now=T0 + 2 * H)["bands"][-1]["band"] == pb.TOTALS[1][0]
+    # a pool under $5k measured by the scorer (status thin_done) lands in its band and the under-$5k total only
+    _pool(st, "TH", T0 + 900, "CT", 5.0, 0.3, liq=2_000.0, liquid=0)
+    st.execute("UPDATE watch_launch_live SET status='thin_done' WHERE pool='TH'")
+    st.execute("DELETE FROM market_hours")
+    mm.MarketMonitor(st, j, cfg).step(now=T0 + H + mm.HOUR_DELAY_S + 1)
+    agg = {r["band"]: r for r in pb.aggregate(mm.load(st))}
+    assert agg["$1-2.5k"]["pools"] == 1 and agg["$1-2.5k"]["mean_pct"] == 30.0 and agg["$1-2.5k"]["kept_n"] == 0
+    assert agg[pb.TOTALS[1][0]]["pools"] == 1 and agg[pb.TOTAL]["pools"] == 5
+    assert mm.load(st)[0]["liquid"] == 5  # the thin pool stays out of every other measure
     s = mm.status(st, hours=24, now=T0 + 2 * H)
     assert "whole life" in s["bands"] and "RUG-VS-WIN BY POOL SIZE" in mm.render(s)
-    assert pb.band_of(4_999) is None and pb.band_of(150_000) == "$150-300k" and pb.band_of(10**7) == "$600k+"
+    assert pb.band_of(4_999) == "$2.5-5k" and pb.band_of(None) is None and pb.band_of(0) == "$0-1k" and pb.band_of(150_000) == "$150-300k" and pb.band_of(10**7) == "$600k+"
     out = pb.study(st, j, now=T0 + 2 * H)
-    assert [x["band"] for x in out["bands"]] == [*pb.NAMES, pb.TOTAL]
-    assert out["bands"][0]["launchrw50_sz real"]["pnl_usd"] == 100
+    assert [x["band"] for x in out["bands"]] == [*pb.NAMES, *(t[0] for t in pb.TOTALS)]
+    by = {x["band"]: x for x in out["bands"]}
+    assert by["$5-15k"]["launchrw50_sz real"]["pnl_usd"] == 100 and by["$1-2.5k"]["pools"] == 1
+    assert by[pb.TOTAL]["pools"] == 5 and by[pb.TOTALS[1][0]]["pools"] == 1
     assert "RUG-VS-WIN BY POOL SIZE" in pb.render(out)

@@ -1,4 +1,5 @@
-"""Rug-vs-win results by pool size (11-08): eight liquidity bands at second 4.
+"""Rug-vs-win results by pool size (11-08): eleven liquidity bands at second 4 (three under the $5k minimum, which the
+scorer measures but no book trades: status thin_done).
 
 sz's edge sits in pools under $15k and fades above $25k, so every measure here is split by the pool's liquidity at
 the scorer's decision (second 4). Two views share the band list:
@@ -17,7 +18,8 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-BANDS = (("$5-15k", 5_000.0, 15_000.0), ("$15-25k", 15_000.0, 25_000.0), ("$25-40k", 25_000.0, 40_000.0),
+BANDS = (("$0-1k", 0.0, 1_000.0), ("$1-2.5k", 1_000.0, 2_500.0), ("$2.5-5k", 2_500.0, 5_000.0),
+         ("$5-15k", 5_000.0, 15_000.0), ("$15-25k", 15_000.0, 25_000.0), ("$25-40k", 25_000.0, 40_000.0),
          ("$40-80k", 40_000.0, 80_000.0), ("$80-150k", 80_000.0, 150_000.0), ("$150-300k", 150_000.0, 300_000.0),
          ("$300-600k", 300_000.0, 600_000.0), ("$600k+", 600_000.0, float("inf")))
 NAMES = tuple(b[0] for b in BANDS)
@@ -25,7 +27,15 @@ RUG = -0.999
 BIG_WIN = 0.5
 STUCK_S = 1800  # a real trade still open this long after its buy never sold: -100%
 BOOKS = ("launchrw50_sz", "launchrw50")  # real trades shown per band (sz sized by band, launchrw50 flat $100)
-TOTAL = "All bands"  # the running tally row aggregate() adds after the eight bands
+TRADABLE_USD = 5_000.0  # model_book_min_liq_usd: bands below it are measured only (status thin_done), never traded
+# running-tally rows added after the bands: (name, liquidity from, to)
+TOTALS = (("All $5k+ (traded)", TRADABLE_USD, float("inf")), ("All under $5k (measured only)", 0.0, TRADABLE_USD))
+TOTAL = TOTALS[0][0]
+_LO = {name: lo for name, lo, _ in BANDS}
+
+
+def in_total(band: str | None, total: tuple) -> bool:
+    return band is not None and total[1] <= _LO[band] < total[2]
 KEYS = ("n", "ret_sum", "rugs", "big", "wins", "kept_n", "kept_sum", "kept_rugs", "kept_big", "kept_wins", "skip_n",
         "skip_sum", "sz_n", "sz_pnl", "sz_cost")
 
@@ -95,9 +105,10 @@ def aggregate(rows: list[dict]) -> list[dict]:
                 for k in KEYS:
                     tot[name][k] += s.get(k) or 0
     pools = sum(t["n"] for t in tot.values())
-    tot[TOTAL] = {k: sum(tot[n][k] for n in NAMES) for k in KEYS}
+    for t in TOTALS:
+        tot[t[0]] = {k: sum(tot[n][k] for n in NAMES if in_total(n, t)) for k in KEYS}
     out = []
-    for name in NAMES + (TOTAL,):
+    for name in NAMES + tuple(t[0] for t in TOTALS):
         t = tot[name]
         n = int(t["n"])
         mean = lambda s, c: round(100 * s / c, 1) if c else None
@@ -166,15 +177,18 @@ def study(store, journal, hours: float | None = None, now: float | None = None) 
     ll.ensure_schema(store)
     since = now - hours * 3600 if hours else 0.0
     rows = [dict(r) for r in store.query(
-        "SELECT * FROM watch_launch_live WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND create_ts >= ? "
+        "SELECT * FROM watch_launch_live WHERE ((status='done' AND liquid=1) OR status='thin_done') AND ret IS NOT NULL "
+        "AND create_ts >= ? "
         "ORDER BY create_ts", (since,))]
     keep = lambda r: None if r["rw_pct"] is None else r["rw_pct"] < 100 - ll.RW_SKIP
     real = {b: _real_trades(store, journal, b, since, now) for b in BOOKS} if journal is not None else {}
     total = sum(1 for r in rows if band_of(r["liq_usd"]))
     bands = []
-    for name in NAMES + (TOTAL,):
+    totals = {t[0]: t for t in TOTALS}
+    for name in NAMES + tuple(totals):
         rng = np.random.default_rng(0)
-        g = [r for r in rows if band_of(r["liq_usd"]) == name or (name == TOTAL and band_of(r["liq_usd"]))]
+        hit = (lambda b: in_total(b, totals[name])) if name in totals else (lambda b: b == name)
+        g = [r for r in rows if hit(band_of(r["liq_usd"]))]
         entry: dict = {"band": name, "pools": len(g), "share_pct": round(100 * len(g) / total, 1) if total else None}
         if g:
             scored = [r for r in g if keep(r) is not None]
@@ -188,8 +202,7 @@ def study(store, journal, hours: float | None = None, now: float | None = None) 
             entry["launch4 top 2%"] = ll._group([r for r in g if r.get("top2")], rng)
             entry["launch4 top 5%"] = ll._group([r for r in g if r.get("top5")], rng)
         for b, ts in real.items():
-            entry[f"{b} real"] = _real_summary([t for t in ts if band_of(t["liq"]) == name
-                                                or (name == TOTAL and band_of(t["liq"]))], rng)
+            entry[f"{b} real"] = _real_summary([t for t in ts if hit(band_of(t["liq"]))], rng)
         bands.append(entry)
     return {"window": f"last {hours:g} h" if hours else "whole life",
             "from": datetime.fromtimestamp(rows[0]["create_ts"], timezone.utc).strftime("%m-%d %H:%M") if rows else None,

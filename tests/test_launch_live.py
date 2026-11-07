@@ -988,3 +988,36 @@ def test_block_compare_scores_each_book_per_block_against_the_market(cfg):
     assert head["won"] == 2
     text = ll.render_block_compare(out)
     assert "launchrw50_sz" in text and "BLOCK COMPARE" in text
+
+
+def test_pools_under_the_liquidity_minimum_are_measured_but_never_scored_or_sent(setup):
+    """11-08: pools under $5k at second 4 keep their fill and minute-6 reads (status thin -> thin_done) for the
+    pool-size bands; they get no flags, no signal and stay out of the creator record."""
+    cfg, st, hel, clock, live, p, create = setup
+    st.execute("UPDATE watch_market SET sol_usd=40")  # 2 x ~51.5 SOL x $40 = ~$4.1k, under the $5k minimum
+    live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+    live.step()
+    clock.t += cfg.launch_live_decide_delay_s
+    live.step()
+    r = live._row(HAND_POOL)
+    assert r["status"] == "thin" and r["liquid"] == 0 and r["liq_usd"] < 5000 and not r["top5"]
+    assert r["rw_pct"] is None and live.signals.empty()
+    clock.t = create + ll.FILL_S + 0.5
+    live.step()
+    hel.accts[p["sol_vault"]] = ("tok", token_acct(75_000_000_000))
+    clock.t = create + ll.EXIT_S
+    live.step()
+    r = live._row(HAND_POOL)
+    assert r["status"] == "thin_done" and r["ret"] == pytest.approx(75 / 60 - 1 - la.COST)
+    assert st.query("SELECT COUNT(*) FROM watch_launch_live WHERE status IN ('scored','done')")[0][0] == 0
+
+
+def test_thin_tracking_can_be_switched_off(setup):
+    cfg, st, hel, clock, live, p, create = setup
+    live.cfg = cfg.with_overrides({"launch_live_track_thin": "0"})
+    st.execute("UPDATE watch_market SET sol_usd=40")
+    live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+    live.step()
+    clock.t += cfg.launch_live_decide_delay_s
+    live.step()
+    assert live._row(HAND_POOL)["status"] == "skipped"

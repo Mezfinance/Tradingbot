@@ -43,7 +43,8 @@ BATCH_HOURS = 24  # hours built per read on a backfill
 STATUS_KEY = "market_monitor:status"  # last step: ran, ok_ts, took, stored, error
 SZ_STUCK_S = 1800  # a sized-book trade still open this long counts as -100% (as block-compare)
 
-VERSION = 5  # older rows are rebuilt (2: liquidity bands, 3: sz $ P&L and cost, 4: 8 bands, 5: band win/rug counts)
+VERSION = 6  # older rows are rebuilt (2: liquidity bands, 3: sz $ P&L and cost, 4: 8 bands, 5: band win/rug counts,
+# 6: bands under $5k)
 BANDS = (("thin", 0.0, 15_000.0), ("mid", 15_000.0, 25_000.0), ("thick", 25_000.0, float("inf")))  # sz's bands
 
 SCHEMA = "CREATE TABLE IF NOT EXISTS market_hours (hour REAL PRIMARY KEY, data TEXT NOT NULL, ts REAL)"
@@ -194,7 +195,8 @@ def hour_metrics(pools: list[dict], trades: list[dict], prices: dict, now: float
         else:
             continue
         real_liq.append((*real[-1], t.get("liq")))
-    out["bands"] = pool_bands.hour_bands(done, real_liq, ll.RW_SKIP)  # 8 pool-size bands (sums; not a METRIC)
+    thin = [p for p in pools if p.get("status") == "thin_done" and p.get("ret") is not None]  # measured, not traded
+    out["bands"] = pool_bands.hour_bands(done + thin, real_liq, ll.RW_SKIP)  # 8 pool-size bands (sums; not a METRIC)
     out.update(sz_trades=len(real), sz_real=_wpct(real), sz_pnl=round(sum(r * c for r, c in real), 2),
                sz_cost=round(sum(c for _, c in real), 2))
     out["sz_fill_gap"] = round(out["sz_real"] - out["sz_picks_ideal"], 1) \
@@ -583,7 +585,7 @@ def render_bands(bands: dict) -> list[str]:
                   f"{'$ @100':>13} | {'n':>6}{'mean':>7}{'win%':>6}{'rug%':>6}{'+50%':>6}{'$ @100':>9}{'vs all':>7}"
                   f" | {'skip':>7}{'gap':>9} | {'n':>6}{'sz':>7}{'sz $':>9}"]
         for r in rows:
-            if not r["pools"] and not r["sz_n"] and r["band"] != pool_bands.TOTAL:
+            if not r["pools"] and not r["sz_n"] and not r["band"].startswith("All"):
                 continue
             lines.append("  " + f"{r['band']:<11}{r['pools']:>6}{p(r['share_pct']):>7} | "
                          f"{f(r['mean_pct']):>7}{p(r['win_pct']):>6}{p(r['rugged_pct']):>6}{p(r['big_pct']):>6}"

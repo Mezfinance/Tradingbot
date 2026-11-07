@@ -65,6 +65,8 @@ class Config:
     market_monitor_since: float = 0.0  # unix time: the monitor's baseline starts no earlier (hours before it are kept, not compared)
     launch_live_daily_credits: int = 20_000
     launch_live_decide_delay_s: float = 4.0  # after the websocket notification (~1 s after creation)
+    launch_live_track_thin: bool = True  # pools under model_book_min_liq_usd at second 4: still read the fill and
+    # minute-6 exit (2 credits) for the pool-size bands; status 'thin' -> 'thin_done', never scored or traded
     launch_train_days: float = 14.0
     # Paper books launch4_2 / launch4_5 on the scorer's top 2% / top 5% picks (needs launch_live and model_book):
     # bought through Jupiter with the model books' simulated executor, sold at pool minute 6, no stop/take-profit.
