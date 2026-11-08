@@ -371,6 +371,7 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.data.helius import Helius
         from tradingbot.watcher import WatchStore, hist_db_path
         import os as _os
+        import time as _time  # a later `import time` in main() makes the bare name local here
         key = _os.environ.get("HELIUS_BACKFILL_API_KEY", "")
         if not key:
             print("HELIUS_BACKFILL_API_KEY is not set: fly secrets set HELIUS_BACKFILL_API_KEY=<key> -a supermeme "
@@ -378,7 +379,7 @@ def main(argv: list[str] | None = None) -> None:
             sys.exit(2)
         days = args.days if args.days != 7.0 else 365.0
         store = WatchStore(hist_db_path(cfg))
-        added = launch_hist.fill_sol_prices(store, time.time() - days * 86400 - 86400, time.time())
+        added = launch_hist.fill_sol_prices(store, _time.time() - days * 86400 - 86400, _time.time())
         print(f"SOL prices: {added} hours added", file=sys.stderr, flush=True)
         helius = Helius(api_key=key, client=httpx.Client(timeout=60))
         helius.min_interval_s = 1 / max(args.rps if args.rps != 2.0 else 10.0, 0.1)  # its own account: own rate

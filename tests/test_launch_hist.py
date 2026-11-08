@@ -290,3 +290,29 @@ def test_a_failed_supply_read_leaves_the_pull_unchecked():
     lh.backfill(st, hel, 3, 10_000, now=NOW)
     rec = json.loads(st.query("SELECT data FROM watch_launch_hist")[0]["data"])
     assert rec["pulled_ts"] is None and rec["pull_checked"] is False
+
+
+def test_history_backfill_command_runs_through_the_cli(tmp_path, monkeypatch, capsys):
+    """11-08: the command itself (not just the functions): a local import later in cli.main() once shadowed `time`."""
+    from tradingbot import cli
+    calls = {}
+    monkeypatch.setenv("HELIUS_BACKFILL_API_KEY", "k")
+    monkeypatch.setenv("TB_DB_PATH", str(tmp_path / "tradingbot.db"))
+    monkeypatch.setattr(lh, "fill_sol_prices", lambda store, since, until: calls.setdefault("sol", (since, until)) and 0)
+    monkeypatch.setattr(lh, "backfill", lambda store, helius, days, cap, **kw: calls.setdefault("bf", (days, kw)) and {"ok": 1})
+    monkeypatch.setattr(lh, "pulls", lambda store, helius, **kw: calls.setdefault("pulls", kw) and {"ok": 2})
+    cli.main(["history-backfill", "--estimate"])
+    assert calls["bf"][0] == 365.0 and calls["bf"][1]["estimate"] and calls["sol"][1] > calls["sol"][0]
+    assert (tmp_path / "hist.db").exists()
+    cli.main(["history-backfill", "--pulls-only", "--workers", "3"])
+    assert calls["pulls"]["workers"] == 3
+    monkeypatch.delenv("HELIUS_BACKFILL_API_KEY")
+    with pytest.raises(SystemExit):
+        cli.main(["history-backfill"])
+
+
+def test_risk_model_history_command_runs_without_data(tmp_path, monkeypatch, capsys):
+    from tradingbot import cli
+    monkeypatch.setenv("TB_DB_PATH", str(tmp_path / "tradingbot.db"))
+    cli.main(["risk-model", "--history"])
+    assert "fewer than 500" in capsys.readouterr().out
