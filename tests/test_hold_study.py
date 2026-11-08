@@ -57,3 +57,15 @@ def test_small_pools_are_left_out_unless_asked():
     h.states["T"] = lambda ts: (100.0, 1_000_000)
     assert "$5-15k" not in hs.study(st, h, now=T0 + 7200, max_credits=10**6)["bands"]
     assert "$5-15k" in hs.study(st, h, now=T0 + 7200, max_credits=10**6, min_liq=0)["bands"]
+
+
+def test_kept_only_with_a_size_cap_and_rug_causes():
+    st, h = _store()
+    st.execute("UPDATE watch_launch_live SET pulled_ts=? WHERE pool='S1'", (T0 + 500,))
+    out = hs.study(st, h, now=T0 + 7200, max_credits=10**6, kept_only=True, max_liq=80_000)
+    assert list(out["bands"]) == ["$25-40k"]                                   # $80-150k left out by the cap
+    g = out["bands"]["$25-40k"]["rug-vs-win kept (rw_pct < 50)"]
+    assert g["n"] == 10 and list(out["bands"]["$25-40k"]) == ["rug-vs-win kept (rw_pct < 50)"]
+    causes = g["rug causes"]["10 min"]
+    assert causes["LP pulled"] == 1 and causes["SOL drained"] == 9           # S1 pulled at 500 s, the rest drained
+    assert "rugs by cause" in hs.render(out) and "kept only" in hs.render(out)
