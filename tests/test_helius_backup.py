@@ -81,3 +81,34 @@ def test_no_main_key_uses_the_backup(monkeypatch):
     assert h.enabled and h.key() == "BACKUP" and hl.current_key() == "BACKUP"
     monkeypatch.delenv(hl.BACKUP_ENV)
     assert not hl.Helius(client=_Http(empty=set())).enabled
+
+
+def test_a_rate_limited_method_slows_down_alone_and_recovers(monkeypatch):
+    monkeypatch.setattr(hl, "_method_pace", {})
+    monkeypatch.setattr(hl.time, "sleep", lambda s: None)
+
+    class _Limited(_Http):
+        def __init__(self):
+            super().__init__(empty=())
+            self.busy = 2
+
+        def post(self, url, params=None, json=None):
+            if json["method"] == "getTransactionsForAddress" and self.busy:
+                self.busy -= 1
+                return httpx.Response(429, text="Too Many Requests", request=httpx.Request("POST", url))
+            return super().post(url, params, json)
+
+    http = _Limited()
+    h = hl.Helius(client=http)
+    h.min_interval_s = 0.15
+    assert h._rpc("getTransactionsForAddress", [], 10) == {"key": "MAIN"}  # two 429s, then answered
+    slowed = hl.pace_status()["getTransactionsForAddress"]
+    assert slowed > 0.15 and "getSlot" not in hl.pace_status()  # other methods keep the base pace
+    assert not hl.KEYS["on_backup"]  # a 429 that clears on retry doesn't switch keys
+    for _ in range(100):  # successes narrow it back to the base
+        h._rpc("getTransactionsForAddress", [], 10)
+    assert "getTransactionsForAddress" not in hl.pace_status()
+    for _ in range(40):
+        hl._adapt("x", True, 0.15)
+    assert hl.pace_status()["x"] == hl.MAX_INTERVAL_S
+    assert "slowed_methods" in hl.key_status()

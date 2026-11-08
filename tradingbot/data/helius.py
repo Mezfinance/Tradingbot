@@ -107,7 +107,7 @@ def _switch(to_backup: bool, reason: str, probe_s: float = PROBE_S) -> None:
 
 def key_status() -> dict:
     return {"on_backup": KEYS["on_backup"], "backup_set": bool(backup_key()), "switches": KEYS["switches"],
-            "since": KEYS["since"], "last_reason": KEYS["last_reason"]}
+            "since": KEYS["since"], "last_reason": KEYS["last_reason"], "slowed_methods": pace_status()}
 
 
 _pace_lock = threading.Lock()
@@ -117,17 +117,51 @@ _next_free = [0.0]
 STATS = {"calls": 0, "rate_limited": 0, "failed": 0, "wait_s": 0.0}
 
 
-def _pace(interval: float) -> None:
-    """Space Helius calls across every client and thread in the process."""
+# Adaptive pace per method (11-08): on Fly both free-plan keys answered plain 429 'Too Many Requests' to
+# getTransactionsForAddress while other methods were fine, so each method gets its own spacing on top of the
+# process-wide one: x ADAPT_UP after a 429 (from at least the base interval, up to MAX_INTERVAL_S), x ADAPT_DOWN
+# after a success, back to the base (0 = only the process-wide pace) once it falls below it.
+ADAPT_UP = 1.5
+ADAPT_DOWN = 0.97
+MAX_INTERVAL_S = 3.0
+_method_pace: dict[str, list[float]] = {}  # method -> [interval, next free (monotonic)]
+
+
+def _pace(interval: float, method: str | None = None) -> None:
+    """Space Helius calls across every client and thread in the process (and per method when one is slowed)."""
     if interval <= 0:
         return
     with _pace_lock:
         now = time.monotonic()
-        wait = _next_free[0] - now
-        _next_free[0] = max(now, _next_free[0]) + interval
+        start = max(now, _next_free[0])
+        gate = _method_pace.get(method) if method else None
+        if gate and gate[0] > 0:
+            start = max(start, gate[1])
+            gate[1] = start + gate[0]
+        _next_free[0] = start + interval
+        wait = start - now
     if wait > 0:
         STATS["wait_s"] += wait
         time.sleep(wait)
+
+
+def _adapt(method: str, limited: bool, base: float) -> None:
+    """Widen a method's spacing after a 429, narrow it after a success."""
+    if base <= 0:
+        return
+    with _pace_lock:
+        gate = _method_pace.setdefault(method, [0.0, 0.0])
+        if limited:
+            gate[0] = min(MAX_INTERVAL_S, max(gate[0], base) * ADAPT_UP)
+        elif gate[0] > 0:
+            gate[0] *= ADAPT_DOWN
+            if gate[0] < base:
+                gate[0] = 0.0
+
+
+def pace_status() -> dict:
+    """Methods currently slowed below the process-wide pace: seconds between their calls."""
+    return {m: round(g[0], 2) for m, g in _method_pace.items() if g[0] > 0}
 
 
 class Helius:
@@ -161,7 +195,7 @@ class Helius:
                     KEYS["probe_at"] = time.time() + PROBE_S
                     probing = True
         for attempt in range(RETRIES_429 + 1):
-            _pace(self.min_interval_s)
+            _pace(self.min_interval_s, method)
             STATS["calls"] += 1
             key = self.api_key if probing else self.key()
             try:
@@ -179,8 +213,12 @@ class Helius:
                 _switch(False, "probe answered")
                 probing = False
             if resp.status_code != 429:
+                if resp.status_code == 200:
+                    _adapt(method, False, self.min_interval_s)
                 break
             STATS["rate_limited"] += 1
+            if not out_of_credits(resp):
+                _adapt(method, True, self.min_interval_s)
             if attempt < RETRIES_429:
                 back_off = min(8.0, 1.0 * 2 ** attempt)
                 STATS["wait_s"] += back_off
