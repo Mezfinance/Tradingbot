@@ -28,7 +28,8 @@ HOLDS_S = (60, 120, 180, 240, 300, 360, 600, 900, 1800, 3600)
 SIX = 360
 BANDS = (("$5-15k", 5_000, 15_000), ("$15-25k", 15_000, 25_000), ("$25-40k", 25_000, 40_000),
          ("$40-80k", 40_000, 80_000), ("$80-150k", 80_000, 150_000), ("$150k+", 150_000, float("inf")))
-PER_BAND = 100
+PER_BAND = 150
+MIN_LIQ = 25_000   # the user's question is about the bigger pools; --min-liq 0 adds the small bands back
 CREDITS_PER_CALL = 10
 
 
@@ -39,11 +40,11 @@ def band_of(liq) -> str | None:
     return None
 
 
-def sample(rows: list[dict], per_band: int) -> dict:
+def sample(rows: list[dict], per_band: int, min_liq: float = 0.0) -> dict:
     """A stable random sample (hash of the pool) of up to `per_band` pools in each band."""
     by: dict = collections.defaultdict(list)
     for r in sorted(rows, key=lambda r: hashlib.sha1(f"hold:{r['pool']}".encode()).hexdigest()):
-        b = band_of(r["liq_usd"])
+        b = band_of(r["liq_usd"]) if r["liq_usd"] >= min_liq else None
         if b and len(by[b]) < per_band:
             by[b].append(r)
     return by
@@ -88,7 +89,7 @@ def _needs(r: dict, have: dict) -> list[int]:
 
 
 def study(store, helius, hours: float | None = None, per_band: int = PER_BAND, max_credits: int = 40_000,
-          now: float | None = None, seed: int = 7) -> dict:
+          now: float | None = None, seed: int = 7, min_liq: float = MIN_LIQ) -> dict:
     ll.ensure_schema(store)
     store.execute(ll.PATH_SCHEMA)
     now = now if now is not None else time.time()
@@ -98,9 +99,10 @@ def study(store, helius, hours: float | None = None, per_band: int = PER_BAND, m
         "FROM watch_launch_live WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND fill_px IS NOT NULL "
         "AND fill_sol IS NOT NULL AND liq_usd IS NOT NULL AND create_ts >= ? AND create_ts <= ? ORDER BY create_ts",
         (since, now - HOLDS_S[-1] - 120))]
+    rows = [r for r in rows if r["liq_usd"] >= min_liq]
     if not rows:
         return {"pools": 0, "note": "no finished liquid pools at least an hour old"}
-    groups = sample(rows, per_band)
+    groups = sample(rows, per_band, min_liq)
     have = {(r["pool"], r["sec"]): {"sol": r["sol"], "tok": r["tok"]}
             for r in store.query("SELECT pool, sec, sol, tok FROM watch_launch_path")}
     stats: collections.Counter = collections.Counter()
@@ -135,7 +137,7 @@ def study(store, helius, hours: float | None = None, per_band: int = PER_BAND, m
     rng = np.random.default_rng(seed)
     fmt = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d %H:%M")
     out = {"pools": len(rows), "window": f"{fmt(rows[0]['create_ts'])} .. {fmt(rows[-1]['create_ts'])} UTC",
-           "per_band": per_band, "fetch": dict(stats), "bands": {}}
+           "per_band": per_band, "min_liq": min_liq, "fetch": dict(stats), "bands": {}}
     for name, _, _ in BANDS:
         g = groups.get(name, [])
         if not g:
@@ -173,7 +175,7 @@ def _label(sec: int) -> str:
 def render(out: dict) -> str:
     if "bands" not in out:
         return str(out)
-    L = [f"HOLD TIMES BY POOL SIZE ({out['window']}: {out['pools']:,} finished liquid pools; up to {out['per_band']} "
+    L = [f"HOLD TIMES BY POOL SIZE ({out['window']}: {out['pools']:,} finished pools with ${out['min_liq']:,.0f}+ at second 4; up to {out['per_band']} "
          "sampled per band)",
          "  fetch: " + ", ".join(f"{k} {v}" for k, v in out["fetch"].items()), ""]
     for band, groups in out["bands"].items():

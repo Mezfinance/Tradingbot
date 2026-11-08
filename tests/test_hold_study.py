@@ -12,7 +12,7 @@ def _store(n=20):
     ll.ensure_schema(st)
     states = {}
     for i in range(n):
-        for kind, liq in (("S", 10_000.0), ("B", 100_000.0)):
+        for kind, liq in (("S", 30_000.0), ("B", 100_000.0)):
             pool = f"{kind}{i}"
             st.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, liquid, liq_usd, fill_px, fill_sol, "
                        "peak_sol, ret, rw_pct, status) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
@@ -28,7 +28,7 @@ def _store(n=20):
 def test_holds_split_by_band_and_compare_with_minute_six():
     st, h = _store()
     out = hs.study(st, h, now=T0 + 7200, max_credits=10**6)
-    small, big = out["bands"]["$5-15k"]["every pool"], out["bands"]["$80-150k"]["every pool"]
+    small, big = out["bands"]["$25-40k"]["every pool"], out["bands"]["$80-150k"]["every pool"]
     assert small["n"] == 20 and big["n"] == 20
     assert small["holds"]["1 min"]["mean_pct"] == 4.0                     # +10% - 6% cost
     assert small["holds"]["10 min"]["rugged_pct"] == 100 and small["holds"]["10 min"]["vs_minute6_pts"] < -100
@@ -46,5 +46,14 @@ def test_credit_cap_fills_bands_evenly_and_young_pools_wait():
     out = hs.study(st, h, now=T0 + 7200, max_credits=400)                   # 40 calls
     assert "stopped at the credit cap" in " ".join(out["fetch"])
     got = {b: g["every pool"]["holds"]["1 min"]["n"] for b, g in out["bands"].items()}
-    assert abs(got["$5-15k"] - got["$80-150k"]) <= 1
+    assert abs(got["$25-40k"] - got["$80-150k"]) <= 1
     assert hs.study(st, h, now=T0 + 600)["pools"] == 0                       # nothing an hour old yet
+
+
+def test_small_pools_are_left_out_unless_asked():
+    st, h = _store(4)
+    st.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, liquid, liq_usd, fill_px, fill_sol, peak_sol, "
+               "ret, status) VALUES ('T','MT',?,1,8000,0.0001,100,100,0.1,'done')", (T0,))
+    h.states["T"] = lambda ts: (100.0, 1_000_000)
+    assert "$5-15k" not in hs.study(st, h, now=T0 + 7200, max_credits=10**6)["bands"]
+    assert "$5-15k" in hs.study(st, h, now=T0 + 7200, max_credits=10**6, min_liq=0)["bands"]
