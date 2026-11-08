@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -541,6 +541,14 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(out, indent=2, default=str) if args.json else band_compare.render(out))
         return
 
+    if args.command == "band-prize":  # is there a prize in one band if filtered better? (default $40-80k, whole life)
+        from tradingbot import band_prize
+        from tradingbot.watcher import WatchStore as _WS, watch_db_path as _wdp
+        lo = args.min_liq if args.min_liq != 25_000.0 else band_prize.MIN_LIQ
+        out = band_prize.study(_WS(_wdp(cfg)), hours=args.hours, min_liq=lo,
+                               max_liq=args.max_liq or band_prize.MAX_LIQ)
+        print(json.dumps(out, indent=2, default=str) if args.json else band_prize.render(out))
+        return
     if args.command == "band-rw-study":  # rug-vs-win trained per pool-size band, walk-forward (default whole life)
         from tradingbot import band_rw
         from tradingbot.watcher import WatchStore, watch_db_path
