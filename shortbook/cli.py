@@ -1,8 +1,9 @@
-"""python -m shortbook run | status | report [--json] | market [--json] | check
+"""python -m shortbook run | status | report [--json] | market [--json] | leverage [--json] | check
 
 run     the paper book (detector + positions + equity) with a /health endpoint
 status  heartbeat, NAV, open positions, pending listings
 report  results by group vs the research expectation, closed trades, skip reasons
+leverage  live 1x/2x/3x/4x return profiles on the book's own shorts
 market  every listing's price path: picks vs skips vs shorting every listing vs buying every listing
 check   which exchange endpoints answer from this machine (run it once after the first deploy)"""
 from __future__ import annotations
@@ -12,7 +13,7 @@ from .book import Book
 from .config import Config
 from .http import Http
 from .store import Store
-from . import market
+from . import leverage, market
 from .venues import LISTING, PERPS, SpotAges, BinanceSpot
 
 EXPECTED = {"B upbit": 13.3, "B binance": 16.7, "A upbit": 29.5, "B coinbase": 6.0, "all": 14.3}  # research, % per trade
@@ -168,7 +169,15 @@ def feed(book: Book, now: float | None = None) -> dict:
         "listing_counts": {f"{v} {st}": n for (v, st), n in sorted(counts.items())},
         "pending": sum(n for (v, st), n in counts.items() if st == "pending"),
         "market": _market(book),
+        "leverage": _leverage(book),
     }
+
+
+def _leverage(book: Book) -> dict | None:
+    try:
+        return leverage.profiles(book)
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 MARKET_TTL_S = 300
@@ -239,7 +248,7 @@ def serve(book: Book, port: int):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="shortbook")
-    ap.add_argument("cmd", choices=["run", "status", "report", "market", "check"])
+    ap.add_argument("cmd", choices=["run", "status", "report", "market", "leverage", "check"])
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -255,6 +264,13 @@ def main(argv=None) -> int:
             serve(book, cfg.health_port)
         logging.info("shortbook paper book: NAV $%s, groups %s", f"{book.nav():,.0f}", cfg.groups)
         book.run_forever()
+        return 0
+    if a.cmd == "leverage":
+        out = leverage.profiles(book)
+        if not a.json:
+            print(leverage.render(out))
+        else:
+            print(json.dumps(out, indent=2, default=str))
         return 0
     if a.cmd == "market":
         while market.track(book, limit=200):   # fill whatever is missing first (the running book keeps doing this)

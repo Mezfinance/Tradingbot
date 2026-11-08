@@ -8,7 +8,7 @@ from __future__ import annotations
 import json, logging, math, time
 from .config import Config
 from .store import Store
-from . import market
+from . import leverage, market
 from .venues import STABLE, Contract, Quote
 
 log = logging.getLogger("shortbook")
@@ -24,6 +24,7 @@ class Book:
         self.ages, self.spot_age, self.now = ages, spot_age, now
         self._contracts: dict[str, dict[str, Contract]] = {}
         self._contracts_ts = 0.0
+        leverage.ensure(self.s)
         if self.s.get("cash") is None:
             self.s.put("cash", cfg.cash_usd)
             self.s.put("started", self.now())
@@ -193,6 +194,7 @@ class Book:
             last_px = q.price if q else p["last_px"]
             if q:
                 self.s.x("UPDATE positions SET last_px=?, last_ts=? WHERE id=?", (q.price, now, p["id"]))
+                leverage.track_high(self, p, q.price)
             # funding paid at each settlement since the last one we booked (positive rate: longs pay shorts)
             if perp:
                 fund = p["funding_usd"] or 0.0
@@ -222,8 +224,10 @@ class Book:
         ops = self.open_positions()
         unreal = sum(self.unrealized(p) for p in ops)
         cash = float(self.s.get("cash"))
+        now = self.now()
         self.s.x("INSERT OR REPLACE INTO equity (ts, nav, cash, open_usd, unrealized) VALUES (?, ?, ?, ?, ?)",
-                 (self.now(), cash + unreal, cash, sum(p["size_usd"] for p in ops), unreal))
+                 (now, cash + unreal, cash, sum(p["size_usd"] for p in ops), unreal))
+        leverage.snapshot(self, now)
 
     # ------------------------------------------------------------ loop
     def step(self, last: dict) -> None:

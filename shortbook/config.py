@@ -24,6 +24,7 @@ class Config:
     detect_s: float = 30.0                 # listing poll interval
     manage_s: float = 300.0                # price / funding / exit pass
     equity_s: float = 3600.0               # equity snapshot interval
+    leverage_profiles: str = "1,2,3,4"     # live leverage profiles on the same shorts (shortbook/leverage.py)
     health_port: int = 8080
     watchdog_s: float = 900.0              # /health fails if the loop is older than this
 
