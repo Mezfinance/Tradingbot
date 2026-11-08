@@ -80,3 +80,37 @@ def test_scorer_rows_win_over_history_and_check_compares_rankings(cfg):
     assert r["src"] == "scorer" and r["ret"] == 0.42 and info["scorer rows"] == 1
     assert rh.check(rows2)["pools"] <= 1                     # too few ranked by both
     assert rh.model(None, WatchStore(":memory:"), None, cfg)["note"].startswith("fewer than 500")
+
+
+def test_a_sampled_backfill_widens_windows_and_rebuilds_full_size_days(cfg):
+    hist = _hist(n_days=30, per_day=40)
+    n = hist.query("SELECT COUNT(*) n FROM watch_launch_hist")[0]["n"]
+    # the listing had 10x the pools the backfill fetched: a 10% random sample
+    hist.executemany("INSERT INTO hist_candidates(pool, token_mint, lp_mint) VALUES (?,?,?)",
+                     [(f"X{i}", "t", "l") for i in range(9 * n)])
+    watch = WatchStore(":memory:")
+    ll.ensure_schema(watch)
+    cfg = cfg.with_overrides({"model_book_min_liq_usd": "1000"})
+    rows, info = rh.load_pools(hist, watch, cfg)
+    assert abs(info["sample share"] - 0.1) < 0.01 and all(abs(r["w"] - 10) < 1 for r in rows)
+    out = rh.model(hist, watch, Journal(":memory:"), cfg, now=NOW, sims=20)
+    assert out["sample"]["share"] == round(info["sample share"], 4)
+    s = out["books"]["every liquid pool"]["stats"]
+    assert s["sampled_trades"] < s["trades"] and abs(s["trades"] / s["sampled_trades"] - 10) < 1.5
+    assert "sampled history" in rh.render(out)
+
+
+def test_expand_keeps_real_day_swings_and_drops_sampling_noise():
+    rng = np.random.default_rng(0)
+    ts = []
+    for d in range(60):   # every day drawn from one distribution: day-to-day differences are pure sampling noise
+        for _ in range(20):
+            ts.append({"ret": float(rng.normal(0.02, 0.5)), "cost": 100.0, "ts": d * D + 1000, "opened": d * D + 640,
+                       "liq": 20_000.0, "w": 10.0})
+    out, meta = rh.expand(ts)
+    assert meta["k"] < 0.3 and len(out) == 60 * 200
+    ts2 = [dict(t, ret=t["ret"] + (0.5 if (t["ts"] // D) % 2 else -0.5)) for t in ts]   # real swings, alternate days
+    _, meta2 = rh.expand(ts2)
+    assert meta2["k"] > 0.7
+    full = [dict(t, w=1.0) for t in ts[:50]]
+    assert rh.expand(full)[0] == full

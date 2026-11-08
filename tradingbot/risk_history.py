@@ -40,10 +40,11 @@ def load_pools(hist_store, watch_store, cfg) -> tuple[list[dict], dict]:
     from tradingbot import launch_hist as lh
     from tradingbot import launch_live as ll
     pools: dict = {}
-    info = {"history rows": 0, "scorer rows": 0}
+    info = {"history rows": 0, "scorer rows": 0, "sample share": 1.0}
     if hist_store is not None:
         hist, dropped = lh.rows(hist_store, cfg)
         info["history dropped"] = dropped
+        info["sample share"] = sample_share(hist_store, len(hist), sum(dropped.values()))
         for r in hist:
             pools[r["pool"]] = {"pool": r["pool"], "create_ts": r["created_ts"], "creator": r.get("creator"),
                                 "pulled_ts": r.get("pulled_ts"), "liquid": r["liquid"], "liq_usd": r["liq_usd"],
@@ -75,7 +76,29 @@ def load_pools(hist_store, watch_store, cfg) -> tuple[list[dict], dict]:
     info["liquid pools"] = len(liquid)
     info["from"] = _fmt(liquid[0]["create_ts"]) if liquid else None
     info["to"] = _fmt(liquid[-1]["create_ts"]) if liquid else None
+    scorer_ts = [r["create_ts"] for r in liquid if r["src"] == "scorer"]
+    info["scorer from"] = min(scorer_ts) if scorer_ts else None
+    # Before the scorer started, the history is a random sample: each pool stands for 1/share pools, so ranking
+    # windows widen by that factor (about as many pools per window as live) and trades are scaled up later.
+    until = info["scorer from"] if info["scorer from"] is not None else math.inf
+    for r in liquid:
+        r["w"] = 1.0 / info["sample share"] if r["create_ts"] < until else 1.0
     return liquid, info
+
+
+def sample_share(hist_store, kept: int, dropped: int) -> float:
+    """Share of the window's pools the backfill holds: pools fetched (any saved status) over pools listed, times
+    the share of fetched pools that parsed. The fetch order is a random shuffle, so this holds for every day.
+    1.0 when no listing is saved (older stores, tests)."""
+    try:
+        listed = hist_store.query("SELECT COUNT(*) n FROM hist_candidates")[0]["n"]
+    except Exception:  # noqa: BLE001  no listing table
+        return 1.0
+    fetched = hist_store.query("SELECT COUNT(*) n FROM watch_launch_hist")[0]["n"]
+    if not listed or fetched >= listed:
+        return 1.0
+    parsed = kept / (kept + dropped) if kept + dropped else 1.0
+    return max(1e-4, fetched / listed * parsed)
 
 
 def _fmt(t) -> str:
@@ -159,7 +182,8 @@ def replay(rows: list[dict], retrain_h: float = RETRAIN_H, max_train: int = MAX_
         if r["rw"] is None:
             r["rw_pct"] = r["rwb_pct"] = None
             continue
-        lo = bisect_left(past_t, r["create_ts"] - ll.RW_BLOCK_S)
+        w_ = r.get("w", 1.0)   # sampled history: a window w times longer holds about as many pools as live's
+        lo = bisect_left(past_t, r["create_ts"] - ll.RW_BLOCK_S * w_)
         window = past_s[lo:]
         if len(window) >= ll.ROLLING_MIN:
             r["rw_pct"] = 100.0 * float(np.mean(np.array(window) < r["rw"]))
@@ -169,7 +193,7 @@ def replay(rows: list[dict], retrain_h: float = RETRAIN_H, max_train: int = MAX_
             r["rw_pct"] = 100.0 * bisect_left(ts_, r["rw"]) / len(ts_)
         b = ll.band_of(r["liq_usd"])
         if b:
-            lo = bisect_left(band_t[b], r["create_ts"] - BAND_WINDOW_S)
+            lo = bisect_left(band_t[b], r["create_ts"] - BAND_WINDOW_S * w_)
             w = band_s[b][lo:]
             r["rwb_pct"] = 100.0 * float(np.mean(np.array(w) < r["rw"])) if len(w) >= ll.ROLLING_MIN else None
             band_t[b].append(r["create_ts"]); band_s[b].append(r["rw"])
@@ -236,8 +260,64 @@ def rule_trades(rows: list[dict], flag, sizing: str, gap: float, liq_share: floa
         if size < 5:
             continue
         out.append({"ret": max(-1.0, r["ret"] - gap), "cost": size, "ts": r["create_ts"] + ll.EXIT_S,
-                    "opened": r["create_ts"] + 10, "liq": r["liq_usd"]})
+                    "opened": r["create_ts"] + 10, "liq": r["liq_usd"], "w": r.get("w", 1.0)})
     return out
+
+
+LOCAL_DAYS = 7       # shrink a sampled day's mean toward the trades within +-7 days
+MIN_DAY_N = 5
+
+
+def expand(ts: list[dict], seed: int = 3) -> tuple[list[dict], dict]:
+    """Rebuild full-size days from the sampled history, for the measures that read daily P&L (Sharpe, drawdown,
+    trades per day, the trade-size bootstrap).
+
+    A sampled day with n trades stands for about n x w real trades (w = 1 / sample share). Scaling its P&L by w
+    would also scale its noise: the day's sample mean misses the real day's mean by about sd / sqrt(n), and that
+    error times n x w trades swamps the real day-to-day swings. So each day is rebuilt from n x w draws: with
+    chance k from that day's own trades, otherwise from the trades within +-LOCAL_DAYS days. k is the share of the
+    day-to-day spread (of day means around their local mean) that is real rather than sampling noise
+    (1 - mean(sd^2 / n) / variance), so the rebuilt day means keep the real swings and the draws add the real
+    within-day noise of a full day. Trades keep their own return, size and liquidity; days with no sampled trade
+    stay empty. Trades with w = 1 (the scorer's days) pass through as they are."""
+    full = [t for t in ts if t.get("w", 1.0) <= 1.0]
+    samp = [t for t in ts if t.get("w", 1.0) > 1.0]
+    if not samp:
+        return ts, {"k": None, "sampled days": 0}
+    from tradingbot import risk_model as rm
+    rng = np.random.default_rng(seed)
+    by: dict = collections.defaultdict(list)
+    for t in samp:
+        by[rm._day(t["ts"])].append(t)
+    days = sorted(by)
+    ret = {d: np.array([t["ret"] for t in by[d]]) for d in days}
+    local = {}
+    for d in days:
+        near = [ret[e] for e in range(d - LOCAL_DAYS, d + LOCAL_DAYS + 1) if e in ret]
+        local[d] = np.concatenate(near)
+    ok = [d for d in days if len(ret[d]) >= MIN_DAY_N]
+    k = 0.0
+    if len(ok) >= 5:
+        dev = np.array([ret[d].mean() - local[d].mean() for d in ok])
+        noise = float(np.mean([ret[d].var(ddof=1) / len(ret[d]) for d in ok]))
+        var = float(dev.var())
+        k = float(np.clip(1 - noise / var, 0.0, 1.0)) if var > 0 else 0.0
+    out = list(full)
+    for d in days:
+        own = by[d]
+        pool = [t for e in range(d - LOCAL_DAYS, d + LOCAL_DAYS + 1) for t in by.get(e, ())]
+        n = int(round(sum(t["w"] for t in own)))
+        if n <= 0:
+            continue
+        mine = rng.random(n) < k
+        picks = [own[i] for i in rng.integers(0, len(own), int(mine.sum()))]
+        picks += [pool[i] for i in rng.integers(0, len(pool), n - int(mine.sum()))]
+        base = d * 86400
+        for t in picks:
+            end = base + t["ts"] % 86400
+            out.append({**t, "ts": end, "opened": end - (t["ts"] - t["opened"]), "w": 1.0})
+    out.sort(key=lambda t: t["ts"])
+    return out, {"k": round(k, 2), "sampled days": len(days)}
 
 
 def monthly(trades: list[dict]) -> dict:
@@ -263,12 +343,14 @@ def model(hist_store, watch_store, journal, cfg, retrain_h: float = RETRAIN_H, m
     meta = replay(rows, retrain_h, max_train)
     g = gaps(journal, watch_store, now)
     capital, rng = cfg.model_book_cash_usd, np.random.default_rng(0)
-    books, months, corr_src = {}, {}, {}
+    books, months, corr_src, shrink = {}, {}, {}, {}
+    sampled = info["sample share"] < 1.0
     for name, flag, sizing in RULES:
-        ts = sorted(rule_trades(rows, flag, sizing, g[name]["gap"], cfg.model_book_liq_share), key=lambda t: t["ts"])
-        if len(ts) < rm.MIN_TRADES:
+        actual = sorted(rule_trades(rows, flag, sizing, g[name]["gap"], cfg.model_book_liq_share), key=lambda t: t["ts"])
+        if len(actual) < rm.MIN_TRADES:
             continue
-        st = rm.book_stats(ts, capital, rng)
+        ts, shrink[name] = expand(actual)   # full-size days rebuilt from the sample (as is when nothing is sampled)
+        st = rm.book_stats(ts, capital, rng, per_trade=actual if sampled else None)
         pnl, capped = rm.day_tables(ts, cfg.model_book_liq_share)
         sizing_rows = [rm.simulate(pnl, capped, c, f, np.random.default_rng(1), sims=sims or rm.SIMS)
                        for c in rm.CAPITALS for f in rm.FRACTIONS]
@@ -292,6 +374,7 @@ def model(hist_store, watch_store, journal, cfg, retrain_h: float = RETRAIN_H, m
                      "mean single-book sharpe": round(float(np.mean([books[n]["stats"]["sharpe"] or 0 for n in names])), 2)}
     return {"window": f"history {info['from']} .. {info['to']}", "built": _fmt(now), "capital": capital,
             "liq_share": cfg.model_book_liq_share, "pools": info, "replay": meta, "check": check(rows), "gaps": g,
+            "sample": {"share": round(info["sample share"], 4), "rebuilt days": shrink} if sampled else None,
             "books": books, "monthly": months, "too few trades": {}, "correlation": corr,
             "equal_weight_portfolio": portfolio, "took_s": round(time.time() - t0),
             "note": ("Replayed books: walk-forward rug-vs-win model retrained every "
@@ -299,6 +382,10 @@ def model(hist_store, watch_store, journal, cfg, retrain_h: float = RETRAIN_H, m
                      "24 h); trades = ideal result (second ~6 in, minute 6 out, 6% cost, +300% cap, rug -100%) minus "
                      "each book's execution gap, sized like the book and capped at the pool share. History pools: "
                      "a creator's earlier pulls are seen from the LP pull times the backfill records. "
+                     "When the backfill holds a random sample, ranking windows widen by 1/share, per-trade measures "
+                     "weight each sampled trade by the pools it stands for, and daily measures use days rebuilt to "
+                     "full size (draws from the day's own trades with chance k, else from +-7 days; k = the share of "
+                     "day-to-day swings that is not sampling noise); monthly trade counts are estimates. "
                      "Then the same risk measures and trade-size bootstrap as risk-model.")}
 
 
@@ -311,6 +398,9 @@ def render(out: dict) -> str:
          f"  pools: {p['liquid pools']:,} liquid ({p['history rows']:,} from the backfill, {p['scorer rows']:,} from the live "
          f"scorer); model fits {r['fits']} (every {r['retrain_h']:g} h, <= {r['max_train']:,} pools), scored {r['scored']:,} "
          f"({r['ranked on training scores (thin 6 h windows)']:,} ranked on training scores: fewer than 50 pools in their 6 h)",
+         *([f"  sampled history: the backfill holds {100 * out['sample']['share']:.1f}% of the window's pools; days before the "
+            "live scorer rebuilt to full size, share of day-to-day swings kept (k): " + ", ".join(
+                f"{n} {v['k']}" for n, v in out["sample"]["rebuilt days"].items())] if out.get("sample") else []),
          "  replay vs live ranking: " + (f"{c['pools']:,} pools, rank correlation {c['rank correlation']}, same rw50 decision "
                                         f"{c['same rw50 decision %']}%" if "rank correlation" in c else c.get("note", "")),
          "  execution gap per trade: " + ", ".join(f"{k} {100 * v['gap']:.1f} pts ({v['source']})" for k, v in out["gaps"].items()),

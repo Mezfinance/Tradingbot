@@ -101,20 +101,41 @@ def peak_open(ts: list[dict]) -> int:
     return best
 
 
-def book_stats(ts: list[dict], capital: float, rng) -> dict:
-    r = np.array([t["ret"] for t in ts]); c = np.array([t["cost"] for t in ts])
+def _wquantile(x: np.ndarray, w: np.ndarray, q: float) -> float:
+    o = np.argsort(x)
+    cw = np.cumsum(w[o])
+    return float(x[o][min(len(x) - 1, int(np.searchsorted(cw, q * cw[-1])))])
+
+
+def book_stats(ts: list[dict], capital: float, rng, per_trade: list[dict] | None = None) -> dict:
+    """Daily measures from `ts`; per-trade measures (mean, median, win, rugged, profit factor, interval) from
+    `per_trade` when given (the sampled history's own trades, each weighted by `w` = pools it stands for)."""
     first, last = _day(ts[0]["ts"]), _day(ts[-1]["ts"])
     daily = _daily(ts, first, last)
-    gains, losses = float((r * c)[r > 0].sum()), float(-(r * c)[r < 0].sum())
+    pt = per_trade if per_trade is not None else ts
+    r = np.array([t["ret"] for t in pt]); c = np.array([t["cost"] for t in pt])
+    w = np.array([t.get("w", 1.0) for t in pt])
+    rc = r * c * w
+    gains, losses = float(rc[r > 0].sum()), float(-rc[r < 0].sum())
+    ct = np.array([t["cost"] for t in ts])
     out = {"trades": len(ts), "trades_per_day": round(len(ts) / max(1, last - first + 1), 1),
-           "pnl_usd": round(float((r * c).sum())), "traded_usd": round(float(c.sum())),
-           "mean_trade_pct": round(100 * float((r * c).sum() / c.sum()), 2),
-           "median_trade_pct": round(100 * float(np.median(r)), 1), "win_pct": round(100 * float(np.mean(r > 0))),
-           "rugged_pct": round(100 * float(np.mean(r <= -0.8))),
+           "pnl_usd": round(float(daily.sum())), "traded_usd": round(float(ct.sum())),
+           "mean_trade_pct": round(100 * float(rc.sum() / (c * w).sum()), 2),
+           "median_trade_pct": round(100 * (float(np.median(r)) if np.all(w == 1.0) else _wquantile(r, w, 0.5)), 1),
+           "win_pct": round(100 * float(w[r > 0].sum() / w.sum())),
+           "rugged_pct": round(100 * float(w[r <= -0.8].sum() / w.sum())),
            "profit_factor": round(gains / losses, 2) if losses else None, "peak_open": peak_open(ts),
            **_curve_stats(daily, capital)}
-    idx = rng.integers(0, len(r), (DRAWS, len(r)))
-    boots = (r[idx] * c[idx]).sum(1) / c[idx].sum(1)
+    if per_trade is not None:
+        out["sampled_trades"] = len(pt)
+    chunk = max(1, min(DRAWS, 20_000_000 // max(1, len(r))))   # keeps the index matrix under ~160 MB
+    p = None if np.all(w == 1.0) else w / w.sum()
+    boots = []
+    for i in range(0, DRAWS, chunk):
+        m = min(chunk, DRAWS - i)
+        idx = rng.integers(0, len(r), (m, len(r))) if p is None else rng.choice(len(r), (m, len(r)), p=p)
+        boots.append((r[idx] * c[idx]).sum(1) / c[idx].sum(1))
+    boots = np.concatenate(boots)
     out["mean_trade_ci90"] = [round(100 * float(np.quantile(boots, q)), 2) for q in (0.05, 0.95)]
     return out
 
