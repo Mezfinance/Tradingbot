@@ -90,6 +90,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
     parser.add_argument("--workers", type=int, default=8, help="history-backfill: parallel Helius calls")
     parser.add_argument("--estimate", action="store_true", help="history-backfill: list the pools and the credits only")
+    parser.add_argument("--pulls-only", action="store_true",
+                        help="history-backfill: only add LP pull times to pools saved before they were recorded")
     parser.add_argument("--books", default="", help="risk-model: comma list of books (default: every running book)")
     parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
@@ -377,6 +379,10 @@ def main(argv: list[str] | None = None) -> None:
         print(f"SOL prices: {added} hours added", file=sys.stderr, flush=True)
         helius = Helius(api_key=key, client=httpx.Client(timeout=60))
         helius.min_interval_s = 1 / max(args.rps if args.rps != 2.0 else 10.0, 0.1)  # its own account: own rate
+        if args.pulls_only:
+            print(json.dumps(launch_hist.pulls(store, helius, workers=args.workers, progress=lambda i, n, c: print(
+                f"pools {i}/{n}, credits {c}", file=sys.stderr, flush=True)), indent=2))
+            return
         out = launch_hist.backfill(store, helius, days, args.max_credits or 15_000_000, workers=args.workers,
                                    estimate=args.estimate, seed=7, progress=lambda i, n, c: print(
                                        f"pools {i}/{n}, credits {c}", file=sys.stderr, flush=True))

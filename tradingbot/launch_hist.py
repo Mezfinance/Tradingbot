@@ -64,9 +64,10 @@ def candidates(helius: Helius, days: float, progress=None, max_pages: int = 5000
 
 def _fetch_one(helius: Helius, p: dict, start: float, end: float) -> tuple[str, float | None, str | None, str]:
     """One pool: (status to save or '' to leave it for a rerun, create_ts, data JSON, stats key)."""
-    t = helius.first_time(p["lp_mint"])
-    if t is None:
+    act = helius.lp_activity(p["lp_mint"])
+    if act is None:
         return "", None, None, "no LP mint history (left for a rerun)"
+    t = act["first"]
     if not start <= t <= end:
         return "outside window", t, None, "outside window"
     txs, reached, ok = helius.history_from_start(p["pool"], HEAD_S, HEAD_PAGES)
@@ -94,10 +95,47 @@ def _fetch_one(helius: Helius, p: dict, start: float, end: float) -> tuple[str, 
             rec["exit"] = [(last.get("blockTime") or 0) - rec["create_ts"],
                            _vault(last, p["pool"], p["token_mint"], "postTokenBalances"),
                            _vault(last, p["pool"], ps.WSOL, "postTokenBalances")]
+    pulled, checked = helius.pull_time(p["lp_mint"], act)
+    rec["pulled_ts"], rec["pull_checked"] = pulled, checked
     return "ok", rec["create_ts"], json.dumps(rec), key
 
 
-CREDITS_PER_POOL = 22  # typical: creation lookup 1 + first page 10 + minute-6 state 10 (+ a second page sometimes)
+def pulls(store, helius: Helius, workers: int = 1, max_credits: int = 10**9, progress=None) -> dict:
+    """Pass over saved pools that have no pull time checked yet (fetched before 11-08): LP mint signatures + a
+    supply read when the LP moved after creation -> `pulled_ts` in the row (same meaning as live: LP supply 0)."""
+    import concurrent.futures as cf
+    stats: collections.Counter = collections.Counter()
+    base = helius.credits_used
+    todo = [dict(r) for r in store.query("SELECT pool, lp_mint, data FROM watch_launch_hist WHERE status='ok'")]
+    todo = [r for r in todo if not json.loads(r["data"]).get("pull_checked")]
+    stats["to check"] = len(todo)
+
+    def one(r):
+        act = helius.lp_activity(r["lp_mint"])
+        if act is None:
+            return r, None, False
+        pulled, checked = helius.pull_time(r["lp_mint"], act)
+        return r, pulled, checked
+
+    with cf.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        for i, (r, pulled, checked) in enumerate(ex.map(one, todo)):
+            if progress and i % 500 == 0:
+                progress(i, len(todo), helius.credits_used - base)
+            if not checked:
+                stats["failed (left for a rerun)"] += 1
+                continue
+            rec = json.loads(r["data"])
+            rec["pulled_ts"], rec["pull_checked"] = pulled, True
+            store.execute("UPDATE watch_launch_hist SET data=? WHERE pool=?", (json.dumps(rec), r["pool"]))
+            stats["pulled" if pulled else "not pulled"] += 1
+            if helius.credits_used - base > max_credits:
+                stats["stopped: credit cap"] = len(todo) - i - 1
+                break
+    stats["credits_used"] = helius.credits_used - base
+    return dict(stats)
+
+
+CREDITS_PER_POOL = 22  # typical: LP signatures 1 + first page 10 + minute-6 state 10 (+ LP supply 1 when it moved)
 
 
 def backfill(store, helius: Helius, days: float, max_credits: int, now: float | None = None,
@@ -226,6 +264,7 @@ def rows(store, cfg: Config) -> tuple[list[dict], dict]:
         ret = -1.0 if rugged or not entry or not exit_p else min(exit_p / entry - 1 - la.COST, 3.0)
         feat = live_features(rec, create, la._prior_pools(store, rec.get("creator"), create))
         out.append({"pool": r["pool"], "created_ts": create, "listed": r["pool"] in listed, "liquid": liquid,
+                    "creator": rec.get("creator"), "pulled_ts": rec.get("pulled_ts"),
                     "liq_usd": 2 * sol4 * sol_usd if sol_usd else None,
                     "feat": {DECIDE_S: feat}, "ret": {FILL_S: ret}})
     return out, dict(dropped)

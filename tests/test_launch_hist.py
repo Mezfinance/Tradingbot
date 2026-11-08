@@ -53,9 +53,24 @@ class FakeHelius:
         return [(p, slice_bytes(ps.WSOL, TOKEN, LP)) for p in self.pools] + \
             [("NOTSOL", slice_bytes(TOKEN, TOKEN, LP))]
 
+    supply = 1000.0       # LP supply now (0 = fully pulled)
+    lp_moves = 1          # LP mint signatures: 1 = creation only
+
     def first_time(self, address):
         self.credits_used += 1
         return self.t_for(address)
+
+    def lp_activity(self, address):
+        self.credits_used += 1
+        t = self.t_for(address)
+        return None if t is None else {"first": t, "last": t + 45 * (self.lp_moves - 1), "count": self.lp_moves}
+
+    def token_supply(self, mint):
+        self.credits_used += 1
+        return self.supply
+
+    from tradingbot.data.helius import Helius as _H
+    pull_time = _H.pull_time
 
     def history_from_start(self, address, span_s, max_pages=6):
         self.history_calls += 1
@@ -239,3 +254,39 @@ def test_a_failing_pool_does_not_end_the_run():
     hel.history_from_start = lambda a, s, m=6: (_ for _ in ()).throw(RuntimeError("boom")) if a == "P3" else real(a, s, m)
     out = lh.backfill(st, hel, 365, 10_000_000, now=NOW, workers=3)
     assert out["fetched"] == 9 and out["error (left for a rerun): RuntimeError"] == 1
+
+
+def test_pull_time_recorded_like_live_and_added_later_to_old_rows():
+    """11-08: the LP mint's signatures give the pull time (LP supply 0 now = fully pulled at its last move)."""
+    st = WatchStore(":memory:")
+    pools = {"A": (NOW - 3600, 1.0)}
+    hel = FakeHelius(pools)
+    hel.t_for = lambda lp: NOW - 3600
+    hel.lp_moves, hel.supply = 2, 0.0
+    lh.backfill(st, hel, 3, 10_000, now=NOW)
+    rec = json.loads(st.query("SELECT data FROM watch_launch_hist WHERE pool='A'")[0]["data"])
+    assert rec["pulled_ts"] == NOW - 3600 + 45 and rec["pull_checked"]
+    rows, _ = lh.rows(st, Config())
+    assert rows[0]["pulled_ts"] == NOW - 3600 + 45
+    # not pulled: creation only (no supply read), or the LP moved but supply is left
+    st2 = WatchStore(":memory:")
+    calm = FakeHelius(pools); calm.t_for = lambda lp: NOW - 3600
+    lh.backfill(st2, calm, 3, 10_000, now=NOW)
+    assert json.loads(st2.query("SELECT data FROM watch_launch_hist")[0]["data"])["pulled_ts"] is None
+    # rows saved before pull times were recorded get them from the pulls pass
+    st2.execute("UPDATE watch_launch_hist SET data=?", (json.dumps({**rec, "pulled_ts": None, "pull_checked": False}),))
+    later = FakeHelius(pools); later.t_for = lambda lp: NOW - 3600
+    later.lp_moves, later.supply = 3, 0.0
+    out = lh.pulls(st2, later, workers=2)
+    assert out["to check"] == 1 and out["pulled"] == 1
+    assert json.loads(st2.query("SELECT data FROM watch_launch_hist")[0]["data"])["pulled_ts"] == NOW - 3600 + 90
+    assert lh.pulls(st2, later)["to check"] == 0
+
+
+def test_a_failed_supply_read_leaves_the_pull_unchecked():
+    st = WatchStore(":memory:")
+    hel = FakeHelius({"A": (NOW - 3600, 1.0)}); hel.t_for = lambda lp: NOW - 3600
+    hel.lp_moves, hel.supply = 2, None
+    lh.backfill(st, hel, 3, 10_000, now=NOW)
+    rec = json.loads(st.query("SELECT data FROM watch_launch_hist")[0]["data"])
+    assert rec["pulled_ts"] is None and rec["pull_checked"] is False

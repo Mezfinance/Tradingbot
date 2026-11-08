@@ -176,6 +176,24 @@ class Helius:
         times = [s.get("blockTime") for s in res or [] if s.get("blockTime")]
         return float(min(times)) if times else None
 
+    def lp_activity(self, lp_mint: str) -> dict | None:
+        """An LP mint's successful signatures (1 credit, last 1,000): creation = the oldest; the LP only moves on
+        create / deposit / withdraw, so the newest one after creation is when a full pull happened (if the supply
+        is 0 now). None if the call failed or there is no history."""
+        res = self._rpc("getSignaturesForAddress", [lp_mint, {"limit": 1000}], RPC_CREDITS)
+        times = sorted(float(s["blockTime"]) for s in res or [] if s.get("blockTime") and not s.get("err"))
+        return {"first": times[0], "last": times[-1], "count": len(times)} if times else None
+
+    def pull_time(self, lp_mint: str, activity: dict) -> tuple[float | None, bool]:
+        """(when the LP supply went to 0, or None if it hasn't; checked). One supply read (1 credit), only when the
+        LP moved after creation. A supply read that fails returns checked=False, so the pool is tried again."""
+        if activity["count"] <= 1:
+            return None, True
+        supply = self.token_supply(lp_mint)
+        if supply is None:
+            return None, False
+        return (activity["last"] if supply == 0 else None), True
+
     def history_from_start(self, address: str, span_s: float, max_pages: int = 6) -> tuple[list[dict], bool, bool]:
         """Oldest-first transactions from the first one until `span_s` seconds after it (or the end of the
         history, or `max_pages` pages of 100). Returns (txs, reached span or end, every call succeeded)."""
