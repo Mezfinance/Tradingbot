@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -97,6 +97,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--history", action="store_true",
                         help="risk-model: replay the books over hist.db + the scorer table instead of their real trades")
     parser.add_argument("--retrain-h", type=float, default=24.0, help="risk-model --history: model retrain interval")
+    parser.add_argument("--per-band", type=int, default=100, help="hold-study: pools sampled per liquidity band")
     parser.add_argument("--books", default="", help="risk-model: comma list of books (default: every running book)")
     parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
@@ -393,6 +394,17 @@ def main(argv: list[str] | None = None) -> None:
                                    estimate=args.estimate, seed=7, relist=args.relist, progress=lambda i, n, c: print(
                                        f"pools {i}/{n}, credits {c}", file=sys.stderr, flush=True))
         print(json.dumps(out, indent=2))
+        return
+
+    if args.command == "hold-study":
+        import httpx as _httpx
+        from tradingbot import hold_study
+        from tradingbot.data.helius import Helius as _Helius
+        from tradingbot.watcher import WatchStore as _WS, watch_db_path as _wdp
+        helius = _Helius(client=_httpx.Client(timeout=60))
+        helius.min_interval_s = 1 / max(args.rps, 0.1)  # leave the live scorer its share of the plan's rate
+        out = hold_study.study(_WS(_wdp(cfg)), helius, args.hours, args.per_band, int(args.max_credits or 40_000))
+        print(json.dumps(out, indent=2) if args.json else hold_study.render(out))
         return
 
     if args.command == "launch-exit-study":
