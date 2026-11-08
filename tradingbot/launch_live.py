@@ -607,6 +607,7 @@ class LaunchLive:
             calls, lags = sorted(self.history_s), sorted(self.start_lag_s)
         from tradingbot.data import helius as hl
         ws["helius_process"] = {k: round(v, 1) for k, v in hl.STATS.items()}  # whole bot process, since start
+        ws["helius_key"] = hl.key_status()  # main or BACKUP_HELIUS_API_KEY
         if calls:  # how long the decision's history call took (recent ones), pace queue and 429 back-off included
             ws["history_call_s"] = {"n": len(calls), "median": round(calls[len(calls) // 2], 2),
                                     "max": round(calls[-1], 2)}
@@ -1120,7 +1121,7 @@ class LaunchLive:
 
     # websocket ------------------------------------------------------------------------------------
     def ws_url(self) -> str:
-        return WS_HELIUS.format(key=self.helius.api_key) if self.helius.enabled else WS_PUBLIC
+        return WS_HELIUS.format(key=self.helius.key()) if self.helius.enabled else WS_PUBLIC
 
     async def _ws_loop(self, stop: threading.Event) -> None:
         sub = {"jsonrpc": "2.0", "id": 1, "method": "programSubscribe",
@@ -1130,6 +1131,7 @@ class LaunchLive:
         while not stop.is_set():
             try:
                 import websockets  # inside the try: a missing package shows in last_error, not a dead thread
+                key = self.helius.key() if self.helius.enabled else None
                 async with websockets.connect(self.ws_url(), max_size=2 ** 22, ping_interval=20,
                                               ping_timeout=20, open_timeout=20) as ws:
                     await ws.send(json.dumps(sub))
@@ -1140,6 +1142,11 @@ class LaunchLive:
                         if stop.is_set():
                             return
                         self.on_message(msg)
+                        if key is not None and self.helius.key() != key:
+                            log.warning("launch-live websocket: Helius key changed (backup switch); reconnecting")
+                            break  # reconnect on the key now in use
+                    with self.lock:
+                        self.ws["connected"] = False
             except Exception as exc:  # network drops are normal: reconnect with back-off
                 with self.lock:
                     self.ws.update(connected=False, last_error=f"{type(exc).__name__}: {str(exc)[:120]}")

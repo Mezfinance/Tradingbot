@@ -51,6 +51,64 @@ WITHDRAW_RE = re.compile(r"Instruction: (Withdraw|RemoveLiquidity|RemoveAllLiqui
                          r"remove_liquidity|withdraw)\b")
 
 
+# Backup key (11-08): when the main key's credits run out Helius answers HTTP 429 "max usage reached"
+# (helius.dev billing FAQ); every client on the default key then moves to BACKUP_HELIUS_API_KEY at once, and one
+# call per PROBE_S tries the main key again, so the bot moves back when the main account has credits again.
+# Clients given an explicit key (the history backfill's own account) never switch.
+BACKUP_ENV = "BACKUP_HELIUS_API_KEY"
+PROBE_S = 3600
+OUT_OF_CREDITS = re.compile(r"max usage|out of credits|credit limit|insufficient credits|usage limit|quota",
+                            re.IGNORECASE)
+KEYS = {"on_backup": False, "since": None, "switches": 0, "probe_at": 0.0, "last_reason": None}
+_keys_lock = threading.Lock()
+
+
+def main_key() -> str:
+    return os.environ.get("HELIUS_API_KEY", "")
+
+
+def backup_key() -> str:
+    return os.environ.get(BACKUP_ENV, "")
+
+
+def current_key() -> str:
+    """The key every default client uses now: the backup while the main is out of credits (or missing)."""
+    if (KEYS["on_backup"] or not main_key()) and backup_key():
+        return backup_key()
+    return main_key()
+
+
+def out_of_credits(resp) -> bool:
+    """Helius's 'no credits left' answer (429 / 402 / 403 with a usage message), not an ordinary rate limit."""
+    if resp.status_code not in (402, 403, 429):
+        return False
+    try:
+        text = resp.text or ""
+    except Exception:  # noqa: BLE001
+        text = ""
+    return resp.status_code == 402 or bool(OUT_OF_CREDITS.search(text))
+
+
+def _switch(to_backup: bool, reason: str) -> None:
+    with _keys_lock:
+        if KEYS["on_backup"] == to_backup:
+            return
+        KEYS["on_backup"] = to_backup
+        KEYS["since"] = time.time()
+        KEYS["switches"] += 1
+        KEYS["last_reason"] = reason
+        KEYS["probe_at"] = time.time() + PROBE_S
+    if to_backup:
+        log.warning("helius: main key out of credits (%s): switched to %s", reason, BACKUP_ENV)
+    else:
+        log.warning("helius: main key answers again: switched back from %s", BACKUP_ENV)
+
+
+def key_status() -> dict:
+    return {"on_backup": KEYS["on_backup"], "backup_set": bool(backup_key()), "switches": KEYS["switches"],
+            "since": KEYS["since"], "last_reason": KEYS["last_reason"]}
+
+
 _pace_lock = threading.Lock()
 _next_free = [0.0]
 # Process-wide call counts, so slow live decisions can be traced to Helius refusing calls (429s are retried
@@ -73,6 +131,7 @@ def _pace(interval: float) -> None:
 
 class Helius:
     def __init__(self, api_key: str | None = None, client: httpx.Client | None = None):
+        self.fixed_key = api_key is not None  # an explicit key never falls back to the backup
         self.api_key = api_key if api_key is not None else os.environ.get("HELIUS_API_KEY", "")
         self.http = client or httpx.Client(timeout=30)
         self.credits_used = 0
@@ -81,21 +140,43 @@ class Helius:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.api_key)
+        return bool(self.api_key) or (not self.fixed_key and bool(backup_key()))
+
+    def key(self) -> str:
+        """The key for the next call (also the websocket's)."""
+        if self.fixed_key:
+            return self.api_key
+        if (KEYS["on_backup"] or not self.api_key) and backup_key():
+            return backup_key()
+        return self.api_key
 
     def _rpc(self, method: str, params: list, credits: int):
         if not self.enabled:
             return None
+        probing = False
+        if not self.fixed_key and KEYS["on_backup"] and self.api_key and time.time() >= KEYS["probe_at"]:
+            with _keys_lock:  # one call per PROBE_S tries the main key again
+                if time.time() >= KEYS["probe_at"]:
+                    KEYS["probe_at"] = time.time() + PROBE_S
+                    probing = True
         for attempt in range(RETRIES_429 + 1):
             _pace(self.min_interval_s)
             STATS["calls"] += 1
+            key = self.api_key if probing else self.key()
             try:
-                resp = self.http.post(RPC_URL, params={"api-key": self.api_key},
+                resp = self.http.post(RPC_URL, params={"api-key": key},
                                       json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
             except httpx.HTTPError as exc:
                 STATS["failed"] += 1
                 log.warning("helius %s failed: %s", method, exc)
                 return None
+            if not self.fixed_key and backup_key() and key != backup_key() and out_of_credits(resp):
+                probing = False
+                _switch(True, f"HTTP {resp.status_code}")
+                continue  # the same call again on the backup key
+            if probing and resp.status_code == 200:
+                _switch(False, "probe answered")
+                probing = False
             if resp.status_code != 429:
                 break
             STATS["rate_limited"] += 1

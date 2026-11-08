@@ -54,7 +54,8 @@ DEFAULT_PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
 
 def rpc_url(cfg: Config) -> str:
     """The configured RPC, or Helius when only the public default is set and a key exists (faster landing)."""
-    key = os.environ.get("HELIUS_API_KEY")
+    from tradingbot.data.helius import current_key
+    key = current_key()  # the backup key while the main is out of credits
     if cfg.solana_rpc_url == DEFAULT_PUBLIC_RPC and key:
         return f"{HELIUS_RPC}?api-key={key}"
     return cfg.solana_rpc_url
