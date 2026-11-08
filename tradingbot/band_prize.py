@@ -294,6 +294,144 @@ def _by_exit(cov: list[dict], tested: list[dict], keys: list[str], rng) -> dict:
     return out
 
 
+# ---- minute 30: conditional holds and models trained on the minute-30 outcome (11-08) ----
+HOLD_THRESHOLDS = (0.0, 0.10, 0.25)  # keep holding at a check only if the trade is at least this far up (after cost)
+HOLD_FINALS = (15, 30)
+LEAD_FILTER = "skip:+50% (all pools):30"  # the one robust minute-6 filter, to see the holds on its picks too
+SETTLE_S = 120
+
+
+def hold_result(ret_by: dict, thr: float, rising: bool, final: int) -> tuple[float, int]:
+    """Buy at second 6, check at minutes 6 / 10 / 15 (before `final`): keep holding only while the pool is alive,
+    the trade is at least `thr` up and (with `rising`) not below the previous check; else sell at that check.
+    Returns (return, minute sold). Uses only states known at each check."""
+    prev = None
+    for cp in (6, 10, 15):
+        if cp >= final:
+            break
+        r = ret_by[cp]
+        if r <= -0.999:
+            return -1.0, cp
+        if r < thr or (rising and prev is not None and r < prev):
+            return r, cp
+        prev = r
+    return ret_by[final], final
+
+
+def _holds(cov: list[dict], tested: list[dict], rng) -> dict:
+    """Every conditional hold rule on the covered pools, and on the lead filter's kept pools among them."""
+    blocks = {r["pool"]: r["block"] for r in tested}
+    kept = {r["pool"] for r in tested if r.get(LEAD_FILTER) is False}
+    groups = {"every pool": cov, "lead filter's picks (+50% model, all pools, best 30%)":
+              [r for r in cov if r["pool"] in kept]}
+    out = {}
+    for gname, pools in groups.items():
+        if len(pools) < 20:
+            out[gname] = {"pools": len(pools), "note": "too few pools"}
+            continue
+        six = [r["ret_by"][6] for r in pools]
+        thirty = [r["ret_by"][30] for r in pools]
+        rows = {"sell at minute 6": {**br._summary(six)}, "hold to minute 30": {
+            **br._summary(thirty), "vs minute 6 (pts, paired)": _paired(thirty, six, rng)}}
+        for final in HOLD_FINALS:
+            for thr in HOLD_THRESHOLDS:
+                for rising in (False, True):
+                    res = [hold_result(r["ret_by"], thr, rising, final) for r in pools]
+                    rets = [x[0] for x in res]
+                    label = f"hold to {final} while up {100 * thr:.0f}%+" + (" and rising" if rising else "")
+                    won, n = 0, 0
+                    by_block: dict = {}
+                    for r, x in zip(pools, rets):
+                        if r["pool"] in blocks:
+                            by_block.setdefault(blocks[r["pool"]], []).append((x, r["ret_by"][6]))
+                    for g in by_block.values():
+                        if len(g) >= 3:
+                            n += 1
+                            won += np.mean([a for a, _ in g]) > np.mean([b for _, b in g])
+                    rows[label] = {**br._summary(rets), "vs minute 6 (pts, paired)": _paired(rets, six, rng),
+                                   "held to the end %": round(100 * sum(x[1] == final for x in res) / len(res)),
+                                   "blocks beating minute 6": f"{won} of {n}"}
+        out[gname] = {"pools": len(pools), "rules": rows}
+    return out
+
+
+def _fits30(train: list[dict]) -> dict:
+    """Goodness scorers (higher = keep) fitted on the minute-30 outcome of `train`."""
+    from tradingbot import launch_live as ll
+    if len(train) < MIN_TRAIN:
+        return {}
+    r30 = np.array([r["ret_by"][30] for r in train])
+    out = {}
+    rug = _logit(train, (r30 <= -0.999).astype(float))
+    big = _logit(train, (r30 >= 0.5).astype(float))
+    win = _logit(train, (r30 > 0).astype(float))
+    if rug:
+        out["not rug by 30"] = lambda x, m=rug: -m.score(x)
+    if win:
+        out["win at 30"] = lambda x, m=win: m.score(x)
+    if big:
+        out["+50% at 30"] = lambda x, m=big: m.score(x)
+    if rug and big:
+        rw = ll.RugWinModel(rug, big, {})
+        out["rug-vs-win at 30"] = lambda x, m=rw: -m.score(x)
+    return out
+
+
+def _walk30(cov: list[dict]) -> tuple[list[dict], int]:
+    """Walk-forward on the covered band pools, models fitted only on pools whose minute-30 outcome was known
+    before the block (created at least 30 min + SETTLE_S earlier)."""
+    cov = sorted(cov, key=lambda r: r["create_ts"])
+    block = BLOCK_H * 3600
+    first = cov[0]["create_ts"] // block * block
+    tested, blocks = [], 0
+    t = first + block
+    while t <= cov[-1]["create_ts"]:
+        test = [r for r in cov if t <= r["create_ts"] < t + block]
+        train = [r for r in cov if r["create_ts"] < t - EXITS[30] - SETTLE_S]
+        models = _fits30(train) if test else {}
+        if models:
+            blocks += 1
+            cuts = {(m, k): _cut(f, train, t, k) for m, f in models.items() for k in KEEPS}
+            for r in test:
+                rec = {"pool": r["pool"], "ret": r["ret_by"][30], "ret6": r["ret_by"][6], "block": t,
+                       "create_ts": r["create_ts"]}
+                for m, f in models.items():
+                    rec[f"score:{m}"] = f(r["x"])
+                for (m, k), c in cuts.items():
+                    rec[f"skip:{m}:{k}"] = rec[f"score:{m}"] < c
+                tested.append(rec)
+        t += block
+    return tested, blocks
+
+
+def _models30(cov: list[dict], rng) -> dict:
+    from tradingbot.watch_analysis import auc
+    tested, blocks = _walk30(cov)
+    out: dict = {"blocks": blocks, "tested pools": len(tested)}
+    if len(tested) < 20:
+        out["note"] = f"too few pools with a minute-30 outcome to train on (needs {MIN_TRAIN} before the first block)"
+        return out
+    rets = np.array([r["ret"] for r in tested])
+    rug = (rets <= -0.999).astype(int)
+    models = sorted({k.split(":", 1)[1] for r in tested for k in r if k.startswith("score:")})
+    out["AUC for a rug by minute 30 (riskiness; want > 0.5)"] = {
+        m: _r(auc(-np.array([r[f"score:{m}"] for r in tested]), rug)) for m in models
+        if all(f"score:{m}" in r for r in tested)}
+    filters = {}
+    for m in models:
+        for k in KEEPS:
+            j = br._judge([r for r in tested if f"skip:{m}:{k}" in r], f"skip:{m}:{k}", rng)
+            kept6 = [r["ret6"] for r in tested if r.get(f"skip:{m}:{k}") is False]
+            j["kept at minute 6"] = br._summary(kept6)
+            filters[f"{m}, keep best {k}%"] = j
+    out["filters (judged at minute 30)"] = filters
+    return out
+
+
+def _r(x):
+    return None if x is None else round(x, 3)
+
+
 def study(store, hours: float | None = None, min_liq: float = MIN_LIQ, max_liq: float = MAX_LIQ,
           now: float | None = None, seed: int = 13, helius=None, max_credits: int = 20_000) -> dict:
     """`helius`: fetch the minute-10/15/30 states first (else only cached states are used)."""
@@ -324,6 +462,8 @@ def study(store, hours: float | None = None, min_liq: float = MIN_LIQ, max_liq: 
     out["later exits"] = {**ex, "covered": len(cov), "fetch": fetch}
     if len(cov) >= 20:
         out["later exits"]["by exit"] = _by_exit(cov, tested, keys, rng)
+        out["conditional holds"] = _holds(cov, tested, rng)
+        out["minute-30 models"] = _models30(cov, rng)
     out["note"] = (f"ideal trade = the scorer's (second ~6.5 in, minute 6 out, 6% cost, +300% cap, rug -100%); "
                    "minutes 10/15/30 = vault price at the pool's last tx by then vs the same fill, same cost and cap, "
                    "-100% once pulled or SOL < 10% of the peak so far ('no balance found' counts as -100%: possibly a "
@@ -402,7 +542,54 @@ def render(out: dict) -> str:
                              f"{(f'{ci[0]:+.1f}..{ci[1]:+.1f}' if ci else '-'):>16}"
                              f"{j.get('random keeps worse than kept', '-'):>7}"
                              f"{j.get('blocks where kept beat every pool', '-'):>9}{k.get('usd_at_100', '-'):>11}")
+    lines += _render30(out, f)
     lines += ["", "vs all = kept mean - every pool's mean; gap = kept - skipped with 90% interval; rand< = share of "
               "random keeps of the same size that did worse; blocks = blocks where kept beat every pool",
               out["note"]]
     return "\n".join(lines)
+
+
+def _render30(out: dict, f) -> list[str]:
+    lines = []
+    ch = out.get("conditional holds")
+    if ch:
+        lines += ["", "CONDITIONAL HOLDS (buy at second 6; at minutes 6 / 10 / 15 keep holding only while alive and up "
+                  "by the threshold, else sell there; same pools as LATER EXITS)"]
+        for gname, g in ch.items():
+            lines.append(f"  {gname}: {g['pools']} pools")
+            if "rules" not in g:
+                lines.append(f"    {g['note']}")
+                continue
+            lines.append(f"    {'rule':<36}{'mean':>8}{'median':>8}{'rug':>6}{'$ at $100':>11}{'vs min 6':>10}"
+                         f"{'90%':>16}{'held %':>8}{'blocks':>9}")
+            for label, s in g["rules"].items():
+                gap = s.get("vs minute 6 (pts, paired)")
+                ci = gap["ci90"] if gap else None
+                lines.append(f"    {label[:35]:<36}{f(s.get('mean_pct')):>8}{f(s.get('median_pct')):>8}"
+                             f"{s.get('rugged_pct'):>5}%{s.get('usd_at_100'):>11}{f(gap['mean'] if gap else None):>10}"
+                             f"{(f'{ci[0]:+.1f}..{ci[1]:+.1f}' if ci else '-'):>16}"
+                             f"{str(s.get('held to the end %', '-')):>8}{s.get('blocks beating minute 6', '-'):>9}")
+    m30 = out.get("minute-30 models")
+    if m30:
+        lines += ["", f"MINUTE-30 MODELS (trained on the band's minute-30 outcome, walk-forward; {m30['blocks']} blocks, "
+                  f"{m30['tested pools']} pools)"]
+        if "note" in m30:
+            lines.append(f"  {m30['note']}")
+        else:
+            lines.append("  AUC for a rug by minute 30: " + ", ".join(
+                f"{m} {v}" for m, v in m30["AUC for a rug by minute 30 (riskiness; want > 0.5)"].items()))
+            lines.append(f"  {'filter (minute-30 exit)':<38}{'kept n':>7}{'kept':>8}{'rug':>6}{'skip':>8}{'vs all':>8}"
+                         f"{'gap 90%':>16}{'rand<':>7}{'blocks':>9}{'kept $100':>11}{'kept @6':>9}")
+            for label, j in m30["filters (judged at minute 30)"].items():
+                k, s = j["kept"], j["skipped"]
+                ci = (j.get("kept minus skipped (pts)") or {}).get("ci90")
+                lines.append(f"  {label[:37]:<38}{k.get('n', 0):>7}{f(k.get('mean_pct')):>8}"
+                             f"{str(k.get('rugged_pct', '-')) + '%':>6}{f(s.get('mean_pct')):>8}"
+                             f"{f(j.get('kept minus every pool (pts)')):>8}"
+                             f"{(f'{ci[0]:+.1f}..{ci[1]:+.1f}' if ci else '-'):>16}"
+                             f"{j.get('random keeps worse than kept', '-'):>7}"
+                             f"{j.get('blocks where kept beat every pool', '-'):>9}{k.get('usd_at_100', '-'):>11}"
+                             f"{f(j['kept at minute 6'].get('mean_pct')):>9}")
+        lines.append("  many rules and models are tried here, so the best row is optimistic; trust a rule only if it "
+                     "beats minute 6 in most blocks and a model only if it beats random keeps (rand< ~0.95+) in most blocks")
+    return lines
