@@ -101,6 +101,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--min-liq", type=float, default=25_000.0, help="hold-study: smallest pool (USD at second 4)")
     parser.add_argument("--max-liq", type=float, default=0.0, help="hold-study: largest pool (USD at second 4; 0 = none)")
     parser.add_argument("--kept-only", action="store_true", help="hold-study: only the rug-vs-win kept half")
+    parser.add_argument("--fetch", action="store_true",
+                        help="band-prize: fetch minute-10/15/30 pool states from Helius first (~10 credits each)")
     parser.add_argument("--books", default="", help="risk-model: comma list of books (default: every running book)")
     parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
@@ -545,8 +547,15 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot import band_prize
         from tradingbot.watcher import WatchStore as _WS, watch_db_path as _wdp
         lo = args.min_liq if args.min_liq != 25_000.0 else band_prize.MIN_LIQ
+        bp_helius = None
+        if args.fetch:
+            import httpx as _bp_httpx
+            from tradingbot.data.helius import Helius as _BpHelius
+            bp_helius = _BpHelius(client=_bp_httpx.Client(timeout=60))
+            bp_helius.min_interval_s = 1 / max(args.rps, 0.1)  # leave the live scorer its share of the plan's rate
         out = band_prize.study(_WS(_wdp(cfg)), hours=args.hours, min_liq=lo,
-                               max_liq=args.max_liq or band_prize.MAX_LIQ)
+                               max_liq=args.max_liq or band_prize.MAX_LIQ, helius=bp_helius,
+                               max_credits=int(args.max_credits or 20_000))
         print(json.dumps(out, indent=2, default=str) if args.json else band_prize.render(out))
         return
     if args.command == "band-rw-study":  # rug-vs-win trained per pool-size band, walk-forward (default whole life)

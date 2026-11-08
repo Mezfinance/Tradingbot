@@ -1,4 +1,4 @@
-"""Is there a prize in one liquidity band if we filter it better? (11-08 study, read only, no Helius spend.)
+"""Is there a prize in one liquidity band if we filter it better? (11-08 study, read only; Helius only with --fetch.)
 
 Asked for $40-80k: `band-rw-study` found no robust rug-vs-win filter there, so this looks wider:
 1. ceiling: what the band's pools made at the ideal minute-6 trade, and what a perfect filter would have made
@@ -11,8 +11,9 @@ Asked for $40-80k: `band-rw-study` found no robust rug-vs-win filter there, so t
    P(rug) / P(win) / P(+50%) logistics and the rug-vs-win score, each trained on the band only and on every pool,
    keep the best KEEPS share by past-score cut-offs, judged with `band_rw._judge` (kept vs every pool, vs skipped,
    vs random keeps of the same size, blocks won); the deployed rule (rw_pct < 50) for reference;
-4. minute 10: pools with cached hold-study states (`watch_launch_path`) get their minute-10 result too (only
-   the rug-vs-win kept half, which the kept-only hold study fetched in full).
+4. later exits: the same ideal trade sold at pool minute 10 / 15 / 30 (vault states from `Helius.last_before`,
+   fetched by `fetch_states` with --fetch, cached in `watch_launch_path`), ceiling and every filter judged again
+   at each exit on one fixed set of pools (`_exits`).
 """
 from __future__ import annotations
 
@@ -34,6 +35,8 @@ EXIT_S = 360
 MIN_LIQ, MAX_LIQ = 40_000.0, 80_000.0
 LIVE_SCORES = ("rw_pct", "score", "score_h", "log_liq")
 TOP_SIGNALS = 15
+EXITS = {10: 600, 15: 900, 30: 1800}  # later ideal exits (pool minute: seconds after creation)
+CREDITS_PER_CALL = 10
 
 
 def _rows(store, since: float) -> list[dict]:
@@ -47,6 +50,7 @@ def _rows(store, since: float) -> list[dict]:
         e = extra.get(r["pool"], {})
         r["liq"], r["rw_pct"], r["score"] = e.get("liq_usd"), e.get("rw_pct"), e.get("score")
         r["fill_px"], r["fill_sol"], r["peak_sol"] = e.get("fill_px"), e.get("fill_sol"), e.get("peak_sol")
+        r["token_mint"] = e.get("token_mint")
         r["log_liq"] = math.log(r["liq"]) if r["liq"] else None
     return [r for r in rows if r["liq"] is not None]
 
@@ -173,7 +177,7 @@ def _walk(rows: list[dict], band: list[dict]) -> tuple[list[dict], int]:
             cuts = {(m, k): _cut(f, train_b, t, k) for m, f in models.items() for k in KEEPS}
             blocks += 1
             for r in test:
-                rec = {"ret": r["ret"], "ret10": r.get("ret10"), "block": t, "create_ts": r["create_ts"],
+                rec = {"pool": r["pool"], "ret": r["ret"], "block": t, "create_ts": r["create_ts"],
                        "skip:live": None if r["rw_pct"] is None else r["rw_pct"] >= 100 - ll.RW_SKIP}
                 for (m, k), c in cuts.items():
                     rec[f"skip:{m}:{k}"] = models[m](r["x"]) < c
@@ -182,40 +186,127 @@ def _walk(rows: list[dict], band: list[dict]) -> tuple[list[dict], int]:
     return tested, blocks
 
 
-def _minute10(store, band: list[dict]) -> None:
-    """Adds `ret10` (minute-10 result) to band pools whose hold-study states are cached."""
+def _order(band: list[dict]) -> list[dict]:
+    """Stable random order (hash of the pool), so a credit cap leaves an even sample of the band."""
+    import hashlib
+    return sorted(band, key=lambda r: hashlib.sha1(f"prize:{r['pool']}".encode()).hexdigest())
+
+
+def _have(store) -> dict:
+    from tradingbot import launch_live as ll
+    store.execute(ll.PATH_SCHEMA)
+    return {(r["pool"], r["sec"]): {"sol": r["sol"], "tok": r["tok"]}
+            for r in store.query("SELECT pool, sec, sol, tok FROM watch_launch_path")}
+
+
+def _usable(r: dict) -> bool:
+    return r["fill_px"] is not None and r["fill_sol"] is not None
+
+
+def fetch_states(store, helius, band: list[dict], max_credits: int) -> dict:
+    """Pool state after its last tx by minutes 10 / 15 / 30 (`Helius.last_before`, ~10 credits each, cached in
+    `watch_launch_path` like the hold study), for every band pool still alive at minute 6, in `_order`. Stops at
+    the first known death (later exits are -100% without a call) and before `max_credits`."""
     from tradingbot import hold_study as hs
     from tradingbot import launch_live as ll
+    from tradingbot.data import pumpswap as ps
+    have = _have(store)
+    stats = {"fetched": 0, "call failed": 0, "credits_used": 0}
+    start = helius.credits_used
+    for r in _order(band):
+        if not _usable(r) or r["ret"] <= -0.999:
+            continue
+        for sec in EXITS.values():
+            p = hs.path(r, have)
+            if p[sec] is not None:
+                if p[sec] <= -0.999:
+                    break  # dead: later exits follow without a call
+                continue
+            if helius.credits_used - start + CREDITS_PER_CALL > max_credits:
+                stats["stopped at the credit cap (rerun to continue; nothing is fetched twice)"] = 1
+                stats["credits_used"] = helius.credits_used - start
+                return stats
+            tx = helius.last_before(r["pool"], r["create_ts"] + sec)
+            if tx is False:
+                stats["call failed"] += 1
+                break
+            st = {"sol": ll._raw_vault(tx, r["pool"], ps.WSOL) if tx else None,
+                  "tok": ll._raw_vault(tx, r["pool"], r["token_mint"]) if tx else None}
+            store.execute("INSERT OR REPLACE INTO watch_launch_path(pool, sec, sol, tok, ts) VALUES (?,?,?,?,?)",
+                          (r["pool"], sec, st["sol"], st["tok"], time.time()))
+            have[(r["pool"], sec)] = st
+            stats["fetched"] += 1
+    stats["credits_used"] = helius.credits_used - start
+    return stats
+
+
+def _exits(store, band: list[dict]) -> dict:
+    """Adds `ret_by` {6, 10, 15, 30} and `cause_by` to every band pool and returns the covered set: pools in
+    `_order` up to the last one alive at minute 6 with every later exit known. Pools rugged by minute 6 need no
+    state, so counting all of them while only some live ones were fetched would add rugs; the prefix keeps the
+    set an even sample. Live pools inside the prefix still missing a state (a failed call) are left out."""
+    from tradingbot import hold_study as hs
     try:
-        store.execute(ll.PATH_SCHEMA)
-        have = {(r["pool"], r["sec"]): {"sol": r["sol"], "tok": r["tok"]}
-                for r in store.query("SELECT pool, sec, sol, tok FROM watch_launch_path WHERE sec <= 600")}
+        have = _have(store)
     except Exception:  # noqa: BLE001 - optional part
-        return
-    cached = {pool for pool, _ in have}
-    if not cached:
-        return  # the hold study never ran here
-    for r in band:
-        # only the kept half: the kept-only hold study fetched every kept pool (a rug by minute 6 needs no state), so
-        # the kept half is covered without picking; elsewhere only rugs would show up uncached
-        if r["fill_px"] is None or r["fill_sol"] is None or r["rw_pct"] is None or r["rw_pct"] >= 50:
-            continue
-        if r["pool"] not in cached and not (r["ret"] <= -0.999):
-            continue
-        p = hs.path(r, have)
-        r["ret10"] = p.get(600)
+        have = {}
+    order = [r for r in _order(band) if _usable(r)]
+    last = -1
+    for i, r in enumerate(order):
+        d = hs.path_detail(r, have)
+        r["ret_by"] = {6: r["ret"], **{m: d[sec][0] for m, sec in EXITS.items()}}
+        r["cause_by"] = {m: d[sec][1] for m, sec in EXITS.items()}
+        if r["ret"] > -0.999 and all(v is not None for v in r["ret_by"].values()):
+            last = i
+    covered = [r for r in order[:last + 1] if all(v is not None for v in r["ret_by"].values())]
+    alive = sum(r["ret"] > -0.999 for r in order)
+    return {"covered": covered, "usable": len(order), "alive at minute 6": alive,
+            "alive covered": sum(r["ret"] > -0.999 for r in covered)}
+
+
+def _paired(a: list[float], b: list[float], rng) -> dict:
+    d = np.array(a) - np.array(b)
+    boots = [rng.choice(d, len(d)).mean() for _ in range(1000)]
+    return {"mean": round(100 * float(d.mean()), 1),
+            "ci90": [round(100 * float(np.quantile(boots, q)), 1) for q in (0.05, 0.95)]}
+
+
+def _by_exit(cov: list[dict], tested: list[dict], keys: list[str], rng) -> dict:
+    """Ideal trade at each exit on the covered pools: every pool, rugs removed, paired gap vs minute 6, rug
+    causes, and every walk-forward filter judged at that exit."""
+    import collections
+    out = {}
+    six = [r["ret_by"][6] for r in cov]
+    by_pool = {r["pool"]: r for r in cov}
+    for m in (6, *EXITS):
+        rets = [r["ret_by"][m] for r in cov]
+        e = {"every pool": br._summary(rets),
+             "rugs removed": br._summary([x for x in rets if x > -0.999])}
+        if m != 6:
+            e["vs minute 6 (pts, paired)"] = _paired(rets, six, rng)
+            e["rug causes"] = dict(collections.Counter(r["cause_by"][m] for r in cov if r["cause_by"][m]))
+        t = [{**x, "ret": by_pool[x["pool"]]["ret_by"][m]} for x in tested if x["pool"] in by_pool]
+        e["filters"] = {"live rule (rw_pct < 50)": br._judge(t, "skip:live", rng)}
+        for k in keys:
+            _, name, keep = k.split(":")
+            e["filters"][f"{name}, keep best {keep}%"] = br._judge(t, k, rng)
+        out[m] = e
+    return out
 
 
 def study(store, hours: float | None = None, min_liq: float = MIN_LIQ, max_liq: float = MAX_LIQ,
-          now: float | None = None, seed: int = 13) -> dict:
+          now: float | None = None, seed: int = 13, helius=None, max_credits: int = 20_000) -> dict:
+    """`helius`: fetch the minute-10/15/30 states first (else only cached states are used)."""
     now = now if now is not None else time.time()
     rows = _rows(store, now - hours * 3600 if hours else 0.0)
-    band = [r for r in rows if min_liq <= r["liq"] < max_liq]
+    # a pool needs its 30-minute state to be due (and a little settling) before it counts
+    band = [r for r in rows if min_liq <= r["liq"] < max_liq and r["create_ts"] <= now - EXITS[30] - 120]
     name = f"${min_liq / 1000:g}-{max_liq / 1000:g}k" if math.isfinite(max_liq) else f"${min_liq / 1000:g}k+"
     if len(band) < MIN_TRAIN + 50:
         return {"band": name, "pools": len(band), "note": f"needs {MIN_TRAIN + 50}+ finished liquid pools in the band"}
     rng = np.random.default_rng(seed)
-    _minute10(store, band)
+    fetch = fetch_states(store, helius, band, max_credits) if helius is not None else None
+    ex = _exits(store, band)
     tested, blocks = _walk(rows, band)
     fmt = lambda t: datetime.fromtimestamp(t, timezone.utc).strftime("%m-%d %H:%M")
     out: dict = {"band": name, "pools": len(band), "every pool in the data": len(rows),
@@ -229,31 +320,19 @@ def study(store, hours: float | None = None, min_liq: float = MIN_LIQ, max_liq: 
         _, m, keep = k.split(":")
         filters[f"{m}, keep best {keep}%"] = br._judge(tested, k, rng)
     out["filters"] = filters
-    with10 = [r for r in tested if r.get("ret10") is not None]
-    out["minute 10 (cached pools only)"] = {"pools": len(with10)}
-    if len(with10) >= 20:
-        t10 = [{**r, "ret": r["ret10"]} for r in with10]
-        out["minute 10 (cached pools only)"].update({
-            "minute 6 on the same pools": br._summary([r["ret"] for r in with10]),
-            "minute 10": br._summary([r["ret10"] for r in with10]),
-            "best filter at minute 10": _best(t10, keys, rng)})
+    cov = ex.pop("covered")
+    out["later exits"] = {**ex, "covered": len(cov), "fetch": fetch}
+    if len(cov) >= 20:
+        out["later exits"]["by exit"] = _by_exit(cov, tested, keys, rng)
     out["note"] = (f"ideal trade = the scorer's (second ~6.5 in, minute 6 out, 6% cost, +300% cap, rug -100%); "
+                   "minutes 10/15/30 = vault price at the pool's last tx by then vs the same fill, same cost and cap, "
+                   "-100% once pulled or SOL < 10% of the peak so far ('no balance found' counts as -100%: possibly a "
+                   "data gap); "
                    f"walk-forward in {BLOCK_H} h blocks, models fitted on pools created before each block (band "
                    f"models need {MIN_TRAIN}), keep cut-offs from the band's past {CUT_WINDOW_H} h of training scores; "
                    "signals are in-sample (whole band), so trust only those with the same sign in both halves and a "
                    "walk-forward filter that beats random keeps in most blocks")
     return out
-
-
-def _best(tested: list[dict], keys: list[str], rng) -> dict | None:
-    best = None
-    for k in keys:
-        j = br._judge(tested, k, rng)
-        if "note" in j:
-            continue
-        if best is None or j["kept"]["mean_pct"] > best[1]["kept"]["mean_pct"]:
-            best = (k, j)
-    return None if best is None else {"filter": best[0], **best[1]}
 
 
 def render(out: dict) -> str:
@@ -291,18 +370,38 @@ def render(out: dict) -> str:
                      f"{(f'{ci[0]:+.1f}..{ci[1]:+.1f}' if ci else '-'):>16}"
                      f"{j.get('random keeps worse than kept', '-'):>7}"
                      f"{j.get('blocks where kept beat every pool', '-'):>9}{k.get('usd_at_100', '-'):>11}")
-    m10 = out["minute 10 (cached pools only)"]
-    lines += ["", f"MINUTE 10 (pools with cached hold-study states: {m10['pools']}; rug-vs-win kept half only)"]
-    if "minute 10" in m10:
-        for label in ("minute 6 on the same pools", "minute 10"):
-            s = m10[label]
-            lines.append(f"  {label:<28} n {s['n']}  mean {f(s.get('mean_pct'))}%  rug {s.get('rugged_pct')}%  "
-                         f"$ at $100 {s.get('usd_at_100')}")
-        b = m10.get("best filter at minute 10")
-        if b:
-            lines.append(f"  best walk-forward filter at minute 10: {b['filter'][5:]}: kept n {b['kept']['n']} mean "
-                         f"{f(b['kept'].get('mean_pct'))}% vs every pool {f(b['every pool'].get('mean_pct'))}%, "
-                         f"rand< {b.get('random keeps worse than kept')} (best of many, so optimistic)")
+    le = out["later exits"]
+    lines += ["", f"LATER EXITS (ideal trade at pool minute 6 / 10 / 15 / 30 on the same {le['covered']} pools; "
+              f"{le['alive covered']} of {le['alive at minute 6']} pools alive at minute 6 have every state)"]
+    if le.get("fetch"):
+        lines.append(f"  fetch: {le['fetch']}")
+    if "by exit" not in le:
+        lines.append("  too few pools with minute-10/15/30 states: run with --fetch")
+    else:
+        lines.append(f"  {'exit':<10}{'n':>6}{'mean':>8}{'median':>8}{'win':>6}{'rug':>6}{'+50%':>6}{'$ at $100':>11}"
+                     f"{'no rugs':>9}{'vs min 6':>10}{'90%':>16}")
+        for m, e in le["by exit"].items():
+            s_, nr, g = e["every pool"], e["rugs removed"], e.get("vs minute 6 (pts, paired)")
+            ci = g["ci90"] if g else None
+            lines.append(f"  {'minute ' + str(m):<10}{s_['n']:>6}{f(s_.get('mean_pct')):>8}{f(s_.get('median_pct')):>8}"
+                         f"{s_.get('win_pct'):>5}%{s_.get('rugged_pct'):>5}%{s_.get('big_pct'):>5}%"
+                         f"{s_.get('usd_at_100'):>11}{f(nr.get('mean_pct')):>9}{f(g['mean'] if g else None):>10}"
+                         f"{(f'{ci[0]:+.1f}..{ci[1]:+.1f}' if ci else '-'):>16}")
+        for m, e in le["by exit"].items():
+            if e.get("rug causes"):
+                lines.append(f"  rug causes by minute {m}: " + ", ".join(f"{k} {v}" for k, v in e["rug causes"].items()))
+        for m, e in le["by exit"].items():
+            lines += ["", f"  FILTERS AT MINUTE {m} (same pools)",
+                      f"  {'filter':<40}{'kept n':>7}{'kept':>8}{'skip':>8}{'vs all':>8}{'gap 90%':>16}{'rand<':>7}"
+                      f"{'blocks':>9}{'kept $100':>11}"]
+            for label, j in e["filters"].items():
+                k, sk = j["kept"], j["skipped"]
+                ci = (j.get("kept minus skipped (pts)") or {}).get("ci90")
+                lines.append(f"  {label[:39]:<40}{k.get('n', 0):>7}{f(k.get('mean_pct')):>8}{f(sk.get('mean_pct')):>8}"
+                             f"{f(j.get('kept minus every pool (pts)')):>8}"
+                             f"{(f'{ci[0]:+.1f}..{ci[1]:+.1f}' if ci else '-'):>16}"
+                             f"{j.get('random keeps worse than kept', '-'):>7}"
+                             f"{j.get('blocks where kept beat every pool', '-'):>9}{k.get('usd_at_100', '-'):>11}")
     lines += ["", "vs all = kept mean - every pool's mean; gap = kept - skipped with 90% interval; rand< = share of "
               "random keeps of the same size that did worse; blocks = blocks where kept beat every pool",
               out["note"]]
