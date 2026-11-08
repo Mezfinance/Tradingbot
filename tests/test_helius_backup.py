@@ -51,15 +51,23 @@ def test_switches_to_the_backup_when_the_main_is_out_of_credits_and_back_when_it
     assert not hl.KEYS["on_backup"] and hl.KEYS["switches"] == 2 and other.key() == "MAIN"
 
 
-def test_plain_rate_limits_and_explicit_keys_do_not_switch(monkeypatch):
+def test_a_main_key_refusing_every_retry_moves_to_the_backup(monkeypatch):
     class _Busy(_Http):
         def post(self, url, params=None, json=None):
-            self.keys.append(params["api-key"])
-            return httpx.Response(429, text="Too Many Requests", request=httpx.Request("POST", url))
+            if params["api-key"] == "MAIN":  # a bare 429 with no credits message, as seen on Fly 11-08
+                self.keys.append("MAIN")
+                return httpx.Response(429, text="Too Many Requests", request=httpx.Request("POST", url))
+            return super().post(url, params, json)
     monkeypatch.setattr(hl.time, "sleep", lambda s: None)
-    h = hl.Helius(client=_Busy([]))
+    http = _Busy([])
+    h = hl.Helius(client=http)
     h.min_interval_s = 0
-    assert h._rpc("getSlot", [], 1) is None and not hl.KEYS["on_backup"]
+    assert h._rpc("getSlot", [], 1) == {"key": "BACKUP"}
+    assert http.keys == ["MAIN"] * (hl.RETRIES_429 + 1) + ["BACKUP"]
+    assert hl.KEYS["on_backup"] and hl.KEYS["probe_at"] - hl.KEYS["since"] == pytest.approx(hl.RATE_PROBE_S, abs=1)
+
+
+def test_explicit_keys_do_not_switch(monkeypatch):
     fixed = hl.Helius(api_key="OWN", client=_Http(empty={"OWN"}))  # the backfill's own account never falls back
     fixed.min_interval_s = 0
     monkeypatch.setattr(hl, "RETRIES_429", 0)

@@ -57,6 +57,7 @@ WITHDRAW_RE = re.compile(r"Instruction: (Withdraw|RemoveLiquidity|RemoveAllLiqui
 # Clients given an explicit key (the history backfill's own account) never switch.
 BACKUP_ENV = "BACKUP_HELIUS_API_KEY"
 PROBE_S = 3600
+RATE_PROBE_S = 600  # after a switch on plain 429s (no credits message), try the main again sooner
 OUT_OF_CREDITS = re.compile(r"max usage|out of credits|credit limit|insufficient credits|usage limit|quota",
                             re.IGNORECASE)
 KEYS = {"on_backup": False, "since": None, "switches": 0, "probe_at": 0.0, "last_reason": None}
@@ -89,7 +90,7 @@ def out_of_credits(resp) -> bool:
     return resp.status_code == 402 or bool(OUT_OF_CREDITS.search(text))
 
 
-def _switch(to_backup: bool, reason: str) -> None:
+def _switch(to_backup: bool, reason: str, probe_s: float = PROBE_S) -> None:
     with _keys_lock:
         if KEYS["on_backup"] == to_backup:
             return
@@ -97,7 +98,7 @@ def _switch(to_backup: bool, reason: str) -> None:
         KEYS["since"] = time.time()
         KEYS["switches"] += 1
         KEYS["last_reason"] = reason
-        KEYS["probe_at"] = time.time() + PROBE_S
+        KEYS["probe_at"] = time.time() + probe_s
     if to_backup:
         log.warning("helius: main key out of credits (%s): switched to %s", reason, BACKUP_ENV)
     else:
@@ -185,7 +186,18 @@ class Helius:
                 STATS["wait_s"] += back_off
                 time.sleep(back_off)
         if resp.status_code != 200:
-            log.warning("helius %s -> HTTP %s", method, resp.status_code)
+            try:
+                text = (resp.text or "")[:200]
+            except Exception:  # noqa: BLE001
+                text = ""
+            log.warning("helius %s -> HTTP %s%s (key: %s)", method, resp.status_code, f": {text}" if text else "",
+                        "backup" if key == backup_key() and backup_key() else "main")
+            if (resp.status_code == 429 and not self.fixed_key and backup_key() and key != backup_key()):
+                # 11-08: on Fly the main key answered 429 to every retry for minutes; whether its reply carries the
+                # 'max usage' text or not, a key that refuses every retry is no use to the scorer: move to the backup
+                # and probe the main again sooner than after a credits reply
+                _switch(True, "HTTP 429 through every retry", probe_s=RATE_PROBE_S)
+                return self._rpc(method, params, credits)
             return None
         with self._credit_lock:
             self.credits_used += credits
