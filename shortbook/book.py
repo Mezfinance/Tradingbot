@@ -8,6 +8,7 @@ from __future__ import annotations
 import json, logging, math, time
 from .config import Config
 from .store import Store
+from . import market
 from .venues import STABLE, Contract, Quote
 
 log = logging.getLogger("shortbook")
@@ -230,7 +231,8 @@ class Book:
         now = self.now()
         jobs = (("detect", self.cfg.detect_s, lambda: (self.detect(), self.check_pending())),
                 ("manage", self.cfg.manage_s, self.manage),
-                ("equity", self.cfg.equity_s, self.snapshot))
+                ("equity", self.cfg.equity_s, self.snapshot),
+                ("marks", self.cfg.manage_s, lambda: market.track(self)))
         for name, every, fn in jobs:
             if now - last.get(name, 0) >= every:
                 try:

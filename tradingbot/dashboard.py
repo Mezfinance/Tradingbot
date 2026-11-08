@@ -630,6 +630,8 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div id="sh-note"></div>
 <div class="stats" id="sh-stats"></div>
 <section class="card"><p class="label eyebrow">Strategy</p><h2 id="sh-strat">Strategy 1: listing shorts</h2><p class="sub">Per group, against the research expectation per trade (after costs and funding). Judge after 30+ closed trades.</p><div class="scroll"><table id="sh-groups"></table></div></section>
+<section class="card"><p class="label eyebrow">Market</p><h2>Picks against the market</h2><p class="sub" id="sh-msub">Every listing that traded, on one yardstick: spot price 5 minutes after the first trade to each horizon, 0.2% round trip, no funding, a short floored at -100%. Picks = the listings the book shorted.</p>
+<div class="filters"><select id="sh-mh" aria-label="Horizon"></select></div><div class="scroll"><table id="sh-market"></table></div><p class="sub" id="sh-mgap"></p></section>
 <section class="card chart"><p class="label eyebrow">Equity</p><h2>Net asset value</h2><p class="sub">Hourly NAV (cash + open shorts marked to market, funding and fees included). Dashed: the starting capital.</p><div id="sh-chart"></div></section>
 <section class="card"><p class="label eyebrow">Positions</p><h2>Open shorts</h2><div class="scroll"><table id="sh-open"></table></div></section>
 <section class="card"><p class="label eyebrow">Positions</p><h2>Closed shorts</h2><div class="scroll"><table id="sh-closed"></table></div></section>
@@ -899,8 +901,18 @@ Object.entries(strat.groups||{}).map(([g,v])=>`<tr><td>${esc(g)}</td><td>${v.ope
 shorts+=`<p class="more"><a class="lk" href="#/shorts">Open MZF Short Only</a></p></section>`;
 $("progs").innerHTML=meme+shorts}
 const days=s=>s==null?"-":(s/86400).toFixed(1)+"d";
+function renderShortMarket(){const M=S.shorts&&S.shorts.market,sel=$("sh-mh");if(!M||!M.horizons){$("sh-market").innerHTML=`<tr><td class="muted">${M&&M.error?esc(M.error):"No market analysis yet (the short book fills prices for every listing as horizons come due)."}</td></tr>`;$("sh-mgap").textContent="";return}
+const hs=Object.keys(M.horizons);if(sel.options.length!==hs.length){const cur=sel.value||"168";sel.innerHTML=hs.map(h=>`<option value="${h}"${h===cur?" selected":""}>${h==="168"?"7 days (the book's hold)":h==="72"?"3 days":h==="24"?"24 hours":h+" hour"}</option>`).join("");sel.onchange=renderShortMarket}
+const hz=M.horizons[sel.value]||M.horizons[hs[hs.length-1]],pc=v=>v==null?"-":`<span class="${cls(v)}">${sgn(v)}</span>`,ci=c=>c?`<span class="mono">${sgn(c[0],1)} .. ${sgn(c[1],1)}</span>`:"-";
+const sec=t=>`<tr><td class="l muted" colspan="7" style="border-top:2px solid var(--rule)">${t}</td></tr>`,row=(k,v,b)=>`<tr${b?' style="font-weight:700"':""}><td class="l book">${esc(k)}</td><td>${fmt(v.n||0,0)}</td><td>${pc(v.mean_pct)}</td><td>${pc(v.median_pct)}</td><td>${v.n?fmt(v.win_pct,0,"%"):"-"}</td><td>${v.n?pc(v.worst_pct):"-"}</td><td>${ci(v.ci90)}</td></tr>`;
+const part=o=>Object.entries(o||{}).map(([k,v])=>row(k,v)).join("");
+$("sh-market").innerHTML='<tr><th class="l">Group</th><th>n</th><th>Mean</th><th>Median</th><th>Win</th><th>Worst</th><th>90% CI of mean</th></tr>'+
+Object.entries(hz.groups).map(([k,v])=>row(k,v,true)).join("")+sec("Skipped, by reason (short)")+part(hz.skip_reasons)+sec("Every listing by kind (short)")+part(hz.kinds)+sec("Every listing by venue (short)")+part(hz.venues);
+const g=(t,x)=>x?`${t} ${sgn(x.pts,1," pts")} (90% CI ${sgn(x.ci90[0],1)} .. ${sgn(x.ci90[1],1)})`:"";const r=M.picks_real||{};
+$("sh-mgap").textContent=[g("Picks minus skipped:",hz.picks_vs_skipped),g("Picks minus every listing:",hz.picks_vs_every),r.n?`Picks' real book result: ${r.n} closed, mean ${sgn(r.mean_pct)} (perp fills, fees, funding).`:""].filter(Boolean).join(" · ")}
 function renderShorts(){const[st,msg]=shortsState();$("sh-note").innerHTML=st==="ok"?"":`<p class="note">${esc(msg)}</p>`;const f=S.shorts,sh=shortStats();
 if(!sh){["sh-stats","sh-groups","sh-chart","sh-open","sh-closed","sh-listings"].forEach(i=>$(i).innerHTML="");return}
+renderShortMarket();
 const strat=(f.strategies||[])[0]||{groups:{}};$("sh-strat").textContent=strat.name||"Strategy";$("sh-about").textContent=strat.about||"";
 tiles("sh-stats",[["Net asset value",fmt(sh.nav,0),`$ · started ${fmt(f.start_usd,0)} $`,true],["Return",`<span class="${cls(sh.ret)}">${sgn(sh.ret,2)}</span>`,`${sgn(sh.pnl,0," $")}`],
 ["Open shorts",fmt(sh.open,0),`${fmt(sh.exposure,0)} $ short · ${fmt(sh.pending,0)} listings pending`],["Closed shorts",fmt(sh.closed,0),`mean ${sgn(sh.mean)} per trade`],

@@ -71,6 +71,16 @@ class Upbit:
             return None
         return min(_utc(c["candle_date_time_utc"]) for c in d)
 
+    def _close_before(self, symbol: str, ts: float) -> float | None:
+        to = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts + 60))
+        d = self.h.get(f"{self.B}/candles/minutes/1", {"market": symbol, "to": to, "count": 1})
+        return _f(d[0].get("trade_price")) if isinstance(d, list) and d else None
+
+    def price_at(self, symbol: str, ts: float) -> float | None:
+        """USD close of the last 1-minute candle at or before ts (KRW price / KRW-USDT at the same minute)."""
+        px, usdt = self._close_before(symbol, ts), self._close_before("KRW-USDT", ts)
+        return px / usdt if px and usdt else None
+
     def price_usd(self, symbol: str) -> float | None:
         d = self.h.get(f"{self.B}/ticker", {"markets": f"{symbol},KRW-USDT"})
         if not isinstance(d, list):
@@ -103,6 +113,15 @@ class Coinbase:
         if not isinstance(d, list) or not d:
             return None
         return float(min(c[0] for c in d))
+
+    def price_at(self, symbol: str, ts: float) -> float | None:
+        """Close of the last 1-minute candle at or before ts (looks back up to 5 hours for quiet markets)."""
+        iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+        d = self.h.get(f"{self.B}/products/{symbol}/candles", {"granularity": 60, "start": iso(ts - 5 * 3600), "end": iso(ts)})
+        if not isinstance(d, list):
+            return None
+        c = [x for x in d if isinstance(x, list) and len(x) > 4 and x[0] <= ts]
+        return float(max(c, key=lambda x: x[0])[4]) if c else None
 
     def price_usd(self, symbol: str) -> float | None:
         d = self.h.get(f"{self.B}/products/{symbol}/ticker")
@@ -152,6 +171,13 @@ class BinanceSpot:
     def first_trade_base(self, base: str) -> float | None:
         """Age evidence: first candle of BASEUSDT (None if Binance has no such market)."""
         return self.first_trade(f"{base}USDT")
+
+    def price_at(self, symbol: str, ts: float) -> float | None:
+        """Close of the last 1-minute candle starting at or before ts (USD-like quotes only)."""
+        if not symbol.endswith(("USDT", "USDC", "FDUSD")):
+            return None
+        d = self.h.get(f"{self.B}/klines", {"symbol": symbol, "interval": "1m", "endTime": int(ts * 1000), "limit": 1})
+        return _f(d[-1][4]) if isinstance(d, list) and d else None
 
     def price_usd(self, symbol: str) -> float | None:
         d = self.h.get(f"{self.B}/ticker/price", {"symbol": symbol})

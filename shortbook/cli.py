@@ -1,8 +1,9 @@
-"""python -m shortbook run | status | report [--json] | check
+"""python -m shortbook run | status | report [--json] | market [--json] | check
 
 run     the paper book (detector + positions + equity) with a /health endpoint
 status  heartbeat, NAV, open positions, pending listings
 report  results by group vs the research expectation, closed trades, skip reasons
+market  every listing's price path: picks vs skips vs shorting every listing vs buying every listing
 check   which exchange endpoints answer from this machine (run it once after the first deploy)"""
 from __future__ import annotations
 import argparse, collections, json, logging, sys, threading, time
@@ -11,6 +12,7 @@ from .book import Book
 from .config import Config
 from .http import Http
 from .store import Store
+from . import market
 from .venues import LISTING, PERPS, SpotAges, BinanceSpot
 
 EXPECTED = {"B upbit": 13.3, "B binance": 16.7, "A upbit": 29.5, "B coinbase": 6.0, "all": 14.3}  # research, % per trade
@@ -165,7 +167,25 @@ def feed(book: Book, now: float | None = None) -> dict:
         "listings": [dict(r) for r in listings],
         "listing_counts": {f"{v} {st}": n for (v, st), n in sorted(counts.items())},
         "pending": sum(n for (v, st), n in counts.items() if st == "pending"),
+        "market": _market(book),
     }
+
+
+MARKET_TTL_S = 300
+_market_cache: dict = {}
+
+
+def _market(book: Book) -> dict | None:
+    """The market analysis, recomputed at most every MARKET_TTL_S (the dashboard polls every 30 s)."""
+    t = time.time()
+    if _market_cache.get("book") is book and t - _market_cache.get("ts", 0) < MARKET_TTL_S:
+        return _market_cache["out"]
+    try:
+        out = market.analyse(book.s, book.cfg.fee_round_trip_pct)
+    except Exception as exc:  # noqa: BLE001
+        out = {"error": f"{type(exc).__name__}: {exc}"}
+    _market_cache.update(book=book, ts=t, out=out)
+    return out
 
 
 class _Health(BaseHTTPRequestHandler):
@@ -219,7 +239,7 @@ def serve(book: Book, port: int):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="shortbook")
-    ap.add_argument("cmd", choices=["run", "status", "report", "check"])
+    ap.add_argument("cmd", choices=["run", "status", "report", "market", "check"])
     ap.add_argument("--json", action="store_true")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -235,6 +255,12 @@ def main(argv=None) -> int:
             serve(book, cfg.health_port)
         logging.info("shortbook paper book: NAV $%s, groups %s", f"{book.nav():,.0f}", cfg.groups)
         book.run_forever()
+        return 0
+    if a.cmd == "market":
+        while market.track(book, limit=200):   # fill whatever is missing first (the running book keeps doing this)
+            pass
+        out = market.analyse(book.s, cfg.fee_round_trip_pct)
+        print(json.dumps(out, indent=2, default=str) if a.json else market.render(out))
         return 0
     out = status(book) if a.cmd == "status" else report(book)
     print(json.dumps(out, indent=2, default=str))
