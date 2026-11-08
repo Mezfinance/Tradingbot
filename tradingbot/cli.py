@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -88,6 +88,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--rps", type=float, default=2.0,
                         help="launch-hist-backfill: Helius calls per second (the live scorer shares the plan's limit)")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
+    parser.add_argument("--workers", type=int, default=8, help="history-backfill: parallel Helius calls")
+    parser.add_argument("--estimate", action="store_true", help="history-backfill: list the pools and the credits only")
     parser.add_argument("--books", default="", help="risk-model: comma list of books (default: every running book)")
     parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
@@ -354,6 +356,29 @@ def main(argv: list[str] | None = None) -> None:
         helius.min_interval_s = 1 / max(args.rps, 0.1)  # its own process: pace it below what the live scorer needs
         out = launch_hist.backfill(WatchStore(watch_db_path(cfg)), helius, args.days,
                                    args.max_credits or 60_000, progress=lambda i, n, c: print(
+                                       f"pools {i}/{n}, credits {c}", file=sys.stderr, flush=True))
+        print(json.dumps(out, indent=2))
+        return
+
+    if args.command == "history-backfill":  # a year (or --days) of hand-made pumpswap pools on the second Helius key
+        import httpx
+        from tradingbot import launch_hist
+        from tradingbot.data.helius import Helius
+        from tradingbot.watcher import WatchStore, hist_db_path
+        import os as _os
+        key = _os.environ.get("HELIUS_BACKFILL_API_KEY", "")
+        if not key:
+            print("HELIUS_BACKFILL_API_KEY is not set: fly secrets set HELIUS_BACKFILL_API_KEY=<key> -a supermeme "
+                  "(the history backfill never uses the live scorer's key)", file=sys.stderr)
+            sys.exit(2)
+        days = args.days if args.days != 7.0 else 365.0
+        store = WatchStore(hist_db_path(cfg))
+        added = launch_hist.fill_sol_prices(store, time.time() - days * 86400 - 86400, time.time())
+        print(f"SOL prices: {added} hours added", file=sys.stderr, flush=True)
+        helius = Helius(api_key=key, client=httpx.Client(timeout=60))
+        helius.min_interval_s = 1 / max(args.rps if args.rps != 2.0 else 10.0, 0.1)  # its own account: own rate
+        out = launch_hist.backfill(store, helius, days, args.max_credits or 15_000_000, workers=args.workers,
+                                   estimate=args.estimate, seed=7, progress=lambda i, n, c: print(
                                        f"pools {i}/{n}, credits {c}", file=sys.stderr, flush=True))
         print(json.dumps(out, indent=2))
         return

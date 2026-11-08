@@ -62,75 +62,131 @@ def candidates(helius: Helius, days: float, progress=None, max_pages: int = 5000
     return out
 
 
+def _fetch_one(helius: Helius, p: dict, start: float, end: float) -> tuple[str, float | None, str | None, str]:
+    """One pool: (status to save or '' to leave it for a rerun, create_ts, data JSON, stats key)."""
+    t = helius.first_time(p["lp_mint"])
+    if t is None:
+        return "", None, None, "no LP mint history (left for a rerun)"
+    if not start <= t <= end:
+        return "outside window", t, None, "outside window"
+    txs, reached, ok = helius.history_from_start(p["pool"], HEAD_S, HEAD_PAGES)
+    if not ok:
+        return "", None, None, "history call failed (left for a rerun)"
+    if not txs:
+        return "no transactions", t, None, "no transactions"
+    rec = launch_record(txs, p["pool"], p["token_mint"], window_s=SPAN_S, exhausted=reached)
+    if not start <= rec["create_ts"] <= end:
+        return "outside window", rec["create_ts"], None, "outside window"
+    last_t = (txs[-1].get("blockTime") or 0) - rec["create_ts"]
+    # a tx at or after minute 6 settles the state by then; a history that ended inside the head is complete
+    covered = last_t >= EXIT_S or (reached and last_t < HEAD_S)
+    key = "fetched"
+    if not covered:
+        # the pool's state at minute 6 = the balances after its last transaction by then (one call)
+        last = helius.last_before(p["pool"], rec["create_ts"] + EXIT_S)
+        if last is False:  # no blockTime filter: page through instead
+            key = "fetched|exit by paging (filter unavailable)"
+            txs, reached, ok = helius.history_from_start(p["pool"], SPAN_S, MAX_PAGES)
+            if not ok:
+                return "", None, None, "history call failed (left for a rerun)"
+            rec = launch_record(txs, p["pool"], p["token_mint"], window_s=SPAN_S, exhausted=reached)
+        elif last:
+            rec["exit"] = [(last.get("blockTime") or 0) - rec["create_ts"],
+                           _vault(last, p["pool"], p["token_mint"], "postTokenBalances"),
+                           _vault(last, p["pool"], ps.WSOL, "postTokenBalances")]
+    return "ok", rec["create_ts"], json.dumps(rec), key
+
+
+CREDITS_PER_POOL = 22  # typical: creation lookup 1 + first page 10 + minute-6 state 10 (+ a second page sometimes)
+
+
 def backfill(store, helius: Helius, days: float, max_credits: int, now: float | None = None,
-             progress=None) -> dict:
+             progress=None, workers: int = 1, estimate: bool = False, seed: int | None = None) -> dict:
+    """Fetch every hand-made SOL-pair pumpswap pool created in the last `days` days. `workers` threads share the
+    Helius client's pace; `seed` shuffles the pools so a run stopped early leaves an even sample over the window;
+    `estimate` only lists the candidates and prints the expected credits. Resumable: saved pools are skipped."""
+    import concurrent.futures as cf
+    import random
     now = now if now is not None else time.time()
     store.execute(SCHEMA)
     stats: collections.Counter = collections.Counter()
     base = helius.credits_used  # the listing calls count toward the cap too
     pools = candidates(helius, days, progress, max_pages=max(1, max_credits // 3 // 10))  # listing <= 1/3 of the cap
     if pools is None:
-        return {"error": "could not list pools (getSlot / getProgramAccountsV2 failed; needs HELIUS_API_KEY)"}
+        return {"error": "could not list pools (getSlot / getProgramAccountsV2 failed; check the Helius key)"}
     stats["candidates"] = len(pools)
     stats["listing pages"] = getattr(helius, "last_pages", None)
     start, end = now - days * 86400, now - SPAN_S - 60
     # A pool saved as 'outside window' by a shorter run is fetched again once a longer window covers it.
     done = {r[0] for r in store.query("SELECT pool, status, create_ts FROM watch_launch_hist")
             if r[1] != "outside window" or r[2] is None or not start <= r[2] <= end}
+    todo = [p for p in pools if p["pool"] not in done]
+    stats["already fetched"] = len(pools) - len(todo)
+    if estimate:
+        stats["to fetch"] = len(todo)
+        stats["estimated credits (upper: every candidate in the window)"] = len(todo) * CREDITS_PER_POOL
+        stats["listing credits"] = helius.credits_used - base
+        return dict(stats)
+    if seed is not None:
+        random.Random(seed).shuffle(todo)
     save = lambda p, status, create=None, data=None: store.execute(
         "INSERT OR REPLACE INTO watch_launch_hist(pool, token_mint, lp_mint, create_ts, status, data, ts) "
         "VALUES(?,?,?,?,?,?,?)", (p["pool"], p["token_mint"], p["lp_mint"], create, status, data, now))
-    for i, p in enumerate(pools):
-        if progress and i % 100 == 0:
-            progress(i, len(pools), helius.credits_used - base)
-        if p["pool"] in done:
-            stats["already fetched"] += 1
-            continue
-        if helius.credits_used - base + RESERVE > max_credits:
-            stats["stopped: credit cap"] = len(pools) - i
-            break
-        t = helius.first_time(p["lp_mint"])
-        if t is None:
-            stats["no LP mint history (left for a rerun)"] += 1
-            continue
-        if not start <= t <= end:
-            save(p, "outside window", t)
-            stats["outside window"] += 1
-            continue
-        txs, reached, ok = helius.history_from_start(p["pool"], HEAD_S, HEAD_PAGES)
-        if not ok:
-            stats["history call failed (left for a rerun)"] += 1
-            continue
-        if not txs:
-            save(p, "no transactions", t)
-            stats["no transactions"] += 1
-            continue
-        rec = launch_record(txs, p["pool"], p["token_mint"], window_s=SPAN_S, exhausted=reached)
-        if not start <= rec["create_ts"] <= end:
-            save(p, "outside window", rec["create_ts"])
-            stats["outside window"] += 1
-            continue
-        last_t = (txs[-1].get("blockTime") or 0) - rec["create_ts"]
-        # a tx at or after minute 6 settles the state by then; a history that ended inside the head is complete
-        covered = last_t >= EXIT_S or (reached and last_t < HEAD_S)
-        if not covered:
-            # the pool's state at minute 6 = the balances after its last transaction by then (one call)
-            last = helius.last_before(p["pool"], rec["create_ts"] + EXIT_S)
-            if last is False:  # no blockTime filter: page through instead
-                stats["exit by paging (filter unavailable)"] += 1
-                txs, reached, ok = helius.history_from_start(p["pool"], SPAN_S, MAX_PAGES)
-                if not ok:
-                    stats["history call failed (left for a rerun)"] += 1
-                    continue
-                rec = launch_record(txs, p["pool"], p["token_mint"], window_s=SPAN_S, exhausted=reached)
-            elif last:
-                rec["exit"] = [(last.get("blockTime") or 0) - rec["create_ts"],
-                               _vault(last, p["pool"], p["token_mint"], "postTokenBalances"),
-                               _vault(last, p["pool"], ps.WSOL, "postTokenBalances")]
-        save(p, "ok", rec["create_ts"], json.dumps(rec))
-        stats["fetched"] += 1
+    it = iter(enumerate(todo))
+    stopped = False
+    with cf.ThreadPoolExecutor(max_workers=max(1, workers)) as ex:
+        running: dict = {}
+        while True:
+            while not stopped and len(running) < max(1, workers):
+                nxt = next(it, None)
+                if nxt is None:
+                    break
+                i, p = nxt
+                if helius.credits_used - base + RESERVE * max(1, workers) > max_credits:
+                    stats["stopped: credit cap"] = len(todo) - i
+                    stopped = True
+                    break
+                if progress and i % 100 == 0:
+                    progress(i, len(todo), helius.credits_used - base)
+                running[ex.submit(_fetch_one, helius, p, start, end)] = p
+            if not running:
+                break
+            fin, _ = cf.wait(running, return_when=cf.FIRST_COMPLETED)
+            for f in fin:
+                p = running.pop(f)
+                try:
+                    status, create, data, key = f.result()
+                except Exception as exc:  # noqa: BLE001  one bad pool must not end a days-long run
+                    status, create, data, key = "", None, None, f"error (left for a rerun): {type(exc).__name__}"
+                if status:
+                    save(p, status, create, data)
+                for k in key.split("|"):
+                    stats[k] += 1
     stats["credits_used"] = helius.credits_used - base
     return dict(stats)
+
+
+def fill_sol_prices(store, since: float, until: float, http=None) -> int:
+    """Hourly SOL/USD (Binance SOLUSDT closes, public data mirror) into this store's `watch_market`, so pool
+    liquidity in USD can be worked out for history older than the watcher's own SOL prices. Returns rows added."""
+    import httpx
+    http = http or httpx.Client(timeout=30)
+    store.execute("CREATE TABLE IF NOT EXISTS watch_market(ts REAL PRIMARY KEY, sol_usd REAL, new_pools INTEGER)")
+    have = {int(r[0]) for r in store.query("SELECT ts FROM watch_market WHERE ts >= ? AND ts <= ?", (since, until))}
+    rows, t = [], since - since % 3600
+    while t < until:
+        try:
+            d = http.get("https://data-api.binance.vision/api/v3/klines",
+                         params={"symbol": "SOLUSDT", "interval": "1h", "startTime": int(t * 1000), "limit": 1000}).json()
+        except Exception:  # noqa: BLE001
+            break
+        if not isinstance(d, list) or not d:
+            break
+        rows += [(x[0] / 1000, float(x[4])) for x in d if int(x[0] / 1000) not in have]
+        t = d[-1][0] / 1000 + 3600
+    if rows:
+        store.executemany("INSERT OR IGNORE INTO watch_market(ts, sol_usd) VALUES (?, ?)", rows)
+    return len(rows)
 
 
 def rows(store, cfg: Config) -> tuple[list[dict], dict]:

@@ -211,3 +211,31 @@ def test_program_accounts_pages_through_empty_pages():
     h.min_interval_s = 0
     out = h.program_accounts_changed("prog", [], {"offset": 0, "length": 1}, 1)
     assert [p for p, _ in out] == ["P3", "P4"] and h.last_pages == 4  # two empty pages did not stop it
+
+
+def test_threaded_backfill_estimate_shuffle_and_resume():
+    """11-08 year backfill: several workers share the client, --estimate only lists, a rerun skips saved pools."""
+    st = WatchStore(":memory:")
+    pools = {f"P{i}": (NOW - 3600, 2.0 if i % 2 else 0.5) for i in range(40)}
+    hel = FakeHelius(pools)
+    hel.t_for = lambda lp: NOW - 3600
+    est = lh.backfill(st, hel, 365, 10_000_000, now=NOW, estimate=True)
+    assert est["to fetch"] == 40 and est["estimated credits (upper: every candidate in the window)"] == 40 * lh.CREDITS_PER_POOL
+    assert hel.history_calls == 0 and not st.query("SELECT * FROM watch_launch_hist")
+    out = lh.backfill(st, hel, 365, 10_000_000, now=NOW, workers=6, seed=7)
+    assert out["fetched"] == 40 and hel.history_calls == 40
+    assert st.query("SELECT COUNT(*) n FROM watch_launch_hist WHERE status='ok'")[0]["n"] == 40
+    again = FakeHelius(pools)
+    again.t_for = lambda lp: NOW - 3600
+    assert lh.backfill(st, again, 365, 10_000_000, now=NOW, workers=6)["already fetched"] == 40 and again.history_calls == 0
+
+
+def test_a_failing_pool_does_not_end_the_run():
+    st = WatchStore(":memory:")
+    pools = {f"P{i}": (NOW - 3600, 1.0) for i in range(10)}
+    hel = FakeHelius(pools)
+    hel.t_for = lambda lp: NOW - 3600
+    real = hel.history_from_start
+    hel.history_from_start = lambda a, s, m=6: (_ for _ in ()).throw(RuntimeError("boom")) if a == "P3" else real(a, s, m)
+    out = lh.backfill(st, hel, 365, 10_000_000, now=NOW, workers=3)
+    assert out["fetched"] == 9 and out["error (left for a rerun): RuntimeError"] == 1

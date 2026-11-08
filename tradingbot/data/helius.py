@@ -76,6 +76,7 @@ class Helius:
         self.api_key = api_key if api_key is not None else os.environ.get("HELIUS_API_KEY", "")
         self.http = client or httpx.Client(timeout=30)
         self.credits_used = 0
+        self._credit_lock = threading.Lock()  # the history backfill calls from several threads
         self.min_interval_s = MIN_INTERVAL_S
 
     @property
@@ -105,7 +106,8 @@ class Helius:
         if resp.status_code != 200:
             log.warning("helius %s -> HTTP %s", method, resp.status_code)
             return None
-        self.credits_used += credits
+        with self._credit_lock:
+            self.credits_used += credits
         body = resp.json()
         if body.get("error"):
             log.warning("helius %s error: %s", method, body["error"])

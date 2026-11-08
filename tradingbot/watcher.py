@@ -116,6 +116,11 @@ CREATE TABLE IF NOT EXISTS watch_pulls (pool TEXT PRIMARY KEY, checked_ts REAL N
 """
 
 
+def hist_db_path(cfg: Config) -> str:
+    """The year-long pool history (`history-backfill`): its own file so watch.db and its daily backup stay small."""
+    return str(Path(watch_db_path(cfg)).resolve().parent / "hist.db")
+
+
 def watch_db_path(cfg: Config) -> str:
     if cfg.watch_db_path:
         return cfg.watch_db_path
