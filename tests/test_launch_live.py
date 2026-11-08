@@ -1072,3 +1072,26 @@ def test_rug_vs_win_ranks_each_pool_within_its_band_and_feeds_the_band_books(set
         assert mb.exit_deadline(cfg, mb.LAUNCH_BAND_SZ, sig) == 100.0 + 360
     finally:
         cfg.launch_band_book, cfg.launch_live = False, False
+
+
+def test_hold_books_take_kept_25_40k_pools_and_sell_at_minute_10_and_15(cfg):
+    from tradingbot import model_book as mb
+    assert ll.band_flags(30_000, 40.0, None)["rw50big"] and not ll.band_flags(30_000, 60.0, None)["rw50big"]
+    assert not ll.band_flags(20_000, 10.0, None)["rw50big"] and not ll.band_flags(45_000, 10.0, None)["rw50big"]
+    assert not ll.band_flags(None, 10.0, None)["rw50big"] and not ll.band_flags(30_000, None, None)["rw50big"]
+    assert ll.band_flags(100_000, 10.0, None) == {"rwband": False, "rw50big": False}
+    cfg.launch_hold_book, cfg.launch_live = True, True
+    try:
+        assert set(mb.LAUNCH_HOLD_CUT) <= set(mb.active_books(cfg))
+        sig = {"rw50big": True, "rw50": True, "mint": "M", "created_ts": 100.0}
+        assert mb.wants(mb.LAUNCH_HOLD10, sig) and mb.wants(mb.LAUNCH_HOLD15, sig)
+        assert not mb.wants(mb.LAUNCH_HOLD10, dict(sig, rw50big=False))
+        assert mb.exit_deadline(cfg, mb.LAUNCH_HOLD10, sig) == 100.0 + 600
+        assert mb.exit_deadline(cfg, mb.LAUNCH_HOLD15, sig) == 100.0 + 900
+        assert mb.band_usd(mb.LAUNCH_HOLD10, 30_000) == 250.0 == mb.band_usd(mb.LAUNCH_HOLD15, 39_000)
+        assert mb.hold_min(cfg, mb.LAUNCH_HOLD15) == 15.0
+        assert mb.signal_kind(mb.LAUNCH_HOLD10) == "launch"
+        from tradingbot import dashboard
+        assert dashboard.family_of(mb.LAUNCH_HOLD10) == "Rug-vs-win"
+    finally:
+        cfg.launch_hold_book, cfg.launch_live = False, False

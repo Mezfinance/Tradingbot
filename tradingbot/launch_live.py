@@ -331,13 +331,19 @@ def band_of(liq) -> str | None:
     return next((name for name, lo, hi, _, _ in BAND_RULES if lo <= liq < hi), None)
 
 
+HOLD_BAND = (25_000.0, 40_000.0)  # 11-08 hold-study: the kept half here gained by holding to pool minute 10-15
+
+
 def band_flags(liq_usd, rw_pct, rwb_pct) -> dict:
-    """Signal flag of the by-band books: `rwband` = kept by its band's rule in BAND_RULES."""
+    """Signal flags tied to the pool's liquidity at second 4: `rwband` = kept by its band's rule in BAND_RULES;
+    `rw50big` = the live rug-vs-win kept half (rw_pct < 50) in `HOLD_BAND` (the minute-10 / minute-15 books)."""
+    big = (liq_usd is not None and HOLD_BAND[0] <= liq_usd < HOLD_BAND[1]
+           and rw_pct is not None and rw_pct < 100 - RW_SKIP)
     rule = next((r for r in BAND_RULES if liq_usd is not None and r[1] <= liq_usd < r[2]), None)
     if rule is None:
-        return {"rwband": False}
+        return {"rwband": False, "rw50big": big}
     pct = rwb_pct if rule[3] == "band" else rw_pct
-    return {"rwband": pct is not None and pct < rule[4]}
+    return {"rwband": pct is not None and pct < rule[4], "rw50big": big}
 
 
 class RugWinModel:
@@ -944,7 +950,8 @@ class LaunchLive:
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
         if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")
                                          or flags["d12"] or flags["rw50"] or flags["d12rw50"]
-                                         or flags["rw50_24"] or flags["d12rw50_24"] or flags["rwband"]):
+                                         or flags["rw50_24"] or flags["d12rw50_24"] or flags["rwband"]
+                                         or flags["rw50big"]):
             px = la.chain_price(rows, DECIDE_S)  # SOL per whole token (vault UI amounts)
             if sol_usd and px:
                 self.signals.put_nowait({

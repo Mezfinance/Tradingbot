@@ -531,6 +531,10 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
     "launchrwband": "rug-vs-win ranked within each liquidity band (band-rw-study, 11-08, ideal fills at $100 a pool, "
                     "chosen after looking): $5-15k skip riskiest 20% +27.4% (every pool +20.2%), $15-25k skip 70% "
                     "+8.0% (-7.5%), $25-40k live rule +2.9% (-9.5%), $40k+ not traded; $100 a trade",
+    "launchrw50_25k10": "rug-vs-win kept half in $25-40k pools, out at pool minute 10, $250 (hold-study 11-08, 336 kept "
+                        "pools, ideal fills): +7.9%/trade (90% CI +1.6..+14.2), +5.5 pts over minute 6, 27% rugged",
+    "launchrw50_25k15": "same pools, out at pool minute 15: +11.0%/trade (90% CI +3.3..+18.7), +8.7 pts over minute 6, "
+                        "34% rugged; real fills ran ~2.4 pts below ideal",
     "launchrwband_sz": "launchrwband's rule with $250 in $5-15k pools ($100 elsewhere): measures thin-pool impact",
     "launchrw50_sz": "launchrw50's picks sized by liquidity at second 4: $250 below $15k, $25 at $15-25k, $100 above "
                      "(capped at 2% of the pool). size-study on 1,039 launchrw50 trades: ~+$12.9k vs +$2.6k at a flat "

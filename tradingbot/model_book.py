@@ -99,6 +99,14 @@ LAUNCH_BAND_SZ = "launchrwband_sz"
 LAUNCH_BAND_CUT = {LAUNCH_BAND: "rwband", LAUNCH_BAND_SZ: "rwband"}
 BAND_SIZE_BANDS = {LAUNCH_BAND: ((15_000.0, 100.0), (float("inf"), 100.0)),
                    LAUNCH_BAND_SZ: ((15_000.0, 250.0), (float("inf"), 100.0))}  # (liquidity below, trade size $)
+# Longer holds in $25-40k pools (11-08, `hold-study --kept-only`, 336 kept pools): the live rug-vs-win kept half
+# (flag `rw50big`, launch_live.HOLD_BAND) held to pool minute 10 made +7.9% (+5.5 pts over minute 6, 90% CI +2.0..+8.8),
+# to minute 15 +11.0% (+8.7 pts, CI +2.9..+14.2); ideal fills, hold times chosen after looking. Twins: out at minute 10
+# vs 15, $250 a trade (near the impact-limited best size for these pools), capped at 2% of the pool as usual.
+LAUNCH_HOLD10 = "launchrw50_25k10"
+LAUNCH_HOLD15 = "launchrw50_25k15"
+LAUNCH_HOLD_CUT = {LAUNCH_HOLD10: "rw50big", LAUNCH_HOLD15: "rw50big"}
+BAND_SIZE_BANDS.update({LAUNCH_HOLD10: ((float("inf"), 250.0),), LAUNCH_HOLD15: ((float("inf"), 250.0),)})
 # Real-money canary (11-06; was canary_rw50_24h, never switched on): copies the size-by-band book (`CANARY_TWIN`),
 # same signals and minute-6 exit, filled by the live Jupiter executor; every pool (fly.toml sets
 # `launch_canary_max_liq_usd` 0), sized like the twin's bands in the same order: $250 / $25 / $100 -> $5 / $0.50 / $2 (1/50).
@@ -107,9 +115,10 @@ CANARY_TWIN = LAUNCH_SIZED
 CANARY_BOOKS = (CANARY4,)
 CANARY_SIZE_BANDS = ((15_000.0, 5.0), (25_000.0, 0.5), (float("inf"), 2.0))  # (liquidity below, $)
 LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
-              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_BAND_CUT}
+              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_BAND_CUT, **LAUNCH_HOLD_CUT}
 LAUNCH_CUT[CANARY4] = LAUNCH_CUT[CANARY_TWIN]  # the canary takes its twin's signals
-LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 6.0 for b in LAUNCH_CUT}
+LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 10.0 if b == LAUNCH_HOLD10 else 15.0 if b == LAUNCH_HOLD15 else 6.0
+                   for b in LAUNCH_CUT}
 POOL_MINUTE_EXIT = {**EARLY_EXIT_MIN, **LAUNCH_EXIT_MIN}  # books that sell every position by a pool minute
 EARLY_MAX_SEEN_MIN = 4.0  # first sight later than this leaves no time to trade (and was left out of training)
 EARLY_GAIN = 0.10  # label: the 5-minute snapshot price >= first-sight price x 1.10 after costs, pool intact
@@ -185,6 +194,7 @@ def _family_books(cfg: Config) -> list[str]:
         + (list(LAUNCH_RW24_CUT) if cfg.launch_rw24_book and cfg.launch_live else []) \
         + (list(LAUNCH_SIZED_CUT) if cfg.launch_sized_book and cfg.launch_live else []) \
         + (list(LAUNCH_BAND_CUT) if cfg.launch_band_book and cfg.launch_live else []) \
+        + (list(LAUNCH_HOLD_CUT) if cfg.launch_hold_book and cfg.launch_live else []) \
         + ([CANARY4] if cfg.launch_canary and cfg.launch_live else [])
 
 
@@ -726,7 +736,8 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
                                       "launchd12": 30.0, "launchd12_s10": 27.0, "launchd12_s20": 24.0,
                                       "launchd12_s30": 18.0, "launchd12_s50": 11.0,
                                       "launchrw50": 21.0, "launchd12rw50": 17.0, LAUNCH_SIZED: 23.0,
-                                      LAUNCH_BAND: 25.0, LAUNCH_BAND_SZ: 25.0}.get(name, 76.0),  # backtests
+                                      LAUNCH_BAND: 25.0, LAUNCH_BAND_SZ: 25.0, LAUNCH_HOLD10: 27.0,
+                                      LAUNCH_HOLD15: 34.0}.get(name, 76.0),  # backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 
