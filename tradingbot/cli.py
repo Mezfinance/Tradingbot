@@ -90,6 +90,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
     parser.add_argument("--workers", type=int, default=8, help="history-backfill: parallel Helius calls")
     parser.add_argument("--estimate", action="store_true", help="history-backfill: list the pools and the credits only")
+    parser.add_argument("--relist", action="store_true",
+                        help="history-backfill: list the pools again instead of reusing the saved list (< 7 days old)")
     parser.add_argument("--pulls-only", action="store_true",
                         help="history-backfill: only add LP pull times to pools saved before they were recorded")
     parser.add_argument("--history", action="store_true",
@@ -388,7 +390,7 @@ def main(argv: list[str] | None = None) -> None:
                 f"pools {i}/{n}, credits {c}", file=sys.stderr, flush=True)), indent=2))
             return
         out = launch_hist.backfill(store, helius, days, args.max_credits or 15_000_000, workers=args.workers,
-                                   estimate=args.estimate, seed=7, progress=lambda i, n, c: print(
+                                   estimate=args.estimate, seed=7, relist=args.relist, progress=lambda i, n, c: print(
                                        f"pools {i}/{n}, credits {c}", file=sys.stderr, flush=True))
         print(json.dumps(out, indent=2))
         return

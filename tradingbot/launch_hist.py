@@ -135,23 +135,63 @@ def pulls(store, helius: Helius, workers: int = 1, max_credits: int = 10**9, pro
     return dict(stats)
 
 
+CANDIDATES_MAX_AGE_S = 7 * 86400  # a saved pool listing is reused this long (restarts of a days-long run)
+CANDIDATES_STATE = "hist_candidates:listed"
+CANDIDATES_SCHEMA = "CREATE TABLE IF NOT EXISTS hist_candidates(pool TEXT PRIMARY KEY, token_mint TEXT, lp_mint TEXT)"
+
+
+def saved_candidates(store, days: float, now: float) -> tuple[list[dict] | None, dict | None]:
+    """The pool listing saved by an earlier run, if it covers `days` and is younger than CANDIDATES_MAX_AGE_S."""
+    if not hasattr(store, "get_state"):
+        return None, None
+    raw = store.get_state(CANDIDATES_STATE)
+    if not raw:
+        return None, None
+    meta = json.loads(raw)
+    if meta.get("days", 0) < days or now - meta.get("ts", 0) > CANDIDATES_MAX_AGE_S:
+        return None, meta
+    store.execute(CANDIDATES_SCHEMA)
+    rows = [dict(r) for r in store.query("SELECT pool, token_mint, lp_mint FROM hist_candidates")]
+    return (rows if rows else None), meta
+
+
+def save_candidates(store, pools: list[dict], days: float, now: float) -> None:
+    if not hasattr(store, "set_state"):
+        return
+    store.execute(CANDIDATES_SCHEMA)
+    store.execute("DELETE FROM hist_candidates")
+    store.executemany("INSERT OR REPLACE INTO hist_candidates(pool, token_mint, lp_mint) VALUES (?,?,?)",
+                      [(p["pool"], p["token_mint"], p["lp_mint"]) for p in pools])
+    store.set_state(CANDIDATES_STATE, json.dumps({"ts": now, "days": days, "pools": len(pools)}))
+
+
 CREDITS_PER_POOL = 22  # typical: LP signatures 1 + first page 10 + minute-6 state 10 (+ LP supply 1 when it moved)
 
 
 def backfill(store, helius: Helius, days: float, max_credits: int, now: float | None = None,
-             progress=None, workers: int = 1, estimate: bool = False, seed: int | None = None) -> dict:
+             progress=None, workers: int = 1, estimate: bool = False, seed: int | None = None,
+             relist: bool = False) -> dict:
     """Fetch every hand-made SOL-pair pumpswap pool created in the last `days` days. `workers` threads share the
     Helius client's pace; `seed` shuffles the pools so a run stopped early leaves an even sample over the window;
-    `estimate` only lists the candidates and prints the expected credits. Resumable: saved pools are skipped."""
+    `estimate` only lists the candidates and prints the expected credits. Resumable: saved pools are skipped, and the
+    pool listing is saved in the store and reused for CANDIDATES_MAX_AGE_S unless `relist` (so a restart of a
+    days-long run doesn't list ~1,300 pages again)."""
     import concurrent.futures as cf
     import random
     now = now if now is not None else time.time()
     store.execute(SCHEMA)
     stats: collections.Counter = collections.Counter()
     base = helius.credits_used  # the listing calls count toward the cap too
-    pools = candidates(helius, days, progress, max_pages=max(1, max_credits // 3 // 10))  # listing <= 1/3 of the cap
-    if pools is None:
-        return {"error": "could not list pools (getSlot / getProgramAccountsV2 failed; check the Helius key)"}
+    pools, meta = (None, None) if relist else saved_candidates(store, days, now)
+    if pools is not None:
+        stats["listing"] = (f"saved list from {time.strftime('%Y-%m-%d %H:%M', time.gmtime(meta['ts']))} UTC reused "
+                            "(--relist for a fresh one)")
+    else:
+        pools = candidates(helius, days, progress, max_pages=max(1, max_credits // 3 // 10))  # listing <= 1/3 of cap
+        if pools is None:
+            return {"error": "could not list pools (getSlot / getProgramAccountsV2 failed; check the Helius key)"}
+        save_candidates(store, pools, days, now)
+        stats["listing"] = "listed now and saved"
     stats["candidates"] = len(pools)
     stats["listing pages"] = getattr(helius, "last_pages", None)
     start, end = now - days * 86400, now - SPAN_S - 60

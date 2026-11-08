@@ -316,3 +316,22 @@ def test_risk_model_history_command_runs_without_data(tmp_path, monkeypatch, cap
     monkeypatch.setenv("TB_DB_PATH", str(tmp_path / "tradingbot.db"))
     cli.main(["risk-model", "--history"])
     assert "fewer than 500" in capsys.readouterr().out
+
+
+def test_pool_listing_is_saved_and_reused_on_restart():
+    """11-08: a restart of the year run reuses the saved listing (~1,300 pages) instead of listing again."""
+    st = WatchStore(":memory:")
+    pools = {f"P{i}": (NOW - 3600, 1.0) for i in range(5)}
+    first = FakeHelius(pools); first.t_for = lambda lp: NOW - 3600
+    out = lh.backfill(st, first, 365, 10**8, now=NOW, estimate=True)
+    assert out["listing"] == "listed now and saved" and first.credits_used == 10
+    again = FakeHelius(pools); again.t_for = lambda lp: NOW - 3600
+    again.program_accounts_changed = lambda *a, **k: pytest.fail("listed again")
+    out = lh.backfill(st, again, 365, 10**8, now=NOW + 3600)
+    assert out["listing"].startswith("saved list from") and out["candidates"] == 5 and out["fetched"] == 5
+    fresh = FakeHelius(pools); fresh.t_for = lambda lp: NOW - 3600
+    assert lh.backfill(st, fresh, 365, 10**8, now=NOW + 7200, relist=True)["listing"] == "listed now and saved"
+    old = FakeHelius(pools); old.t_for = lambda lp: NOW - 3600
+    assert lh.backfill(st, old, 365, 10**8, now=NOW + 8 * 86400)["listing"] == "listed now and saved"  # too old
+    wider = FakeHelius(pools); wider.t_for = lambda lp: NOW - 3600
+    assert lh.backfill(st, wider, 400, 10**8, now=NOW + 8 * 86400 + 60)["listing"] == "listed now and saved"  # covers fewer days
