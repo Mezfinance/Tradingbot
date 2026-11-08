@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -88,6 +88,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--rps", type=float, default=2.0,
                         help="launch-hist-backfill: Helius calls per second (the live scorer shares the plan's limit)")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
+    parser.add_argument("--books", default="", help="risk-model: comma list of books (default: every running book)")
     parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                         help="replay: override a setting, e.g. stop_loss_pct=20 (repeatable)")
@@ -458,6 +459,15 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore, watch_db_path
         out = launch_live.block_compare(WatchStore(watch_db_path(cfg)), Journal(cfg.db_path), cfg, hours=args.hours)
         print(json.dumps(out, indent=2, default=str) if args.json else launch_live.render_block_compare(out))
+        return
+
+    if args.command == "risk-model":  # risk-adjusted results per book + the best trade size (default whole life)
+        from tradingbot import risk_model
+        from tradingbot.journal import Journal
+        from tradingbot.watcher import WatchStore, watch_db_path
+        books = [b.strip() for b in args.books.split(",") if b.strip()] or None
+        out = risk_model.model(Journal(cfg.db_path), WatchStore(watch_db_path(cfg)), cfg, books=books, hours=args.hours)
+        print(json.dumps(out, indent=2, default=str) if args.json else risk_model.render(out))
         return
 
     if args.command == "band-compare":  # by-band rug-vs-win books vs the sized book (default since the band books began)
