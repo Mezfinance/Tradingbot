@@ -1095,3 +1095,99 @@ def test_hold_books_take_kept_25_40k_pools_and_sell_at_minute_10_and_15(cfg):
         assert dashboard.family_of(mb.LAUNCH_HOLD10) == "Rug-vs-win"
     finally:
         cfg.launch_hold_book, cfg.launch_live = False, False
+
+
+def test_big_book_ranks_40_80k_pools_by_the_plus50_model_and_holds_while_rising(setup):
+    import random
+    from tradingbot import model_book as mb
+    cfg, st, hel, clock, live, p, create = setup
+    assert ll.big_flags(60_000, 75.0)["big30"] and not ll.big_flags(60_000, 65.0)["big30"]
+    assert not ll.big_flags(30_000, 99.0)["big30"] and not ll.big_flags(90_000, 99.0)["big30"]
+    assert not ll.big_flags(None, 99.0)["big30"] and not ll.big_flags(60_000, None)["big30"]
+    assert ll.train_big(st, cfg, now=clock.t) is None  # no rows yet
+    _rw_done_rows(st, 600, clock.t - 2 * 86400, random.Random(9))
+    st.execute("UPDATE watch_launch_live SET liq_usd=60000")
+    cfg.launch_big_book = True
+    try:
+        assert ll.train_big_and_save(st, cfg) is not None
+        model = live._load_big_model()
+        assert model.meta["band_rows"] == 600 and model.meta["band_quantiles"]
+        win_like = {"creator_buys": 0.5, "log_buyers": 2.5}
+        flat_like = {"creator_buys": 0.5, "log_buyers": 0.5}
+        assert model.score(win_like) > model.score(flat_like)
+        with live.lock:  # the band's past day: every pool between the two
+            live.big_band.clear()
+            mid = (model.score(win_like) + model.score(flat_like)) / 2
+            live.big_band.extend((clock.t - 3600, mid) for _ in range(ll.ROLLING_MIN))
+        assert live._big_verdict(win_like, "N", clock.t, clock.t, 60_000)["big_pct"] == 100.0
+        assert live._big_verdict(flat_like, "N", clock.t, clock.t, 60_000)["big_pct"] == 0.0
+        assert live._big_verdict(win_like, "N", clock.t, clock.t, 30_000) == {}  # other bands: not scored
+        cfg.launch_live = True
+        assert mb.LAUNCH_BIG in mb.active_books(cfg)
+        sig = {"big30": True, "mint": "M", "created_ts": 100.0}
+        assert mb.wants(mb.LAUNCH_BIG, sig) and not mb.wants(mb.LAUNCH_BIG, dict(sig, big30=False))
+        assert mb.exit_deadline(cfg, mb.LAUNCH_BIG, sig) == 100.0 + 900
+        assert mb.hold_checks(mb.LAUNCH_BIG, sig) == [100.0 + 360, 100.0 + 600]
+        assert mb.hold_checks(mb.LAUNCH_HOLD15, sig) is None
+        assert mb.band_usd(mb.LAUNCH_BIG, 60_000) == 250.0
+        assert not mb.hold_check_fails(0.05, None) and mb.hold_check_fails(-0.01, None)
+        assert mb.hold_check_fails(0.10, 0.20) and not mb.hold_check_fails(0.25, 0.20)
+        from tradingbot import dashboard
+        assert dashboard.family_of(mb.LAUNCH_BIG) == "Rug-vs-win"
+    finally:
+        cfg.launch_big_book = cfg.launch_live = False
+
+
+class _QuoteJupiter:
+    """Sell quotes from a list (price per token), one per check."""
+
+    def __init__(self, quotes):
+        self.quotes = list(quotes)
+
+    def prices(self, mints):
+        return {}
+
+    def quote_price(self, mint, usd=20.0):
+        return None
+
+    def sell_price(self, mint, qty):
+        return self.quotes.pop(0) if self.quotes else None
+
+
+@pytest.mark.parametrize("quotes,sold_at,reason", [
+    ([1.2e-5, 1.3e-5], 900, "pool_age_exit"),  # up and rising at 6 and 10: held to 15
+    ([0.9e-5], 360, "hold_check"),            # down at 6: out at once
+    ([1.3e-5, 1.1e-5], 600, "hold_check"),    # still up at 10 but lower than at 6: out at 10
+])
+def test_engine_runs_the_conditional_hold_checks(monkeypatch, quotes, sold_at, reason):
+    from types import SimpleNamespace
+    from tradingbot import engine as eng_mod
+    from tradingbot import model_book as mb
+    from tradingbot.engine import Engine
+    from tradingbot.execution.paper import PaperExecutor
+    from tradingbot.journal import Journal
+    from tests.test_model_book import FakeDex
+    cfg = Config(db_path=":memory:", launch_big_book=True, launch_live=True)
+    j = Journal(":memory:")
+    paper = PaperExecutor(cfg)
+    jup = _QuoteJupiter(quotes)
+    eng = Engine(cfg, FakeDex(None), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                 jupiter=jup, model_executor=paper)
+    book = eng.books[mb.LAUNCH_BIG]
+    created = 1_000_000.0
+    clock = [created + 10]
+    monkeypatch.setattr(eng_mod.time, "time", lambda: clock[0])
+    fill = paper.buy("BIGMINT", 250.0, 1e-5)
+    pos = eng._open_position(book, "BIGMINT", "BIG", fill, 1e-5, None)
+    eng._deadlines[pos.id] = created + 900
+    eng._holds[pos.id] = {"at": mb.hold_checks(mb.LAUNCH_BIG, {"created_ts": created}), "last": None}
+    eng.current_prices = lambda tokens, held=None: {}
+    sold = None
+    while clock[0] < created + 1000 and sold is None:
+        eng.manage_positions()
+        if not j.open_positions(book.name):
+            sold = clock[0]
+        clock[0] += 10
+    assert sold is not None and created + sold_at <= sold < created + sold_at + 10
+    [(r,)] = j.query("SELECT reason FROM fills WHERE side='sell'")
+    assert r == reason

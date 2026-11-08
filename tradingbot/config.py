@@ -81,6 +81,7 @@ class Config:
     # launchrw50 / launchd12rw50 (11-04): every liquid pool / the history model's bottom 20%, minus the riskiest
     # half by the rug-vs-win model (model/rw.json: P(rug before the exit) - P(+50% win)), sold at pool minute 6
     launch_rw_book: bool = False
+    launch_big_book: bool = False  # 11-08: launchbig40k, the +50% model's best 30% of $40-80k pools held to minute 15 while rising
     launch_hold_book: bool = False  # 11-08: launchrw50_25k10 / _25k15, rug-vs-win kept $25-40k pools held to pool minute 10 / 15
     launch_band_book: bool = False  # 11-08: launchrwband / launchrwband_sz, rug-vs-win ranked within each liquidity band
     launch_sized_book: bool = False  # 11-06: launchrw50_sz, launchrw50's signals sized by liquidity band

@@ -79,8 +79,8 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-hist-backfill", "launch-hist-test", "launch-exit-study",
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
-                                            "launch-filter-study", "launch-rw-train", "launch-rw24-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize"])
+                                            "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -298,6 +298,16 @@ def main(argv: list[str] | None = None) -> None:
             print(f"pull model written to {out}" if out else "pull model: not enough data to train yet")
             out = launch_live.train_rw_and_save(store, cfg)
             print(f"rug-vs-win model written to {out}" if out else "rug-vs-win model: not enough data to train yet")
+            if cfg.launch_big_book:
+                out = launch_live.train_big_and_save(store, cfg)
+                print(f"+50% model written to {out}" if out else "+50% model: not enough data to train yet")
+        return
+
+    if args.command == "launch-big-train":  # only the +50% model of launchbig40k (retrained every 6 h by the bot)
+        from tradingbot import launch_live
+        from tradingbot.watcher import WatchStore, watch_db_path
+        out = launch_live.train_big_and_save(WatchStore(watch_db_path(cfg)), cfg)
+        print(f"+50% model written to {out}" if out else "+50% model: not enough data to train yet")
         return
 
     if args.command == "launch-rw-train":  # only the rug-vs-win model (light; watch-model-train does all)
@@ -541,6 +551,14 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore, watch_db_path
         out = band_compare.compare(WatchStore(watch_db_path(cfg)), Journal(cfg.db_path), hours=args.hours)
         print(json.dumps(out, indent=2, default=str) if args.json else band_compare.render(out))
+        return
+
+    if args.command == "sz-whatif":  # sz with another book's rule in some bands (real trades at sz's sizes)
+        from tradingbot import sz_whatif
+        from tradingbot.journal import Journal
+        from tradingbot.watcher import WatchStore, watch_db_path
+        out = sz_whatif.whatif(WatchStore(watch_db_path(cfg)), Journal(cfg.db_path), hours=args.hours)
+        print(json.dumps(out, indent=2, default=str) if args.json else sz_whatif.render(out))
         return
 
     if args.command == "band-prize":  # is there a prize in one band if filtered better? (default $40-80k, whole life)

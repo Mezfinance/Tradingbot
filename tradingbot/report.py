@@ -535,6 +535,10 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
                         "pools, ideal fills): +7.9%/trade (90% CI +1.6..+14.2), +5.5 pts over minute 6, 27% rugged",
     "launchrw50_25k15": "same pools, out at pool minute 15: +11.0%/trade (90% CI +3.3..+18.7), +8.7 pts over minute 6, "
                         "34% rugged; real fills ran ~2.4 pts below ideal",
+    "launchbig40k": "+50% model's best 30% of $40-80k pools (band-prize 11-08, 571 pools, ideal fills, chosen after "
+                    "looking), sold at pool minute 6 or 10 unless up and rising, else at 15: +6.6%/trade (median +35%, "
+                    "30% rugged) vs +2.6% selling at minute 6 (gap +4.0 pts, 90% CI -3.6..+11.9); every $40-80k pool "
+                    "-15%; $250 a trade",
     "launchrwband_sz": "launchrwband's rule with $250 in $5-15k pools ($100 elsewhere): measures thin-pool impact",
     "launchrw50_sz": "launchrw50's picks sized by liquidity at second 4: $250 below $15k, $25 at $15-25k, $100 above "
                      "(capped at 2% of the pool). size-study on 1,039 launchrw50 trades: ~+$12.9k vs +$2.6k at a flat "

@@ -319,11 +319,24 @@ def hold_result(ret_by: dict, thr: float, rising: bool, final: int) -> tuple[flo
 
 
 def _holds(cov: list[dict], tested: list[dict], rng) -> dict:
-    """Every conditional hold rule on the covered pools, and on the lead filter's kept pools among them."""
+    """Every conditional hold rule on the covered pools, and on the kept pools of the live rule, the lead filter
+    and the best walk-forward filter among them."""
     blocks = {r["pool"]: r["block"] for r in tested}
-    kept = {r["pool"] for r in tested if r.get(LEAD_FILTER) is False}
-    groups = {"every pool": cov, "lead filter's picks (+50% model, all pools, best 30%)":
-              [r for r in cov if r["pool"] in kept]}
+    kept = lambda key: {r["pool"] for r in tested if r.get(key) is False}
+    groups = {"every pool": cov,
+              "live rule's picks (rw_pct < 50: what the sized book buys now)":
+                  [r for r in cov if r["pool"] in kept("skip:live")],
+              "lead filter's picks (+50% model, all pools, best 30%)": [r for r in cov if r["pool"] in kept(LEAD_FILTER)]}
+    # the walk-forward filter with the best minute-6 mean on its kept pools (30+), picked after looking
+    best, best_mean = None, None
+    for key in sorted({k for r in tested for k in r if k.startswith("skip:") and k not in ("skip:live", LEAD_FILTER)}):
+        rets = [r["ret"] for r in tested if r.get(key) is False]
+        if len(rets) >= 30 and (best_mean is None or np.mean(rets) > best_mean):
+            best, best_mean = key, float(np.mean(rets))
+    if best:
+        _, m, k = best.split(":")
+        groups[f"best minute-6 filter, chosen after looking ({m}, keep best {k}%)"] = \
+            [r for r in cov if r["pool"] in kept(best)]
     out = {}
     for gname, pools in groups.items():
         if len(pools) < 20:

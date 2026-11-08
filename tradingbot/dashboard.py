@@ -288,7 +288,7 @@ POS_COLS = ("id", "strategy", "symbol", "token", "cost_usd", "realized_usd", "qt
             "closed_at", "exit_reason")
 LAUNCH_COLS = ("pool", "token_mint", "create_ts", "decided_ts", "liquid", "ret", "status", "pulled_ts", "liq_usd",
                "top2", "top5", "top2h", "top5h", "low_h", "risk_pct", "rw_pct", "rw_low_pct", "rw_low6",
-               "rw24_pct", "rw24_low_pct", "rwb_pct")
+               "rw24_pct", "rw24_low_pct", "rwb_pct", "big_pct")
 LAUNCH_KEEP_S = 86400  # the scorer's pools sent to the page (it windows them 1/6/24 h)
 STUCK_AFTER_S = 0  # as engine.STUCK_AFTER_S: a position with no route out counts as $0 at once
 
@@ -297,7 +297,7 @@ FAMILIES = (  # book families for the dashboard's family view, in display order
     ("Canary", "real money: launchrw50_sz picks bought for real at a fraction of the twin's band sizes, judged on swap prices against the twin"),
     ("Launch picks", "the second-4 launch scorer's top 2% / 5% picks"),
     ("Low decile", "the history model's bottom 20% (D1-D2), minus the riskiest early pullers"),
-    ("Rug-vs-win", "skip the riskiest half by P(rug before the exit) - P(+50% win); study rule, 24 h rule, a size-by-band twin, by-band rules and longer holds in $25-40k pools"),
+    ("Rug-vs-win", "skip the riskiest half by P(rug before the exit) - P(+50% win); study rule, 24 h rule, a size-by-band twin, by-band rules, longer holds in $25-40k pools and the +50% filter held to minute 15 in $40-80k pools"),
     ("Early", "hand-made pools at first sight, out by pool minute 5-7"),
     ("model5", "the 5-minute snapshot model's short-hold books"))
 
@@ -313,7 +313,7 @@ def family_of(name: str) -> str:
     if name in mb.CANARY_BOOKS:
         return "Canary"
     if name in mb.LAUNCH_RW_CUT or name in mb.LAUNCH_RW24_CUT or name in mb.LAUNCH_SIZED_CUT or name in mb.LAUNCH_BAND_CUT \
-            or name in mb.LAUNCH_HOLD_CUT:
+            or name in mb.LAUNCH_HOLD_CUT or name in mb.LAUNCH_BIG_CUT:
         return "Rug-vs-win"
     if name in mb.LAUNCH_LOW_CUT:
         return "Low decile"
@@ -460,7 +460,8 @@ class Live:
             for fl in (launch_live.low_flags(r["low_h"], r["risk_pct"]),
                        launch_live.rw_flags(launch_live.rw_low(r), r["rw_pct"], r["rw_low_pct"]),
                        launch_live.rw24_flags(r["low_h"], r["rw24_pct"], r["rw24_low_pct"]),
-                       launch_live.band_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"])):
+                       launch_live.band_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"]),
+                       launch_live.big_flags(r["liq_usd"], r["big_pct"])):
                 flags += [k for k, on in fl.items() if on]
             ret = r["ret"]
             self._bump(self.launch, r["pool"], [r["pool"], r["token_mint"], r["create_ts"], r["decided_ts"],

@@ -94,7 +94,9 @@ def ensure_schema(store) -> None:
                 # 11-05: the earlier live rule's score and ranks, kept for the rw24 twin books
                 "rw24 REAL", "rw24_pct REAL", "rw24_low_pct REAL",
                 # 11-08: the rug-vs-win score's rank among the past day's liquid pools of the same band
-                "rwb_pct REAL"):
+                "rwb_pct REAL",
+                # 11-08: the +50% model's rank among the past day's $40-80k pools (launchbig40k, band-prize)
+                "big REAL", "big_pct REAL"):
         try:
             store.execute(f"ALTER TABLE watch_launch_live ADD COLUMN {col}")
         except sqlite3.OperationalError:
@@ -119,6 +121,10 @@ def rw_model_path(cfg: Config) -> Path:
 
 def rw24_model_path(cfg: Config) -> Path:
     return Path(cfg.db_path).resolve().parent / "model" / "rw24.json"
+
+
+def big_model_path(cfg: Config) -> Path:
+    return Path(cfg.db_path).resolve().parent / "model" / "big50.json"
 
 
 # --- training -------------------------------------------------------------------------------------
@@ -346,6 +352,21 @@ def band_flags(liq_usd, rw_pct, rwb_pct) -> dict:
     return {"rwband": pct is not None and pct < rule[4], "rw50big": big}
 
 
+# +50% filter in $40-80k pools (11-08, `band-prize`, 571 pools): a logistic for "+50% or more by the minute-6
+# exit" trained on every finished liquid pool, each $40-80k pool ranked against the band's past day; the best 30%
+# made +2.6% at minute 6 (every pool -15%) and +6.6% held to pool minute 15 while up and rising (gap +4.0 pts,
+# 90% CI -3.6..+11.9, 8 of 14 blocks). Retrained every RW_BLOCK_S as the study did before each 6 h block.
+BIG_BAND = (40_000.0, 80_000.0)
+BIG_KEEP = 30  # % of the band's pools kept (highest +50% odds)
+BIG_WINDOW_S = 86400
+
+
+def big_flags(liq_usd, big_pct) -> dict:
+    """`big30` = a $40-80k pool in the best BIG_KEEP% of the band's past day by the +50% model."""
+    return {"big30": liq_usd is not None and BIG_BAND[0] <= liq_usd < BIG_BAND[1]
+            and big_pct is not None and big_pct >= 100 - BIG_KEEP}
+
+
 class RugWinModel:
     """Two logistics on the early-pull inputs (second-4 features + creator record): rugged before the exit, and
     +50% or more. Score = P(rug) - P(win); higher = riskier."""
@@ -403,6 +424,39 @@ def train_rw(store, cfg: Config, now: float | None = None, days: float | None = 
                                     for q in RISK_LEVELS],
                   "days": round((now - rows[0]["create_ts"]) / 86400, 1)}
     return model
+
+
+def train_big(store, cfg: Config, now: float | None = None):
+    """The +50% model (big50.json) on every finished liquid pool; meta `band_quantiles` = score percentiles of the
+    $40-80k training pools of the last day (all of them while fewer than ROLLING_MIN), the fallback ranking."""
+    ensure_schema(store)
+    now = now if now is not None else time.time()
+    rows = _pull_rows(store, 0.0)
+    if len(rows) < PULL_MIN_TRAIN:
+        log.warning("+50%% model: not enough rows to train (%d)", len(rows))
+        return None
+    y = np.array([float(r["ret"] >= RW_BIG) for r in rows])
+    if y.min() == y.max():
+        return None
+    model = _fit_capped(rows, y)
+    liq = {r["pool"]: r["liq_usd"] for r in store.query(
+        "SELECT pool, liq_usd FROM watch_launch_live WHERE status='done' AND liquid=1")}
+    band = [r for r in rows if liq.get(r["pool"]) is not None and BIG_BAND[0] <= liq[r["pool"]] < BIG_BAND[1]]
+    recent = [r for r in band if r["create_ts"] >= now - BIG_WINDOW_S]
+    base = recent if len(recent) >= ROLLING_MIN else band
+    scores = [model.score(r["x"]) for r in base]
+    model.meta = {**model.meta, "trained_ts": time.time(), "rows": len(rows), "big_win_rate": float(y.mean()),
+                  "band_rows": len(band),
+                  "band_quantiles": [float(np.quantile(scores, q / 100)) for q in RISK_LEVELS] if scores else None}
+    return model
+
+
+def train_big_and_save(store, cfg: Config) -> Path | None:
+    model = train_big(store, cfg)
+    if model is None:
+        return None
+    log.info("+50%% model trained on %d rows (%d in $40-80k)", model.meta["rows"], model.meta["band_rows"])
+    return _save(model, big_model_path(cfg))
 
 
 def train_rw24_and_save(store, cfg: Config, now: float | None = None) -> Path | None:
@@ -493,6 +547,8 @@ class LaunchLive:
         self.rw24_low: collections.deque = collections.deque()
         # (decided_ts, rw) of liquid pools per BAND_RULES band, past BAND_WINDOW_S (rebuilt with the rw model)
         self.rw_band: dict = {b[0]: collections.deque() for b in BAND_RULES}
+        self.big_model, self.big_mtime, self.big_checked = None, None, 0.0
+        self.big_band: collections.deque = collections.deque()  # (decided_ts, +50% score) of $40-80k pools, past day
         self.pool = ThreadPoolExecutor(workers, thread_name_prefix="launch-live") if workers else None
         self.saved_at = 0.0
         self.tries: dict[str, int] = {}
@@ -748,6 +804,51 @@ class LaunchLive:
             out["rwb_pct"] = _rank_pct(past_band, rw, None)  # None (no flag) until ROLLING_MIN pools in the band
         return out
 
+    def _load_big_model(self):
+        """The +50% model (big50.json). A new one re-scores the band's past day."""
+        now = self.clock()
+        if self.big_model is not None and now - self.big_checked < MODEL_RELOAD_S:
+            return self.big_model
+        self.big_checked = now
+        path = big_model_path(self.cfg)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return self.big_model
+        if mtime != self.big_mtime:
+            from tradingbot.model_book import Model
+            try:
+                model = Model.from_json(json.loads(path.read_text()))
+            except (OSError, ValueError, KeyError) as exc:
+                log.warning("+50%% model unreadable: %s", exc)
+                return self.big_model
+            past = [(r["decided_ts"], model.score(pull_inputs(json.loads(r["feat"]),
+                                                               self._op_live(r["creator"], r["create_ts"]))))
+                    for r in self.store.query(
+                        "SELECT creator, create_ts, decided_ts, feat FROM watch_launch_live WHERE liquid=1 "
+                        "AND feat IS NOT NULL AND liq_usd >= ? AND liq_usd < ? AND decided_ts >= ? "
+                        "ORDER BY decided_ts", (*BIG_BAND, now - BIG_WINDOW_S))]
+            with self.lock:
+                self.big_model, self.big_mtime = model, mtime
+                self.big_band = collections.deque(past)
+        return self.big_model
+
+    def _big_verdict(self, feat: dict, creator: str | None, create_ts: float, now: float, liq) -> dict:
+        """+50% score of a $40-80k pool and its percentile (higher = better odds) among the band's past day
+        (the training band's percentiles until ROLLING_MIN pools)."""
+        if liq is None or not BIG_BAND[0] <= liq < BIG_BAND[1]:
+            return {}
+        model = self._load_big_model()
+        if model is None:
+            return {}
+        score = model.score(pull_inputs(feat, self._op_live(creator, create_ts)))
+        with self.lock:
+            while self.big_band and self.big_band[0][0] < now - BIG_WINDOW_S:
+                self.big_band.popleft()
+            past = [v for _, v in self.big_band]
+            self.big_band.append((now, score))
+        return {"big": score, "big_pct": _rank_pct(past, score, model.meta.get("band_quantiles"))}
+
     def _hist_verdict(self, feat: dict, now: float) -> dict:
         """score_h and the rolling top-2% / top-5% flags for a liquid pool (the score joins the history after)."""
         model = self._load_hist_model()
@@ -943,15 +1044,18 @@ class LaunchLive:
                                      liq=cols.get("liq_usd")))
         if self.cfg.launch_rw24_book:
             cols.update(self._rw_verdict(feat, rec.get("creator"), create, now, bool(cols.get("low_h")), track="rw24"))
+        if self.cfg.launch_big_book:
+            cols.update(self._big_verdict(feat, rec.get("creator"), create, now, cols.get("liq_usd")))
         flags = {**low_flags(cols.get("low_h"), cols.get("risk_pct")),
                  **rw_flags(cols.get("rw_low6"), cols.get("rw_pct"), cols.get("rw_low_pct")),
                  **rw24_flags(cols.get("low_h"), cols.get("rw24_pct"), cols.get("rw24_low_pct")),
-                 **band_flags(cols.get("liq_usd"), cols.get("rw_pct"), cols.get("rwb_pct"))}
+                 **band_flags(cols.get("liq_usd"), cols.get("rw_pct"), cols.get("rwb_pct")),
+                 **big_flags(cols.get("liq_usd"), cols.get("big_pct"))}
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
         if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")
                                          or flags["d12"] or flags["rw50"] or flags["d12rw50"]
                                          or flags["rw50_24"] or flags["d12rw50_24"] or flags["rwband"]
-                                         or flags["rw50big"]):
+                                         or flags["rw50big"] or flags["big30"]):
             px = la.chain_price(rows, DECIDE_S)  # SOL per whole token (vault UI amounts)
             if sol_usd and px:
                 self.signals.put_nowait({
@@ -1059,7 +1163,8 @@ class LaunchLive:
                 wait = 0.5 if due is None else min(0.5, max(0.02, due - self.clock()))
                 stop.wait(wait)
         threading.Thread(target=run, name="launch-live", daemon=True).start()
-        if (self.cfg.launch_rw_book or self.cfg.launch_rw24_book) and self.cfg.db_path != ":memory:":
+        if (self.cfg.launch_rw_book or self.cfg.launch_rw24_book or self.cfg.launch_big_book) \
+                and self.cfg.db_path != ":memory:":
             threading.Thread(target=self._rw_retrain_loop, args=(stop,), name="rw-retrain", daemon=True).start()
         return stop
 
@@ -1080,7 +1185,8 @@ class LaunchLive:
             except OSError:
                 pass
         jobs = ([(rw_model_path, RW_BLOCK_S, "launch-rw-train")] if self.cfg.launch_rw_book else []) + \
-            ([(rw24_model_path, RW24_RETRAIN_S, "launch-rw24-train")] if self.cfg.launch_rw24_book else [])
+            ([(rw24_model_path, RW24_RETRAIN_S, "launch-rw24-train")] if self.cfg.launch_rw24_book else []) + \
+            ([(big_model_path, RW_BLOCK_S, "launch-big-train")] if self.cfg.launch_big_book else [])
         while not stop.is_set():
             wait = RW_RETRY_S
             for path_fn, every, command in jobs:
@@ -1741,13 +1847,13 @@ def fill_gap(store, journal, book: str, since: float, rng) -> dict:
                                                 (book, since - 600))}
     missed = []
     if flag:
-        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct, rw_pct, rw_low_pct, rw_low6, rw24_pct, rw24_low_pct, liq_usd, rwb_pct "
+        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct, rw_pct, rw_low_pct, rw_low6, rw24_pct, rw24_low_pct, liq_usd, rwb_pct, big_pct "
                              "FROM watch_launch_live "
                              "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND create_ts >= ?", (since,)):
             hit = r[flag] if flag in ("top2", "top5", "top2h", "top5h") else {
                 **low_flags(r["low_h"], r["risk_pct"]), **rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"]),
                 **rw24_flags(r["low_h"], r["rw24_pct"], r["rw24_low_pct"]),
-                **band_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"])}[flag]
+                **band_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"]), **big_flags(r["liq_usd"], r["big_pct"])}[flag]
             if hit and r["token_mint"] not in bought:
                 missed.append({"ret": r["ret"]})
     if not pairs:

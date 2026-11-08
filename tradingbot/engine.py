@@ -121,6 +121,7 @@ class Engine:
         self._blocked: dict[int, dict] = {}  # position id -> exit blocked (no route): since, next try, note
         self._deadlines = self._load_deadlines()  # position id -> sell by this time (pool-age exit)
         self._climbs = self._load_climbs()  # position id -> [check time, price to reach, best price seen]
+        self._holds = self._load_holds()  # position id -> {"at": [check times left], "last": return at the last check}
         self._model_pool = None  # threads that let every book buy a signal at the same time
         self._sell_pool = None  # threads that sell every due exit of a monitor pass at once
         self._last_snapshot = 0.0
@@ -388,6 +389,8 @@ class Engine:
                 exits = [(pos.qty, "pool_age_exit")]  # hand-made pool: out before its creator usually pulls it
             if not exits and self._climb_failed(pos.id, price, now):
                 exits = [(pos.qty, "no_climb")]  # flat after the first minutes: pulled pools mostly look like this
+            if not exits and self._hold_failed(pos, now):
+                exits = [(pos.qty, "hold_check")]  # not up (or falling) at a pool-minute check: out now
             if any(r.startswith("take_profit") for _, r in exits):
                 # A feed price can be stale or bogus (a rugged pool once showed 21,000x entry); take profit
                 # only if a quote to sell the position clears the target too.
@@ -816,6 +819,11 @@ class Engine:
             self.journal.log_event("model_climb_check", sig["mint"],
                                    json.dumps({"position_id": pos.id, "at": check[0], "price": check[1]}),
                                    strategy=book.name)
+        checks = mb.hold_checks(book.name, sig)
+        if checks:
+            self._holds[pos.id] = {"at": list(checks), "last": None}
+            self.journal.log_event("model_hold_check", sig["mint"],
+                                   json.dumps({"position_id": pos.id, "at": checks}), strategy=book.name)
         self.journal.log_event("model_buy", sig["mint"], f"score {sig['score']:.3f} liq ${sig['liq']:,.0f}",
                                strategy=book.name)
         if sig.get("kind") in ("early", "launch"):  # where the seconds between the pool's creation and our fill go
@@ -847,6 +855,45 @@ class Engine:
             if d["position_id"] in open_ids:
                 out[d["position_id"]] = [d["at"], d["price"], 0.0]
         return out
+
+    def _load_holds(self) -> dict[int, dict]:
+        """Pending conditional hold checks of open positions (the last check's return restarts unknown)."""
+        open_ids = {p.id for p in self.journal.open_positions(strategy=None)}
+        out = {}
+        now = time.time()
+        for r in self.journal.query("SELECT detail FROM events WHERE kind='model_hold_check'"):
+            d = json.loads(r["detail"])
+            if d["position_id"] in open_ids:
+                # a check missed while down: run the latest one due now, skip the older ones
+                due = [t for t in d["at"] if t <= now]
+                out[d["position_id"]] = {"at": due[-1:] + [t for t in d["at"] if t > now], "last": None}
+        return out
+
+    def _hold_failed(self, pos: Position, now: float) -> bool:
+        """At each due check (model_book.HOLD_CHECK_MIN) quote a sale of the position: True (sell) when it would
+        return less than model_book.HOLD_CHECK_GAIN of the cost, or less than at the previous check. A failed quote
+        retries next pass (the pool-minute deadline still sells it)."""
+        h = self._holds.get(pos.id)
+        if h is not None and h.get("sell"):
+            return True  # a failed check whose sale didn't go through: keep trying (exit-blocked rules apply)
+        if h is None or not h["at"] or now < h["at"][0]:
+            return False
+        from tradingbot import model_book as mb
+        px = self._confirm_sell_price(pos)
+        if not px or not pos.initial_qty or not pos.cost_usd:
+            return False
+        ret = px * pos.qty / (pos.cost_usd * pos.qty / pos.initial_qty) - 1
+        fails = mb.hold_check_fails(ret, h["last"])
+        self.journal.log_event("hold_check_result", pos.token_address,
+                               json.dumps({"position_id": pos.id, "ret": round(ret, 4),
+                                           "last": h["last"], "sell": fails}), strategy=pos.strategy)
+        h["at"].pop(0)
+        h["last"] = ret
+        if fails:
+            h["sell"] = True
+        elif not h["at"]:
+            self._holds.pop(pos.id, None)
+        return fails
 
     def _climb_failed(self, pos_id: int, price: float, now: float) -> bool:
         """True once the check time passes without the price having reached its target; a pass ends the check."""

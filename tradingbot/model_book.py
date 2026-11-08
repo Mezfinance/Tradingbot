@@ -107,6 +107,17 @@ LAUNCH_HOLD10 = "launchrw50_25k10"
 LAUNCH_HOLD15 = "launchrw50_25k15"
 LAUNCH_HOLD_CUT = {LAUNCH_HOLD10: "rw50big", LAUNCH_HOLD15: "rw50big"}
 BAND_SIZE_BANDS.update({LAUNCH_HOLD10: ((float("inf"), 250.0),), LAUNCH_HOLD15: ((float("inf"), 250.0),)})
+# +50% filter in $40-80k pools with a conditional hold (11-08, `band-prize`, 571 pools, ideal fills, rule chosen
+# after looking): the +50% model (launch_live.BIG_BAND, flag `big30`) keeps the best 30% of the band's past day;
+# at pool minute 6 and 10 the position stays only while a sell quote would return at least the cost and (at 10)
+# no less than at 6, else it sells there; the rest sell at pool minute 15. Backtest +6.6%/trade vs +2.6% selling
+# at minute 6 (every $40-80k pool -15%); $250 a trade (2% of a $40k pool is $800).
+LAUNCH_BIG = "launchbig40k"
+LAUNCH_BIG_CUT = {LAUNCH_BIG: "big30"}
+BAND_SIZE_BANDS[LAUNCH_BIG] = ((float("inf"), 250.0),)
+HOLD_CHECK_MIN = {LAUNCH_BIG: (6.0, 10.0)}  # pool minutes of the conditional hold checks
+HOLD_CHECK_GAIN = 0.0  # stay only while the sale would return at least the cost ...
+HOLD_CHECK_RISING = True  # ... and no less than at the previous check
 # Real-money canary (11-06; was canary_rw50_24h, never switched on): copies the size-by-band book (`CANARY_TWIN`),
 # same signals and minute-6 exit, filled by the live Jupiter executor; every pool (fly.toml sets
 # `launch_canary_max_liq_usd` 0), sized like the twin's bands in the same order: $250 / $25 / $100 -> $5 / $0.50 / $2 (1/50).
@@ -115,9 +126,9 @@ CANARY_TWIN = LAUNCH_SIZED
 CANARY_BOOKS = (CANARY4,)
 CANARY_SIZE_BANDS = ((15_000.0, 5.0), (25_000.0, 0.5), (float("inf"), 2.0))  # (liquidity below, $)
 LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
-              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_BAND_CUT, **LAUNCH_HOLD_CUT}
+              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_BAND_CUT, **LAUNCH_HOLD_CUT, **LAUNCH_BIG_CUT}
 LAUNCH_CUT[CANARY4] = LAUNCH_CUT[CANARY_TWIN]  # the canary takes its twin's signals
-LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 10.0 if b == LAUNCH_HOLD10 else 15.0 if b == LAUNCH_HOLD15 else 6.0
+LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 10.0 if b == LAUNCH_HOLD10 else 15.0 if b in (LAUNCH_HOLD15, LAUNCH_BIG) else 6.0
                    for b in LAUNCH_CUT}
 POOL_MINUTE_EXIT = {**EARLY_EXIT_MIN, **LAUNCH_EXIT_MIN}  # books that sell every position by a pool minute
 EARLY_MAX_SEEN_MIN = 4.0  # first sight later than this leaves no time to trade (and was left out of training)
@@ -195,6 +206,7 @@ def _family_books(cfg: Config) -> list[str]:
         + (list(LAUNCH_SIZED_CUT) if cfg.launch_sized_book and cfg.launch_live else []) \
         + (list(LAUNCH_BAND_CUT) if cfg.launch_band_book and cfg.launch_live else []) \
         + (list(LAUNCH_HOLD_CUT) if cfg.launch_hold_book and cfg.launch_live else []) \
+        + (list(LAUNCH_BIG_CUT) if cfg.launch_big_book and cfg.launch_live else []) \
         + ([CANARY4] if cfg.launch_canary and cfg.launch_live else [])
 
 
@@ -223,6 +235,20 @@ def climb_check(cfg: Config, name: str, bought_ts: float, market_price: float) -
     if name != CLIMB or not market_price:
         return None
     return bought_ts + cfg.model_book_climb_after_min * 60, market_price * (1 + cfg.model_book_climb_min_gain_pct / 100)
+
+
+def hold_checks(name: str, sig: dict) -> list[float] | None:
+    """Times of a book's conditional hold checks (pool minutes in HOLD_CHECK_MIN after the pool's creation)."""
+    mins = HOLD_CHECK_MIN.get(name)
+    if not mins or not sig.get("created_ts"):
+        return None
+    return [sig["created_ts"] + m * 60 for m in mins]
+
+
+def hold_check_fails(ret: float, last: float | None) -> bool:
+    """band_prize.hold_result's rule on a live sell quote: sell unless up HOLD_CHECK_GAIN and (with
+    HOLD_CHECK_RISING) no lower than at the previous check."""
+    return ret < HOLD_CHECK_GAIN or (HOLD_CHECK_RISING and last is not None and ret < last)
 
 
 def signal_kind(name: str) -> str | None:
@@ -737,7 +763,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
                                       "launchd12_s30": 18.0, "launchd12_s50": 11.0,
                                       "launchrw50": 21.0, "launchd12rw50": 17.0, LAUNCH_SIZED: 23.0,
                                       LAUNCH_BAND: 25.0, LAUNCH_BAND_SZ: 25.0, LAUNCH_HOLD10: 27.0,
-                                      LAUNCH_HOLD15: 34.0}.get(name, 76.0),  # backtests
+                                      LAUNCH_HOLD15: 34.0, LAUNCH_BIG: 30.0}.get(name, 76.0),  # backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 
