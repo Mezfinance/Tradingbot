@@ -74,3 +74,29 @@ def test_correlation_portfolio_and_too_few_trades(cfg):
     assert out["too few trades"] == {"early6": 5}
     assert out["correlation"]["launchrw50"]["launchrw50_sz"] == pytest.approx(1.0)
     assert out["equal_weight_portfolio"]["books"] == 2
+
+
+def test_sizing_keeps_a_sized_books_own_size_split(cfg):
+    """A book that trades $250 in thin winning pools and $25 in losing mid pools makes money at its own sizes;
+    giving every trade one size (the old simulation) turned it into a loser."""
+    st, j = WatchStore(":memory:"), Journal(":memory:")
+    ll.ensure_schema(st)
+    _book(j, st, "launchrw50_sz", [0.30] * 20, liq=12_000.0, cost=250.0, per_day=2)     # thin: 2 a day
+    for i in range(80):                                                                # mid: 8 a day, losing
+        ts = T0 + (i // 8) * D + 300 + i * 30
+        tok = f"mid{i}"
+        j.execute("INSERT INTO positions(token, symbol, cost_usd, realized_usd, qty, opened_at, closed_at, strategy) "
+                  "VALUES (?,?,25,?,0,?,?,'launchrw50_sz')", (tok, tok, 25 * 0.9, ts, ts + 360))
+        st.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, status, liq_usd, feat) "
+                   "VALUES (?,?,?,?,?,?)", (tok, tok, ts - 10, "done", 20_000.0, json.dumps({})))
+    ts = rm.trades(j, st, "launchrw50_sz", 0, T0 + 30 * D, True)
+    pnl, _ = rm.day_tables(ts, 0.02)
+    mean_cost = (2 * 250 + 8 * 25) / 10
+    i = int(np.argmin(abs(rm.GRID - mean_cost)))
+    real_day = 2 * 250 * 0.30 - 8 * 25 * 0.10                                          # +130 $ a day
+    assert pnl[0, i] == pytest.approx(real_day * rm.GRID[i] / mean_cost, rel=0.05)
+    assert pnl[0, i] > 0
+    out = rm.model(j, st, _cfg(cfg), books=["launchrw50_sz"], now=T0 + 30 * D, sims=40)
+    row = next(r for r in out["books"]["launchrw50_sz"]["sizing"] if r["capital"] == 10_000 and r["pct_per_trade"] == 0.5)
+    assert row["ret_median"] > 0            # $50 average trade, the same split: a winner, as the book really was
+    assert out["books"]["launchrw50_sz"]["stats"]["actual_trade_usd"] == pytest.approx(mean_cost)

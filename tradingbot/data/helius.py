@@ -90,11 +90,15 @@ def out_of_credits(resp) -> bool:
     return resp.status_code == 402 or bool(OUT_OF_CREDITS.search(text))
 
 
-def _switch(to_backup: bool, reason: str, probe_s: float = PROBE_S) -> None:
+def _switch(to_backup: bool, reason: str, probe_s: float = PROBE_S, method: str | None = None) -> None:
     with _keys_lock:
         if KEYS["on_backup"] == to_backup:
             return
         KEYS["on_backup"] = to_backup
+        # 11-08: the probe must use the call type that failed. On Fly the main key, out of credits for
+        # getTransactionsForAddress, still answered cheap calls, so any call's 200 moved every client back and the
+        # next history call moved them away again (13 switches, a websocket reconnect each, ~25% of pools lost)
+        KEYS["method"] = method if to_backup else None
         KEYS["since"] = time.time()
         KEYS["switches"] += 1
         KEYS["last_reason"] = reason
@@ -107,7 +111,8 @@ def _switch(to_backup: bool, reason: str, probe_s: float = PROBE_S) -> None:
 
 def key_status() -> dict:
     return {"on_backup": KEYS["on_backup"], "backup_set": bool(backup_key()), "switches": KEYS["switches"],
-            "since": KEYS["since"], "last_reason": KEYS["last_reason"], "slowed_methods": pace_status()}
+            "since": KEYS["since"], "last_reason": KEYS["last_reason"], "probe_method": KEYS.get("method"),
+            "slowed_methods": pace_status()}
 
 
 _pace_lock = threading.Lock()
@@ -189,7 +194,8 @@ class Helius:
         if not self.enabled:
             return None
         probing = False
-        if not self.fixed_key and KEYS["on_backup"] and self.api_key and time.time() >= KEYS["probe_at"]:
+        if (not self.fixed_key and KEYS["on_backup"] and self.api_key and time.time() >= KEYS["probe_at"]
+                and KEYS.get("method") in (None, method)):
             with _keys_lock:  # one call per PROBE_S tries the main key again
                 if time.time() >= KEYS["probe_at"]:
                     KEYS["probe_at"] = time.time() + PROBE_S
@@ -207,7 +213,7 @@ class Helius:
                 return None
             if not self.fixed_key and backup_key() and key != backup_key() and out_of_credits(resp):
                 probing = False
-                _switch(True, f"HTTP {resp.status_code}")
+                _switch(True, f"HTTP {resp.status_code}", method=method)
                 continue  # the same call again on the backup key
             if probing and resp.status_code == 200:
                 _switch(False, "probe answered")
@@ -234,7 +240,7 @@ class Helius:
                 # 11-08: on Fly the main key answered 429 to every retry for minutes; whether its reply carries the
                 # 'max usage' text or not, a key that refuses every retry is no use to the scorer: move to the backup
                 # and probe the main again sooner than after a credits reply
-                _switch(True, "HTTP 429 through every retry", probe_s=RATE_PROBE_S)
+                _switch(True, "HTTP 429 through every retry", probe_s=RATE_PROBE_S, method=method)
                 return self._rpc(method, params, credits)
             return None
         with self._credit_lock:

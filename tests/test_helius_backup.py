@@ -112,3 +112,26 @@ def test_a_rate_limited_method_slows_down_alone_and_recovers(monkeypatch):
         hl._adapt("x", True, 0.15)
     assert hl.pace_status()["x"] == hl.MAX_INTERVAL_S
     assert "slowed_methods" in hl.key_status()
+
+
+def test_a_cheap_call_answering_on_the_main_key_does_not_move_clients_back(monkeypatch):
+    """Main key out of credits for history calls but still answering cheap ones: only a history call may probe."""
+    class _Partial(_Http):
+        def post(self, url, params=None, json=None):
+            if params["api-key"] == "MAIN" and json["method"] == "getTransactionsForAddress":
+                self.keys.append("MAIN")
+                return httpx.Response(429, json={"error": {"message": "max usage reached"}},
+                                      request=httpx.Request("POST", url))
+            return super().post(url, params, json)
+
+    http = _Partial(empty=())
+    h = hl.Helius(client=http)
+    h.min_interval_s = 0
+    assert h._rpc("getTransactionsForAddress", [], 10) == {"key": "BACKUP"}
+    assert hl.KEYS["on_backup"] and hl.key_status()["probe_method"] == "getTransactionsForAddress"
+    monkeypatch.setattr(hl.time, "time", lambda: hl.KEYS["probe_at"] + 1)
+    http.keys.clear()
+    assert h._rpc("getSlot", [], 1) == {"key": "BACKUP"}  # a cheap call doesn't probe
+    assert http.keys == ["BACKUP"] and hl.KEYS["on_backup"] and hl.KEYS["switches"] == 1
+    assert h._rpc("getTransactionsForAddress", [], 10) == {"key": "BACKUP"}  # the probe: main still empty
+    assert http.keys[-2:] == ["MAIN", "BACKUP"] and hl.KEYS["on_backup"] and hl.KEYS["switches"] == 1

@@ -354,8 +354,8 @@ def model(hist_store, watch_store, journal, cfg, retrain_h: float = RETRAIN_H, m
         pnl, capped = rm.day_tables(ts, cfg.model_book_liq_share)
         sizing_rows = [rm.simulate(pnl, capped, c, f, np.random.default_rng(1), sims=sims or rm.SIMS)
                        for c in rm.CAPITALS for f in rm.FRACTIONS]
-        st["actual_trade_usd_median"] = round(float(np.median([t["cost"] for t in ts])), 2)
-        st["actual_pct_of_capital"] = round(100 * st["actual_trade_usd_median"] / capital, 2)
+        st["actual_trade_usd"] = round(float(np.mean([t["cost"] for t in ts])), 2)
+        st["actual_pct_of_capital"] = round(100 * st["actual_trade_usd"] / capital, 2)
         st["with_liquidity_pct"] = round(100 * sum(1 for t in ts if t["liq"]) / len(ts))
         for r in sizing_rows:
             r["cash_short"] = r["pct_per_trade"] * st["peak_open"] > 100

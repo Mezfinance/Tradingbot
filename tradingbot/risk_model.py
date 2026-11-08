@@ -141,20 +141,24 @@ def book_stats(ts: list[dict], capital: float, rng, per_trade: list[dict] | None
 
 
 def day_tables(ts: list[dict], liq_share: float) -> tuple[np.ndarray, np.ndarray]:
-    """Per historical day (including days with no trade): P&L at trade size x for every x in GRID, and the share
-    of that day's trades held back by the liquidity cap at x."""
+    """Per historical day (including days with no trade): P&L when the book's AVERAGE trade is x, for every x in
+    GRID, and the share of that day's trades held back by the liquidity cap at x. Each trade keeps its own size
+    relative to the average (11-08: every trade used to get the same size, which threw away a sized book's sizing:
+    launchrw50_sz's $250 thin-pool / $25 mid-pool split is its whole edge, and at one size it read as a loser)."""
     first, last = _day(ts[0]["ts"]), _day(ts[-1]["ts"])
     pnl = np.zeros((last - first + 1, len(GRID))); capped = np.zeros_like(pnl); count = np.zeros(last - first + 1)
+    ref = float(np.mean([t["cost"] for t in ts])) or 1.0
     for t in ts:
         d = _day(t["ts"]) - first
         count[d] += 1
+        want = GRID * (t["cost"] / ref)
         if t["liq"]:
             cap = liq_share * t["liq"]
-            s = np.minimum(GRID, cap)
+            s = np.minimum(want, cap)
             ret = np.maximum(-1.0, t["ret"] - IMPACT_RT * (s - t["cost"]) / t["liq"])
-            capped[d] += GRID > cap
+            capped[d] += want > cap
         else:
-            s, ret = GRID, np.full(len(GRID), t["ret"])
+            s, ret = want, np.full(len(GRID), t["ret"])
         pnl[d] += s * ret
     with np.errstate(invalid="ignore", divide="ignore"):
         capped = np.where(count[:, None] > 0, capped / np.maximum(count[:, None], 1), 0.0)
@@ -229,8 +233,8 @@ def model(journal, store, cfg, books: list[str] | None = None, hours: float | No
         st = book_stats(ts, capital, rng)
         pnl, capped = day_tables(ts, cfg.model_book_liq_share)
         sims_out = [simulate(pnl, capped, c, f, np.random.default_rng(1), sims=sims) for c in CAPITALS for f in FRACTIONS]
-        st["actual_trade_usd_median"] = round(float(np.median([t["cost"] for t in ts])), 2)
-        st["actual_pct_of_capital"] = round(100 * st["actual_trade_usd_median"] / capital, 2)
+        st["actual_trade_usd"] = round(float(np.mean([t["cost"] for t in ts])), 2)
+        st["actual_pct_of_capital"] = round(100 * st["actual_trade_usd"] / capital, 2)
         st["with_liquidity_pct"] = round(100 * sum(1 for t in ts if t["liq"]) / len(ts))
         for r in sims_out:
             r["cash_short"] = r["pct_per_trade"] * st["peak_open"] > 100   # more open at once than the book holds
@@ -251,8 +255,8 @@ def model(journal, store, cfg, books: list[str] | None = None, hours: float | No
             "capital": capital, "liq_share": cfg.model_book_liq_share, "books": per,
             "too few trades": skipped, "correlation": corr, "equal_weight_portfolio": portfolio,
             "note": ("Sharpe/Sortino from daily P&L on each book's starting capital (sqrt 365); stuck trades count "
-                     "-100%; sizing simulation: whole historical days drawn with replacement, size = share of "
-                     f"equity capped at {100 * cfg.model_book_liq_share:g}% of the pool, extra round-trip impact "
+                     "-100%; sizing simulation: whole historical days drawn with replacement, average trade = share of "
+                     f"equity (each trade keeps its size relative to the book's average), capped at {100 * cfg.model_book_liq_share:g}% of the pool, extra round-trip impact "
                      f"{IMPACT_RT:g} x extra size / liquidity, {sims} one-year paths. Few days of history make the "
                      "year paths repeat the same days: read them as the shape of the trade-off, not a forecast.")}
 
@@ -281,11 +285,11 @@ def render(out: dict) -> str:
         L += ["", "  correlation of daily results", "  " + " " * 20 + "".join(f"{n[:9]:>10}" for n in names)]
         for a in names:
             L.append(f"  {a[:20]:20}" + "".join(f"{out['correlation'][a][b]:>10.2f}" for b in names))
-    L += ["", "2. TRADE SIZE (share of equity per trade, capped at %g%% of the pool; 1-year bootstrap of real days)"
+    L += ["", "2. TRADE SIZE (average trade as a share of equity, each trade keeping its size relative to the average, capped at %g%% of the pool; 1-year bootstrap of real days)"
           % (100 * out["liq_share"])]
     for b, e in ranked:
         s = e["stats"]
-        L += ["", f"  {b}: trades today at ~${s['actual_trade_usd_median']:,.0f} = {s['actual_pct_of_capital']:.2f}% of capital; "
+        L += ["", f"  {b}: average trade today ${s['actual_trade_usd']:,.0f} = {s['actual_pct_of_capital']:.2f}% of capital; "
                   f"{s['with_liquidity_pct']}% of trades have pool liquidity on record; best: " +
               "; ".join(f"{k} growth {v['best growth']}% / per-DD {v['best return per drawdown (ruin < 5%)']}%"
                         for k, v in e["best"].items()),
