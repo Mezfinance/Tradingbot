@@ -90,10 +90,20 @@ def test_later_exits_fetch_states_and_judge_every_exit_on_the_same_pools():
 
 def test_a_credit_cap_leaves_an_even_sample():
     st, h, now = _store(), _Helius(), T0 + 2000 * 90 + 3600
+    # a live pool near the end of the hash order already complete from another study's cache must not stretch the
+    # covered set over every rug of the band (11-08 $15-25k run: 42% rugged vs 29%)
+    band = [r for r in bp._rows(st, 0.0) if bp.MIN_LIQ <= r["liq"] < bp.MAX_LIQ and r["ret"] > -0.999]
+    tail = bp._order(band)[-1]["pool"]
+    ll.ensure_schema(st)
+    st.execute(ll.PATH_SCHEMA)
+    for sec in bp.EXITS.values():
+        st.execute("INSERT INTO watch_launch_path(pool, sec, sol, tok, ts) VALUES (?,?,?,?,?)",
+                   (tail, sec, 120.0, 1_000_000.0, 0.0))
     out = bp.study(st, now=now, helius=h, max_credits=1500)
     le = out["later exits"]
     assert h.credits_used <= 1500 and "stopped at the credit cap" in " ".join(le["fetch"])
     assert 0 < le["alive covered"] < le["alive at minute 6"]
+    assert le["complete live pools past the fetched prefix (left out)"] >= 1
     # rugs by minute 6 are only counted inside the fetched prefix, so the minute-6 rug rate stays near the band's
     assert "by exit" in le
     assert abs(le["by exit"][6]["every pool"]["rugged_pct"] - out["ceiling"]["every pool"]["rugged_pct"]) < 15

@@ -242,26 +242,31 @@ def fetch_states(store, helius, band: list[dict], max_credits: int) -> dict:
 
 def _exits(store, band: list[dict]) -> dict:
     """Adds `ret_by` {6, 10, 15, 30} and `cause_by` to every band pool and returns the covered set: pools in
-    `_order` up to the last one alive at minute 6 with every later exit known. Pools rugged by minute 6 need no
-    state, so counting all of them while only some live ones were fetched would add rugs; the prefix keeps the
-    set an even sample. Live pools inside the prefix still missing a state (a failed call) are left out."""
+    `_order` up to the first one alive at minute 6 that is missing a later state (where the fetch stopped). Pools
+    rugged by minute 6 need no state, so counting all of them while only some live ones were fetched would add
+    rugs; the prefix keeps the set an even sample. A failed call also ends the prefix (rerun to fetch it)."""
     from tradingbot import hold_study as hs
     try:
         have = _have(store)
     except Exception:  # noqa: BLE001 - optional part
         have = {}
     order = [r for r in _order(band) if _usable(r)]
-    last = -1
+    cut = len(order)
     for i, r in enumerate(order):
         d = hs.path_detail(r, have)
         r["ret_by"] = {6: r["ret"], **{m: d[sec][0] for m, sec in EXITS.items()}}
         r["cause_by"] = {m: d[sec][1] for m, sec in EXITS.items()}
-        if r["ret"] > -0.999 and all(v is not None for v in r["ret_by"].values()):
-            last = i
-    covered = [r for r in order[:last + 1] if all(v is not None for v in r["ret_by"].values())]
+        if cut == len(order) and r["ret"] > -0.999 and any(v is None for v in r["ret_by"].values()):
+            cut = i  # the fetch (in this same order) stopped here
+    # 11-08: the prefix used to run to the LAST complete live pool, so one pool complete from another study's cache
+    # near the end of the order pulled in every rug of the band while most live pools were still unfetched
+    # ($15-25k run: 42% rugged at minute 6 in the covered set vs 29% in the band).
+    covered = order[:cut]
     alive = sum(r["ret"] > -0.999 for r in order)
     return {"covered": covered, "usable": len(order), "alive at minute 6": alive,
-            "alive covered": sum(r["ret"] > -0.999 for r in covered)}
+            "alive covered": sum(r["ret"] > -0.999 for r in covered),
+            "complete live pools past the fetched prefix (left out)":
+                sum(r["ret"] > -0.999 and all(v is not None for v in r["ret_by"].values()) for r in order[cut:])}
 
 
 def _paired(a: list[float], b: list[float], rng) -> dict:
@@ -525,7 +530,9 @@ def render(out: dict) -> str:
                      f"{j.get('blocks where kept beat every pool', '-'):>9}{k.get('usd_at_100', '-'):>11}")
     le = out["later exits"]
     lines += ["", f"LATER EXITS (ideal trade at pool minute 6 / 10 / 15 / 30 on the same {le['covered']} pools; "
-              f"{le['alive covered']} of {le['alive at minute 6']} pools alive at minute 6 have every state)"]
+              f"{le['alive covered']} of {le['alive at minute 6']} pools alive at minute 6, the fetched prefix of an even "
+              f"sample; {le.get('complete live pools past the fetched prefix (left out)', 0)} complete pools past it "
+              "left out)"]
     if le.get("fetch"):
         lines.append(f"  fetch: {le['fetch']}")
     if "by exit" not in le:
