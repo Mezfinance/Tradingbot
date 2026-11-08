@@ -92,6 +92,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--estimate", action="store_true", help="history-backfill: list the pools and the credits only")
     parser.add_argument("--pulls-only", action="store_true",
                         help="history-backfill: only add LP pull times to pools saved before they were recorded")
+    parser.add_argument("--history", action="store_true",
+                        help="risk-model: replay the books over hist.db + the scorer table instead of their real trades")
+    parser.add_argument("--retrain-h", type=float, default=24.0, help="risk-model --history: model retrain interval")
     parser.add_argument("--books", default="", help="risk-model: comma list of books (default: every running book)")
     parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
@@ -496,6 +499,15 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot import risk_model
         from tradingbot.journal import Journal
         from tradingbot.watcher import WatchStore, watch_db_path
+        if args.history:
+            from tradingbot import risk_history
+            from tradingbot.watcher import hist_db_path
+            import os as _os
+            hist = WatchStore(hist_db_path(cfg)) if _os.path.exists(hist_db_path(cfg)) else None
+            out = risk_history.model(hist, WatchStore(watch_db_path(cfg)), Journal(cfg.db_path), cfg,
+                                     retrain_h=args.retrain_h)
+            print(json.dumps(out, indent=2, default=str) if args.json else risk_history.render(out))
+            return
         books = [b.strip() for b in args.books.split(",") if b.strip()] or None
         out = risk_model.model(Journal(cfg.db_path), WatchStore(watch_db_path(cfg)), cfg, books=books, hours=args.hours)
         print(json.dumps(out, indent=2, default=str) if args.json else risk_model.render(out))

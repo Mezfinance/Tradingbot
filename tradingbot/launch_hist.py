@@ -210,6 +210,7 @@ def fill_sol_prices(store, since: float, until: float, http=None) -> int:
     import httpx
     http = http or httpx.Client(timeout=30)
     store.execute("CREATE TABLE IF NOT EXISTS watch_market(ts REAL PRIMARY KEY, sol_usd REAL, new_pools INTEGER)")
+    store.execute("CREATE INDEX IF NOT EXISTS watch_market_ts ON watch_market(ts)")  # one lookup per pool
     have = {int(r[0]) for r in store.query("SELECT ts FROM watch_market WHERE ts >= ? AND ts <= ?", (since, until))}
     rows, t = [], since - since % 3600
     while t < until:
@@ -234,7 +235,8 @@ def rows(store, cfg: Config) -> tuple[list[dict], dict]:
     listed = {r[0] for r in store.query("SELECT pool FROM watch_pools")}
     dropped: collections.Counter = collections.Counter()
     out = []
-    for r in store.query("SELECT pool, data FROM watch_launch_hist WHERE status='ok'"):
+    scan = getattr(store, "iterate", store.query)  # a year of rows: stream them instead of holding every JSON at once
+    for r in scan("SELECT pool, data FROM watch_launch_hist WHERE status='ok'"):
         rec = json.loads(r["data"])
         txs, create = rec.get("txs") or [], rec["create_ts"]
         if not txs:
