@@ -1194,3 +1194,41 @@ def test_engine_runs_the_conditional_hold_checks(monkeypatch, quotes, sold_at, r
     assert sold is not None and created + sold_at <= sold < created + sold_at + 10
     [(r,)] = j.query("SELECT reason FROM fills WHERE side='sell'")
     assert r == reason
+
+
+def test_mid_band_book_ranks_15_25k_pools_against_their_own_band(setup):
+    """11-09: the +50% filter tried in $15-25k (launchbig15k), ranked only against that band's past day."""
+    import random
+    from tradingbot import model_book as mb
+    cfg, st, hel, clock, live, p, create = setup
+    assert ll.big_flags(20_000, 75.0) == {"big30": False, "big30m": True}
+    assert ll.big_flags(60_000, 75.0) == {"big30": True, "big30m": False}
+    assert not any(ll.big_flags(20_000, 65.0).values()) and not any(ll.big_flags(30_000, 99.0).values())
+    _rw_done_rows(st, 600, clock.t - 2 * 86400, random.Random(9))
+    st.execute("UPDATE watch_launch_live SET liq_usd = CASE WHEN rowid % 2 = 0 THEN 20000 ELSE 60000 END")
+    cfg.launch_big_mid_book = True
+    try:
+        assert ll.train_big_and_save(st, cfg) is not None
+        model = live._load_big_model()
+        assert model.meta["band_rows_big30m"] == 300 and model.meta["band_quantiles_big30m"]
+        assert len(live.big_bands["big30m"]) == 0  # rows are older than the band's past day
+        win_like = {"creator_buys": 0.5, "log_buyers": 2.5}
+        flat_like = {"creator_buys": 0.5, "log_buyers": 0.5}
+        mid = (model.score(win_like) + model.score(flat_like)) / 2
+        with live.lock:
+            live.big_bands["big30m"].extend((clock.t - 3600, mid) for _ in range(ll.ROLLING_MIN))
+            live.big_bands["big30"].extend((clock.t - 3600, 99.0) for _ in range(ll.ROLLING_MIN))  # other band's past
+        assert live._big_verdict(win_like, "N", clock.t, clock.t, 20_000)["big_pct"] == 100.0
+        assert live._big_verdict(flat_like, "N", clock.t, clock.t, 20_000)["big_pct"] == 0.0
+        assert live._big_verdict(win_like, "N", clock.t, clock.t, 60_000) == {}  # launchbig40k is off: not scored
+        cfg.launch_live = True
+        assert mb.LAUNCH_BIG_MID in mb.active_books(cfg) and mb.LAUNCH_BIG not in mb.active_books(cfg)
+        sig = {"big30m": True, "big30": False, "mint": "M", "created_ts": 100.0}
+        assert mb.wants(mb.LAUNCH_BIG_MID, sig) and not mb.wants(mb.LAUNCH_BIG, sig)
+        assert mb.exit_deadline(cfg, mb.LAUNCH_BIG_MID, sig) == 100.0 + 360
+        assert mb.hold_checks(mb.LAUNCH_BIG_MID, sig) is None
+        assert mb.band_usd(mb.LAUNCH_BIG_MID, 20_000) == 100.0
+        from tradingbot import dashboard
+        assert dashboard.family_of(mb.LAUNCH_BIG_MID) == "Rug-vs-win"
+    finally:
+        cfg.launch_big_mid_book, cfg.launch_live = False, False

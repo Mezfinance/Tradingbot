@@ -22,6 +22,7 @@ SWAPS = {  # name -> (band from, band to, book whose trades replace sz's in that
     "$25-40k held to 10": (25_000.0, 40_000.0, "launchrw50_25k10"),
     "$25-40k held to 15": (25_000.0, 40_000.0, "launchrw50_25k15"),
     "$40-80k +50% filter, held while rising": (40_000.0, 80_000.0, "launchbig40k"),
+    "$15-25k +50% filter": (15_000.0, 25_000.0, "launchbig15k"),  # 11-09
 }
 VARIANTS = (
     ("$25-40k held to 10",),
@@ -29,6 +30,8 @@ VARIANTS = (
     ("$40-80k +50% filter, held while rising",),
     ("$25-40k held to 10", "$40-80k +50% filter, held while rising"),
     ("$25-40k held to 15", "$40-80k +50% filter, held while rising"),
+    ("$15-25k +50% filter",),
+    ("$15-25k +50% filter", "$25-40k held to 15"),
 )
 BANDS = (("$5-15k", 5_000.0, 15_000.0), ("$15-25k", 15_000.0, 25_000.0), ("$25-40k", 25_000.0, 40_000.0),
          ("$40-80k", 40_000.0, 80_000.0), ("$80k+", 80_000.0, float("inf")))

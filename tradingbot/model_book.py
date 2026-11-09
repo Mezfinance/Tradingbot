@@ -120,6 +120,12 @@ BAND_SIZE_BANDS.update({LAUNCH_HOLD10: ((float("inf"), 250.0),), LAUNCH_HOLD15: 
 LAUNCH_BIG = "launchbig40k"
 LAUNCH_BIG_CUT = {LAUNCH_BIG: "big30"}
 BAND_SIZE_BANDS[LAUNCH_BIG] = ((float("inf"), 250.0),)
+# 11-09: the same +50% filter in $15-25k pools (flag `big30m`, launch_live.MID_BAND), minute-6 exit (holding
+# longer lost in that band), $100 a trade like launchrwband there, so the two rules for the band compare directly
+LAUNCH_BIG_MID = "launchbig15k"
+LAUNCH_BIG_CUT[LAUNCH_BIG_MID] = "big30m"
+LAUNCH_BIG_MID_CUT = {LAUNCH_BIG_MID: "big30m"}
+BAND_SIZE_BANDS[LAUNCH_BIG_MID] = ((float("inf"), 100.0),)
 HOLD_CHECK_MIN = {LAUNCH_BIG: (6.0, 10.0)}  # pool minutes of the conditional hold checks
 HOLD_CHECK_GAIN = 0.0  # stay only while the sale would return at least the cost ...
 HOLD_CHECK_RISING = True  # ... and no less than at the previous check
@@ -211,7 +217,8 @@ def _family_books(cfg: Config) -> list[str]:
         + (list(LAUNCH_SIZED_CUT) if cfg.launch_sized_book and cfg.launch_live else []) \
         + (list(LAUNCH_BAND_CUT) if cfg.launch_band_book and cfg.launch_live else []) \
         + (list(LAUNCH_HOLD_CUT) if cfg.launch_hold_book and cfg.launch_live else []) \
-        + (list(LAUNCH_BIG_CUT) if cfg.launch_big_book and cfg.launch_live else []) \
+        + ([LAUNCH_BIG] if cfg.launch_big_book and cfg.launch_live else []) \
+        + ([LAUNCH_BIG_MID] if cfg.launch_big_mid_book and cfg.launch_live else []) \
         + ([CANARY4] if cfg.launch_canary and cfg.launch_live else [])
 
 
@@ -768,7 +775,8 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
                                       "launchd12_s30": 18.0, "launchd12_s50": 11.0,
                                       "launchrw50": 21.0, "launchd12rw50": 17.0, LAUNCH_SIZED: 23.0,
                                       LAUNCH_BAND: 25.0, LAUNCH_BAND_SZ: 25.0, LAUNCH_HOLD10: 27.0,
-                                      LAUNCH_HOLD15: 34.0, LAUNCH_HOLD15_MAX: 34.0, LAUNCH_BIG: 30.0}.get(name, 76.0),  # backtests
+                                      LAUNCH_HOLD15: 34.0, LAUNCH_HOLD15_MAX: 34.0, LAUNCH_BIG: 30.0,
+                                      LAUNCH_BIG_MID: 43.0}.get(name, 76.0),  # backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 

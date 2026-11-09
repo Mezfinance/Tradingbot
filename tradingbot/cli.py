@@ -303,7 +303,7 @@ def main(argv: list[str] | None = None) -> None:
             print(f"pull model written to {out}" if out else "pull model: not enough data to train yet")
             out = launch_live.train_rw_and_save(store, cfg)
             print(f"rug-vs-win model written to {out}" if out else "rug-vs-win model: not enough data to train yet")
-            if cfg.launch_big_book:
+            if cfg.launch_big_book or cfg.launch_big_mid_book:
                 out = launch_live.train_big_and_save(store, cfg)
                 print(f"+50% model written to {out}" if out else "+50% model: not enough data to train yet")
         return
