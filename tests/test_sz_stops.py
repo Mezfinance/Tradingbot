@@ -71,6 +71,24 @@ def test_climb_sells_a_pool_that_never_rose_and_keeps_one_that_did():
     assert r["climb 1m +0%"]["fired"] == 1 and r["climb 2m +0%"]["fired"] == 1   # 'late' never rose above the buy
 
 
+def test_drawdown_limits_combine_with_exit_rules_and_early_sales_count_early():
+    slow = lambda s: 1 - 0.002 * max(0, s - 10)           # noqa: E731  -76% each at minute 6, -21% if stopped
+    up = lambda s: 1.0 + 0.001 * max(0, s - 10)           # noqa: E731
+    pools = {f"l{i}": (slow, -0.76, None) for i in range(3)}
+    pools.update({f"w{i}": (up, 0.30, None) for i in range(3)})
+    st, j = _setup(pools)                                  # one buy every 1,000 s, all in one UTC day
+    out = ss.study(st, j, now=T0 + 3 * D)
+    g = {(c["rule"], c["limit"]): c for c in out["combos"]}
+    # $100 limit: the first two losers are sold (-$152) before the third buy, so the rest of the day is skipped
+    assert g[("no rule", "day loss 1%")]["trades"] == 2
+    assert g[("no rule", "day loss 10%")]["trades"] == 6               # $1,000 never reached
+    # with a -20% stop each loser costs ~$21 and is sold ~100 s after its buy: -$63 never reaches $100
+    assert g[("stop -20%", "day loss 1%")]["trades"] == 6
+    assert len(out["limits"]) == len(ss.limits()) - 1 and all(c["delta_ci"] is not None for c in out["limits"])
+    text = ss.render(out)
+    assert "DRAWDOWN LIMITS ALONE" in text and "EXIT RULE x DRAWDOWN LIMIT" in text and "BEST 10 COMBINATIONS" in text
+
+
 def test_paths_cut_by_the_page_cap_are_not_judged():
     st, j = _setup({"a": (lambda s: 0.5, -0.56, None)}, complete=False)
     out = ss.study(st, j, now=T0 + 3 * D)

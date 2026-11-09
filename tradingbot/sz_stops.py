@@ -1,4 +1,4 @@
-"""Stop losses and climb checks on a launch book's real trades (11-09, read only; Helius only with --fetch).
+"""Stop losses, climb checks and drawdown limits on a launch book's real trades (11-09, read only; Helius only with --fetch).
 
 Question (user): would a per-trade exit rule have saved sz money, without giving up its winners? The evidence before
 this was mixed: a -25% stop on model5 was slightly worse in its backtest and slightly better on 25 live trades, an
@@ -22,6 +22,11 @@ The exited trade's return = real return + (proceeds per token at the rule's sale
 (`_keep`: tokens / (tokens + ours)) from the pool's reserves then: larger than at the real sale when liquidity was
 withdrawn (both reserves shrink), smaller after a sell-off (the token reserve grows). The trade keeps its own fees
 and fill gap. A pull in one transaction leaves nothing to sell, as in reality.
+
+Drawdown limits (`limits()`, run by `dd_limits.apply_rule` on the starting capital `CAPITAL_USD`): day loss
+`DAY_LOSS` and day trail `DAY_TRAIL` (no buys for the rest of the UTC day once the day's realized P&L is k below 0 /
+below its high for the day), alone and on top of every exit rule; an early sale counts toward the day when its money
+came back. They need no path, so they act on every trade.
 
 Per rule: $, change vs no rule with a 90% bootstrap interval over trades (paired), the change in each half of the
 life, by liquidity band and per 6 h block, how often it fired, $ saved on trades that went on falling, $ lost on
@@ -56,6 +61,9 @@ TRAILS = (20, 30, 40)  # % below the best pool price since our buy
 CLIMBS = [(m, g) for m in (1, 2, 3, 4) for g in (0, 5, 10)]  # (minutes after the buy, % gain needed by then)
 BANDS = ((0, 15_000, "under $15k"), (15_000, 25_000, "$15-25k"), (25_000, float("inf"), "$25k+"))
 DRAWS = 2000
+CAPITAL_USD = 10_000.0   # drawdown limits are % of this (the book's starting cash)
+DAY_LOSS = (1, 2, 3, 5, 7.5, 10)   # % of capital: stop buying for the rest of the UTC day once down this much
+DAY_TRAIL = (1, 2, 3, 5, 7.5, 10)  # % of capital below the day's realized high
 TOP = 10
 
 SCHEMA = "CREATE TABLE IF NOT EXISTS watch_trade_path(pool TEXT PRIMARY KEY, data TEXT, ts REAL)"
@@ -233,10 +241,11 @@ def samples(t: dict, path: dict | None) -> dict | None:
     return {"p0": p0, "end": proceeds(t["sold"], end_state), "checks": checks, "impact": ours is not None}
 
 
-def rule_return(t: dict, smp: dict | None, rule: dict) -> tuple[float, bool]:
-    """(return under the rule, whether it sold early). Without a usable path the real return stands."""
+def rule_return(t: dict, smp: dict | None, rule: dict) -> tuple[float, bool, float]:
+    """(return under the rule, whether it sold early, when its money came back). Without a usable path the real
+    trade stands."""
     if smp is None or rule["kind"] == "none":
-        return t["ret"], False
+        return t["ret"], False, t["ts"]
     p0, best, seen = smp["p0"], smp["p0"], 0.0   # seen = best price at the checks after the buy (climb)
     for age, p, sp in smp["checks"]:
         best, seen = max(best, p), max(seen, p)
@@ -248,11 +257,21 @@ def rule_return(t: dict, smp: dict | None, rule: dict) -> tuple[float, bool]:
             if age < rule["after"]:
                 continue
             if seen > p0 * (1 + rule["gain"]):
-                return t["ret"], False
+                return t["ret"], False, t["ts"]
             hit = True
         if hit:
-            return max(-1.0, min(CAP, t["ret"] + (sp - smp["end"]) / p0)), True
-    return t["ret"], False
+            sold = min(t["opened"] + age + SELL_DELAY_S, t["sold"])
+            return max(-1.0, min(CAP, t["ret"] + (sp - smp["end"]) / p0)), True, sold
+    return t["ret"], False, t["ts"]
+
+
+def limits() -> list[tuple[str, dict]]:
+    """Drawdown limits from dd-limits, on the starting capital: the day's realized loss, and the day's give-back
+    from its realized high (no buys for the rest of the UTC day once hit)."""
+    out = [("no limit", {"kind": "none"})]
+    out += [(f"day loss {k:g}%", {"kind": "day", "k": k}) for k in DAY_LOSS]
+    out += [(f"day trail {k:g}%", {"kind": "trail", "k": k}) for k in DAY_TRAIL]
+    return out
 
 
 def rules() -> list[tuple[str, str, dict]]:
@@ -280,11 +299,14 @@ def _ci(delta: np.ndarray, rng) -> list:
     return [round(float(np.percentile(sums, 5))), round(float(np.percentile(sums, 95)))]
 
 
-def score(tr: list[dict], rets: np.ndarray, fired: np.ndarray, base: np.ndarray, mid: float, rng) -> dict:
+def score(tr: list[dict], rets: np.ndarray, fired: np.ndarray, base: np.ndarray, mid: float, rng,
+          mult: np.ndarray | None = None, ts: np.ndarray | None = None, ci: bool = True) -> dict:
     cost = np.array([t["cost"] for t in tr])
-    pnl = cost * rets
+    mult = np.ones(len(tr)) if mult is None else mult
+    fired = fired & (mult > 0)
+    pnl = mult * cost * rets
     delta = pnl - base
-    ts = np.array([t["ts"] for t in tr])
+    ts = np.array([t["ts"] for t in tr]) if ts is None else ts
     order = np.argsort(ts, kind="stable")
     eq = np.concatenate([[0.0], np.cumsum(pnl[order])])
     dd = float((eq - np.maximum.accumulate(eq)).min())
@@ -294,8 +316,11 @@ def score(tr: list[dict], rets: np.ndarray, fired: np.ndarray, base: np.ndarray,
     bdel = np.bincount(inv, weights=delta, minlength=len(keys))
     real = np.array([t["ret"] for t in tr])
     went_on = fired & (delta > 0)
-    return {"usd": round(float(pnl.sum())), "delta_usd": round(float(delta.sum())), "delta_ci": _ci(delta, rng),
-            "mean_pct": round(100 * float(pnl.sum() / cost.sum()), 2) if cost.sum() else None,
+    traded = float((mult * cost).sum())
+    return {"usd": round(float(pnl.sum())), "delta_usd": round(float(delta.sum())),
+            "delta_ci": _ci(delta, rng) if ci else None, "trades": int((mult > 0).sum()),
+            "mean_pct": round(100 * float(pnl.sum() / traded), 2) if traded else None,
+            "ret_per_dd": round(float(pnl.sum()) / -dd, 2) if dd < -1 else None,
             "fired": int(fired.sum()), "saved_usd": round(float(delta[went_on].sum())),
             "cut_winners_usd": round(float(delta[fired & (delta < 0)].sum())),
             "fired_on_rugs": int((fired & (real <= -0.99)).sum()),
@@ -325,18 +350,38 @@ def study(store, journal, book: str = BOOK, hours: float | None = None, now: flo
     cost = np.array([t["cost"] for t in tr])
     base = cost * np.array([t["ret"] for t in tr])
     mid = (tr[0]["opened"] + max(t["ts"] for t in tr)) / 2
-    res = []
+    from tradingbot import dd_limits
+    res, combos = [], []
     for label, fam, rule in rules():
-        rs, fs = zip(*(rule_return(t, s, rule) for t, s in zip(tr, smps)))
-        res.append({"rule": label, "family": fam,
-                    **score(tr, np.array(rs), np.array(fs, dtype=bool), base, mid, rng)})
+        rs, fs, sts = zip(*(rule_return(t, s, rule) for t, s in zip(tr, smps)))
+        rs, fs, sts = np.array(rs), np.array(fs, dtype=bool), np.array(sts)
+        res.append({"rule": label, "family": fam, **score(tr, rs, fs, base, mid, rng, ts=sts)})
+        # the same trades under each drawdown limit; an early sale counts toward the day when its money came back
+        lt = [{"opened": t["opened"], "ts": float(x), "cost": t["cost"], "ret": float(r)}
+              for t, r, x in zip(tr, rs, sts)]
+        for lname, lim in limits()[1:]:
+            mult = np.array(dd_limits.apply_rule(lt, lim, CAPITAL_USD))
+            combos.append({"rule": label, "family": fam, "limit": lname, "_args": (rs, fs, sts, mult),
+                           **score(tr, rs, fs, base, mid, rng, mult=mult, ts=sts, ci=False)})
+    alone = [c for c in combos if c["rule"] == "no rule"]
+    usd_alone = {r["rule"]: r["usd"] for r in res}
+    # combinations where the limit changed something (otherwise they repeat the exit rule's own row)
+    bound = [c for c in combos if c["rule"] != "no rule" and c["usd"] != usd_alone[c["rule"]]]
+    best = sorted(bound, key=lambda c: -(c["ret_per_dd"] or -99))[:TOP]
+    for c in alone + best:   # intervals only where they are read
+        if c.get("delta_ci") is None:
+            rs, fs, sts, mult = c["_args"]
+            c["delta_ci"] = _ci(mult * cost * rs - base, rng)
+    for c in combos:
+        c.pop("_args", None)
     # units check: the pool's move over the hold minus the real return, on usable non-rug trades
     check = [(s["end"] / s["p0"] - 1) - t["ret"] for t, s in zip(tr, smps) if s and t["ret"] > -0.99]
     usable = [t for t, s in zip(tr, smps) if s]
     return {"book": book, "from": tr[0]["opened"], "to": max(t["ts"] for t in tr), "coverage": cover,
             "fetch": fetch, "usable_usd": round(float(sum(t["cost"] * t["ret"] for t in usable))),
             "path_check": {"n": len(check), "median_pts": round(100 * float(np.median(check)), 1) if check else None},
-            "rules": res}
+            "rules": res, "limits": alone, "combos": combos, "best_combos": best,
+            "capital": CAPITAL_USD}
 
 
 # render ----------------------------------------------------------------------------------------------------------
@@ -353,12 +398,29 @@ HEAD = (f"  {'rule':<17}{'fired':>6}{'$':>9}{'vs none':>9}{'90% CI':>17}{'half 1
         f"{'blk +/-':>9}{'saved':>8}{'cut win':>9}{'on rugs':>8}{'mean':>8}{'max DD':>9}")
 
 
+LHEAD = (f"  {'limit':<22}{'trades':>7}{'$':>9}{'vs none':>9}{'90% CI':>17}{'half 1':>8}{'half 2':>8}"
+         f"{'blk +/-':>9}{'mean':>8}{'max DD':>9}{'$/DD':>7}")
+
+
+def _lrow(c: dict, label: str | None = None, width: int = 22) -> str:
+    ci = f"{c['delta_ci'][0]:,}..{c['delta_ci'][1]:,}" if c.get("delta_ci") else "-"
+    return (f"  {(label or c['limit']):<{width}}{c['trades']:>7,}{c['usd']:>9,}{c['delta_usd']:>9,}{ci:>17}"
+            f"{c['half1_delta']:>8,}{c['half2_delta']:>8,}{(str(c['blocks_better']) + '/' + str(c['blocks_worse'])):>9}"
+            f"{_f(c['mean_pct'], 7)}%{c['max_dd_usd']:>9,}{_f(c['ret_per_dd'], 7)}")
+
+
 def _row(r: dict) -> str:
     ci = f"{r['delta_ci'][0]:,}..{r['delta_ci'][1]:,}"
     return (f"  {r['rule']:<17}{_f(r['fired'], 6)}{_f(r['usd'], 9)}{_f(r['delta_usd'], 9)}{ci:>17}"
             f"{_f(r['half1_delta'], 8)}{_f(r['half2_delta'], 8)}{(str(r['blocks_better']) + '/' + str(r['blocks_worse'])):>9}"
             f"{_f(r['saved_usd'], 8)}{_f(r['cut_winners_usd'], 9)}{_f(r['fired_on_rugs'], 8)}"
             f"{_f(r['mean_pct'], 7)}%{_f(r['max_dd_usd'], 9)}")
+
+
+def _name(r: dict) -> str:
+    if "limit" not in r:
+        return r["rule"]
+    return r["limit"] if r["rule"] == "no rule" else f"{r['rule']} + {r['limit']}"
 
 
 def render(out: dict) -> str:
@@ -386,8 +448,26 @@ def render(out: dict) -> str:
     L += ["", "BY LIQUIDITY BAND ($ change vs none)", f"  {'rule':<17}" + "".join(f"{b:>12}" for _, _, b in BANDS)]
     for r in out["rules"][1:]:
         L.append(f"  {r['rule']:<17}" + "".join(f"{r['by_band'][b]:>12,}" for _, _, b in BANDS))
-    clear = [r for r in out["rules"][1:] if r["delta_ci"][0] > 0 and r["half1_delta"] > 0 and r["half2_delta"] > 0]
+    base = out["rules"][0]
+    L += ["", f"DRAWDOWN LIMITS ALONE (no exit rule; % of ${out['capital']:,.0f}; no buys for the rest of the UTC day "
+          "once hit; open trades run to their exit)", LHEAD, _lrow({**base, "limit": "no limit"})]
+    L += [_lrow(c) for c in out["limits"]]
+    lims = ["no limit"] + [c["limit"] for c in out["limits"]]
+    short = lambda n: n.replace("day loss ", "loss ").replace("day trail ", "trl ").replace("no limit", "none")  # noqa: E731
+    grid = {(c["rule"], c["limit"]): c for c in out["combos"]}
+    L += ["", "EXIT RULE x DRAWDOWN LIMIT ($ change vs no rule and no limit)",
+          f"  {'rule':<17}" + "".join(f"{short(n):>10}" for n in lims)]
+    for r in out["rules"]:
+        cells = [r["delta_usd"]] + [grid[(r["rule"], n)]["delta_usd"] for n in lims[1:]]
+        L.append(f"  {r['rule']:<17}" + "".join(f"{v:>10,}" for v in cells))
+    L += ["", f"BEST {TOP} COMBINATIONS BY $ PER $ OF DRAWDOWN, where the limit changed something "
+          f"(no rule, no limit: {base['ret_per_dd']})", LHEAD.replace(f"{'limit':<22}", f"{'exit rule + limit':<34}")]
+    L += [_lrow(c, f"{c['rule']} + {c['limit']}", 34) for c in out["best_combos"]] or ["  none: no limit ever bound"]
+    judged = out["rules"][1:] + out["limits"] + out["best_combos"]
+    clear = [r for r in judged if r.get("delta_ci") and r["delta_ci"][0] > 0 and r["half1_delta"] > 0
+             and r["half2_delta"] > 0]
     L += ["", "RULES WHOSE INTERVAL CLEARS ZERO AND HELP IN BOTH HALVES: "
-          + (", ".join(r["rule"] for r in clear) or "none")]
-    L.append("Read: a rule is worth building only if it is in that list and the settings either side of it are too.")
+          + (", ".join(_name(r) for r in clear) or "none")]
+    L.append("Read: a rule is worth building only if it is in that list and the settings either side of it are too. "
+             "Drawdown limits count every trade (no path needed); exit rules change only the judged trades.")
     return "\n".join(L)
