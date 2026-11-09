@@ -96,7 +96,9 @@ SIZE_BANDS = ((15_000.0, 250.0), (25_000.0, 25.0), (float("inf"), 100.0))  # (li
 # it made $11,706 vs $8,247 with max DD -31% vs -60%; on the year replay $4.49M vs $4.09M, DD -$34k vs -$512k.
 LAUNCH_SIZED_DD = "launchrw50_sz_dd24"
 LAUNCH_SIZED_DD_CUT = {LAUNCH_SIZED_DD: "rw50"}
-DD_LIMITS = {LAUNCH_SIZED_DD: (24.0, 500.0)}  # book -> (window hours, realized loss $ that stops new buys)
+# 11-10 (user): $1,000 (10% of $10k), was $500. dd-limits' own-days year replay: -5% gave up 33% of the year's money
+# for a ~90% smaller drawdown, -10% gave up 17% for nearly the same protection and did at least as well on sz's life.
+DD_LIMITS = {LAUNCH_SIZED_DD: (24.0, 1000.0)}  # book -> (window hours, realized loss $ that stops new buys)
 # By-band twins (11-08, `band-rw-study`): the live rug-vs-win model ranked within each liquidity band (flag
 # `rwband`, launch_live.BAND_RULES): $5-15k skip the riskiest 20%, $15-25k skip 70%, $25-40k the live rule, nothing
 # above $40k. Same rule in both books; only the thin band's size differs ($100 vs $250), to measure price impact.

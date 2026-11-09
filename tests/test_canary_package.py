@@ -59,7 +59,7 @@ def test_each_band_uses_its_own_rule_size_and_exit():
 def test_the_twins_drawdown_pauses_the_canary_and_a_missing_minute_10_keeps_minute_6():
     rows = []
     t = T0
-    for i in range(3):   # the twin buys $240 of each (2% of $12k) and loses it all: -$720 inside 24 h
+    for i in range(5):   # the twin buys $240 of each (2% of $12k) and loses it all: -$1,200 inside 24 h
         rows.append(_row(f"r{i}", t, 12_000.0, 10.0, -1.0)); t += 600
     t += 3600
     for i in range(5):   # bought within the next day: paused
@@ -70,7 +70,7 @@ def test_the_twins_drawdown_pauses_the_canary_and_a_missing_minute_10_keeps_minu
         rows.append(_row(f"b{i}", t, 12_000.0, 10.0, 0.3)); t += 600
     out = cp.study(_store(rows), None, None, Cfg(), now=t + D)
     p, q = out["packages"]["proposed"], out["packages"]["proposed + pause"]
-    assert p["bands"]["under $15k"]["trades"] == 13 and q["bands"]["under $15k"]["trades"] == 8   # 3 losers + 5 later
+    assert p["bands"]["under $15k"]["trades"] == 15 and q["bands"]["under $15k"]["trades"] == 10   # 5 losers + 5 later
     assert "$25-40k" not in q["bands"]
     assert out["info"]["$25-40k minute-10 states missing (minute 6 used)"] == 1
     assert abs(p["bands"]["$25-40k"]["mean_pct"] - 100 * (0.1 - out["gap"] - 0.03)) < 0.1

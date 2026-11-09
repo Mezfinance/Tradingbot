@@ -553,10 +553,10 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
     "launchrw50_sz": "launchrw50's picks sized by liquidity at second 4: $250 below $15k, $25 at $15-25k, $100 above "
                      "(capped at 2% of the pool). size-study on 1,039 launchrw50 trades: ~+$12.9k vs +$2.6k at a flat "
                      "$100, in-sample and optimistic at the big sizes; compare $ per $100 deployed with launchrw50",
-    "launchrw50_sz_dd24": "launchrw50_sz with no new buys while its realized P&L over the past 24 h is down $500+: "
-                          "dd-limits 11-09 on sz's life $11,706 vs $8,247 (max DD -31% vs -60%), year replay $4.49M vs "
-                          "$4.09M (DD -$34k vs -$512k; kept 98% of winning days, saved 90% of losing days); compare "
-                          "with launchrw50_sz on the same tokens",
+    "launchrw50_sz_dd24": "launchrw50_sz with no new buys while its realized P&L over the past 24 h is down $1,000+ "
+                          "($500 until 11-10; the canary follows its pause): dd-limits own-days year replay $3.44M vs "
+                          "$4.16M unlimited (DD -$64k vs -$568k; kept 71% of winning days, saved 74% of losing days); "
+                          "sz's life $11,941 vs $7,990",
 }
 
 

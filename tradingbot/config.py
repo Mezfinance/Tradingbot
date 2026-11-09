@@ -87,7 +87,7 @@ class Config:
     launch_hold_book: bool = False  # 11-08: launchrw50_25k10 / _25k15, rug-vs-win kept $25-40k pools held to pool minute 10 / 15
     launch_band_book: bool = False  # 11-08: launchrwband / launchrwband_sz, rug-vs-win ranked within each liquidity band
     launch_sized_book: bool = False  # 11-06: launchrw50_sz, launchrw50's signals sized by liquidity band
-    launch_sized_dd_book: bool = False  # 11-09: launchrw50_sz_dd24, sz that stops buying while down $500 over 24 h
+    launch_sized_dd_book: bool = False  # 11-09: launchrw50_sz_dd24, sz that stops buying while down $1,000 over 24 h (was $500)
     launch_rw24_book: bool = False  # 11-05: twin rw books on the earlier rule (24 h ranking, nightly 14-day model)
     # canary_rw50_sz (11-06): REAL MONEY. launchrw50_sz's thin-pool picks bought and sold for real through Jupiter
     # (live executor), to measure how real fills differ from the simulated ones. Needs the keypair and TB_LIVE_CONFIRM.

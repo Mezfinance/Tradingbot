@@ -306,13 +306,13 @@ def test_canary_book_takes_top2_picks_at_its_own_size_and_limits(cfg, good_pair)
         assert eng._model_skip_reason(book, sig("C")) == "canary halted (kill switch)"
         j.execute("DELETE FROM state WHERE key=?", (CANARY_HALT,))
         real = j.realized_since   # the dd24 paper twin down $500 over 24 h pauses the canary; its own losses don't
-        j.realized_since = lambda since, name: -500.0 if name == mb.LAUNCH_SIZED_DD else 0.0
+        j.realized_since = lambda since, name: -1000.0 if name == mb.LAUNCH_SIZED_DD else 0.0
         assert eng._model_skip_reason(book, sig("C")) == \
-            "twin launchrw50_sz_dd24 paused: past 24h drawdown limit (down $500)"
+            "twin launchrw50_sz_dd24 paused: past 24h drawdown limit (down $1,000)"
         cfg.launch_canary_follow_dd = False
         assert eng._model_skip_reason(book, sig("C")) is None
         cfg.launch_canary_follow_dd = True
-        j.realized_since = lambda since, name: -499.0 if name == mb.LAUNCH_SIZED_DD else -40.0
+        j.realized_since = lambda since, name: -999.0 if name == mb.LAUNCH_SIZED_DD else -40.0
         assert eng._model_skip_reason(book, sig("C")) is None
         j.realized_since = real
         cfg.launch_canary_max_open = 1

@@ -10,7 +10,7 @@ The user's package, one rule per liquidity band at second 4, at the canary's own
   $40k+        sz's rule                                                   $10, minute 6
 
 compared with the current canary rules (sz's rule in every band at $25 / $10 / $10, all sold at minute 6), each with
-and without the canary's drawdown pause (no new buys while the full-size paper twin launchrw50_sz_dd24 is down $500
+and without the canary's drawdown pause (no new buys while the full-size paper twin launchrw50_sz_dd24 is down $1,000
 over the past 24 h, `model_book.DD_LIMITS`, scaled to the replay's money like `dd-limits`).
 
 Inputs: the year replay saved by `risk-model --history` (hist.db `hist_replay`; it must carry each pool's `big`
@@ -118,6 +118,11 @@ def records(rows: list[dict], have10: dict, gap: float, liq_share: float) -> tup
     return out, dict(info)
 
 
+def _limit() -> float:
+    from tradingbot import model_book as mb
+    return mb.DD_LIMITS[mb.LAUNCH_SIZED_DD][1]
+
+
 def _pause(recs: list[dict], capital: float) -> list[float]:
     """The twin's past-24h $500 limit (scaled) at each record's open time; canary trades ride along at zero P&L."""
     from tradingbot import dd_limits as dl
@@ -191,7 +196,7 @@ def study(hist_store, watch_store, journal, cfg, fresh: bool = False, helius=Non
     mult = _pause(full, CAPITAL * scale)
     days = max(1, int((max(t["ts"] for t in full) - min(t["opened"] for t in full)) // 86400) + 1) if full else 1
     out = {"source": source, "gap": gap, "fee_usd": FEE_USD, "sizes": SIZES, "expand": exp, "scale": round(scale, 2),
-           "pause_usd_scaled": round(500 * scale), "days": days, "info": info, "minute10_fetch": fetched,
+           "pause_usd_scaled": round(_limit() * scale), "days": days, "info": info, "minute10_fetch": fetched,
            "minute10_states": len(have10), "packages": {}}
     for p in PACKAGES:
         for paused in (False, True):
@@ -215,7 +220,7 @@ def render(out: dict) -> str:
          "proposed: under $15k sz $25 m6 | $15-25k big15k $10 m6 | $25-40k 25k10 $10 held to minute 10 | $40k+ sz $10 m6",
          "current:  sz's rule in every band at $25 / $10 / $10 / $10, all sold at minute 6",
          f"pause: no new buys while the paper twin (sz at its own sizes) is down ${out['pause_usd_scaled']:,} over "
-         f"24 h (the live $500 x{out['scale']} replay money); it paused {out['twin'].get('paused_share_of_trades_pct')}% "
+         f"24 h (the live ${_limit():,.0f} x{out['scale']} replay money); it paused {out['twin'].get('paused_share_of_trades_pct')}% "
          "of the picks",
          f"minute-10 states on hand: {out['minute10_states']:,}"
          + (f"; this run's fetch: {out['minute10_fetch']}" if out.get("minute10_fetch") else ""),
