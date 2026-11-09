@@ -415,6 +415,12 @@ class MarketMonitor:
         if n:
             log.info("market monitor: %d hour(s) stored", n)
         self.events = self.update_flags()
+        if self.journal is not None:  # what the flags meant for each book (read only); never breaks the monitor
+            try:
+                from tradingbot import flag_tracker
+                flag_tracker.update(self.store, self.journal, self.cfg, now)
+            except Exception:  # noqa: BLE001
+                log.exception("flag tracker update failed")
         return n
 
     def update_flags(self) -> list[dict]:
@@ -554,10 +560,10 @@ def flag_summary(rows: list[dict], flags: list[dict], now: float | None = None, 
 
 
 def payload(rows: list[dict], now: float | None = None, since: float = 0.0, flags: list[dict] | None = None,
-            status: dict | None = None) -> dict:
+            status: dict | None = None, tracker: dict | None = None) -> dict:
     """What the dashboard's Market tab needs: the last PAGE_HOURS rows, the comparison and the metric list."""
     now = now if now is not None else time.time()
-    return {"built_ts": now, "rows": [r for r in rows if r["hour"] >= now - PAGE_HOURS * HOUR_S],
+    return {"built_ts": now, "tracker": tracker or {}, "rows": [r for r in rows if r["hour"] >= now - PAGE_HOURS * HOUR_S],
             "compare": compare(rows, since=since), "baseline_since": since, "metrics": [list(m) for m in METRICS],
             "recent_h": RECENT_H, "baseline_h": BASELINE_H, "last_hour": rows[-1]["hour"] if rows else None,
             "status": status or {}, "poll_s": MONITOR_POLL_S,
