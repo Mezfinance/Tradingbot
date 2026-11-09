@@ -946,8 +946,8 @@ def test_a_reverted_pool_minute_exit_is_retried_at_once(cfg, good_pair):
 
 
 def test_canary_sizes_follow_the_twins_bands_in_the_same_order():
-    # the twin's $250 / $25 / $100 (thin / middle / deep) become $5 / $0.50 / $2 for the real-money canary
-    assert [mb.band_usd(mb.CANARY4, liq) for liq in (10_000, 20_000, 60_000)] == [5.0, 0.5, 2.0]
+    # the real-money canary (user, 11-10): $25 thin, $5 at $15-25k, $10 above
+    assert [mb.band_usd(mb.CANARY4, liq) for liq in (10_000, 20_000, 60_000)] == [25.0, 5.0, 10.0]
     assert [mb.band_usd(mb.CANARY_TWIN, liq) for liq in (10_000, 20_000, 60_000)] == [250.0, 25.0, 100.0]
     assert mb.band_usd("launchrw50", 10_000) is None and mb.band_usd(mb.CANARY4, None) is None
 

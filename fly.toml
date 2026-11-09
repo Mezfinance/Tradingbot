@@ -31,7 +31,7 @@ primary_region = "iad"
   TB_LAUNCH_CANARY_USD = "5"  # fallback size when a signal has no liquidity
   TB_LAUNCH_CANARY_MAX_LIQ_USD = "0"  # every pool, all three bands (user, 11-07)
   TB_LAUNCH_CANARY_FLAT_USD = "0"  # off: sizes follow the twin's bands (was 0.01, the 1-cent test)
-  TB_LAUNCH_CANARY_BAND_SCALE = "0.04"  # 1/25 of the twin: $10 below $15k, $1 at $15-25k, $4 above (11-07)
+  TB_LAUNCH_CANARY_BAND_SCALE = "0"  # off: sizes from model_book.CANARY_SIZE_BANDS, $25 below $15k / $5 at $15-25k / $10 above (user, 11-10)
   TB_LAUNCH_CANARY_BUDGET_USD = "600"  # the USDC in the canary wallet (11-07; was 45)
   TB_LAUNCH_CANARY_DAILY_LOSS_USD = "300"  # no new buys once today's net realized loss reaches $300 (11-07)
   TB_LAUNCH_CANARY_EVERY_N = "1"  # every pick (11-07; 2 = every other, which gives canary-rug-check a skipped control)
