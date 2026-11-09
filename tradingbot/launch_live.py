@@ -1912,6 +1912,20 @@ def parity(store, rows) -> dict:
             "median_max_diff": round(float(np.median(diffs)), 4), "worst_max_diff": round(float(max(diffs)), 4)}
 
 
+FLAG_COLS = ("top2, top5, top2h, top5h, low_h, risk_pct, rw_pct, rw_low_pct, rw_low6, rw24_pct, rw24_low_pct, "
+             "liq_usd, rwb_pct, big_pct")  # the scorer columns every book flag is computed from
+
+
+def flag_hit(r, flag: str) -> bool:
+    """Was this scorer row a signal for a book with this flag (model_book.LAUNCH_CUT)? Same rules as the live send."""
+    if flag in ("top2", "top5", "top2h", "top5h"):
+        return bool(r[flag])
+    return bool({**low_flags(r["low_h"], r["risk_pct"]), **rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"]),
+                 **rw24_flags(r["low_h"], r["rw24_pct"], r["rw24_low_pct"]),
+                 **band_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"]), **big_flags(r["liq_usd"], r["big_pct"]),
+                 **thin_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"])}.get(flag))
+
+
 def fill_gap(store, journal, book: str, since: float, rng) -> dict:
     """A book's real (Jupiter-simulated) trades vs the scorer's ideal trade on the same pools: vault price at
     second ~6.5 in, vault price at minute 6 out, flat 6% cost. The gap is what a real fill costs live."""
@@ -1931,15 +1945,9 @@ def fill_gap(store, journal, book: str, since: float, rng) -> dict:
                                                 (book, since - 600))}
     missed = []
     if flag:
-        for r in store.query("SELECT token_mint, ret, top2, top5, top2h, top5h, low_h, risk_pct, rw_pct, rw_low_pct, rw_low6, rw24_pct, rw24_low_pct, liq_usd, rwb_pct, big_pct "
-                             "FROM watch_launch_live "
+        for r in store.query(f"SELECT token_mint, ret, {FLAG_COLS} FROM watch_launch_live "
                              "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND create_ts >= ?", (since,)):
-            hit = r[flag] if flag in ("top2", "top5", "top2h", "top5h") else {
-                **low_flags(r["low_h"], r["risk_pct"]), **rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"]),
-                **rw24_flags(r["low_h"], r["rw24_pct"], r["rw24_low_pct"]),
-                **band_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"]), **big_flags(r["liq_usd"], r["big_pct"]),
-                **thin_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"])}[flag]
-            if hit and r["token_mint"] not in bought:
+            if flag_hit(r, flag) and r["token_mint"] not in bought:
                 missed.append({"ret": r["ret"]})
     if not pairs:
         return {"trades": 0, "signalled but not bought (ideal)": _group(missed, rng)}

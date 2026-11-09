@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -109,6 +109,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--fetch", action="store_true",
                         help="band-prize: fetch minute-10/15/30 pool states from Helius first (~10 credits each)")
     parser.add_argument("--books", default="", help="risk-model: comma list of books (default: every running book)")
+    parser.add_argument("--book", default="launchrw50_sz", help="missed-signals: the launch book to look at")
     parser.add_argument("--group", default="bought", help="replay: bought|passed|survivors|filters|all")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=VALUE",
                         help="replay: override a setting, e.g. stop_loss_pct=20 (repeatable)")
@@ -592,6 +593,15 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore as _TsWS, watch_db_path as _ts_wdp
         out = thin_sizing.study(_TsWS(_ts_wdp(cfg)), _TsJournal(cfg.db_path), hours=args.hours)
         print(json.dumps(out, indent=2, default=str) if args.json else thin_sizing.render(out))
+        return
+
+    if args.command == "missed-signals":  # signals a launch book was sent but didn't buy, and why
+        from tradingbot import missed_signals
+        from tradingbot.journal import Journal as _MsJournal
+        from tradingbot.watcher import WatchStore as _MsWS, watch_db_path as _ms_wdp
+        out = missed_signals.study(_MsWS(_ms_wdp(cfg)), _MsJournal(cfg.db_path), book=args.book,
+                                   hours=args.hours or 24.0)
+        print(json.dumps(out, indent=2, default=str) if args.json else missed_signals.render(out))
         return
 
     if args.command == "band-prize":  # is there a prize in one band if filtered better? (default $40-80k, whole life)
