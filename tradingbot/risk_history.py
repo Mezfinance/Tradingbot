@@ -467,6 +467,9 @@ def model(hist_store, watch_store, journal, cfg, retrain_h: float = RETRAIN_H, m
     if len(rows) < 500:
         return {"pools": info, "note": "fewer than 500 liquid pools: run history-backfill first"}
     meta = replay(rows, retrain_h, max_train)
+    if hist_store is not None:   # 11-09: `safeguards` reads this instead of replaying again (~80 min on Fly)
+        from tradingbot import safeguards
+        safeguards.save_replay(hist_store, rows, meta)
     g = gaps(journal, watch_store, now)
     capital, rng = cfg.model_book_cash_usd, np.random.default_rng(0)
     books, months, corr_src, shrink = {}, {}, {}, {}

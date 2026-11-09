@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -97,6 +97,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--history", action="store_true",
                         help="risk-model: replay the books over hist.db + the scorer table instead of their real trades")
     parser.add_argument("--retrain-h", type=float, default=24.0, help="risk-model --history: model retrain interval")
+    parser.add_argument("--fresh", action="store_true",
+                        help="safeguards: replay again instead of using the replay saved by the last risk-model --history")
     parser.add_argument("--hold15", action="store_true",
                         help="risk-model --history: add sz with the minute-15 hold at $500 in $25-40k pools (fetches "
                              "those pools' minute-15 states first, ~10 credits each, live key; --max-credits, --rps)")
@@ -528,6 +530,19 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore, watch_db_path
         out = launch_live.block_compare(WatchStore(watch_db_path(cfg)), Journal(cfg.db_path), cfg, hours=args.hours)
         print(json.dumps(out, indent=2, default=str) if args.json else launch_live.render_block_compare(out))
+        return
+
+    if args.command == "safeguards":  # 11-09: pause / stop rules for bad markets, tested on the year replay
+        from tradingbot import safeguards
+        from tradingbot.journal import Journal
+        from tradingbot.watcher import WatchStore, watch_db_path, hist_db_path
+        import os as _os
+        if not _os.path.exists(hist_db_path(cfg)):
+            print("no hist.db: run history-backfill first")
+            return
+        out = safeguards.study(WatchStore(hist_db_path(cfg)), WatchStore(watch_db_path(cfg)), Journal(cfg.db_path), cfg,
+                               fresh=args.fresh)
+        print(json.dumps(out, indent=2, default=str) if args.json else safeguards.render(out))
         return
 
     if args.command == "risk-model":  # risk-adjusted results per book + the best trade size (default whole life)
