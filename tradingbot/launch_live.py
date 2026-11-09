@@ -62,6 +62,12 @@ SEEN_MAX = 200_000
 STATE_SAVE_S = 60
 WS_HELIUS = "wss://mainnet.helius-rpc.com/?api-key={key}"
 WS_PUBLIC = "wss://api.mainnet-beta.solana.com"
+# 11-09: Helius refusing the websocket (HTTP 429/401/402/403) moves the main key to the backup like a refused RPC
+# call does (before, only RPC calls switched keys, and with no pools seen no RPC call was made: after a restart on
+# the out-of-credits main key the bot sat with no websocket for good); when the backup is refused too, the public
+# node for WS_PUBLIC_S. A websocket switch is probed back on the websocket every RATE_PROBE_S.
+WS_REFUSED = ("HTTP 429", "HTTP 401", "HTTP 402", "HTTP 403")
+WS_PUBLIC_S = 600
 TOP2, TOP5 = 0.02, 0.05
 # History-trained model (11-03): 7-day walk-forward on every hand-made pool, no hour/weekend features, top 5% of
 # each day: +8.8%/trade (90% CI +2.8..+14.7), 23% rugged vs -5.2% / 31% for every pool; with them +4.6%.
@@ -531,6 +537,8 @@ class LaunchLive:
         self.lp_pool: dict[str, str] = {}  # LP mint -> pool, for pools waiting on their outcome
         self.counts: collections.Counter = collections.Counter()
         self.ws = {"connected": False, "messages": 0, "bytes": 0, "reconnects": 0, "last_error": None}
+        self._ws_public_until = 0.0
+        self._ws_probing = False
         self.history_s = collections.deque(maxlen=50)  # seconds each decision's history call took
         self.start_lag_s = collections.deque(maxlen=50)  # seconds each first decide attempt started after its due time
         self.model, self.model_mtime, self.model_checked = None, None, 0.0
@@ -1121,7 +1129,30 @@ class LaunchLive:
 
     # websocket ------------------------------------------------------------------------------------
     def ws_url(self) -> str:
-        return WS_HELIUS.format(key=self.helius.key()) if self.helius.enabled else WS_PUBLIC
+        from tradingbot.data import helius as hmod
+        self._ws_probing = False
+        if not self.helius.enabled or time.time() < self._ws_public_until:
+            return WS_PUBLIC
+        if (hmod.KEYS["on_backup"] and hmod.KEYS.get("method") == "websocket" and self.helius.api_key
+                and not self.helius.fixed_key and time.time() >= hmod.KEYS["probe_at"]):
+            self._ws_probing = True  # try the main key again on the websocket
+            return WS_HELIUS.format(key=self.helius.api_key)
+        return WS_HELIUS.format(key=self.helius.key())
+
+    def _ws_refused(self, exc) -> None:
+        """Helius refused the websocket: main key -> backup; probe failed -> stay; backup refused -> public node."""
+        from tradingbot.data import helius as hmod
+        text = str(exc)
+        if not self.helius.enabled or not any(code in text for code in WS_REFUSED):
+            return
+        if self._ws_probing:
+            hmod.KEYS["probe_at"] = time.time() + hmod.RATE_PROBE_S
+        elif not hmod.KEYS["on_backup"] and hmod.backup_key() and not self.helius.fixed_key \
+                and self.helius.key() != hmod.backup_key():
+            hmod._switch(True, f"websocket refused ({text[:60]})", probe_s=hmod.RATE_PROBE_S, method="websocket")
+        else:
+            self._ws_public_until = time.time() + WS_PUBLIC_S
+            log.warning("launch-live websocket: Helius refused every key; public node for %d s", WS_PUBLIC_S)
 
     async def _ws_loop(self, stop: threading.Event) -> None:
         sub = {"jsonrpc": "2.0", "id": 1, "method": "programSubscribe",
@@ -1138,6 +1169,10 @@ class LaunchLive:
                     with self.lock:
                         self.ws["connected"] = True
                     backoff = 1.0
+                    if self._ws_probing:
+                        from tradingbot.data import helius as hmod
+                        hmod._switch(False, "websocket answers on the main key")
+                        key = self.helius.key()
                     async for msg in ws:
                         if stop.is_set():
                             return
@@ -1148,6 +1183,7 @@ class LaunchLive:
                     with self.lock:
                         self.ws["connected"] = False
             except Exception as exc:  # network drops are normal: reconnect with back-off
+                self._ws_refused(exc)
                 with self.lock:
                     self.ws.update(connected=False, last_error=f"{type(exc).__name__}: {str(exc)[:120]}")
                     self.ws["reconnects"] += 1

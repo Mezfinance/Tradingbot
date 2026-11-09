@@ -135,3 +135,26 @@ def test_a_cheap_call_answering_on_the_main_key_does_not_move_clients_back(monke
     assert http.keys == ["BACKUP"] and hl.KEYS["on_backup"] and hl.KEYS["switches"] == 1
     assert h._rpc("getTransactionsForAddress", [], 10) == {"key": "BACKUP"}  # the probe: main still empty
     assert http.keys[-2:] == ["MAIN", "BACKUP"] and hl.KEYS["on_backup"] and hl.KEYS["switches"] == 1
+
+
+def test_a_refused_websocket_moves_to_the_backup_then_the_public_node_and_probes_back(monkeypatch):
+    """11-09: after a restart on the out-of-credits main key Helius refused the websocket (HTTP 429), no pool was
+    seen, so no RPC call failed and nothing switched keys: the bot traded nothing until the websocket moved."""
+    from tradingbot import launch_live as ll
+    from tradingbot.config import Config
+    from tradingbot.watcher import WatchStore
+    live = ll.LaunchLive(Config(db_path=":memory:"), WatchStore(":memory:"), helius=hl.Helius())
+    assert "api-key=MAIN" in live.ws_url()
+    refused = Exception("server rejected WebSocket connection: HTTP 429")
+    live._ws_refused(refused)
+    assert hl.KEYS["on_backup"] and hl.KEYS["method"] == "websocket" and "api-key=BACKUP" in live.ws_url()
+    live._ws_refused(Exception("connection reset"))  # an ordinary drop changes nothing
+    assert "api-key=BACKUP" in live.ws_url()
+    live._ws_refused(refused)  # the backup refused too
+    assert live.ws_url() == ll.WS_PUBLIC
+    live._ws_public_until = 0.0
+    now = hl.KEYS["probe_at"] + 1
+    monkeypatch.setattr(hl.time, "time", lambda: now)
+    assert "api-key=MAIN" in live.ws_url() and live._ws_probing  # the probe tries the main key on the websocket
+    live._ws_refused(refused)  # still refused: stays on the backup, next probe later
+    assert hl.KEYS["on_backup"] and hl.KEYS["probe_at"] == now + hl.RATE_PROBE_S
