@@ -358,6 +358,19 @@ def band_flags(liq_usd, rw_pct, rwb_pct) -> dict:
     return {"rwband": pct is not None and pct < rule[4], "rw50big": big}
 
 
+# Thin-band books (11-09): only liquid pools under THIN_MAX_USD at second 4 (the band sz makes its money in),
+# three filters (every thin pool / sz's rw50 picks / the band rule) at three sizes (model_book.LAUNCH_THIN_CUT).
+THIN_MAX_USD = 15_000.0
+
+
+def thin_flags(liq_usd, rw_pct, rwb_pct, liquid=True) -> dict:
+    """`thin` = a liquid pool under THIN_MAX_USD; `thin_rw50` = also in the live rug-vs-win kept half (sz's picks);
+    `thin_band` = also kept by the band rule (BAND_RULES: the band's own rank < 80)."""
+    thin = bool(liquid) and liq_usd is not None and liq_usd < THIN_MAX_USD
+    return {"thin": thin, "thin_rw50": thin and rw_pct is not None and rw_pct < 100 - RW_SKIP,
+            "thin_band": thin and band_flags(liq_usd, rw_pct, rwb_pct)["rwband"]}
+
+
 # +50% filter in $40-80k pools (11-08, `band-prize`, 571 pools): a logistic for "+50% or more by the minute-6
 # exit" trained on every finished liquid pool, each $40-80k pool ranked against the band's past day; the best 30%
 # made +2.6% at minute 6 (every pool -15%) and +6.6% held to pool minute 15 while up and rising (gap +4.0 pts,
@@ -1084,12 +1097,14 @@ class LaunchLive:
                  **rw_flags(cols.get("rw_low6"), cols.get("rw_pct"), cols.get("rw_low_pct")),
                  **rw24_flags(cols.get("low_h"), cols.get("rw24_pct"), cols.get("rw24_low_pct")),
                  **band_flags(cols.get("liq_usd"), cols.get("rw_pct"), cols.get("rwb_pct")),
-                 **big_flags(cols.get("liq_usd"), cols.get("big_pct"))}
+                 **big_flags(cols.get("liq_usd"), cols.get("big_pct")),
+                 **thin_flags(cols.get("liq_usd"), cols.get("rw_pct"), cols.get("rwb_pct"), cols.get("liquid"))}
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
         if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")
                                          or flags["d12"] or flags["rw50"] or flags["d12rw50"]
                                          or flags["rw50_24"] or flags["d12rw50_24"] or flags["rwband"]
-                                         or flags["rw50big"] or flags["big30"] or flags["big30m"]):
+                                         or flags["rw50big"] or flags["big30"] or flags["big30m"]
+                                         or flags["thin"]):
             px = la.chain_price(rows, DECIDE_S)  # SOL per whole token (vault UI amounts)
             if sol_usd and px:
                 self.signals.put_nowait({
@@ -1922,7 +1937,8 @@ def fill_gap(store, journal, book: str, since: float, rng) -> dict:
             hit = r[flag] if flag in ("top2", "top5", "top2h", "top5h") else {
                 **low_flags(r["low_h"], r["risk_pct"]), **rw_flags(rw_low(r), r["rw_pct"], r["rw_low_pct"]),
                 **rw24_flags(r["low_h"], r["rw24_pct"], r["rw24_low_pct"]),
-                **band_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"]), **big_flags(r["liq_usd"], r["big_pct"])}[flag]
+                **band_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"]), **big_flags(r["liq_usd"], r["big_pct"]),
+                **thin_flags(r["liq_usd"], r["rw_pct"], r["rwb_pct"])}[flag]
             if hit and r["token_mint"] not in bought:
                 missed.append({"ret": r["ret"]})
     if not pairs:

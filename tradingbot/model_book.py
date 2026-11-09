@@ -126,6 +126,15 @@ LAUNCH_BIG_MID = "launchbig15k"
 LAUNCH_BIG_CUT[LAUNCH_BIG_MID] = "big30m"
 LAUNCH_BIG_MID_CUT = {LAUNCH_BIG_MID: "big30m"}
 BAND_SIZE_BANDS[LAUNCH_BIG_MID] = ((float("inf"), 100.0),)
+# Thin-band books (11-09): liquid pools under $15k at second 4 only (launch_live.thin_flags), three filters x three
+# sizes, minute-6 exit, no stop. Sizes: $100 / $250 / 2% of the pool, all still capped by the engine at
+# model_book_liq_share (2%) of the pool and the 5% impact cap, so '_2p' is exactly 2% of the pool every time.
+THIN_FILTERS = (("all", "thin"), ("rw", "thin_rw50"), ("band", "thin_band"))
+THIN_SIZES = (("100", 100.0), ("250", 250.0), ("2p", float("inf")))
+LAUNCH_THIN_CUT = {f"thin_{f}_{z}": flag for f, flag in THIN_FILTERS for z, _ in THIN_SIZES}
+for _f, _ in THIN_FILTERS:
+    for _z, _usd in THIN_SIZES:
+        BAND_SIZE_BANDS[f"thin_{_f}_{_z}"] = ((float("inf"), _usd),)
 HOLD_CHECK_MIN = {LAUNCH_BIG: (6.0, 10.0)}  # pool minutes of the conditional hold checks
 HOLD_CHECK_GAIN = 0.0  # stay only while the sale would return at least the cost ...
 HOLD_CHECK_RISING = True  # ... and no less than at the previous check
@@ -137,7 +146,8 @@ CANARY_TWIN = LAUNCH_SIZED
 CANARY_BOOKS = (CANARY4,)
 CANARY_SIZE_BANDS = ((15_000.0, 5.0), (25_000.0, 0.5), (float("inf"), 2.0))  # (liquidity below, $)
 LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
-              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_BAND_CUT, **LAUNCH_HOLD_CUT, **LAUNCH_BIG_CUT}
+              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_BAND_CUT, **LAUNCH_HOLD_CUT, **LAUNCH_BIG_CUT,
+              **LAUNCH_THIN_CUT}
 LAUNCH_CUT[CANARY4] = LAUNCH_CUT[CANARY_TWIN]  # the canary takes its twin's signals
 LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 10.0 if b == LAUNCH_HOLD10 else 15.0 if b in (LAUNCH_HOLD15, LAUNCH_HOLD15_MAX, LAUNCH_BIG) else 6.0
                    for b in LAUNCH_CUT}
@@ -219,6 +229,7 @@ def _family_books(cfg: Config) -> list[str]:
         + (list(LAUNCH_HOLD_CUT) if cfg.launch_hold_book and cfg.launch_live else []) \
         + ([LAUNCH_BIG] if cfg.launch_big_book and cfg.launch_live else []) \
         + ([LAUNCH_BIG_MID] if cfg.launch_big_mid_book and cfg.launch_live else []) \
+        + (list(LAUNCH_THIN_CUT) if cfg.launch_thin_book and cfg.launch_live else []) \
         + ([CANARY4] if cfg.launch_canary and cfg.launch_live else [])
 
 
@@ -776,7 +787,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
                                       "launchrw50": 21.0, "launchd12rw50": 17.0, LAUNCH_SIZED: 23.0,
                                       LAUNCH_BAND: 25.0, LAUNCH_BAND_SZ: 25.0, LAUNCH_HOLD10: 27.0,
                                       LAUNCH_HOLD15: 34.0, LAUNCH_HOLD15_MAX: 34.0, LAUNCH_BIG: 30.0,
-                                      LAUNCH_BIG_MID: 43.0}.get(name, 76.0),  # backtests
+                                      LAUNCH_BIG_MID: 43.0, **{b: 26.0 for b in LAUNCH_THIN_CUT}}.get(name, 76.0),  # backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 

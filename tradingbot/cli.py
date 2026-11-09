@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -584,6 +584,14 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore, watch_db_path
         out = sz_whatif.whatif(WatchStore(watch_db_path(cfg)), Journal(cfg.db_path), hours=args.hours)
         print(json.dumps(out, indent=2, default=str) if args.json else sz_whatif.render(out))
+        return
+
+    if args.command == "thin-sizing":  # which trade size suits pools under $15k (rebuilt from the scorer's reads)
+        from tradingbot import thin_sizing
+        from tradingbot.journal import Journal as _TsJournal
+        from tradingbot.watcher import WatchStore as _TsWS, watch_db_path as _ts_wdp
+        out = thin_sizing.study(_TsWS(_ts_wdp(cfg)), _TsJournal(cfg.db_path), hours=args.hours)
+        print(json.dumps(out, indent=2, default=str) if args.json else thin_sizing.render(out))
         return
 
     if args.command == "band-prize":  # is there a prize in one band if filtered better? (default $40-80k, whole life)

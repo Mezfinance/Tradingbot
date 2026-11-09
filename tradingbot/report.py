@@ -545,6 +545,10 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
     "launchbig15k": "+50% model's best 30% of $15-25k pools (band-prize 11-08 rerun, 1,106 kept of 4,172, ideal "
                     "fills): +7.4%/trade at minute 6 vs every pool -5.9%, 19 of 23 blocks, 43% rugged (big winners "
                     "carry it); ~+5% after the ~2.4-pt fill gap; $100 a trade, compare with launchrwband in the band",
+    **{f"thin_{f}_{z}": f"liquid pools under $15k only ({ {'all': 'every pool', 'rw': 'sz rule rw_pct < 50', 'band': 'band rule, band rank < 80'}[f] }), "
+       f"{ {'100': '$100', '250': '$250', '2p': '2% of the pool'}[z] } a trade (2% of the pool at most), minute 6: rw-bands 11-08 every thin "
+       f"pool +21.3% ideal (27% rugged), band-rw-study skip riskiest 20% +27.4%; real fills ran ~5 pts below ideal at $250 in thin pools"
+       for f in ("all", "rw", "band") for z in ("100", "250", "2p")},
     "launchrwband_sz": "launchrwband's rule with $250 in $5-15k pools ($100 elsewhere): measures thin-pool impact",
     "launchrw50_sz": "launchrw50's picks sized by liquidity at second 4: $250 below $15k, $25 at $15-25k, $100 above "
                      "(capped at 2% of the pool). size-study on 1,039 launchrw50 trades: ~+$12.9k vs +$2.6k at a flat "

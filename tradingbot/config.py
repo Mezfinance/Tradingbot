@@ -83,6 +83,7 @@ class Config:
     launch_rw_book: bool = False
     launch_big_book: bool = False  # 11-08: launchbig40k, the +50% model's best 30% of $40-80k pools held to minute 15 while rising
     launch_big_mid_book: bool = False  # 11-09: launchbig15k, the +50% model's best 30% of $15-25k pools, $100, out at minute 6
+    launch_thin_book: bool = False  # 11-09: nine thin-band books (pools under $15k): every pool / rw50 / band rule x $100 / $250 / 2% of pool
     launch_hold_book: bool = False  # 11-08: launchrw50_25k10 / _25k15, rug-vs-win kept $25-40k pools held to pool minute 10 / 15
     launch_band_book: bool = False  # 11-08: launchrwband / launchrwband_sz, rug-vs-win ranked within each liquidity band
     launch_sized_book: bool = False  # 11-06: launchrw50_sz, launchrw50's signals sized by liquidity band
