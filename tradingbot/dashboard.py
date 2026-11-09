@@ -317,7 +317,7 @@ def family_of(name: str) -> str:
         return "Canary"
     if name in mb.LAUNCH_THIN_CUT:
         return "Thin band"
-    if name in mb.LAUNCH_RW_CUT or name in mb.LAUNCH_RW24_CUT or name in mb.LAUNCH_SIZED_CUT or name in mb.LAUNCH_BAND_CUT \
+    if name in mb.LAUNCH_RW_CUT or name in mb.LAUNCH_RW24_CUT or name in mb.LAUNCH_SIZED_CUT or name in mb.LAUNCH_SIZED_DD_CUT or name in mb.LAUNCH_BAND_CUT \
             or name in mb.LAUNCH_HOLD_CUT or name in mb.LAUNCH_BIG_CUT:
         return "Rug-vs-win"
     if name in mb.LAUNCH_LOW_CUT:

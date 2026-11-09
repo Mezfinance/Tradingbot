@@ -91,6 +91,12 @@ LAUNCH_RW24_CUT = {"launchrw50_24h": "rw50_24", "launchd12rw50_24h": "d12rw50_24
 LAUNCH_SIZED = "launchrw50_sz"
 LAUNCH_SIZED_CUT = {LAUNCH_SIZED: "rw50"}
 SIZE_BANDS = ((15_000.0, 250.0), (25_000.0, 25.0), (float("inf"), 100.0))  # (liquidity below, trade size $)
+# sz with a drawdown limit (11-09, `dd-limits`): the same signals and sizes, but no new buys while the book's own
+# realized P&L over the past 24 h is down $500 (5% of $10k) or more; open trades still run to their exit. On sz's life
+# it made $11,706 vs $8,247 with max DD -31% vs -60%; on the year replay $4.49M vs $4.09M, DD -$34k vs -$512k.
+LAUNCH_SIZED_DD = "launchrw50_sz_dd24"
+LAUNCH_SIZED_DD_CUT = {LAUNCH_SIZED_DD: "rw50"}
+DD_LIMITS = {LAUNCH_SIZED_DD: (24.0, 500.0)}  # book -> (window hours, realized loss $ that stops new buys)
 # By-band twins (11-08, `band-rw-study`): the live rug-vs-win model ranked within each liquidity band (flag
 # `rwband`, launch_live.BAND_RULES): $5-15k skip the riskiest 20%, $15-25k skip 70%, $25-40k the live rule, nothing
 # above $40k. Same rule in both books; only the thin band's size differs ($100 vs $250), to measure price impact.
@@ -146,7 +152,7 @@ CANARY_TWIN = LAUNCH_SIZED
 CANARY_BOOKS = (CANARY4,)
 CANARY_SIZE_BANDS = ((15_000.0, 5.0), (25_000.0, 0.5), (float("inf"), 2.0))  # (liquidity below, $)
 LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
-              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_BAND_CUT, **LAUNCH_HOLD_CUT, **LAUNCH_BIG_CUT,
+              **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_SIZED_DD_CUT, **LAUNCH_BAND_CUT, **LAUNCH_HOLD_CUT, **LAUNCH_BIG_CUT,
               **LAUNCH_THIN_CUT}
 LAUNCH_CUT[CANARY4] = LAUNCH_CUT[CANARY_TWIN]  # the canary takes its twin's signals
 LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 10.0 if b == LAUNCH_HOLD10 else 15.0 if b in (LAUNCH_HOLD15, LAUNCH_HOLD15_MAX, LAUNCH_BIG) else 6.0
@@ -201,7 +207,7 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
 def band_usd(name: str, liq: float | None) -> float | None:
     """Trade size of a size-by-band book (the sized twin, or the canary at its small sizes) for a pool with this
     liquidity; None for every other book."""
-    bands = SIZE_BANDS if name in LAUNCH_SIZED_CUT else CANARY_SIZE_BANDS if name in CANARY_BOOKS \
+    bands = SIZE_BANDS if name in LAUNCH_SIZED_CUT or name in LAUNCH_SIZED_DD_CUT else CANARY_SIZE_BANDS if name in CANARY_BOOKS \
         else BAND_SIZE_BANDS.get(name)
     if bands is None or liq is None:
         return None
@@ -225,6 +231,7 @@ def _family_books(cfg: Config) -> list[str]:
         + (list(LAUNCH_RW_CUT) if cfg.launch_rw_book and cfg.launch_live else [])\
         + (list(LAUNCH_RW24_CUT) if cfg.launch_rw24_book and cfg.launch_live else []) \
         + (list(LAUNCH_SIZED_CUT) if cfg.launch_sized_book and cfg.launch_live else []) \
+        + (list(LAUNCH_SIZED_DD_CUT) if cfg.launch_sized_dd_book and cfg.launch_live else []) \
         + (list(LAUNCH_BAND_CUT) if cfg.launch_band_book and cfg.launch_live else []) \
         + (list(LAUNCH_HOLD_CUT) if cfg.launch_hold_book and cfg.launch_live else []) \
         + ([LAUNCH_BIG] if cfg.launch_big_book and cfg.launch_live else []) \
@@ -784,7 +791,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
                                       EARLY5R: 26.0, EARLY6R: 26.0, EARLY7R: 26.0, EARLY6W: 25.0, EARLY6T: 27.0,
                                       "launchd12": 30.0, "launchd12_s10": 27.0, "launchd12_s20": 24.0,
                                       "launchd12_s30": 18.0, "launchd12_s50": 11.0,
-                                      "launchrw50": 21.0, "launchd12rw50": 17.0, LAUNCH_SIZED: 23.0,
+                                      "launchrw50": 21.0, "launchd12rw50": 17.0, LAUNCH_SIZED: 23.0, LAUNCH_SIZED_DD: 23.0,
                                       LAUNCH_BAND: 25.0, LAUNCH_BAND_SZ: 25.0, LAUNCH_HOLD10: 27.0,
                                       LAUNCH_HOLD15: 34.0, LAUNCH_HOLD15_MAX: 34.0, LAUNCH_BIG: 30.0,
                                       LAUNCH_BIG_MID: 43.0, **{b: 26.0 for b in LAUNCH_THIN_CUT}}.get(name, 76.0),  # backtests

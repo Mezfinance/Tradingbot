@@ -950,3 +950,35 @@ def test_canary_sizes_follow_the_twins_bands_in_the_same_order():
     assert [mb.band_usd(mb.CANARY4, liq) for liq in (10_000, 20_000, 60_000)] == [5.0, 0.5, 2.0]
     assert [mb.band_usd(mb.CANARY_TWIN, liq) for liq in (10_000, 20_000, 60_000)] == [250.0, 25.0, 100.0]
     assert mb.band_usd("launchrw50", 10_000) is None and mb.band_usd(mb.CANARY4, None) is None
+
+
+def test_sz_drawdown_twin_stops_buying_while_down_500_over_24h(cfg):
+    from tradingbot.models import Position
+    assert mb.band_usd(mb.LAUNCH_SIZED_DD, 9_000) == 250.0 and mb.LAUNCH_CUT[mb.LAUNCH_SIZED_DD] == "rw50"
+    on = cfg.with_overrides({"launch_live": "1", "launch_sized_dd_book": "1", "model_book_daily_loss_pct": "0"})
+    assert mb.LAUNCH_SIZED_DD in mb.active_books(on) and mb.LAUNCH_SIZED not in mb.active_books(on)
+    j = Journal(":memory:")
+    eng = Engine(on, FakeDex(None), SimpleNamespace(report=lambda m: None), None, PaperExecutor(on), j,
+                 model_executor=PaperExecutor(on))
+    book, sig = eng.books[mb.LAUNCH_SIZED_DD], {"mint": "X", "ts": time.time()}
+    asked = []
+
+    def realized(since, name):
+        asked.append(since)
+        return -499.0
+    j.realized_since = realized
+    assert eng._model_skip_reason(book, sig) is None
+    assert time.time() - asked[-1] == pytest.approx(24 * 3600, abs=5)   # the window is the past 24 h
+    j.realized_since = lambda since, name: -500.0
+    assert eng._model_skip_reason(book, sig) == "past 24h drawdown limit (down $500)"
+    # an open trade with no route out counts as lost once its exit was blocked inside the window
+    j.realized_since = lambda since, name: -450.0
+    pid = j.save_position(Position(None, "R", "R", 1.0, 0.0, 100.0, 100.0, time.time(), 0.0, 1.0,
+                                   strategy=mb.LAUNCH_SIZED_DD))
+    pid = pid if isinstance(pid, int) else j.open_positions(mb.LAUNCH_SIZED_DD)[0].id
+    assert eng._model_skip_reason(book, sig) is None
+    eng._blocked[pid] = {"since": time.time() - 3600}
+    assert eng._model_skip_reason(book, sig) == "past 24h drawdown limit (down $550)"
+    eng._blocked[pid] = {"since": time.time() - 30 * 3600}   # blocked before the window: already counted then
+    assert eng._model_skip_reason(book, sig) is None
+    assert eng._model_skip_reason(eng.books[mb.LAUNCH_SIZED_DD], dict(sig, mint="Y")) is None

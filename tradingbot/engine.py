@@ -761,10 +761,21 @@ class Engine:
             return None
         if len(open_) >= c.model_book_max_open:
             return "max open positions"
+        dd = mb.DD_LIMITS.get(book.name)
+        if dd:
+            lost = self._window_loss(book, open_, time.time() - dd[0] * 3600)
+            if lost >= dd[1]:
+                return f"past {dd[0]:g}h drawdown limit (down ${lost:,.0f})"
         if c.model_book_daily_loss_pct > 0 and \
                 -self.journal.realized_since(day_start, book.name) >= self.equity(book) * c.model_book_daily_loss_pct / 100:
             return "daily loss limit"
         return None
+
+    def _window_loss(self, book: Book, open_: list, since: float) -> float:
+        """Realized loss since `since` (sales in the window), plus open positions whose exit has been blocked since
+        then (no route out: written off at $0, as equity and the dd-limits study count them)."""
+        lost = -self.journal.realized_since(since, book.name)
+        return lost + sum(p.cost_usd for p in open_ if self._blocked.get(p.id, {}).get("since", 0) >= since)
 
     def _buy_model(self, book: Book, sig: dict) -> str | None:
         c = self.cfg
