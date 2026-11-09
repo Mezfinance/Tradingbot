@@ -276,7 +276,7 @@ def rows(store, cfg: Config) -> tuple[list[dict], dict]:
     dropped: collections.Counter = collections.Counter()
     out = []
     scan = getattr(store, "iterate", store.query)  # a year of rows: stream them instead of holding every JSON at once
-    for r in scan("SELECT pool, data FROM watch_launch_hist WHERE status='ok'"):
+    for r in scan("SELECT pool, token_mint, data FROM watch_launch_hist WHERE status='ok'"):
         rec = json.loads(r["data"])
         txs, create = rec.get("txs") or [], rec["create_ts"]
         if not txs:
@@ -308,7 +308,10 @@ def rows(store, cfg: Config) -> tuple[list[dict], dict]:
         out.append({"pool": r["pool"], "created_ts": create, "listed": r["pool"] in listed, "liquid": liquid,
                     "creator": rec.get("creator"), "pulled_ts": rec.get("pulled_ts"),
                     "liq_usd": 2 * sol4 * sol_usd if sol_usd else None,
-                    "feat": {DECIDE_S: feat}, "ret": {FILL_S: ret}})
+                    "feat": {DECIDE_S: feat}, "ret": {FILL_S: ret},
+                    # 11-09: for later-exit replays (risk_history hold15): entry price and peak pool SOL by minute 6,
+                    # in the record's display units (SOL / ui tokens)
+                    "token_mint": r["token_mint"], "entry_px": entry, "peak_sol": peak})
     return out, dict(dropped)
 
 

@@ -114,3 +114,77 @@ def test_expand_keeps_real_day_swings_and_drops_sampling_noise():
     assert meta2["k"] > 0.7
     full = [dict(t, w=1.0) for t in ts[:50]]
     assert rh.expand(full)[0] == full
+
+
+def _tx(pool, mint, sol, tok_ui, tok_raw):
+    return {"meta": {"err": None, "postTokenBalances": [
+        {"owner": pool, "mint": "So11111111111111111111111111111111111111112", "uiTokenAmount": {"uiAmount": sol}},
+        {"owner": pool, "mint": mint, "uiTokenAmount": {"uiAmount": tok_ui, "amount": str(tok_raw)}}]}, "blockTime": 1}
+
+
+class _Hel:
+    def __init__(self, states):
+        self.states, self.credits_used, self.calls = states, 0, []
+
+    def last_before(self, pool, ts):
+        self.calls.append((pool, ts))
+        self.credits_used += 10
+        return self.states.get(pool)
+
+
+def test_hold15_fetches_minute_15_states_and_prices_history_and_scorer_rows(cfg):
+    hist = WatchStore(":memory:")
+    t0 = NOW - 3 * D
+    hist_row = {"pool": "PH", "token_mint": "MH", "create_ts": t0, "ret": 0.10, "liq_usd": 30_000.0, "rw_pct": 20.0,
+                "entry_px": 0.001, "peak_sol": 100.0, "w": 1.0}                         # display units
+    scorer_row = {"pool": "PS", "token_mint": "MS", "create_ts": t0 + 60, "ret": 0.05, "liq_usd": 35_000.0,
+                  "rw_pct": 30.0, "entry_px": 1e-9, "peak_sol": 100.0, "raw": True, "w": 1.0}  # raw units
+    pulled = {"pool": "PP", "token_mint": "MP", "create_ts": t0 + 120, "ret": 0.2, "liq_usd": 30_000.0,
+              "rw_pct": 10.0, "entry_px": 0.001, "peak_sol": 100.0, "pulled_ts": t0 + 120 + 600, "w": 1.0}
+    drained = dict(hist_row, pool="PD", token_mint="MD", create_ts=t0 + 180)
+    skipped = dict(hist_row, pool="PK", rw_pct=80.0)                                    # not in the kept half
+    thin = {"pool": "PT", "token_mint": "MT", "create_ts": t0 + 240, "ret": 0.30, "liq_usd": 10_000.0, "rw_pct": 5.0,
+            "w": 1.0}
+    rows = [hist_row, scorer_row, pulled, drained, skipped, thin]
+    hel = _Hel({"PH": _tx("PH", "MH", 120.0, 100_000.0, 10**14),        # 0.0012 SOL/token: +20% - 6% = +14%
+                "PS": _tx("PS", "MS", 110.0, 100.0, 10**11),            # 1.1e-9 per raw unit: +10% - 6% = +4%
+                "PD": _tx("PD", "MD", 5.0, 100_000.0, 10**14)})         # SOL 5 < 10% of the 100 peak: rugged
+    cands = rh.hold_candidates(rows)
+    assert {r["pool"] for r in cands} == {"PH", "PS", "PP", "PD"}
+    st = rh.fetch_holds(hist, hel, cands, max_credits=10**6)
+    assert st["fetched"] == 3 and {p for p, _ in hel.calls} == {"PH", "PS", "PD"}   # the pulled pool needs no call
+    assert all(ts == next(r for r in rows if r["pool"] == p)["create_ts"] + rh.HOLD_S for p, ts in hel.calls)
+    have = rh._have_holds(hist)
+    assert abs(rh.hold_ret(hist_row, have) - 0.14) < 1e-9
+    assert abs(rh.hold_ret(scorer_row, have) - 0.04) < 1e-9
+    assert rh.hold_ret(pulled, have) == -1.0 and rh.hold_ret(drained, have) == -1.0
+    assert rh.fetch_holds(hist, hel, cands, max_credits=10**6)["fetched"] == 0      # nothing fetched twice
+    trades, info = rh.hold_trades(rows, have, 0.0, 0.02, extra_impact=False)
+    by_cost = sorted((t["cost"], round(t["ret"], 4)) for t in trades)
+    assert info["band trades"] == 4 and info["minute-15 states missing (minute 6 used)"] == 0
+    assert (500.0, 0.14) in by_cost and (500.0, 0.04) in by_cost and (500.0, -1.0) in by_cost
+    assert (200.0, 0.3) in by_cost                       # thin pool: sz's $250 capped at 2% of $10k, minute 6
+    worse, _ = rh.hold_trades(rows, have, 0.0, 0.02, extra_impact=True)
+    assert sum(t["ret"] for t in worse) < sum(t["ret"] for t in trades)
+
+
+def test_hold15_respects_the_credit_cap(cfg):
+    hist = WatchStore(":memory:")
+    rows = [{"pool": f"P{i}", "token_mint": "M", "create_ts": NOW - D + i, "ret": 0.1, "liq_usd": 30_000.0,
+             "rw_pct": 10.0, "entry_px": 0.001, "peak_sol": 100.0} for i in range(10)]
+    hel = _Hel({r["pool"]: _tx(r["pool"], "M", 100.0, 100_000.0, 10**14) for r in rows})
+    st = rh.fetch_holds(hist, hel, rh.hold_candidates(rows), max_credits=35)
+    assert st["fetched"] == 3 and st["credits_used"] == 30
+    trades, info = rh.hold_trades(rows, rh._have_holds(hist), 0.0, 0.02, extra_impact=False)
+    assert info["minute-15 states missing (minute 6 used)"] == 7
+
+
+def test_history_replay_with_hold15_adds_the_two_books(cfg):
+    hist = _hist(n_days=20, per_day=40)
+    watch = WatchStore(":memory:")
+    ll.ensure_schema(watch)
+    cfg = cfg.with_overrides({"model_book_min_liq_usd": "1000"})
+    out = rh.model(hist, watch, Journal(":memory:"), cfg, now=NOW, sims=10, hold15=True, helius=_Hel({}))
+    assert out["hold15"] is not None and "candidates (kept $25-40k pools)" in out["hold15"]
+    assert set(rh.HOLD_RULES) <= set(out["books"]) and set(rh.HOLD_RULES) <= set(out["monthly"])
+    assert "sz + minute-15 hold" in rh.render(out)

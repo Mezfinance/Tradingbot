@@ -97,6 +97,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--history", action="store_true",
                         help="risk-model: replay the books over hist.db + the scorer table instead of their real trades")
     parser.add_argument("--retrain-h", type=float, default=24.0, help="risk-model --history: model retrain interval")
+    parser.add_argument("--hold15", action="store_true",
+                        help="risk-model --history: add sz with the minute-15 hold at $500 in $25-40k pools (fetches "
+                             "those pools' minute-15 states first, ~10 credits each, live key; --max-credits, --rps)")
     parser.add_argument("--per-band", type=int, default=150, help="hold-study: pools sampled per liquidity band")
     parser.add_argument("--min-liq", type=float, default=25_000.0, help="hold-study: smallest pool (USD at second 4)")
     parser.add_argument("--max-liq", type=float, default=0.0, help="hold-study: largest pool (USD at second 4; 0 = none)")
@@ -536,8 +539,15 @@ def main(argv: list[str] | None = None) -> None:
             from tradingbot.watcher import hist_db_path
             import os as _os
             hist = WatchStore(hist_db_path(cfg)) if _os.path.exists(hist_db_path(cfg)) else None
+            helius = None
+            if args.hold15:   # 11-09: minute-15 states for sz's new $25-40k rule, on the live key (backup when out)
+                from tradingbot.data.helius import Helius as _H
+                helius = _H()
+                helius.min_interval_s = 1 / max(args.rps, 0.1)   # leave the live scorer its share of the plan's rate
             out = risk_history.model(hist, WatchStore(watch_db_path(cfg)), Journal(cfg.db_path), cfg,
-                                     retrain_h=args.retrain_h)
+                                     retrain_h=args.retrain_h, hold15=args.hold15, helius=helius,
+                                     max_credits=int(args.max_credits or 80_000),
+                                     progress=lambda i, n, c: print(f"minute-15 states {i}/{n}, {c} credits", flush=True))
             print(json.dumps(out, indent=2, default=str) if args.json else risk_history.render(out))
             return
         books = [b.strip() for b in args.books.split(",") if b.strip()] or None

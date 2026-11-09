@@ -48,16 +48,22 @@ def load_pools(hist_store, watch_store, cfg) -> tuple[list[dict], dict]:
         for r in hist:
             pools[r["pool"]] = {"pool": r["pool"], "create_ts": r["created_ts"], "creator": r.get("creator"),
                                 "pulled_ts": r.get("pulled_ts"), "liquid": r["liquid"], "liq_usd": r["liq_usd"],
-                                "feat": r["feat"][lh.DECIDE_S], "ret": r["ret"][lh.FILL_S], "src": "history"}
+                                "feat": r["feat"][lh.DECIDE_S], "ret": r["ret"][lh.FILL_S], "src": "history",
+                                "token_mint": r.get("token_mint"), "entry_px": r.get("entry_px"),
+                                "peak_sol": r.get("peak_sol")}
             info["history rows"] += 1
     if watch_store is not None:
         ll.ensure_schema(watch_store)
         for r in watch_store.query(
-                "SELECT pool, creator, create_ts, feat, ret, pulled_ts, liq_usd, rw_pct FROM watch_launch_live "
+                "SELECT pool, creator, create_ts, feat, ret, pulled_ts, liq_usd, rw_pct, token_mint, fill_px, fill_sol, "
+                "peak_sol FROM watch_launch_live "
                 "WHERE status='done' AND liquid=1 AND ret IS NOT NULL AND feat IS NOT NULL"):
+            # the scorer's fill price is SOL per RAW token unit (launch_live._raw_vault); `raw` says so to hold15
             pools[r["pool"]] = {"pool": r["pool"], "create_ts": r["create_ts"], "creator": r["creator"],
                                 "pulled_ts": r["pulled_ts"], "liquid": True, "liq_usd": r["liq_usd"],
-                                "feat": json.loads(r["feat"]), "ret": r["ret"], "src": "scorer", "live_rw_pct": r["rw_pct"]}
+                                "feat": json.loads(r["feat"]), "ret": r["ret"], "src": "scorer", "live_rw_pct": r["rw_pct"],
+                                "token_mint": r["token_mint"], "entry_px": r["fill_px"], "raw": True,
+                                "peak_sol": max(r["fill_sol"] or 0.0, r["peak_sol"] or 0.0) or None}
             info["scorer rows"] += 1
     rows = sorted(pools.values(), key=lambda r: r["create_ts"])
     # a creator's earlier pools over the whole set (liquid or not), as live counts every earlier pool it knows
@@ -264,6 +270,125 @@ def rule_trades(rows: list[dict], flag, sizing: str, gap: float, liq_share: floa
     return out
 
 
+# --- sz with the minute-15 hold in $25-40k pools (11-09) -------------------------------------------------------
+# The user's plan: sz's rule everywhere, but in $25-40k pools the rug-vs-win kept half (launchrw50_25k15's flag) held
+# to pool minute 15 at 2% of the pool up to $500. The history only holds each pool's first 30 s and its minute-6
+# state, so `fetch_holds` reads the minute-15 state of exactly those pools (Helius last_before, 10 credits each) into
+# hist.db `hist_path` (display and raw token units, so history rows (display) and scorer rows (raw) both price).
+HOLD_S = 900
+HOLD_MAX_USD = 500.0
+HOLD_IMPACT_RT = 4.0   # risk_model.IMPACT_RT: extra round-trip impact of the bigger size, for the pessimistic twin
+HOLD_PATH_SCHEMA = """CREATE TABLE IF NOT EXISTS hist_path(
+    pool TEXT, sec INTEGER, sol REAL, tok_ui REAL, tok_raw REAL, ts REAL, PRIMARY KEY(pool, sec))"""
+HOLD_RULES = ("sz + $25-40k held to 15 at $500", "sz + $25-40k held to 15 at $500, extra impact")
+
+
+def hold_candidates(rows: list[dict]) -> list[dict]:
+    """Pools the new band rule buys: the replay's kept half (rw_pct < 50) in launch_live.HOLD_BAND, alive at minute 6
+    with a usable entry price (rugged by minute 6 needs no state: it is -100% either way)."""
+    from tradingbot import launch_live as ll
+    lo, hi = ll.HOLD_BAND
+    return [r for r in rows if r.get("rw_pct") is not None and r["rw_pct"] < 100 - ll.RW_SKIP
+            and r["liq_usd"] is not None and lo <= r["liq_usd"] < hi]
+
+
+def _have_holds(hist_store) -> dict:
+    hist_store.execute(HOLD_PATH_SCHEMA)
+    return {r["pool"]: dict(r) for r in hist_store.query(f"SELECT pool, sol, tok_ui, tok_raw FROM hist_path WHERE sec={HOLD_S}")}
+
+
+def _needs_state(r: dict) -> bool:
+    return (r["ret"] > -0.999 and r.get("entry_px") and r.get("token_mint")
+            and not (r.get("pulled_ts") and r["pulled_ts"] <= r["create_ts"] + HOLD_S))
+
+
+def fetch_holds(hist_store, helius, cands: list[dict], max_credits: int, progress=None) -> dict:
+    """Minute-15 states for the candidates that need one, in a stable hash order (a credit cap leaves an even sample),
+    nothing fetched twice. Returns counts."""
+    import hashlib
+    from tradingbot.data import pumpswap as ps
+    from tradingbot.data.helius import _vault
+    have = _have_holds(hist_store)
+    todo = sorted((r for r in cands if _needs_state(r) and r["pool"] not in have),
+                  key=lambda r: hashlib.sha1(f"hold15:{r['pool']}".encode()).hexdigest())
+    stats = {"needed": len(todo), "fetched": 0, "call failed": 0, "credits_used": 0}
+    start = helius.credits_used
+    for i, r in enumerate(todo):
+        if helius.credits_used - start + 10 > max_credits:
+            stats["stopped at the credit cap (rerun to continue; nothing is fetched twice)"] = len(todo) - i
+            break
+        tx = helius.last_before(r["pool"], r["create_ts"] + HOLD_S)
+        if tx is False:
+            stats["call failed"] += 1
+            continue
+        raw = None
+        for b in ((tx or {}).get("meta") or {}).get("postTokenBalances") or []:
+            if b.get("owner") == r["pool"] and b.get("mint") == r["token_mint"]:
+                raw = float((b.get("uiTokenAmount") or {}).get("amount") or 0)
+        sol = _vault(tx, r["pool"], ps.WSOL, "postTokenBalances") if tx else None
+        tok = _vault(tx, r["pool"], r["token_mint"], "postTokenBalances") if tx else None
+        hist_store.execute("INSERT OR REPLACE INTO hist_path(pool, sec, sol, tok_ui, tok_raw, ts) VALUES (?,?,?,?,?,?)",
+                           (r["pool"], HOLD_S, sol, tok, raw, time.time()))
+        stats["fetched"] += 1
+        if progress and stats["fetched"] % 200 == 0:
+            progress(stats["fetched"], len(todo), helius.credits_used - start)
+    stats["credits_used"] = helius.credits_used - start
+    return stats
+
+
+def hold_ret(r: dict, have: dict):
+    """Minute-15 return (same fill, 6% cost, +300% cap): -100% when rugged by minute 6, the LP pulled by minute 15,
+    no balance found, the pool emptied, or its SOL below 10% of the peak by minute 6; None = state not fetched."""
+    from tradingbot import launch_analysis as la
+    if r["ret"] <= -0.999 or (r.get("pulled_ts") and r["pulled_ts"] <= r["create_ts"] + HOLD_S):
+        return -1.0
+    if not r.get("entry_px") or not r.get("token_mint"):
+        return None
+    st = have.get(r["pool"])
+    if st is None:
+        return None
+    tok = st["tok_raw"] if r.get("raw") else st["tok_ui"]
+    sol = st["sol"]
+    if not sol or not tok:
+        return -1.0
+    if r.get("peak_sol") and sol < la.PULLED_SHARE * r["peak_sol"]:
+        return -1.0
+    return min((sol / tok) / r["entry_px"] - 1 - la.COST, 3.0)
+
+
+def hold_trades(rows: list[dict], have: dict, gap: float, liq_share: float, extra_impact: bool) -> tuple[list, dict]:
+    """sz's trades with the $25-40k kept pools replaced by the minute-15 hold at 2% of the pool up to $500. A pool
+    whose minute-15 state is missing keeps its minute-6 result (counted)."""
+    from tradingbot import launch_live as ll
+    from tradingbot import model_book as mb
+    lo, hi = ll.HOLD_BAND
+    out, info = [], {"band trades": 0, "minute-15 states missing (minute 6 used)": 0}
+    for r in rows:
+        if r.get("rw_pct") is None or r["rw_pct"] >= 100 - ll.RW_SKIP:
+            continue
+        in_band = r["liq_usd"] is not None and lo <= r["liq_usd"] < hi
+        if in_band:
+            size = min(HOLD_MAX_USD, liq_share * r["liq_usd"])
+            ret = hold_ret(r, have)
+            info["band trades"] += 1
+            if ret is None:
+                ret = r["ret"]
+                info["minute-15 states missing (minute 6 used)"] += 1
+            if extra_impact:   # the bigger size beyond sz's $100 in this band, round trip
+                ret -= HOLD_IMPACT_RT * (size - (mb.band_usd(mb.LAUNCH_SIZED, r["liq_usd"]) or 100.0)) / r["liq_usd"]
+            held = HOLD_S
+        else:
+            size = mb.band_usd(mb.LAUNCH_SIZED, r["liq_usd"]) or 100.0
+            if r["liq_usd"]:
+                size = min(size, liq_share * r["liq_usd"])
+            ret, held = r["ret"], ll.EXIT_S
+        if size < 5:
+            continue
+        out.append({"ret": max(-1.0, ret - gap), "cost": size, "ts": r["create_ts"] + held,
+                    "opened": r["create_ts"] + 10, "liq": r["liq_usd"], "w": r.get("w", 1.0)})
+    return out, info
+
+
 LOCAL_DAYS = 7       # shrink a sampled day's mean toward the trades within +-7 days
 MIN_DAY_N = 5
 
@@ -333,7 +458,8 @@ def monthly(trades: list[dict]) -> dict:
 
 
 def model(hist_store, watch_store, journal, cfg, retrain_h: float = RETRAIN_H, max_train: int = MAX_TRAIN,
-          now: float | None = None, sims: int | None = None) -> dict:
+          now: float | None = None, sims: int | None = None, hold15: bool = False, helius=None,
+          max_credits: int = 80_000, progress=None) -> dict:
     from tradingbot import risk_model as rm
     now = now if now is not None else time.time()
     t0 = time.time()
@@ -345,8 +471,24 @@ def model(hist_store, watch_store, journal, cfg, retrain_h: float = RETRAIN_H, m
     capital, rng = cfg.model_book_cash_usd, np.random.default_rng(0)
     books, months, corr_src, shrink = {}, {}, {}, {}
     sampled = info["sample share"] < 1.0
-    for name, flag, sizing in RULES:
-        actual = sorted(rule_trades(rows, flag, sizing, g[name]["gap"], cfg.model_book_liq_share), key=lambda t: t["ts"])
+    hold_info = None
+    plan = [(name, flag, sizing) for name, flag, sizing in RULES]
+    if hold15 and hist_store is not None:
+        cands = hold_candidates(rows)
+        fetched = fetch_holds(hist_store, helius, cands, max_credits, progress) if helius is not None else None
+        have = _have_holds(hist_store)
+        hold_info = {"candidates (kept $25-40k pools)": len(cands), "fetch": fetched}
+        for name in HOLD_RULES:
+            g[name] = {"gap": g["launchrw50_sz"]["gap"], "source": "launchrw50_sz's"}
+            plan.append((name, None, None))
+    for name, flag, sizing in plan:
+        if name in HOLD_RULES:
+            actual, hi = hold_trades(rows, have, g[name]["gap"], cfg.model_book_liq_share, name == HOLD_RULES[1])
+            hold_info[name] = hi
+            actual.sort(key=lambda t: t["ts"])
+        else:
+            actual = sorted(rule_trades(rows, flag, sizing, g[name]["gap"], cfg.model_book_liq_share),
+                            key=lambda t: t["ts"])
         if len(actual) < rm.MIN_TRADES:
             continue
         ts, shrink[name] = expand(actual)   # full-size days rebuilt from the sample (as is when nothing is sampled)
@@ -375,7 +517,7 @@ def model(hist_store, watch_store, journal, cfg, retrain_h: float = RETRAIN_H, m
     return {"window": f"history {info['from']} .. {info['to']}", "built": _fmt(now), "capital": capital,
             "liq_share": cfg.model_book_liq_share, "pools": info, "replay": meta, "check": check(rows), "gaps": g,
             "sample": {"share": round(info["sample share"], 4), "rebuilt days": shrink} if sampled else None,
-            "books": books, "monthly": months, "too few trades": {}, "correlation": corr,
+            "books": books, "monthly": months, "too few trades": {}, "correlation": corr, "hold15": hold_info,
             "equal_weight_portfolio": portfolio, "took_s": round(time.time() - t0),
             "note": ("Replayed books: walk-forward rug-vs-win model retrained every "
                      f"{retrain_h:g} h on at most {max_train:,} earlier finished pools, ranked like live (6 h; band "
@@ -404,6 +546,7 @@ def render(out: dict) -> str:
          "  replay vs live ranking: " + (f"{c['pools']:,} pools, rank correlation {c['rank correlation']}, same rw50 decision "
                                         f"{c['same rw50 decision %']}%" if "rank correlation" in c else c.get("note", "")),
          "  execution gap per trade: " + ", ".join(f"{k} {100 * v['gap']:.1f} pts ({v['source']})" for k, v in out["gaps"].items()),
+         *([f"  sz + minute-15 hold in $25-40k: {json.dumps(out['hold15'], default=str)}"] if out.get("hold15") else []),
          "", "BY MONTH (size-weighted % per trade / $ at the book's sizes / rugged %)"]
     names = list(out["monthly"])
     months = sorted({m for n in names for m in out["monthly"][n]})
