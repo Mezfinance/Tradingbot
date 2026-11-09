@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "sz-stops"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -593,6 +593,25 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore as _TsWS, watch_db_path as _ts_wdp
         out = thin_sizing.study(_TsWS(_ts_wdp(cfg)), _TsJournal(cfg.db_path), hours=args.hours)
         print(json.dumps(out, indent=2, default=str) if args.json else thin_sizing.render(out))
+        return
+
+    if args.command == "sz-stops":  # drawdown limits and per-trade stop losses on a book's life
+        from tradingbot import sz_stops
+        from tradingbot.journal import Journal as _SsJournal
+        from tradingbot.watcher import WatchStore as _SsWS, watch_db_path as _ss_wdp
+        ss_helius = None
+        if args.fetch:
+            import httpx as _ss_httpx
+            from tradingbot.data.helius import Helius as _SsHelius
+            ss_helius = _SsHelius(client=_ss_httpx.Client(timeout=60))
+            ss_helius.min_interval_s = 1 / max(args.rps, 0.1)  # leave the live scorer its share of the plan's rate
+        try:
+            ss_store = _SsWS(_ss_wdp(cfg))
+        except Exception:  # noqa: BLE001 - no watch.db: drawdown limits still work
+            ss_store = None
+        out = sz_stops.study(ss_store, _SsJournal(cfg.db_path), book=args.book, hours=args.hours,
+                             helius=ss_helius, max_credits=int(args.max_credits or 60_000))
+        print(json.dumps(out, indent=2, default=str) if args.json else sz_stops.render(out))
         return
 
     if args.command == "flag-tracker":  # what each market flag has meant for each running book (read only)
