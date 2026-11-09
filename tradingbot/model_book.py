@@ -105,8 +105,13 @@ BAND_SIZE_BANDS = {LAUNCH_BAND: ((15_000.0, 100.0), (float("inf"), 100.0)),
 # vs 15, $250 a trade (near the impact-limited best size for these pools), capped at 2% of the pool as usual.
 LAUNCH_HOLD10 = "launchrw50_25k10"
 LAUNCH_HOLD15 = "launchrw50_25k15"
-LAUNCH_HOLD_CUT = {LAUNCH_HOLD10: "rw50big", LAUNCH_HOLD15: "rw50big"}
-BAND_SIZE_BANDS.update({LAUNCH_HOLD10: ((float("inf"), 250.0),), LAUNCH_HOLD15: ((float("inf"), 250.0),)})
+# 11-09: the minute-15 book at the size the user would run it: the engine's 2%-of-pool cap with a $500 ceiling (every
+# $25-40k pool's 2% is $500-800, so $500 a trade); compared with launchrw50_25k15 on the same tokens it measures the
+# impact of the bigger size
+LAUNCH_HOLD15_MAX = "launchrw50_25k15max"
+LAUNCH_HOLD_CUT = {LAUNCH_HOLD10: "rw50big", LAUNCH_HOLD15: "rw50big", LAUNCH_HOLD15_MAX: "rw50big"}
+BAND_SIZE_BANDS.update({LAUNCH_HOLD10: ((float("inf"), 250.0),), LAUNCH_HOLD15: ((float("inf"), 250.0),),
+                        LAUNCH_HOLD15_MAX: ((float("inf"), 500.0),)})
 # +50% filter in $40-80k pools with a conditional hold (11-08, `band-prize`, 571 pools, ideal fills, rule chosen
 # after looking): the +50% model (launch_live.BIG_BAND, flag `big30`) keeps the best 30% of the band's past day;
 # at pool minute 6 and 10 the position stays only while a sell quote would return at least the cost and (at 10)
@@ -128,7 +133,7 @@ CANARY_SIZE_BANDS = ((15_000.0, 5.0), (25_000.0, 0.5), (float("inf"), 2.0))  # (
 LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
               **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_BAND_CUT, **LAUNCH_HOLD_CUT, **LAUNCH_BIG_CUT}
 LAUNCH_CUT[CANARY4] = LAUNCH_CUT[CANARY_TWIN]  # the canary takes its twin's signals
-LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 10.0 if b == LAUNCH_HOLD10 else 15.0 if b in (LAUNCH_HOLD15, LAUNCH_BIG) else 6.0
+LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 10.0 if b == LAUNCH_HOLD10 else 15.0 if b in (LAUNCH_HOLD15, LAUNCH_HOLD15_MAX, LAUNCH_BIG) else 6.0
                    for b in LAUNCH_CUT}
 POOL_MINUTE_EXIT = {**EARLY_EXIT_MIN, **LAUNCH_EXIT_MIN}  # books that sell every position by a pool minute
 EARLY_MAX_SEEN_MIN = 4.0  # first sight later than this leaves no time to trade (and was left out of training)
@@ -763,7 +768,7 @@ def rug_summary(journal, stuck: set[int] | None = None, name: str = NAME) -> dic
                                       "launchd12_s30": 18.0, "launchd12_s50": 11.0,
                                       "launchrw50": 21.0, "launchd12rw50": 17.0, LAUNCH_SIZED: 23.0,
                                       LAUNCH_BAND: 25.0, LAUNCH_BAND_SZ: 25.0, LAUNCH_HOLD10: 27.0,
-                                      LAUNCH_HOLD15: 34.0, LAUNCH_BIG: 30.0}.get(name, 76.0),  # backtests
+                                      LAUNCH_HOLD15: 34.0, LAUNCH_HOLD15_MAX: 34.0, LAUNCH_BIG: 30.0}.get(name, 76.0),  # backtests
             "losing_exit_causes": causes,
             "entry_audit_rugs": medians(rugs), "entry_audit_others": medians(rest)}
 

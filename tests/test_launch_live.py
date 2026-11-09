@@ -1089,6 +1089,9 @@ def test_hold_books_take_kept_25_40k_pools_and_sell_at_minute_10_and_15(cfg):
         assert mb.exit_deadline(cfg, mb.LAUNCH_HOLD10, sig) == 100.0 + 600
         assert mb.exit_deadline(cfg, mb.LAUNCH_HOLD15, sig) == 100.0 + 900
         assert mb.band_usd(mb.LAUNCH_HOLD10, 30_000) == 250.0 == mb.band_usd(mb.LAUNCH_HOLD15, 39_000)
+        assert mb.band_usd(mb.LAUNCH_HOLD15_MAX, 30_000) == 500.0 and mb.wants(mb.LAUNCH_HOLD15_MAX, sig)
+        assert mb.exit_deadline(cfg, mb.LAUNCH_HOLD15_MAX, sig) == 100.0 + 900
+        assert mb.LAUNCH_HOLD15_MAX in mb.active_books(cfg)
         assert mb.hold_min(cfg, mb.LAUNCH_HOLD15) == 15.0
         assert mb.signal_kind(mb.LAUNCH_HOLD10) == "launch"
         from tradingbot import dashboard
