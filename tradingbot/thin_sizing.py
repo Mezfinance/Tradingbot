@@ -85,8 +85,10 @@ def calibrate(store, journal, rows: list[dict]) -> dict:
             real = p["realized_usd"] / p["cost_usd"] - 1
             diffs.append(sized_ret(cands[-1], p["cost_usd"], 0.0) - real)
     if len(diffs) >= GAP_MIN:
-        gap = float(np.clip(np.mean(diffs), 0.0, 0.10))
-        return {"gap": gap, "n": len(diffs), "source": f"{GAP_BOOK} real thin trades vs the model at their size"}
+        raw = float(np.mean(diffs))
+        gap = float(np.clip(raw, 0.0, 0.10))
+        return {"gap": gap, "raw": raw, "median": float(np.median(diffs)), "n": len(diffs),
+                "source": f"{GAP_BOOK} real thin trades vs the model at their size"}
     return {"gap": DEFAULT_GAP, "n": len(diffs), "source": f"default (fewer than {GAP_MIN} {GAP_BOOK} thin trades)"}
 
 
@@ -129,7 +131,9 @@ def _bootstrap(daily: np.ndarray, capital: float, rng) -> dict:
     draws = rng.choice(daily, size=(SIMS, DAYS), replace=True)
     paths = np.cumsum(draws, axis=1)
     final = paths[:, -1]
-    dd = np.min(paths - np.maximum.accumulate(np.concatenate([np.zeros((SIMS, 1)), paths], axis=1))[:, 1:], axis=1)
+    # running peak along each path (axis=1); the default axis=0 ran across the paths and made P(DD>30%) 100%
+    dd = np.min(paths - np.maximum.accumulate(np.concatenate([np.zeros((SIMS, 1)), paths], axis=1), axis=1)[:, 1:],
+                axis=1)
     return {"median_year_usd": round(float(np.median(final))), "p10_year_usd": round(float(np.percentile(final, 10))),
             "p90_year_usd": round(float(np.percentile(final, 90))),
             "p_loss_pct": round(100 * float(np.mean(final < 0)), 1),
@@ -201,7 +205,9 @@ def render(out: dict) -> str:
     g = out["gap"]
     lines = [f"THIN-BAND SIZING  (liquid pools under $15k at second 4, {when(out['since'])} .. {when(out['until'])} UTC, "
              f"{out['pools']:,} pools; capital ${out['capital_usd']:,.0f}, no compounding)",
-             f"extra execution gap {100 * g['gap']:.1f} pts per trade ({g['source']}, n={g['n']}); own price impact "
+             f"extra execution gap {100 * g['gap']:.1f} pts per trade ({g['source']}, n={g['n']}"
+             + (f"; measured mean {100 * g['raw']:+.1f}, median {100 * g['median']:+.1f}, floored at 0"
+                if "raw" in g else "") + "); own price impact "
              "from the pool reserves at the fill and at minute 6; 6% cost, +300% cap, rugs -100%",
              f"band rule needs the band rank (rwb_pct), recorded since 11-08: {out['band_ranked_pools']:,} of the pools"]
     for f, v in out["filters"].items():
@@ -211,15 +217,15 @@ def render(out: dict) -> str:
             continue
         lines.append(f"  {'sizing':<17}{'avg $':>7}{'traded $':>10}{'P&L $':>9}{'$/day':>8}{'sized':>8}{'win':>5}"
                      f"{'rug':>5}{'Sharpe':>7}{'max DD':>9}{'worst day':>10}{'peak open':>10}{'beat $100':>10}"
-                     f" | {'year p10':>9}{'median':>9}{'p90':>9}{'P(loss)':>8}{'P(DD>30%)':>10}")
+                     f" | {'year p10':>11}{'median':>11}{'p90':>11}{'P(loss)':>8}{'P(DD>30%)':>10}")
         for name, s in v["sizings"].items():
             b = s.get("bootstrap") or {}
             sh = "-" if s.get("sharpe_daily") is None else f"{s['sharpe_daily']:.1f}"
             lines.append(f"  {name:<17}{s['mean_size_usd']:>7,.0f}{s['traded_usd']:>10,}{s['pnl_usd']:>9,}"
                          f"{s['per_day_usd']:>8,}{s['sized_pct']:>7.1f}%{s['win_pct']:>5.0f}{s['rugged_pct']:>5.0f}"
                          f"{sh:>7}{s['max_dd_usd']:>9,}{s['worst_day_usd']:>10,}{s['peak_open_usd']:>10,}"
-                         f"{s['blocks_beat_base']:>6}/{s['blocks']:<3} | {b.get('p10_year_usd', 0):>9,}"
-                         f"{b.get('median_year_usd', 0):>9,}{b.get('p90_year_usd', 0):>9,}{b.get('p_loss_pct', 0):>7.0f}%"
+                         f"{s['blocks_beat_base']:>6}/{s['blocks']:<3} | {b.get('p10_year_usd', 0):>11,}"
+                         f"{b.get('median_year_usd', 0):>11,}{b.get('p90_year_usd', 0):>11,}{b.get('p_loss_pct', 0):>7.0f}%"
                          f"{b.get('p_dd_over_30pct', 0):>9.0f}%")
         w = v["walk_forward"]
         lines.append(f"  walk-forward (each {out['block_h']} h block sized by the best $ over the past "

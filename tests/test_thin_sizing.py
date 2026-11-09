@@ -72,3 +72,15 @@ def test_thin_sizing_runs_through_the_cli(cfg, tmp_path, capsys, monkeypatch):
     monkeypatch.setenv("TB_DB_PATH", str(tmp_path / "j.db"))
     cli.main(["thin-sizing"])
     assert "no finished thin pools" in capsys.readouterr().out
+
+
+def test_bootstrap_drawdown_runs_along_each_path_not_across_paths():
+    import numpy as np
+    # a steady winner with small down days never draws down 30% of $10k in a year
+    daily = np.array([1000.0, 900.0, -200.0, 1100.0, 800.0])
+    b = ts._bootstrap(daily, 10_000, np.random.default_rng(1))
+    assert b["p_dd_over_30pct"] == 0
+    assert b["dd_p90_usd"] >= -2_000
+    # a big losing day shows up as a drawdown
+    b = ts._bootstrap(np.array([500.0, -4_000.0]), 10_000, np.random.default_rng(1))
+    assert b["p_dd_over_30pct"] == 100
