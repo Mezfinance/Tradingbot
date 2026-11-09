@@ -221,3 +221,42 @@ def test_hour_rows_carry_eight_pool_size_bands(cfg):
     assert by["$5-15k"]["launchrw50_sz real"]["pnl_usd"] == 100 and by["$1-2.5k"]["pools"] == 1
     assert by[pb.TOTAL]["pools"] == 5 and by[pb.TOTALS[1][0]]["pools"] == 1
     assert "RUG-VS-WIN BY POOL SIZE" in pb.render(out)
+
+
+def test_hours_when_the_scorer_was_impaired_are_left_out(cfg):
+    """11-09 02:00: decisions ran 84 s late, so most pools were skipped 'too late' and the hour read 15 liquid of 82
+    and a -55-pt rug-vs-win gap. Such hours (or hours with no pools at all) must not move the comparison or flags."""
+    st = _store()
+    for i in range(8):  # healthy hour: 8 pools, one not liquid (a market skip, not an impairment)
+        _pool(st, f"H{i}", T0 + i * 60, "X", 50.0, 0.2, rw_pct=30.0, liquid=0 if i == 0 else 1)
+    st.execute("UPDATE watch_launch_live SET status='skipped', reason='not liquid at second 4' WHERE pool='H0'")
+    for i in range(10):  # stalled hour: 7 of 10 skipped too late, the 3 that got through all rugged
+        _pool(st, f"S{i}", T0 + H + i * 60, "X", 50.0, -1.0, rw_pct=30.0)
+    st.execute("UPDATE watch_launch_live SET status='skipped', reason='too late (pool older than 20 s)', liquid=0 "
+               "WHERE pool IN ('S0','S1','S2','S3','S4','S5','S6')")
+    m = mm.MarketMonitor(st, None, cfg)
+    m.step(now=T0 + 3 * H + mm.HOUR_DELAY_S + 1)  # hour 2 has no pools at all
+    ok, stall, empty = mm.load(st)
+    assert not ok["impaired"] and ok["data_skips"] == 0
+    assert stall["impaired"] and stall["data_skips"] == 7 and "7 of 10" in stall["impaired_why"] \
+        and "too late" in stall["impaired_why"]
+    assert empty["impaired"] and "no pools" in empty["impaired_why"]
+    # the comparison ignores impaired hours: a stalled recent window has no value instead of a fake crash
+    rows = [{"hour": T0 + i * H, "liquid": 30 + i % 3, "rug_pct": 20.0 + i % 4} for i in range(60)]
+    rows += [{"hour": T0 + (60 + i) * H, "liquid": 3, "rug_pct": 100.0, "impaired": True} for i in range(3)]
+    c = mm.compare(rows)
+    assert c["liquid"]["now"] is None and c["liquid"]["z"] is None
+    rows[30:33] = [{**r, "liquid": 0, "impaired": True} for r in rows[30:33]]  # nor do they drag the baseline
+    assert mm.compare(rows[:-3])["liquid"]["baseline"] > 29
+    # flags: impaired hours neither open nor extend one
+    st2 = _store()
+    st2.execute(mm.SCHEMA)
+    data = [{"hour": T0 + i * H, "v": mm.VERSION, "liquid": 30 + i % 3} for i in range(40)]
+    data += [{"hour": T0 + (40 + i) * H, "v": mm.VERSION, "liquid": 2, "impaired": True,
+              "impaired_why": "x"} for i in range(4)]
+    st2.executemany("INSERT INTO market_hours(hour, data, ts) VALUES(?,?,?)",
+                    [(d["hour"], json.dumps({k: v for k, v in d.items() if k != "hour"}), 0) for d in data])
+    m2 = mm.MarketMonitor(st2, None, cfg)
+    assert m2.update_flags() == [] and not st2.query("SELECT * FROM market_flags")
+    text = mm.render(mm.status(st2, hours=6, now=T0 + 44 * H))
+    assert "scorer impaired" in text and "!" in text

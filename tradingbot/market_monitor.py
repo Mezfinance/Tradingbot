@@ -42,8 +42,14 @@ TOP_OPERATORS = 5
 BATCH_HOURS = 24  # hours built per read on a backfill
 STATUS_KEY = "market_monitor:status"  # last step: ran, ok_ts, took, stored, error
 SZ_STUCK_S = 1800  # a sized-book trade still open this long counts as -100% (as block-compare)
+# 11-09: an hour in which the scorer itself was impaired (pools skipped for reasons that say nothing about the
+# market: too late, Helius failures, budget, restarts) gives a biased subset of pools: the 11-09 02:00 stall read
+# 15 liquid of 82 and a -55-pt rug-vs-win gap. Such hours (or hours with no pools recorded at all: the bot was down
+# or saw nothing) are marked `impaired` and left out of the comparison, the flags, the band totals and the charts.
+MARKET_SKIPS = ("not liquid at second 4",)  # the only skip reason that is about the pool itself
+IMPAIRED_SHARE = 0.2  # share of the hour's pools skipped for other reasons that marks the hour impaired
 
-VERSION = 6  # older rows are rebuilt (2: liquidity bands, 3: sz $ P&L and cost, 4: 8 bands, 5: band win/rug counts,
+VERSION = 7  # older rows are rebuilt (2: liquidity bands, 3: sz $ P&L and cost, 4: 8 bands, 5: band win/rug counts,
 # 6: bands under $5k)
 BANDS = (("thin", 0.0, 15_000.0), ("mid", 15_000.0, 25_000.0), ("thick", 25_000.0, float("inf")))  # sz's bands
 
@@ -119,6 +125,24 @@ def _wpct(pairs):
     return round(100 * sum(r * s for r, s in pairs) / cost, 1) if cost else None
 
 
+def impairment(pools: list[dict]) -> dict:
+    """Whether the scorer was impaired in the hour: no pools recorded, or IMPAIRED_SHARE+ of them skipped (or lost)
+    for a reason other than MARKET_SKIPS. Returns data_skips, impaired, impaired_why."""
+    bad = collections.Counter(p.get("reason") or p.get("status") for p in pools
+                              if p.get("status") in ("skipped", "lost") and p.get("reason") not in MARKET_SKIPS)
+    n = sum(bad.values())
+    if not pools:
+        return {"data_skips": 0, "impaired": True, "impaired_why": "no pools recorded (bot down or saw nothing)"}
+    if n >= IMPAIRED_SHARE * len(pools):
+        top = ", ".join(f"{r} {c}" for r, c in bad.most_common(2))
+        return {"data_skips": n, "impaired": True, "impaired_why": f"{n} of {len(pools)} pools skipped ({top})"}
+    return {"data_skips": n, "impaired": False, "impaired_why": None}
+
+
+def healthy(rows: list[dict]) -> list[dict]:
+    return [r for r in rows if not r.get("impaired")]
+
+
 def hour_metrics(pools: list[dict], trades: list[dict], prices: dict, now: float) -> dict:
     """One hour's measures. `pools` = watch_launch_live rows created in the hour; `trades` = the sized book's
     positions opened in it; `prices` = {sol_open, sol_close, btc_open, btc_close, fear_greed}."""
@@ -137,6 +161,7 @@ def hour_metrics(pools: list[dict], trades: list[dict], prices: dict, now: float
     out: dict = {"v": VERSION, "pools": len(pools), "liquid": len(liquid), "liquid_pct": _pct(len(liquid), len(pools)),
                  "done": len(done), "med_liq_usd": _med([p.get("liq_usd") for p in liquid]),
                  "med_seed_sol": _med([unlog(f(p, "log_seed_sol")) for p in liquid])}
+    out.update(impairment(pools))
 
     by_creator = collections.Counter(p.get("creator") for p in liquid if p.get("creator"))
     seeds = collections.Counter(round(unlog(f(p, "log_seed_sol")) / SEED_ROUND) for p in liquid
@@ -228,7 +253,8 @@ def compare(rows: list[dict], recent_h: int = RECENT_H, baseline_h: int = BASELI
     if not rows:
         return {}
     recent = rows[-recent_h:]
-    base_all = [r for r in rows[:-recent_h] if r["hour"] >= max(since, recent[0]["hour"] - baseline_h * HOUR_S)]
+    base_all = healthy([r for r in rows[:-recent_h] if r["hour"] >= max(since, recent[0]["hour"] - baseline_h * HOUR_S)])
+    recent = healthy(recent)  # impaired hours say nothing about the market: an all-impaired window has no value
     sz_from = next((r["hour"] for r in rows if r.get("sz_trades")), None)
     out = {}
     for key, _, group in METRICS:
@@ -319,7 +345,7 @@ class MarketMonitor:
         bucket = lambda ts: ts // HOUR_S * HOUR_S
         pools, trades = collections.defaultdict(list), collections.defaultdict(list)
         for r in self.store.query(
-                "SELECT pool, token_mint, creator, create_ts, liquid, status, ret, pulled_ts, liq_usd, feat, rw_pct "
+                "SELECT pool, token_mint, creator, create_ts, liquid, status, reason, ret, pulled_ts, liq_usd, feat, rw_pct "
                 "FROM watch_launch_live WHERE create_ts >= ? AND create_ts < ?", (lo, hi)):
             pools[bucket(r["create_ts"])].append(dict(r))
         if self.journal:
@@ -412,6 +438,9 @@ class MarketMonitor:
         for i, r in enumerate(rows):
             if r["hour"] <= last:
                 continue
+            if r.get("impaired"):  # neither opens, extends nor closes a flag
+                last = r["hour"]
+                continue
             for ev in advance_flags(state, r["hour"], compare(rows[max(0, i - span + 1):i + 1], since=since)):
                 m = ev["metric"]
                 if ev["kind"] == "open":
@@ -493,6 +522,7 @@ def flag_summary(rows: list[dict], flags: list[dict], now: float | None = None, 
     """Open flags, flags closed in the last `days`, and per measure and direction: sz and the market in flagged
     hours vs every other hour since sz's first trade. `rows` = market_hours rows (with sz_pnl / sz_cost)."""
     now = now if now is not None else time.time()
+    rows = healthy(rows)  # an impaired hour's sz and market numbers are a biased subset
     sz_from = next((r["hour"] for r in rows if r.get("sz_trades")), None)
     by_hour = {r["hour"]: r for r in rows}
 
@@ -530,7 +560,9 @@ def payload(rows: list[dict], now: float | None = None, since: float = 0.0, flag
     return {"built_ts": now, "rows": [r for r in rows if r["hour"] >= now - PAGE_HOURS * HOUR_S],
             "compare": compare(rows, since=since), "baseline_since": since, "metrics": [list(m) for m in METRICS],
             "recent_h": RECENT_H, "baseline_h": BASELINE_H, "last_hour": rows[-1]["hour"] if rows else None,
-            "status": status or {}, "poll_s": MONITOR_POLL_S, "bands": band_windows(rows, now),
+            "status": status or {}, "poll_s": MONITOR_POLL_S,
+            "impaired": [{"hour": r["hour"], "why": r.get("impaired_why")} for r in rows
+                         if r.get("impaired") and r["hour"] >= now - PAGE_HOURS * HOUR_S], "bands": band_windows(rows, now),
             "flags": flag_summary(rows, flags or [], now), "flag_rule": {"z": FLAG_Z, "hours": FLAG_HOURS,
                                                                          "close_z": CLOSE_Z}}
 
@@ -566,6 +598,7 @@ BAND_WINDOWS = (("last 6 h", 6), ("last 24 h", 24), ("last 7 days", 168), ("whol
 
 def band_windows(rows: list[dict], now: float) -> dict:
     """`pool_bands.aggregate` over the windows in BAND_WINDOWS (hours whose row carries `bands`)."""
+    rows = healthy(rows)
     return {name: pool_bands.aggregate([r for r in rows if h is None or r["hour"] >= now - h * HOUR_S])
             for name, h in BAND_WINDOWS}
 
@@ -601,11 +634,15 @@ def render(out: dict) -> str:
              "6% cost, minute-6 exit)", ""]
     cols = ["hour (UTC)"] + [SHORT[k] for k in SHOW]
     fmt = lambda v: "-" if v is None else (f"{v:,.0f}" if abs(v) >= 100 else f"{v:g}")
-    table = [cols] + [[datetime.fromtimestamp(r["hour"], timezone.utc).strftime("%m-%d %H")] +
+    table = [cols] + [[datetime.fromtimestamp(r["hour"], timezone.utc).strftime("%m-%d %H") + ("!" if r.get("impaired") else " ")] +
                       [fmt(r.get(k)) for k in SHOW] for r in out["rows"]]
     widths = [max(len(row[i]) for row in table) for i in range(len(cols))]
     for row in table:
         lines.append("  ".join(c.rjust(w) for c, w in zip(row, widths)))
+    bad = [r for r in out["rows"] if r.get("impaired")]
+    if bad:
+        lines += ["", "! = scorer impaired that hour (left out of the comparison, flags and band totals):"]
+        lines += [f"    {datetime.fromtimestamp(r['hour'], timezone.utc):%m-%d %H}:00  {r.get('impaired_why')}" for r in bad]
     since = out.get("baseline_since") or 0
     start = f", baseline from {datetime.fromtimestamp(since, timezone.utc):%m-%d %H:%M} UTC" if since else ""
     lines += ["", f"LAST {out['recent_h']} H VS THE {out['baseline_h'] // 24} DAYS BEFORE{start}  (|z| >= 2 marked *; "
