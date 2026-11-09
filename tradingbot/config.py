@@ -97,6 +97,8 @@ class Config:
     launch_canary_band_scale: float = 0.0  # > 0: the twin's own band size x this (0.04 = 1/25: $10 / $1 / $4), not CANARY_SIZE_BANDS
     launch_canary_budget_usd: float = 50.0  # the book's starting cash; keep about this much USDC in the wallet
     launch_canary_daily_loss_usd: float = 50.0  # no new buys once today's realized loss reaches this
+    launch_canary_follow_dd: bool = True  # 11-10: no new buys while the paper twin launchrw50_sz_dd24 is paused by its
+                                          # past-24h drawdown limit (the canary's own P&L is mostly fees)
     launch_canary_max_open: int = 5
     launch_canary_max_liq_usd: float = 15_000.0  # only pools below this liquidity at second 4 (the $250 band); 0 = all
     launch_canary_every_n: int = 1  # buy 1 in N of the twin's signals (1 = all; each round trip costs ~0.001 SOL)

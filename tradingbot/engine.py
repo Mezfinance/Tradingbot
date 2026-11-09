@@ -747,6 +747,12 @@ class Engine:
         if book.name in mb.CANARY_BOOKS:  # real money: hard limits of its own
             if self.journal.get_state(CANARY_HALT):
                 return "canary halted (kill switch)"
+            dd = mb.DD_LIMITS.get(mb.LAUNCH_SIZED_DD)
+            if c.launch_canary_follow_dd and dd:  # the full-size paper twin's drawdown decides, not the canary's fees
+                lost = self._window_loss(mb.LAUNCH_SIZED_DD, self.journal.open_positions(mb.LAUNCH_SIZED_DD),
+                                         time.time() - dd[0] * 3600)
+                if lost >= dd[1]:
+                    return f"twin {mb.LAUNCH_SIZED_DD} paused: past {dd[0]:g}h drawdown limit (down ${lost:,.0f})"
             if c.launch_canary_max_liq_usd > 0 and (sig.get("liq") or 0) >= c.launch_canary_max_liq_usd:
                 return f"canary trades thin pools only (< ${c.launch_canary_max_liq_usd:,.0f})"
             if c.launch_canary_every_n > 1:  # real fees: a sample of the twin's ~700 signals a day is enough to calibrate
@@ -763,7 +769,7 @@ class Engine:
             return "max open positions"
         dd = mb.DD_LIMITS.get(book.name)
         if dd:
-            lost = self._window_loss(book, open_, time.time() - dd[0] * 3600)
+            lost = self._window_loss(book.name, open_, time.time() - dd[0] * 3600)
             if lost >= dd[1]:
                 return f"past {dd[0]:g}h drawdown limit (down ${lost:,.0f})"
         if c.model_book_daily_loss_pct > 0 and \
@@ -771,10 +777,10 @@ class Engine:
             return "daily loss limit"
         return None
 
-    def _window_loss(self, book: Book, open_: list, since: float) -> float:
+    def _window_loss(self, name: str, open_: list, since: float) -> float:
         """Realized loss since `since` (sales in the window), plus open positions whose exit has been blocked since
         then (no route out: written off at $0, as equity and the dd-limits study count them)."""
-        lost = -self.journal.realized_since(since, book.name)
+        lost = -self.journal.realized_since(since, name)
         return lost + sum(p.cost_usd for p in open_ if self._blocked.get(p.id, {}).get("since", 0) >= since)
 
     def _buy_model(self, book: Book, sig: dict) -> str | None:
