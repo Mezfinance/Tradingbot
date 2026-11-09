@@ -387,10 +387,10 @@ def test_canary_goes_below_the_paper_books_five_dollar_floor(cfg, good_pair):
         return {"pool": "P" + mint, "mint": mint, "dex": "pumpswap", "created_ts": created, "name": "", "price": 1e-5,
                 "liq": liq, "score": 1.0, "ts": time.time(), "decided_ts": time.time(), "kind": "launch",
                 "rw50": True, "rw50_24": False, "top2": False, "top5": True}
-    eng.model_book.signals.put(sig("MID", 20_000.0))  # $5 band (11-10)
+    eng.model_book.signals.put(sig("MID", 20_000.0))  # $10 band (11-10)
     eng.model_book.signals.put(sig("DEEP", 60_000.0))  # $10 band
     eng.buy_model_signals()
-    assert sorted(live.sizes) == [5.0, 10.0]
+    assert sorted(live.sizes) == [10.0, 10.0]
     cfg.launch_canary_flat_usd = 0.01  # one minimum size for every pick
     eng.model_book.signals.put(sig("THIN", 10_000.0))
     eng.buy_model_signals()

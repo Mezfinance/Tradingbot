@@ -144,7 +144,8 @@ class _Fit:
 
 
 def replay(rows: list[dict], retrain_h: float = RETRAIN_H, max_train: int = MAX_TRAIN, seed: int = 7) -> dict:
-    """Score every pool walk-forward and rank it as live does; sets r['rw'], r['rw_pct'], r['rwb_pct']."""
+    """Score every pool walk-forward and rank it as live does; sets r['rw'], r['rw_pct'], r['rwb_pct'], and r['big']
+    (the same day's +50%-by-minute-6 model, the replay's stand-in for launch_live's big model, 11-10)."""
     from tradingbot import launch_analysis as la
     from tradingbot import launch_live as ll
     names = sorted({k for r in rows for k in r["x"]})
@@ -160,6 +161,7 @@ def replay(rows: list[dict], retrain_h: float = RETRAIN_H, max_train: int = MAX_
     t = created[0] - created[0] % step
     fits = 0
     scores = np.full(len(rows), np.nan)
+    bigs = np.full(len(rows), np.nan)
     fallback = np.full(len(rows), -1, dtype=int)  # which fit's training scores rank a pool when the 6 h window is thin
     fit_scores: list = []
     prev = (None, None)
@@ -175,7 +177,8 @@ def replay(rows: list[dict], retrain_h: float = RETRAIN_H, max_train: int = MAX_
                 prev = (rug, big)
                 fit_scores.append(np.sort(rug.prob(X[train]) - big.prob(X[train])))
                 fallback[block] = len(fit_scores) - 1
-                scores[block] = rug.prob(X[block]) - big.prob(X[block])
+                bigs[block] = big.prob(X[block])
+                scores[block] = rug.prob(X[block]) - bigs[block]
                 fits += 1
         t += step
     # rank against the past 6 h (all bands) and the past 24 h of the same band, like the live scorer
@@ -185,6 +188,7 @@ def replay(rows: list[dict], retrain_h: float = RETRAIN_H, max_train: int = MAX_
     for i, r in enumerate(rows):
         s = scores[i]
         r["rw"] = None if np.isnan(s) else float(s)
+        r["big"] = None if np.isnan(bigs[i]) else float(bigs[i])
         if r["rw"] is None:
             r["rw_pct"] = r["rwb_pct"] = None
             continue
@@ -292,32 +296,34 @@ def hold_candidates(rows: list[dict]) -> list[dict]:
             and r["liq_usd"] is not None and lo <= r["liq_usd"] < hi]
 
 
-def _have_holds(hist_store) -> dict:
+def _have_holds(hist_store, sec: int = HOLD_S) -> dict:
     hist_store.execute(HOLD_PATH_SCHEMA)
-    return {r["pool"]: dict(r) for r in hist_store.query(f"SELECT pool, sol, tok_ui, tok_raw FROM hist_path WHERE sec={HOLD_S}")}
+    return {r["pool"]: dict(r) for r in hist_store.query(
+        "SELECT pool, sol, tok_ui, tok_raw FROM hist_path WHERE sec=?", (int(sec),))}
 
 
-def _needs_state(r: dict) -> bool:
+def _needs_state(r: dict, sec: int = HOLD_S) -> bool:
     return (r["ret"] > -0.999 and r.get("entry_px") and r.get("token_mint")
-            and not (r.get("pulled_ts") and r["pulled_ts"] <= r["create_ts"] + HOLD_S))
+            and not (r.get("pulled_ts") and r["pulled_ts"] <= r["create_ts"] + sec))
 
 
-def fetch_holds(hist_store, helius, cands: list[dict], max_credits: int, progress=None) -> dict:
-    """Minute-15 states for the candidates that need one, in a stable hash order (a credit cap leaves an even sample),
-    nothing fetched twice. Returns counts."""
+def fetch_holds(hist_store, helius, cands: list[dict], max_credits: int, progress=None, sec: int = HOLD_S) -> dict:
+    """Pool states at pool second `sec` (minute 15 by default; minute 10 for canary-package) for the candidates that
+    need one, in a stable hash order (a credit cap leaves an even sample), nothing fetched twice. Returns counts."""
     import hashlib
     from tradingbot.data import pumpswap as ps
     from tradingbot.data.helius import _vault
-    have = _have_holds(hist_store)
-    todo = sorted((r for r in cands if _needs_state(r) and r["pool"] not in have),
-                  key=lambda r: hashlib.sha1(f"hold15:{r['pool']}".encode()).hexdigest())
+    have = _have_holds(hist_store, sec)
+    tag = "hold15" if sec == HOLD_S else f"hold{sec}s"
+    todo = sorted((r for r in cands if _needs_state(r, sec) and r["pool"] not in have),
+                  key=lambda r: hashlib.sha1(f"{tag}:{r['pool']}".encode()).hexdigest())
     stats = {"needed": len(todo), "fetched": 0, "call failed": 0, "credits_used": 0}
     start = helius.credits_used
     for i, r in enumerate(todo):
         if helius.credits_used - start + 10 > max_credits:
             stats["stopped at the credit cap (rerun to continue; nothing is fetched twice)"] = len(todo) - i
             break
-        tx = helius.last_before(r["pool"], r["create_ts"] + HOLD_S)
+        tx = helius.last_before(r["pool"], r["create_ts"] + sec)
         if tx is False:
             stats["call failed"] += 1
             continue
@@ -328,7 +334,7 @@ def fetch_holds(hist_store, helius, cands: list[dict], max_credits: int, progres
         sol = _vault(tx, r["pool"], ps.WSOL, "postTokenBalances") if tx else None
         tok = _vault(tx, r["pool"], r["token_mint"], "postTokenBalances") if tx else None
         hist_store.execute("INSERT OR REPLACE INTO hist_path(pool, sec, sol, tok_ui, tok_raw, ts) VALUES (?,?,?,?,?,?)",
-                           (r["pool"], HOLD_S, sol, tok, raw, time.time()))
+                           (r["pool"], int(sec), sol, tok, raw, time.time()))
         stats["fetched"] += 1
         if progress and stats["fetched"] % 200 == 0:
             progress(stats["fetched"], len(todo), helius.credits_used - start)
@@ -336,11 +342,12 @@ def fetch_holds(hist_store, helius, cands: list[dict], max_credits: int, progres
     return stats
 
 
-def hold_ret(r: dict, have: dict):
-    """Minute-15 return (same fill, 6% cost, +300% cap): -100% when rugged by minute 6, the LP pulled by minute 15,
-    no balance found, the pool emptied, or its SOL below 10% of the peak by minute 6; None = state not fetched."""
+def hold_ret(r: dict, have: dict, sec: int = HOLD_S):
+    """Return at pool second `sec` (same fill, 6% cost, +300% cap): -100% when rugged by minute 6, the LP pulled by
+    then, no balance found, the pool emptied, or its SOL below 10% of the peak by minute 6; None = state not fetched.
+    `have` must hold the states for that same second."""
     from tradingbot import launch_analysis as la
-    if r["ret"] <= -0.999 or (r.get("pulled_ts") and r["pulled_ts"] <= r["create_ts"] + HOLD_S):
+    if r["ret"] <= -0.999 or (r.get("pulled_ts") and r["pulled_ts"] <= r["create_ts"] + sec):
         return -1.0
     if not r.get("entry_px") or not r.get("token_mint"):
         return None

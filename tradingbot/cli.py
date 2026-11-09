@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -609,6 +609,25 @@ def main(argv: list[str] | None = None) -> None:
         out = sz_stops.study(_SsWS(_ss_wdp(cfg)), _SsJournal(cfg.db_path), book=args.book, hours=args.hours,
                              helius=ss_helius, max_credits=int(args.max_credits or 15_000))
         print(json.dumps(out, indent=2, default=str) if args.json else sz_stops.render(out))
+        return
+
+    if args.command == "canary-package":  # the canary's proposed rule set replayed over the year (11-10)
+        import os as _os
+        from tradingbot import canary_package
+        from tradingbot.journal import Journal
+        from tradingbot.watcher import WatchStore, hist_db_path, watch_db_path
+        if not _os.path.exists(hist_db_path(cfg)):
+            print("CANARY PACKAGE\n  no hist.db: run history-backfill first")
+            return
+        helius = None
+        if args.fetch:   # minute-10 states of the 25k10 rule's pools, on the live key (backup when out)
+            from tradingbot.data.helius import Helius as _H
+            helius = _H()
+            helius.min_interval_s = 1 / max(args.rps, 0.1)
+        out = canary_package.study(WatchStore(hist_db_path(cfg)), WatchStore(watch_db_path(cfg)), Journal(cfg.db_path),
+                                   cfg, fresh=args.fresh, helius=helius, max_credits=int(args.max_credits or 20_000),
+                                   progress=lambda i, n, c: print(f"minute-10 states {i}/{n}, {c} credits", flush=True))
+        print(canary_package.to_json(out) if args.json else canary_package.render(out))
         return
 
     if args.command == "dd-limits":  # daily / trailing drawdown limits on a book's life and on the year replay

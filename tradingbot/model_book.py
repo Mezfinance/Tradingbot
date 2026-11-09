@@ -146,11 +146,11 @@ HOLD_CHECK_GAIN = 0.0  # stay only while the sale would return at least the cost
 HOLD_CHECK_RISING = True  # ... and no less than at the previous check
 # Real-money canary (11-06; was canary_rw50_24h, never switched on): copies the size-by-band book (`CANARY_TWIN`),
 # same signals and minute-6 exit, filled by the live Jupiter executor; every pool (fly.toml sets
-# `launch_canary_max_liq_usd` 0), sized by `CANARY_SIZE_BANDS` (user, 11-10): $25 below $15k, $5 at $15-25k, $10 above.
+# `launch_canary_max_liq_usd` 0), sized by `CANARY_SIZE_BANDS` (user, 11-10): $25 below $15k, $10 above.
 CANARY4 = "canary_rw50_sz"
 CANARY_TWIN = LAUNCH_SIZED
 CANARY_BOOKS = (CANARY4,)
-CANARY_SIZE_BANDS = ((15_000.0, 25.0), (25_000.0, 5.0), (float("inf"), 10.0))  # (liquidity below, $): user, 11-10
+CANARY_SIZE_BANDS = ((15_000.0, 25.0), (25_000.0, 10.0), (float("inf"), 10.0))  # (liquidity below, $): user, 11-10
 LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
               **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_SIZED_DD_CUT, **LAUNCH_BAND_CUT, **LAUNCH_HOLD_CUT, **LAUNCH_BIG_CUT,
               **LAUNCH_THIN_CUT}

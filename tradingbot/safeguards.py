@@ -36,7 +36,7 @@ MIN_TRADES = 20
 DAY = 86400.0
 REPLAY_SCHEMA = """CREATE TABLE IF NOT EXISTS hist_replay(pool TEXT PRIMARY KEY, data TEXT)"""
 REPLAY_KEYS = ("pool", "create_ts", "ret", "liq_usd", "rw", "rw_pct", "rwb_pct", "w", "pulled_ts", "token_mint",
-               "entry_px", "peak_sol", "raw", "src")
+               "entry_px", "peak_sol", "raw", "src", "big")
 
 MARKET = [(6, t) for t in (-5, -10, -15, -20)] + [(24, t) for t in (-5, -10, -15)]
 RUGS = [(6, t) for t in (35, 40, 45, 50)] + [(24, t) for t in (35, 40)]
