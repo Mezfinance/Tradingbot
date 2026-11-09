@@ -82,7 +82,23 @@ def test_year_trades_are_rebuilt_full_size_and_limits_scaled(monkeypatch):
     out = dl.study(j, now=T0 + 3 * D, year=True, hist_store=object(), watch_store=None, cfg=Cfg())
     y = out["year"]
     assert y["trades"] == 1000 and y["scale"] > 0 and "months" in y["rules"][0]
-    assert "YEAR REPLAY" in dl.render(out)
+    assert y["trades"] > 0 and out["year_own"]["trades"] > 0   # rows here are w=1, nothing to rebuild
+    text = dl.render(out)
+    assert "YEAR REPLAY" in text and "EACH DAY FROM ITS OWN TRADES ONLY" in text
+
+
+def test_own_day_rebuild_draws_only_from_each_days_own_trades():
+    from tradingbot import risk_history as rh
+    ts = []
+    for d in range(10):                      # day d's trades all return d / 100, so a borrowed trade shows
+        for i in range(5):
+            t = T0 + d * D + 3600 + i * 600
+            ts.append({"opened": t - 300, "ts": t, "cost": 100.0, "ret": d / 100, "w": 4.0})
+    own, info = rh.expand(ts, k=1.0)
+    assert info["k"] == 1.0 and len(own) == 10 * 20
+    assert all(round(t["ret"] * 100) == int((t["ts"] - T0) // D) for t in own)
+    mixed, _ = rh.expand(ts, k=0.0)
+    assert any(round(t["ret"] * 100) != int((t["ts"] - T0) // D) for t in mixed)
 
 
 def test_cli_runs_without_data(cfg, tmp_path, capsys, monkeypatch):

@@ -7,7 +7,9 @@ Two runs on the same rule set:
 * year (`--year`): the year replay `risk-model --history` saves in hist.db (`safeguards.load_replay`), sz's rule on
   every replayed pool sized like the book, minus its measured execution gap, with each sampled history day rebuilt
   to full size by `risk_history.expand` (trades keep their own time of day; a weighted sampled trade would breach a
-  limit by itself). The replay trades every flagged pool while the live book skips about half its signals, so the
+  limit by itself). That rebuild borrows most of each day's trades from the 7 days either side, which makes
+  neighbouring days alike and flatters limits that read the recent past, so the year is also run with every day
+  rebuilt from its own trades only (`year_own`, k=1) and the key limits are compared side by side. The replay trades every flagged pool while the live book skips about half its signals, so the
   limits are scaled by the replay's median daily money traded over the live book's (`scale`): a 5% limit bites as
   hard on a replayed day as on a live one.
 
@@ -253,7 +255,8 @@ def year_trades(hist_store, watch_store, journal, cfg, book: str, fresh: bool, n
     gap = g.get(book, {"gap": rh.DEFAULT_GAP})["gap"]
     ts = rh.rule_trades(rows, YEAR_FLAGS[book], book, gap, cfg.model_book_liq_share)
     full, info = rh.expand(ts)
-    return full, {"source": source, "gap": gap, "expand": info}
+    own, own_info = rh.expand(ts, k=1.0)
+    return full, {"source": source, "gap": gap, "expand": info, "own_days": own, "own_expand": own_info}
 
 
 def study(journal, book: str = BOOK, hours: float | None = None, now: float | None = None, year: bool = False,
@@ -275,12 +278,22 @@ def study(journal, book: str = BOOK, hours: float | None = None, now: float | No
         if not tr:
             out["year"] = info
             return out
+        own = info.pop("own_days")
         live_day, year_day = _median_daily(live), _median_daily(tr)
         scale = year_day / live_day if live_day and year_day else 1.0
         out["year"] = {**run(tr, capital * scale, "day"), **info, "scale": round(scale, 2),
                        "live_daily_usd": round(live_day), "year_daily_usd": round(year_day),
                        "took_s": round(time.time() - t0)}
+        # the same limits with each sampled day rebuilt only from its own trades: the smoothed rebuild borrows
+        # most of a day's trades from the 7 days either side, which makes neighbouring days alike and flatters any
+        # limit that reads the recent past
+        out["year_own"] = {**run(own, capital * scale, "day"), "expand": info["own_expand"]}
     return out
+
+
+COMPARE = ("no limit", "past 24h -5%", "past 24h -10%", "past 12h -5%", "past 6h -5%", "past 6h -3%",
+           "day loss 15%", "day loss 5%")
+BAD_MONTHS = ("2026-08", "2026-09", "2026-10")
 
 
 # render ----------------------------------------------------------------------------------------------------------
@@ -329,9 +342,31 @@ def _section(name: str, res: dict) -> list[str]:
         L += ["", "  BY MONTH ($): " + " | ".join(r["limit"] for r in show)]
         for m in base["months"]:
             L.append(f"    {m}  " + "".join(f"{r['months'].get(m, 0):>14,}" for r in show))
-        L.append("  months kept / saved: " + "; ".join(f"{r['limit']} {r['month_kept_pct']}% / {r['month_saved_pct']}%"
+        L.append("  months kept / saved: " + "; ".join(f"{r['limit']} {_pct(r['month_kept_pct'])} / {_pct(r['month_saved_pct'])}"
                                                         for r in show[1:]))
     return L + [""]
+
+
+def _pct(v) -> str:
+    return "-" if v is None else f"{v}%"
+
+
+def _compare(smooth: dict, own: dict) -> list[str]:
+    """Key limits on both rebuilds side by side: a limit whose gain survives without the smoothing is real."""
+    a = {r["limit"]: r for r in smooth["rules"]}
+    b = {r["limit"]: r for r in own["rules"]}
+    L = ["SMOOTHED vs OWN-DAYS REBUILD (the gain should survive without the smoothing)",
+         f"  {'limit':<18}" + "".join(f"{h:>13}" for h in ("$ smoothed", "$ own days", "DD smoothed", "DD own",
+                                                          "kept own", "saved own"))
+         + "".join(f"{m[2:]:>11}" for m in BAD_MONTHS)]
+    for name in COMPARE:
+        if name not in a or name not in b:
+            continue
+        x, y = a[name], b[name]
+        L.append(f"  {name:<18}{x['usd']:>13,}{y['usd']:>13,}{x['max_dd_usd']:>13,}{y['max_dd_usd']:>13,}"
+                 f"{_f(y['kept_pct'], 12, '%')}{_f(y['saved_pct'], 12, '%')}"
+                 + "".join(f"{y['months'].get(m, 0):>11,}" for m in BAD_MONTHS))
+    return L + ["  (bad-month columns are the own-days rebuild)", ""]
 
 
 def render(out: dict) -> str:
@@ -344,6 +379,12 @@ def render(out: dict) -> str:
                      f"{y['expand']}; replay trades ${y['year_daily_usd']:,}/day vs live ${y['live_daily_usd']:,}/day, "
                      f"so limits are scaled x{y['scale']} ({y['took_s']} s)")
         L += _section("YEAR REPLAY", y)
+    if "year_own" in out and not out["year_own"].get("error"):
+        o = out["year_own"]
+        L.append(f"YEAR REPLAY, EACH DAY FROM ITS OWN TRADES ONLY (no borrowing from nearby days; "
+                 f"{o['expand'].get('sampled days', 0)} sampled days)")
+        L += _section("YEAR REPLAY (own days)", o)
+        L += _compare(out["year"], o)
     L.append("Thresholds were all looked at together and the life is a few days: trust a limit only when it holds in "
              "both halves (and on the year) and the settings either side of it agree.")
     return "\n".join(L)

@@ -393,7 +393,7 @@ LOCAL_DAYS = 7       # shrink a sampled day's mean toward the trades within +-7 
 MIN_DAY_N = 5
 
 
-def expand(ts: list[dict], seed: int = 3) -> tuple[list[dict], dict]:
+def expand(ts: list[dict], seed: int = 3, k: float | None = None) -> tuple[list[dict], dict]:
     """Rebuild full-size days from the sampled history, for the measures that read daily P&L (Sharpe, drawdown,
     trades per day, the trade-size bootstrap).
 
@@ -404,7 +404,8 @@ def expand(ts: list[dict], seed: int = 3) -> tuple[list[dict], dict]:
     day-to-day spread (of day means around their local mean) that is real rather than sampling noise
     (1 - mean(sd^2 / n) / variance), so the rebuilt day means keep the real swings and the draws add the real
     within-day noise of a full day. Trades keep their own return, size and liquidity; days with no sampled trade
-    stay empty. Trades with w = 1 (the scorer's days) pass through as they are."""
+    stay empty. Trades with w = 1 (the scorer's days) pass through as they are. `k` fixes the share instead of
+    measuring it (k=1: each day from its own trades only, which adds no day-to-day smoothing)."""
     full = [t for t in ts if t.get("w", 1.0) <= 1.0]
     samp = [t for t in ts if t.get("w", 1.0) > 1.0]
     if not samp:
@@ -421,8 +422,9 @@ def expand(ts: list[dict], seed: int = 3) -> tuple[list[dict], dict]:
         near = [ret[e] for e in range(d - LOCAL_DAYS, d + LOCAL_DAYS + 1) if e in ret]
         local[d] = np.concatenate(near)
     ok = [d for d in days if len(ret[d]) >= MIN_DAY_N]
-    k = 0.0
-    if len(ok) >= 5:
+    fixed = k is not None   # k=1: every draw from the day's own trades (no borrowing from nearby days)
+    k = float(k) if fixed else 0.0
+    if not fixed and len(ok) >= 5:
         dev = np.array([ret[d].mean() - local[d].mean() for d in ok])
         noise = float(np.mean([ret[d].var(ddof=1) / len(ret[d]) for d in ok]))
         var = float(dev.var())
