@@ -8,3 +8,4 @@ __pycache__/
 *.sqlite
 keypair.json
 backups/
+canary_pools.json
