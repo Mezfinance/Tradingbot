@@ -8,7 +8,9 @@ The launch canary's operators pull by withdrawing their own LP (on-chain: `Instr
                     tokens plus the matching SOL as liquidity (we receive LP tokens). We end holding an LP position
                     worth ~`usd`, half exposed to SOL and half to the token. The deposit amounts are computed from the
                     reserves read at send time; `max_base`/`max_quote` cap them, so a shifted pool reverts (fee only)
-                    rather than overspends.
+                    rather than overspends. A follow-up transaction then reads the real wallet balance and deposits the
+                    ~15% of tokens the atomic deposit left naked -- the full balance, no margin, retried on a revert --
+                    so 100% of the bought tokens sit in the LP and nothing is held outside the pool (best-effort).
   sell(token):      one transaction. WITHDRAW our LP (always returns our proportional share, even in a pool the
                     operator has drained) and, in the same transaction, sell the whole token side back to SOL -- both
                     the ~15% the buy left naked (already in the wallet, read exactly) and ~95% of the share the
@@ -51,6 +53,7 @@ WITHDRAW = bytes.fromhex("b712469c946da122")
 CU_LIMIT_LP = 500_000  # buy + deposit (or withdraw + sell) with up to 4 account creates; mainnet sim showed the real use
 ROUTE = "lp"
 DEPOSIT_TOKEN_SHARE = 0.95  # deposit this share of the tokens the buy is guaranteed to yield, leaving a dust margin
+SWEEP_TRIES = 5  # retries for the follow-up sweep: it deposits the full naked balance (no margin), re-reading reserves
 SLACK_LAMPORTS = 5_000_000  # extra wSOL wrapped so the deposit's SOL side never falls short
 
 
@@ -161,8 +164,9 @@ class LpPumpswapExecutor(DirectPumpswapExecutor):
 
     # --- public -------------------------------------------------------------------
     def buy(self, token: str, usd: float, ref_price: float) -> Fill | None:
-        """Buy ~half the budget of tokens and deposit them + matching SOL as liquidity, in one transaction. The Fill's
-        `qty` is the LP tokens received, `usd` the total SOL committed (cost)."""
+        """Buy ~half the budget of tokens and deposit them + matching SOL as liquidity, in one transaction, then
+        sweep the naked tokens that atomic deposit left into a second deposit so nothing is held outside the LP. The
+        Fill's `qty` is the LP tokens received across both deposits, `usd` the total SOL committed (cost)."""
         sol_usd = self.jup.sol_price()
         if not sol_usd:
             self.last_note = "SOL price unknown"
@@ -232,8 +236,69 @@ class LpPumpswapExecutor(DirectPumpswapExecutor):
             return failed(fee_usd, self.last_note)
         qty = lp_got / 10**lp_dec
         cost_usd = spent / 1e9 * sol_usd
+        # Sweep the naked tokens the atomic buy left into the LP, so nothing is held outside the pool (the operators'
+        # wash-trading bots may stop pumping once they see an outside wallet holding the token). Best-effort: a failure
+        # leaves this position standing with its ~15% naked, same as before.
+        sw_lp, sw_spent, sw_fee = self._sweep_deposit(token, sol_usd)
+        if sw_lp > 0:
+            qty += sw_lp / 10**lp_dec
+        cost_usd += sw_spent / 1e9 * sol_usd  # includes any reverted-attempt fees the wallet actually paid
+        fee_usd += sw_fee / 1e9 * sol_usd
         self.last_note = "ok"
         return Fill(qty=qty, price=cost_usd / qty, usd=cost_usd, fee_usd=fee_usd, tx=sent, note="ok")
+
+    def _sweep_deposit(self, token: str, sol_usd: float) -> tuple[int, int, int]:
+        """Deposit the naked tokens the atomic buy left so 100% of the bought tokens end up in the LP -- nothing is held
+        outside the pool. A constant-product deposit mints a fixed LP amount and pulls the matching tokens, so a pool
+        whose token reserve fell since the buy (it was wash-traded up) needs more tokens than we hold and reverts.
+        Rather than leave any tokens out as a margin, it targets the full balance and retries up to `SWEEP_TRIES`,
+        re-reading the reserves each time, until the deposit lands. Best-effort; returns (LP minted raw, SOL lamports
+        spent incl. reverted-attempt fees, fee lamports)."""
+        minted = spent = fees = 0
+        for attempt in range(SWEEP_TRIES):
+            naked = self.token_balance(token)
+            if not naked or naked <= 0:
+                break  # nothing left to deposit
+            st = self._state(token)
+            sup = self._lp_supply(st["pool"]["lp_mint"]) if st else None
+            if st is None or sup is None or sup[0] <= 0:
+                log.info("lp sweep skipped (%s): pool unreadable", token)
+                break
+            lp_supply = sup[0]
+            base_amt, quote_amt = st["reserves"]
+            sol_res, tok_res = (quote_amt, base_amt) if st["token_is_base"] else (base_amt, quote_amt)
+            if tok_res <= 0:
+                break
+            lp_out = int(naked * lp_supply / tok_res)  # target the full balance (no margin); a revert retries with fresh reserves
+            if lp_out <= 0:
+                break
+            base_needed = lp_out * sol_res // lp_supply  # SOL the deposit pulls in
+            max_base = int(base_needed * 1.20)
+            sol = self.sol_balance()
+            if sol is not None and sol < (max_base + SLACK_LAMPORTS) / 1e9 + 0.005:
+                log.info("lp sweep skipped (%s): wallet SOL low", token)
+                break
+            # Cap the token side at the full naked balance (the deposit can never need more than we hold); SOL side gets headroom.
+            if st["token_is_base"]:
+                dep_base, dep_quote = naked, max_base
+            else:
+                dep_base, dep_quote = max_base, naked
+            ixs, create = self._meta_ixs([st["addr"], PROGRAM])
+            ixs += [create(WSOL, TOKEN), create(token, st["token_prog"]), create(st["pool"]["lp_mint"], TOKEN_2022)]
+            ixs += self._wrap_ixs(max_base + SLACK_LAMPORTS)
+            ixs += [self._lp_ix(DEPOSIT, st, lp_out, dep_base, dep_quote), self._close_wsol_ix()]
+            sent = self._send_ixs(ixs)
+            if sent.startswith(NOT_SENT):
+                log.info("lp sweep attempt %d not sent (%s): %s", attempt + 1, token, sent)
+                continue  # preflight rejection (the pool shifted) -- retry with fresh reserves
+            res = self._settle_lp(sent, token, st["pool"]["lp_mint"])
+            fees += res["fee_lamports"]
+            spent += max(0, -res["owner_lamports"])
+            if res["ok"] and res["lp"] > 0:
+                minted += res["lp"]
+                break
+            log.info("lp sweep attempt %d did not land (%s): %s", attempt + 1, token, res["note"])
+        return minted, spent, fees
 
     def sell(self, token: str, qty: float, ref_price: float) -> Fill | None:
         """Withdraw our whole LP and sell the whole token side back to SOL in one transaction (`qty` is ignored, we

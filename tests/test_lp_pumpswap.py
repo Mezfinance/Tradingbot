@@ -66,6 +66,7 @@ class LpRpc:
         self.raw = []
         self.meta = None  # settle meta
         self.revert_first = False  # first sendTransaction's settle reverts (dead-pool exit)
+        self.revert_raw = set()  # 1-based send numbers whose settle reverts (sweep retry test)
         self.reject_atomic = False  # reject (in preflight, before sending) any tx carrying a sale leg
 
     def post(self, url, json=None):
@@ -94,7 +95,8 @@ class LpRpc:
         elif m == "getSignatureStatuses":
             res = {"value": [{"confirmationStatus": "confirmed", "err": (self.meta or {}).get("err")}]}
         elif m == "getTransaction":
-            if self.revert_first and len(self.raw) == 1:
+            n = int(p[0][3:])  # sig is "sig<N>", N = the send's 1-based order
+            if (self.revert_first and n == 1) or n in self.revert_raw:
                 res = {"meta": {**self.meta, "err": {"InstructionError": [7, {"Custom": 6001}]}}}
             else:
                 res = {"meta": self.meta}
@@ -140,6 +142,36 @@ def test_lp_buy_deposits_and_never_touches_jupiter():
     assert L.DEPOSIT.hex() in discs                                   # a deposit instruction is in the buy
     assert D.SELL.hex() in discs or D.BUY_EXACT_QUOTE_IN.hex() in discs  # and the buy swap
     assert JUPITER not in [pid for pid, _ in progs]                   # no Jupiter anywhere
+
+
+def test_lp_buy_sweeps_the_naked_tokens_into_a_second_deposit():
+    # The atomic buy+deposit leaves ~15% of the bought tokens naked (it can't read the exact buy output in-tx). A
+    # follow-up deposit reads the real wallet balance and deposits it, so nothing is held outside the pool.
+    ex, rpc = executor()
+    rpc.bal[MINT] = 2 * 10**12  # naked tokens the atomic buy left behind, read by the sweep
+    rpc.meta = meta(owner_delta=-(25 * 10**9 // 150 + 5000), lp_delta=4_000_000, tok_delta=100)
+    _fill_owner(rpc.meta, ex)
+    fill = ex.buy(MINT, 25.0, 0.0)
+    assert fill is not None and fill.ok
+    assert len(rpc.raw) == 2  # the atomic buy+deposit, then the sweep deposit
+    sweep = [d for _, d in decoded(rpc.raw[1])]
+    assert L.DEPOSIT.hex() in sweep                                              # the sweep is a deposit ...
+    assert D.SELL.hex() not in sweep and D.BUY_EXACT_QUOTE_IN.hex() not in sweep  # ... with no sale leg
+    assert fill.qty > 4_000_000 / 10**6  # LP minted by both deposits is folded into qty
+
+
+def test_lp_buy_sweep_retries_until_the_deposit_lands():
+    # 100% of the tokens must go in. The sweep deposits the full balance (no margin), so a pool that shifted reverts the
+    # deposit; it retries with fresh reserves until it lands rather than leaving any tokens out.
+    ex, rpc = executor()
+    rpc.bal[MINT] = 2 * 10**12
+    rpc.meta = meta(owner_delta=-(25 * 10**9 // 150 + 5000), lp_delta=4_000_000, tok_delta=100)
+    _fill_owner(rpc.meta, ex)
+    rpc.revert_raw = {2}  # the first sweep deposit reverts (the pool shifted); the retry lands
+    fill = ex.buy(MINT, 25.0, 0.0)
+    assert fill is not None and fill.ok
+    assert len(rpc.raw) == 3  # the atomic buy (1), the reverted sweep (2), the successful retry (3)
+    assert L.DEPOSIT.hex() in [d for _, d in decoded(rpc.raw[2])]
 
 
 def test_lp_buy_declines_without_enough_sol():
