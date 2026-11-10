@@ -18,6 +18,17 @@ import time
 from tradingbot.config import LIVE_CONFIRM_PHRASE, Config
 
 
+def canary_executor(cfg: Config, jupiter):
+    """The launch canary's live executor: Jupiter routes, or swaps straight on the pumpswap pool
+    (`launch_canary_route` = 'direct', 11-10)."""
+    if cfg.launch_canary_route == "direct":
+        from tradingbot.execution.pumpswap_direct import DirectPumpswapExecutor as cls
+    else:
+        from tradingbot.execution.jupiter import JupiterExecutor as cls
+    return cls(cfg, jupiter, priority_fee_sol=cfg.launch_canary_priority_fee_sol,
+               sell_slippage_bps=cfg.launch_canary_sell_slippage_bps)
+
+
 def build_engine(cfg: Config, with_analyst: bool = True):
     from tradingbot.analyst import Analyst
     from tradingbot.data.dexscreener import DexScreener
@@ -46,10 +57,7 @@ def build_engine(cfg: Config, with_analyst: bool = True):
         canary = JupiterExecutor(cfg, jupiter)
     launch_canary = None
     if cfg.launch_canary and cfg.model_book:
-        from tradingbot.execution.jupiter import JupiterExecutor
-        launch_canary = JupiterExecutor(replace(cfg, max_price_impact_pct=cfg.model_book_max_impact_pct), jupiter,
-                                        priority_fee_sol=cfg.launch_canary_priority_fee_sol,
-                                        sell_slippage_bps=cfg.launch_canary_sell_slippage_bps)
+        launch_canary = canary_executor(replace(cfg, max_price_impact_pct=cfg.model_book_max_impact_pct), jupiter)
     analyst = Analyst(cfg) if with_analyst else None
     triage = None
     if analyst is not None and cfg.triage:
@@ -345,9 +353,9 @@ def main(argv: list[str] | None = None) -> None:
             raise SystemExit(f"canary-smoke spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
         from tradingbot import launch_canary
         from tradingbot.data.jupiter import Jupiter
-        from tradingbot.execution.jupiter import JupiterExecutor
-        ex = JupiterExecutor(cfg, Jupiter(cfg.slippage_bps), priority_fee_sol=cfg.launch_canary_priority_fee_sol,
-                             sell_slippage_bps=cfg.launch_canary_sell_slippage_bps)
+        ex = canary_executor(cfg, Jupiter(cfg.slippage_bps))
+        if cfg.launch_canary_route == "direct" and not args.path:
+            raise SystemExit("canary-smoke on the direct route needs a token with a pumpswap pool: canary-smoke MINT")
         print(json.dumps(launch_canary.smoke(ex, args.path or launch_canary.SMOKE_MINT, args.usd), indent=2, default=str))
         return
 

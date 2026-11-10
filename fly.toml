@@ -28,6 +28,7 @@ primary_region = "iad"
   TB_LAUNCH_M5_BOOK = "1"  # launch4_2m5: launch4_2's picks sold at pool minute 5 (11-04)
   # REAL MONEY canary of launchrw50_sz: canary-stop to halt, canary-start to clear the kill switch (DEPLOY.md).
   TB_LAUNCH_CANARY = "1"  # ON (user, 11-10: $5 run to test the $2.50 result). "1" = REAL MONEY: canary_rw50_sz
+  TB_LAUNCH_CANARY_ROUTE = "jupiter"  # "direct" = swap on the pumpswap pool itself, no Jupiter route (11-10); spends the wallet's SOL, not USDC
   TB_LAUNCH_CANARY_USD = "5"  # fallback size when a signal has no liquidity
   TB_LAUNCH_CANARY_MAX_LIQ_USD = "0"  # every pool, all three bands (user, 11-07)
   TB_LAUNCH_CANARY_FLAT_USD = "5"  # $5 on every pick, every band (user, 11-10: does the $2.50 pattern (fewer instant pulls than $25) hold at $5? earlier $2.50 run: reset id 2026-11-10-canary-2p50). 0 = sizes follow the twin's bands

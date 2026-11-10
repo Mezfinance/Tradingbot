@@ -819,6 +819,8 @@ class Engine:
                 return self._jup_failure("no swap route")
             if rt[0] > c.max_round_trip_loss_pct:
                 return f"round-trip loss {rt[0]:.1f}% (honeypot/tax/thin pool)"
+        if sig.get("pool") and hasattr(book.executor, "remember_pool"):  # the direct route swaps on this pool
+            book.executor.remember_pool(sig["mint"], sig["pool"])
         fill = book.executor.buy(sig["mint"], usd, trigger)
         if fill is None:
             return f"executor declined: {getattr(book.executor, 'last_note', '') or 'no reason given'}"
