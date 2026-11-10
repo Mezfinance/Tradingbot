@@ -66,6 +66,7 @@ class LpRpc:
         self.raw = []
         self.meta = None  # settle meta
         self.revert_first = False  # first sendTransaction's settle reverts (dead-pool exit)
+        self.reject_atomic = False  # reject (in preflight, before sending) any tx carrying a sale leg
 
     def post(self, url, json=None):
         m, p = json["method"], json["params"]
@@ -84,6 +85,10 @@ class LpRpc:
             from solders.hash import Hash
             res = {"value": {"blockhash": str(Hash.default()), "lastValidBlockHeight": 1}}
         elif m == "sendTransaction":
+            if self.reject_atomic:
+                discs = {d for _, d in decoded(p[0])}
+                if D.SELL.hex() in discs or D.BUY_EXACT_QUOTE_IN.hex() in discs:  # a drained pool reverts the sale leg
+                    return SimpleNamespace(json=lambda: {"error": {"code": -32002, "message": "preflight: custom 6001"}})
             self.raw.append(p[0])
             res = f"sig{len(self.raw)}"
         elif m == "getSignatureStatuses":
@@ -168,6 +173,24 @@ def test_lp_sell_falls_back_to_withdraw_only_when_the_sale_reverts():
     assert all(L.WITHDRAW.hex() in [d for _, d in decoded(r)] for r in rpc.raw)
     fallback = [d for _, d in decoded(rpc.raw[1])]
     assert D.SELL.hex() not in fallback and D.BUY_EXACT_QUOTE_IN.hex() not in fallback  # no sale in the fallback
+
+
+def test_lp_sell_falls_back_when_the_atomic_exit_is_rejected_in_preflight():
+    # The 9w1vtt stuck-at-$0 bug: on a fully-drained pool the sale leg reverts, so the atomic withdraw+sell is
+    # rejected in preflight (never sent). The exit must still fall back to withdraw-only and recover the SOL share,
+    # not bail with a "not sent:" note that the engine retries silently forever.
+    ex, rpc = executor()
+    rpc.bal[LP] = 4_000_000
+    rpc.bal[MINT] = 10**6
+    rpc.reject_atomic = True  # the withdraw+sell tx is rejected before sending; withdraw-only (no sale) still sends
+    rpc.meta = meta(owner_delta=6 * 10**9 // 150)  # the withdraw-only returns our residual SOL
+    _fill_owner(rpc.meta, ex)
+    fill = ex.sell(MINT, 4.0, 0.0)
+    assert fill is not None and fill.ok and fill.usd > 0
+    assert len(rpc.raw) == 1  # only the withdraw-only landed (the atomic was rejected, never sent)
+    discs = [d for _, d in decoded(rpc.raw[0])]
+    assert L.WITHDRAW.hex() in discs
+    assert D.SELL.hex() not in discs and D.BUY_EXACT_QUOTE_IN.hex() not in discs  # no sale leg in the fallback
 
 
 def test_route_setting_picks_the_lp_executor(monkeypatch):

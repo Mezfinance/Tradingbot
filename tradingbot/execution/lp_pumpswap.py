@@ -238,8 +238,9 @@ class LpPumpswapExecutor(DirectPumpswapExecutor):
     def sell(self, token: str, qty: float, ref_price: float) -> Fill | None:
         """Withdraw our whole LP and sell the whole token side back to SOL in one transaction (`qty` is ignored, we
         always withdraw our full LP balance). The sale covers the naked tokens the buy left in the wallet plus ~95% of
-        the share the withdraw returns. If the pool shifted or died and the sale leg reverts the whole transaction,
-        fall back to a withdraw-only transaction so the SOL side is still recovered."""
+        the share the withdraw returns. If the atomic transaction can't land -- whether it was rejected in preflight
+        (the sale leg reverts selling into a drained/empty pool, which is exactly the hardest rug) or it landed and
+        reverted -- fall back to a withdraw-only transaction so the SOL side is still recovered."""
         sol_usd = self.jup.sol_price()
         if not sol_usd:
             return failed(0.0, f"{NOT_SENT} SOL price unknown")
@@ -252,12 +253,14 @@ class LpPumpswapExecutor(DirectPumpswapExecutor):
             return failed(0.0, "no LP balance")
         # Atomic: withdraw the LP and sell the whole token side in the same transaction.
         sent = self._send_ixs(self._exit_ixs(st, token, held_lp, with_sell=True))
-        if sent.startswith(NOT_SENT):
-            return failed(0.0, sent)
-        res = self._settle_lp(sent, token, lp_mint)
-        if not res["ok"] and res["note"].startswith("reverted"):
-            # The pool shifted or died and the sale leg reverted the whole transaction; recover the SOL side only.
-            log.info("lp atomic exit reverted (%s); withdrawing the SOL side only", res["note"])
+        # Fall back to withdraw-only when the atomic exit can't land. A fully-drained pool reverts the sale leg; with
+        # preflight on that is rejected *before sending* (NOT_SENT), so the earlier code bailed here and the engine
+        # silently retried forever -- the stuck-at-$0 bug on the worst rugs. Treat a preflight rejection the same as
+        # an on-chain revert and withdraw our SOL share (withdraw-only has no sale leg, so it passes preflight).
+        res = None if sent.startswith(NOT_SENT) else self._settle_lp(sent, token, lp_mint)
+        if res is None or (not res["ok"] and res["note"].startswith("reverted")):
+            log.info("lp atomic exit did not land (%s); withdrawing the SOL side only",
+                     sent if res is None else res["note"])
             sent = self._send_ixs(self._exit_ixs(st, token, held_lp, with_sell=False))
             if sent.startswith(NOT_SENT):
                 return failed(0.0, sent)
