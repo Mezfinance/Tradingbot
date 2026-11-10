@@ -30,7 +30,7 @@ primary_region = "iad"
   TB_LAUNCH_CANARY = "1"  # ON (user, 11-10: $5 run to test the $2.50 result). "1" = REAL MONEY: canary_rw50_sz
   TB_LAUNCH_CANARY_ROUTE = "direct"  # swap on the pumpswap pool itself, no Jupiter route (user, 11-10); spends the wallet's SOL, not USDC. "jupiter" = the old route
   TB_LAUNCH_CANARY_USD = "5"  # fallback size when a signal has no liquidity
-  TB_LAUNCH_CANARY_MAX_LIQ_USD = "0"  # every pool, all three bands (user, 11-07)
+  TB_LAUNCH_CANARY_MAX_LIQ_USD = "15000"  # thin pools only, liquidity under $15k at second 4 (user, 11-10, direct $5 run); "0" = every pool
   TB_LAUNCH_CANARY_FLAT_USD = "5"  # $5 on every pick, every band (user, 11-10: does the $2.50 pattern (fewer instant pulls than $25) hold at $5? earlier $2.50 run: reset id 2026-11-10-canary-2p50). 0 = sizes follow the twin's bands
   TB_LAUNCH_CANARY_BAND_SCALE = "0.1"  # exact replica of launchrw50_sz at 1/10 of its sizes: $25 below $15k / $2.50 at $15-25k / $10 above (user, 11-10)
   TB_LAUNCH_CANARY_BUDGET_USD = "600"  # the USDC in the canary wallet (11-07; was 45)
@@ -53,8 +53,8 @@ primary_region = "iad"
   TB_LAUNCH_LIVE_DAILY_CREDITS = "10000000"  # scorer uncapped (11-05): the 28k/day pro-rata budget idled every book ~25 min of each UTC hour (0 would mean off)
   TB_DISABLED_BOOKS = "launchd12_s10,launchd12_s20,launchd12_s30,launchd12_s50,early7,early7r,launchd12,launchd12rw50,launchd12rw50_24h,early5,early6,early5r,early6r,early6t,launch4_2,launch4_5,launch4_2m5,launch4_5m5"  # 11-05: skip books + minute-7 exits; 11-08: the d12 family (launchd12 -83%, d12rw50 -33/-29%), every early book (-5..-16%, worse than their backtests) and the launch4 books (-9..-13%): all lose to the market at sz's sizes in most 6 h blocks (block-compare)
   TB_MODEL_BOOK_DAILY_LOSS_PCT = "0"  # 11-05: no daily loss limit on the paper books (launch4_5 skipped 68 signals on it): every signal is traded and measured
-  TB_RESET_BOOKS = "canary_rw50_sz"  # canary starts clean at $600 for the live run (11-10, second id so it runs once more); once per id; earlier: 2026-11-10-canary-5usd canary, 2026-11-10-canary-2p50 canary, 2026-11-10-canary-live-2 canary, 2026-11-10-canary-live canary, 2026-11-07-canary-600 canary, 2026-11-06-canary-20 + 2026-11-06-canary-45 canary, 2026-11-02-drift launch4_2/5, 2026-11-04-impact-probe launchd12 books, 2026-11-05-dashboard-lag + 2026-11-05-study-rule launchrw50/launchd12rw50
-  TB_RESET_BOOKS_ID = "2026-11-10-canary-5usd-direct"
+  TB_RESET_BOOKS = "canary_rw50_sz"  # canary starts clean at $600 for the live run (11-10, second id so it runs once more); once per id; earlier: 2026-11-10-canary-5usd-direct canary, 2026-11-10-canary-5usd canary, 2026-11-10-canary-2p50 canary, 2026-11-10-canary-live-2 canary, 2026-11-10-canary-live canary, 2026-11-07-canary-600 canary, 2026-11-06-canary-20 + 2026-11-06-canary-45 canary, 2026-11-02-drift launch4_2/5, 2026-11-04-impact-probe launchd12 books, 2026-11-05-dashboard-lag + 2026-11-05-study-rule launchrw50/launchd12rw50
+  TB_RESET_BOOKS_ID = "2026-11-10-canary-5usd-direct-thin"
   TB_HELIUS_DAILY_CREDITS = "0"  # early-buyer lookups off: their credits go to the launch scorer
   TB_OPERATOR_DAILY_CREDITS = "0"  # rug-catcher operator lookups off (ops books are off)
 
