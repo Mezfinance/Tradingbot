@@ -231,6 +231,26 @@ def test_engine_hands_the_signals_pool_to_the_direct_executor(cfg, good_pair):
         cfg.launch_book = cfg.launch_live = cfg.launch_canary = False
 
 
+def test_canary_test_run_stops_after_its_trade_cap(cfg, good_pair):
+    cfg.launch_book = cfg.launch_live = cfg.launch_canary = True
+    cfg.launch_canary_max_trades = 2
+    try:
+        j = Journal(":memory:")
+        eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                     model_executor=PaperExecutor(cfg), launch_canary_executor=PaperExecutor(cfg))
+        for m in ("A", "B", "C"):
+            eng.model_book.signals.put({"pool": "P" + m, "mint": m, "dex": "pumpswap", "created_ts": time.time() - 6,
+                                        "name": "", "price": 1e-5, "liq": 12_000.0, "score": 1.0, "ts": time.time(),
+                                        "decided_ts": time.time(), "kind": "launch", "rw50": True})
+            eng.buy_model_signals()
+        assert [p.token_address for p in j.open_positions(mb.CANARY4)] == ["A", "B"]
+        assert eng._model_skip_reason(eng.books[mb.CANARY4], {"mint": "D", "liq": 12_000.0, "ts": time.time()}) == \
+            "canary test run done (2 of 2 trades)"
+    finally:
+        cfg.launch_book = cfg.launch_live = cfg.launch_canary = False
+        cfg.launch_canary_max_trades = 0
+
+
 def test_the_canary_route_setting_picks_the_executor(monkeypatch):
     from tradingbot import cli
     monkeypatch.setattr(d.DirectPumpswapExecutor, "__init__", lambda self, *a, **k: None)

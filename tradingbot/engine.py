@@ -748,6 +748,10 @@ class Engine:
         if book.name in mb.CANARY_BOOKS:  # real money: hard limits of its own
             if self.journal.get_state(CANARY_HALT):
                 return "canary halted (kill switch)"
+            if c.launch_canary_max_trades > 0:  # a fixed-size test run: stop buying after N trades in this book
+                done = self.journal.query("SELECT COUNT(*) n FROM positions WHERE strategy=?", (book.name,))[0]["n"]
+                if done >= c.launch_canary_max_trades:
+                    return f"canary test run done ({done} of {c.launch_canary_max_trades} trades)"
             dd = mb.DD_LIMITS.get(mb.LAUNCH_SIZED_DD)
             if c.launch_canary_follow_dd and dd:  # the full-size paper twin's drawdown decides, not the canary's fees
                 lost = self._window_loss(mb.LAUNCH_SIZED_DD, self.journal.open_positions(mb.LAUNCH_SIZED_DD),
