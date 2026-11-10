@@ -9,10 +9,12 @@ The launch canary's operators pull by withdrawing their own LP (on-chain: `Instr
                     worth ~`usd`, half exposed to SOL and half to the token. The deposit amounts are computed from the
                     reserves read at send time; `max_base`/`max_quote` cap them, so a shifted pool reverts (fee only)
                     rather than overspends.
-  sell(token):      WITHDRAW our LP (always returns our proportional share, even in a pool the operator has drained),
-                    then sell the token side back to SOL. Tried as one transaction; if that reverts because the pool
-                    is dead and the token can't be sold, it falls back to a withdraw-only transaction so the SOL side
-                    is still recovered.
+  sell(token):      one transaction. WITHDRAW our LP (always returns our proportional share, even in a pool the
+                    operator has drained) and, in the same transaction, sell the whole token side back to SOL -- both
+                    the ~15% the buy left naked (already in the wallet, read exactly) and ~95% of the share the
+                    withdraw will return (estimated under, so the sale never over-sells and reverts). If the pool
+                    shifted hard or is dead and the sale leg reverts the whole transaction, it falls back to a
+                    withdraw-only transaction so the SOL side is still recovered.
 
 Layouts are pump.fun's IDL `deposit` / `withdraw` (15 accounts each, no fee recipients), checked against a real
 mainnet withdraw on 11-10; a wrong account order reverts in the mainnet simulation before any money moves. Everything
@@ -234,8 +236,10 @@ class LpPumpswapExecutor(DirectPumpswapExecutor):
         return Fill(qty=qty, price=cost_usd / qty, usd=cost_usd, fee_usd=fee_usd, tx=sent, note="ok")
 
     def sell(self, token: str, qty: float, ref_price: float) -> Fill | None:
-        """Withdraw our whole LP position and sell the token side back to SOL. `qty` is ignored (we always withdraw our
-        full LP balance). Falls back to withdraw-only if the pool is dead and the token can't be sold."""
+        """Withdraw our whole LP and sell the whole token side back to SOL in one transaction (`qty` is ignored, we
+        always withdraw our full LP balance). The sale covers the naked tokens the buy left in the wallet plus ~95% of
+        the share the withdraw returns. If the pool shifted or died and the sale leg reverts the whole transaction,
+        fall back to a withdraw-only transaction so the SOL side is still recovered."""
         sol_usd = self.jup.sol_price()
         if not sol_usd:
             return failed(0.0, f"{NOT_SENT} SOL price unknown")
@@ -246,15 +250,14 @@ class LpPumpswapExecutor(DirectPumpswapExecutor):
         held_lp = self.token_balance(lp_mint)
         if held_lp <= 0:
             return failed(0.0, "no LP balance")
-        # Attempt 1: withdraw the LP, then sell the withdrawn token side for SOL (full value on a live pool).
-        full = self._exit_ixs(st, token, held_lp, with_sell=True)
-        sent = self._send_ixs(full)
+        # Atomic: withdraw the LP and sell the whole token side in the same transaction.
+        sent = self._send_ixs(self._exit_ixs(st, token, held_lp, with_sell=True))
         if sent.startswith(NOT_SENT):
             return failed(0.0, sent)
         res = self._settle_lp(sent, token, lp_mint)
         if not res["ok"] and res["note"].startswith("reverted"):
-            # The pool is dead and the token sale reverted the whole transaction; recover the SOL side only.
-            log.info("lp exit with sell reverted (%s); withdrawing the SOL side only", res["note"])
+            # The pool shifted or died and the sale leg reverted the whole transaction; recover the SOL side only.
+            log.info("lp atomic exit reverted (%s); withdrawing the SOL side only", res["note"])
             sent = self._send_ixs(self._exit_ixs(st, token, held_lp, with_sell=False))
             if sent.startswith(NOT_SENT):
                 return failed(0.0, sent)
@@ -271,12 +274,16 @@ class LpPumpswapExecutor(DirectPumpswapExecutor):
         ixs, create = self._meta_ixs([st["addr"], PROGRAM])
         ixs += [create(WSOL, TOKEN), create(token, st["token_prog"])]
         ixs.append(self._lp_ix(WITHDRAW, st, held_lp, 0, 0))  # min base/quote 0: take our share whatever is left
-        if with_sell:  # sell the token side the withdraw will return (not in our wallet yet, so estimate it)
+        if with_sell:
+            # Sell the naked tokens the buy left (in the wallet now, so exact) plus ~95% of the share the withdraw
+            # returns (estimated under, so naked + 0.95*share stays <= our post-withdraw holdings and never reverts).
+            naked = self.token_balance(token)
             base_amt, quote_amt = st["reserves"]
             tok_res = base_amt if st["token_is_base"] else quote_amt  # the token reserve, whichever side it is
             sup = self._lp_supply(st["pool"]["lp_mint"])
             if sup and sup[0] > 0:
-                tok_back = int(0.95 * held_lp * tok_res / sup[0])  # 95% of our LP's token share; any shortfall reverts
+                share = held_lp * tok_res // sup[0]      # tokens the withdraw will return (estimate)
+                tok_back = naked + int(0.95 * share)
                 if tok_back > 0:
                     ixs.append(self._swap_ix(st, "sell", tok_back, 1))
         ixs.append(self._close_wsol_ix())  # unwrap all recovered SOL back to the wallet

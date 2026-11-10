@@ -142,26 +142,32 @@ def test_lp_buy_declines_without_enough_sol():
     assert ex.buy(MINT, 25.0, 0.0) is None and "wallet SOL low" in ex.last_note and not rpc.raw
 
 
-def test_lp_sell_withdraws_and_sells():
+def test_lp_sell_withdraws_and_sells_in_one_transaction():
     ex, rpc = executor()
     rpc.bal[LP] = 4_000_000  # we hold LP
-    rpc.meta = meta(owner_delta=12 * 10**9 // 150, tok_delta=0)  # SOL recovered
+    rpc.bal[MINT] = 10**6    # naked tokens the buy left in the wallet, to be swept by the sale
+    rpc.meta = meta(owner_delta=12 * 10**9 // 150)  # SOL recovered
     _fill_owner(rpc.meta, ex)
     fill = ex.sell(MINT, 4.0, 0.0)
-    assert fill.ok and fill.usd > 0 and len(rpc.raw) == 1
+    assert fill.ok and fill.usd > 0 and len(rpc.raw) == 1  # one atomic transaction
     discs = [d for _, d in decoded(rpc.raw[0])]
-    assert L.WITHDRAW.hex() in discs
+    assert L.WITHDRAW.hex() in discs                                    # withdraw ...
+    assert D.SELL.hex() in discs or D.BUY_EXACT_QUOTE_IN.hex() in discs  # ... and the sale, in the same tx
+    assert JUPITER not in [pid for pid, _ in decoded(rpc.raw[0])]
 
 
-def test_lp_sell_falls_back_to_withdraw_only_on_a_dead_pool():
+def test_lp_sell_falls_back_to_withdraw_only_when_the_sale_reverts():
     ex, rpc = executor()
     rpc.bal[LP] = 4_000_000
-    rpc.revert_first = True  # the withdraw+sell reverts (token can't be sold); the second tx is withdraw-only
+    rpc.bal[MINT] = 10**6
+    rpc.revert_first = True  # the atomic withdraw+sell reverts; the fallback is a withdraw-only tx
     rpc.meta = meta(owner_delta=6 * 10**9 // 150)
     _fill_owner(rpc.meta, ex)
     fill = ex.sell(MINT, 4.0, 0.0)
-    assert fill.ok and fill.usd > 0 and len(rpc.raw) == 2  # two transactions: the reverted one, then withdraw-only
+    assert fill.ok and fill.usd > 0 and len(rpc.raw) == 2  # the reverted atomic tx, then withdraw-only
     assert all(L.WITHDRAW.hex() in [d for _, d in decoded(r)] for r in rpc.raw)
+    fallback = [d for _, d in decoded(rpc.raw[1])]
+    assert D.SELL.hex() not in fallback and D.BUY_EXACT_QUOTE_IN.hex() not in fallback  # no sale in the fallback
 
 
 def test_route_setting_picks_the_lp_executor(monkeypatch):
