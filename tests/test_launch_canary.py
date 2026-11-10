@@ -322,8 +322,13 @@ def test_canary_book_takes_top2_picks_at_its_own_size_and_limits(cfg, good_pair)
         reasons = [eng._model_skip_reason(book, sig(f"S{i}")) for i in range(6)]
         assert reasons.count(None) == 2 and reasons.count("canary samples 1 in 3 signals") == 4
         cfg.launch_canary_every_n = 1
-        cfg.launch_canary_daily_loss_usd = 0.0
+        cfg.launch_canary_follow_dd = False
+        j.realized_since = lambda since, name: -60.0   # the canary down $60 today against its $50 stop
         assert eng._model_skip_reason(book, sig("C")) == "daily loss limit"
+        cfg.launch_canary_daily_loss_usd = 0.0           # 0 = no daily stop (the exact sz replica)
+        assert eng._model_skip_reason(book, sig("C")) is None
+        j.realized_since = real
+        cfg.launch_canary_follow_dd = True
         st = launch_canary.status(j, cfg)
         assert st["open_positions"] == 1 and st["enabled"]
     finally:

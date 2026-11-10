@@ -762,7 +762,8 @@ class Engine:
                     return f"canary samples 1 in {c.launch_canary_every_n} signals"
             if len(open_) >= c.launch_canary_max_open:
                 return "max open positions"
-            if -self.journal.realized_since(day_start, book.name) >= c.launch_canary_daily_loss_usd:
+            if (c.launch_canary_daily_loss_usd > 0  # 0 = no daily stop (user, 11-10: an exact replica of sz)
+                    and -self.journal.realized_since(day_start, book.name) >= c.launch_canary_daily_loss_usd):
                 return "daily loss limit"
             return None
         if len(open_) >= c.model_book_max_open:
