@@ -99,7 +99,7 @@ class LpRpc:
 def executor(**kw):
     kp = Keypair()
     rpc = LpRpc(str(kp.pubkey()), **kw)
-    ex = L.LpPumpswapExecutor(Config(max_price_impact_pct=5.0), FakeJup(), http=rpc, keypair=kp,
+    ex = L.LpPumpswapExecutor(Config(max_price_impact_pct=5.0, db_path=":memory:"), FakeJup(), http=rpc, keypair=kp,
                               sell_slippage_bps=1000, sleep=lambda s: None)
     ex.remember_pool(MINT, POOL)
     return ex, rpc
