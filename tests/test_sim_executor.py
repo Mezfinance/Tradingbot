@@ -125,6 +125,29 @@ def test_token_too_new_for_the_price_api_gets_decimals_onchain_and_a_quote_price
     assert calls.count("/") == 1  # decimals read on-chain once, then cached
 
 
+def test_paper_decimals_fall_back_to_the_public_rpc_never_the_live_key(monkeypatch):
+    # 11-10: the research (backup) key refused, so paper books declined fresh tokens the canary bought
+    monkeypatch.setenv("HELIUS_API_KEY", "LIVEKEY")
+    monkeypatch.setenv("BACKUP_HELIUS_API_KEY", "RESEARCHKEY")
+    monkeypatch.delenv("SOLANA_RPC_URL", raising=False)
+    hosts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/price/v3":
+            return httpx.Response(200, json={})
+        if request.method == "POST":
+            hosts.append(str(request.url))
+            if "helius" in request.url.host:
+                return httpx.Response(429, text="Too Many Requests")
+            return httpx.Response(200, json={"result": {"value": {"decimals": 9, "amount": "1"}}})
+        return httpx.Response(404)
+
+    jup = Jupiter(http=httpx.Client(transport=httpx.MockTransport(handler), base_url="https://x"))
+    assert jup.decimals("NEWTOKEN") == 9
+    assert len(hosts) == 2 and "RESEARCHKEY" in hosts[0] and "mainnet-beta" in hosts[1]
+    assert not any("LIVEKEY" in h for h in hosts)
+
+
 def test_jupiter_unknown_impact_is_estimated_from_the_trigger_price(sim):
     # Jupiter says 100% (it can't value a seconds-old token) and the size probe fails (None): the quote's own
     # price is 2% above the trigger, so the estimate lets the buy through

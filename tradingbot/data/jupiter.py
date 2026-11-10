@@ -237,12 +237,18 @@ class Jupiter:
     def _decimals_onchain(self, mint: str) -> int | None:
         from tradingbot.data.helius import research_key
         key = research_key()  # paper books and research: the backup account, never the live key
-        url = os.environ.get("SOLANA_RPC_URL") or (f"{HELIUS_RPC}?api-key={key}" if key else PUBLIC_RPC)
-        try:
-            resp = self.http.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [mint]})
-            return int(resp.json()["result"]["value"]["decimals"])
-        except (httpx.HTTPError, ValueError, KeyError, TypeError):
-            return None
+        first = os.environ.get("SOLANA_RPC_URL") or (f"{HELIUS_RPC}?api-key={key}" if key else PUBLIC_RPC)
+        # 11-10: a refused or rate-limited backup key left fresh tokens without decimals, so the
+        # paper books declined buys the canary (main key) made; retry once on the public RPC
+        for url in dict.fromkeys((first, PUBLIC_RPC)):
+            try:
+                resp = self.http.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply",
+                                                 "params": [mint]})
+                return int(resp.json()["result"]["value"]["decimals"])
+            except (httpx.HTTPError, ValueError, KeyError, TypeError):
+                log.info("decimals for %s failed on %s", mint[:8],
+                         "helius (research key)" if "helius" in url else "rpc")
+        return None
 
     def quote_price(self, mint: str, usd: float = 20.0) -> float | None:
         """USD price implied by a small buy quote, for tokens the price API does not list yet."""
