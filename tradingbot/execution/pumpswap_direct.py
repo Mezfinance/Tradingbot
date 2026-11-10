@@ -227,7 +227,10 @@ class DirectPumpswapExecutor(JupiterExecutor):
         return max(1, min(est, cap))
 
     def _instructions(self, st: dict, side: str, amount_in: int, min_out: int) -> list:
-        from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
+        from solders.compute_budget import (
+            set_compute_unit_limit,
+            set_compute_unit_price,
+        )
         from solders.instruction import AccountMeta, Instruction
         from solders.pubkey import Pubkey
         from solders.system_program import TransferParams, transfer

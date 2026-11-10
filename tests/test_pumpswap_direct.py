@@ -6,6 +6,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.test_analyst_engine import FakeDex
+from tests.test_launch_canary import FakeJup, FakeRpc
 from tradingbot import model_book as mb
 from tradingbot.config import Config
 from tradingbot.data.pumpswap import WSOL, parse_pool
@@ -13,13 +15,11 @@ from tradingbot.engine import Engine
 from tradingbot.execution import pumpswap_direct as d
 from tradingbot.execution.paper import PaperExecutor
 from tradingbot.journal import Journal
-from tests.test_analyst_engine import FakeDex
-from tests.test_launch_canary import FakeJup, FakeRpc
 
 solders = pytest.importorskip("solders")
-from solders.keypair import Keypair  # noqa: E402
-from solders.pubkey import Pubkey  # noqa: E402
-from solders.transaction import VersionedTransaction  # noqa: E402
+from solders.keypair import Keypair
+from solders.pubkey import Pubkey
+from solders.transaction import VersionedTransaction
 
 T22, TOK = d.TOKEN_2022, d.TOKEN
 
