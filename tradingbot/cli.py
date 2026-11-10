@@ -80,7 +80,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -610,6 +610,26 @@ def main(argv: list[str] | None = None) -> None:
         out = sz_stops.study(_SsWS(_ss_wdp(cfg)), _SsJournal(cfg.db_path), book=args.book, hours=args.hours,
                              helius=ss_helius, max_credits=int(args.max_credits or 15_000))
         print(json.dumps(out, indent=2, default=str) if args.json else sz_stops.render(out))
+        return
+
+    if args.command == "canary-trades":  # every real canary trade + the pool path after our buy (11-10)
+        import os as _ct_os
+        from tradingbot import canary_trades
+        from tradingbot.journal import Journal as _CtJournal
+        from tradingbot.watcher import WatchStore as _CtWS, watch_db_path as _ct_wdp
+        ct_helius = None
+        if args.fetch:
+            import httpx as _ct_httpx
+            from tradingbot.data.helius import Helius as _CtHelius
+            ct_helius = _CtHelius(client=_ct_httpx.Client(timeout=60))  # research (backup) key, never the live key
+            ct_helius.min_interval_s = 1 / max(args.rps, 0.1)
+        out = canary_trades.study(_CtWS(_ct_wdp(cfg)), _CtJournal(cfg.db_path), helius=ct_helius,
+                                  max_credits=int(args.max_credits or 5_000))
+        dest = args.path or _ct_os.path.join(_ct_os.path.dirname(_ct_os.path.abspath(cfg.db_path)), "canary_trades.json")
+        with open(dest, "w") as fh:
+            json.dump(out, fh, indent=1, default=str)
+        print(json.dumps(out, indent=2, default=str) if args.json else canary_trades.render(out))
+        print(f"\nfull export written to {dest}")
         return
 
     if args.command == "canary-package":  # the canary's proposed rule set replayed over the year (11-10)
