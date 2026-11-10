@@ -88,7 +88,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -333,9 +333,9 @@ def main(argv: list[str] | None = None) -> None:
         print(f"rug-vs-win model written to {out}" if out else "rug-vs-win model: not enough data to train yet")
         return
 
-    if args.command in ("canary-status", "canary-stop", "canary-start"):  # the real-money launch canary
+    if args.command in ("canary-status", "canary-stop", "canary-start", "canary-one"):  # the real-money launch canary
         from tradingbot import launch_canary
-        from tradingbot.engine import CANARY_HALT
+        from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
         from tradingbot.journal import Journal
         import time as _time  # a later `import time` in main() makes the bare name local here
         journal = Journal(cfg.db_path)
@@ -343,8 +343,12 @@ def main(argv: list[str] | None = None) -> None:
             journal.set_state(CANARY_HALT, repr(_time.time()))
             print("launch canary halted: no new buys (open positions still sell at their pool minute)")
         elif args.command == "canary-start":
+            journal.execute("DELETE FROM state WHERE key IN (?, ?)", (CANARY_HALT, CANARY_ALLOW))
+            print("launch canary kill switch cleared (no trade-at-a-time limit)")
+        elif args.command == "canary-one":  # exactly one more buy, then it waits for the next canary-one
+            journal.set_state(CANARY_ALLOW, "1")
             journal.execute("DELETE FROM state WHERE key=?", (CANARY_HALT,))
-            print("launch canary kill switch cleared")
+            print("launch canary: one buy allowed, then it waits for canary-one again")
         out = {"status": launch_canary.status(journal, cfg), "calibration": launch_canary.calibration(journal, args.hours)}
         print(json.dumps(out, indent=2, default=str))
         return

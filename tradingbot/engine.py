@@ -38,6 +38,7 @@ log = logging.getLogger(__name__)
 MAIN = "claude"
 CANARY = "canary"
 CANARY_HALT = "launch_canary:halted"  # state key: set = the real-money launch canary buys nothing (kill switch)
+CANARY_ALLOW = "launch_canary:allow"  # state key: buys left before the canary waits (canary-one sets 1); absent = no limit
 BOOK_PRIORITY = {MAIN: 0, CANARY: 1, "canary_rw50_sz": 1}  # real-money books are exited before simulated baselines
 REANALYSE_AFTER_S = 6 * 3600
 RECHECK_REJECTED_S = 30 * 60
@@ -748,6 +749,9 @@ class Engine:
         if book.name in mb.CANARY_BOOKS:  # real money: hard limits of its own
             if self.journal.get_state(CANARY_HALT):
                 return "canary halted (kill switch)"
+            allow = self.journal.get_state(CANARY_ALLOW)
+            if allow is not None and int(allow) <= 0:  # one trade at a time: canary-one allows the next
+                return "canary waiting for canary-one (one trade at a time)"
             if c.launch_canary_max_trades > 0:  # a fixed-size test run: stop buying after N trades in this book
                 done = self.journal.query("SELECT COUNT(*) n FROM positions WHERE strategy=?", (book.name,))[0]["n"]
                 if done >= c.launch_canary_max_trades:
@@ -833,6 +837,8 @@ class Engine:
             return "transaction failed"
         symbol = (sig["name"].split(" / ")[0] or sig["mint"][:6])[:16]
         pos = self._open_position(book, sig["mint"], symbol, fill, trigger, None)
+        if canary and self.journal.get_state(CANARY_ALLOW) is not None:  # used up the trade canary-one allowed
+            self.journal.set_state(CANARY_ALLOW, str(max(0, int(self.journal.get_state(CANARY_ALLOW)) - 1)))
         deadline = mb.exit_deadline(self.cfg, book.name, sig)
         if deadline is not None:
             self._deadlines[pos.id] = deadline

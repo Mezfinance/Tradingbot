@@ -282,3 +282,31 @@ def test_the_canary_route_setting_picks_the_executor(monkeypatch):
     monkeypatch.setattr(jx.JupiterExecutor, "__init__", lambda self, *a, **k: None)
     assert type(cli.canary_executor(Config(launch_canary_route="direct"), None)) is d.DirectPumpswapExecutor
     assert type(cli.canary_executor(Config(), None)) is jx.JupiterExecutor
+
+
+def test_canary_one_allows_exactly_one_buy_then_waits(cfg, good_pair, tmp_path, monkeypatch, capsys):
+    from tradingbot import cli
+    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
+    db = str(tmp_path / "j.db")
+    monkeypatch.setenv("TB_DB_PATH", db)
+    j = Journal(db)
+    j.set_state(CANARY_HALT, "1")
+    cli.main(["canary-one"])
+    assert "one buy allowed" in capsys.readouterr().out
+    assert j.get_state(CANARY_HALT) is None and j.get_state(CANARY_ALLOW) == "1"
+    cfg.launch_book = cfg.launch_live = cfg.launch_canary = True
+    try:
+        eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                     model_executor=PaperExecutor(cfg), launch_canary_executor=PaperExecutor(cfg))
+        for m in ("A", "B", "C"):  # three picks in a row: only the first is bought
+            eng.model_book.signals.put({"pool": "P" + m, "mint": m, "dex": "pumpswap", "created_ts": time.time() - 6,
+                                        "name": "", "price": 1e-5, "liq": 12_000.0, "score": 1.0, "ts": time.time(),
+                                        "decided_ts": time.time(), "kind": "launch", "rw50": True})
+            eng.buy_model_signals()
+        assert [p.token_address for p in j.open_positions(mb.CANARY4)] == ["A"] and j.get_state(CANARY_ALLOW) == "0"
+        assert eng._model_skip_reason(eng.books[mb.CANARY4], {"mint": "D", "liq": 12_000.0, "ts": time.time()}) == \
+            "canary waiting for canary-one (one trade at a time)"
+    finally:
+        cfg.launch_book = cfg.launch_live = cfg.launch_canary = False
+    cli.main(["canary-start"])  # back to no limit
+    assert j.get_state(CANARY_ALLOW) is None
