@@ -61,6 +61,14 @@ def rpc_url(cfg: Config) -> str:
     return cfg.solana_rpc_url
 
 
+def _rpc_name(url: str) -> str:
+    """The RPC named for logs without the key in its query string."""
+    if "helius" not in url:
+        return url
+    from tradingbot.data import helius as hl
+    return "helius (backup key)" if hl.backup_key() and hl.backup_key() in url else "helius (main key)"
+
+
 def load_keypair(text: str):
     """A Solana key in either common form: the JSON array of 64 numbers (solana-keygen's file) or the base58
     string a wallet app exports (Phantom, Solflare). Surrounding whitespace and quotes are ignored."""
@@ -107,13 +115,18 @@ class JupiterExecutor:
         self.owner = str(keypair.pubkey())
         self.cfg = cfg
         self.jup = jupiter
-        self.rpc_url = rpc_url(cfg)
         self.http = http or httpx.Client(timeout=20)
         self.priority_fee_sol = cfg.priority_fee_sol if priority_fee_sol is None else priority_fee_sol
         self.sell_slippage_bps = sell_slippage_bps
         self.sleep = sleep
         self._pending: dict[str, tuple] = {}  # signature -> (signed bytes, last valid block height) until settled
         self.last_note = ""
+
+    @property
+    def rpc_url(self) -> str:
+        # Worked out on every call (11-10): it was fixed at start-up, so a fresh process kept the main Helius key
+        # after it ran out of credits and read the funded wallet as $0 (Helius's refusal isn't JSON).
+        return rpc_url(self.cfg)
 
     # --- public -------------------------------------------------------------
     def buy(self, token: str, usd: float, ref_price: float) -> Fill | None:
@@ -387,13 +400,47 @@ class JupiterExecutor:
         return self._rpc_err(method, params)[0]
 
     def _rpc_err(self, method: str, params: list):
+        """One JSON-RPC call. A refused or unreadable answer from Helius moves the default clients to the backup
+        key (credits / rate refusals) and retries; failing that, the public RPC is tried once."""
+        payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+        url, err = self.rpc_url, None
+        for _ in range(3):
+            body, err, resp = self._post(url, payload)
+            if body is not None:
+                if "error" in body:
+                    log.error("rpc %s error: %s", method, body["error"])
+                    return None, (body["error"] or {}).get("message", body["error"])
+                return body.get("result"), None
+            log.error("rpc %s failed on %s: %s", method, _rpc_name(url), err)
+            nxt = self._fallback(url, resp, method)
+            if not nxt or nxt == url:
+                break
+            url = nxt
+        return None, err
+
+    def _post(self, url: str, payload: dict):
+        """(body, None, resp) for a readable 200 answer, else (None, reason, resp or None)."""
         try:
-            resp = self.http.post(self.rpc_url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+            resp = self.http.post(url, json=payload)
+        except httpx.HTTPError as exc:
+            return None, str(exc), None
+        status = getattr(resp, "status_code", 200)
+        try:
             body = resp.json()
-        except (httpx.HTTPError, ValueError) as exc:
-            log.error("rpc %s failed: %s", method, exc)
-            return None, str(exc)
-        if "error" in body:
-            log.error("rpc %s error: %s", method, body["error"])
-            return None, (body["error"] or {}).get("message", body["error"])
-        return body.get("result"), None
+        except ValueError:
+            return None, f"HTTP {status}: {str(getattr(resp, 'text', ''))[:200]!r}", resp
+        if status != 200 or not isinstance(body, dict):
+            return None, f"HTTP {status}: {str(body)[:200]}", resp
+        return body, None, resp
+
+    def _fallback(self, url: str, resp, method: str) -> str | None:
+        """Where to retry a failed call: the backup Helius key after a refusal on the main, else the public RPC."""
+        from tradingbot.data import helius as hl
+        if "helius" not in url:
+            return None  # already on the public (or a configured) RPC
+        status = getattr(resp, "status_code", None) if resp is not None else None
+        if status in (401, 402, 403, 429) and not hl.KEYS["on_backup"] and hl.backup_key() \
+                and hl.backup_key() not in url:
+            hl._switch(True, f"live executor {method} -> HTTP {status}", method=f"executor:{method}")
+            return self.rpc_url
+        return DEFAULT_PUBLIC_RPC

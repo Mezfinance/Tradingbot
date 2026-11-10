@@ -439,3 +439,32 @@ def test_canary_can_trade_a_fraction_of_the_twins_band_sizes(cfg, good_pair):
         eng.model_book.signals.put(sig(mint, liq))
     eng.buy_model_signals()
     assert sorted(round(x, 2) for x in live.sizes) == [1.0, 4.0, 10.0]
+
+
+def test_executor_rpc_moves_off_a_refusing_helius_key(monkeypatch):
+    """11-10: the smoke test read a funded wallet as $0: the executor kept the main Helius key (out of credits),
+    whose refusal isn't JSON. Now a refusal moves to the backup key, and failing that to the public RPC."""
+    from tradingbot.data import helius as hl
+    monkeypatch.setenv("HELIUS_API_KEY", "MAIN")
+    monkeypatch.setenv(hl.BACKUP_ENV, "BACKUP")
+    monkeypatch.setattr(hl, "KEYS", {"on_backup": False, "since": None, "switches": 0, "probe_at": 0.0,
+                                     "last_reason": None})
+    ex, rpc = executor(usdc=1_003_067_071)
+    refused, seen = {"MAIN"}, []
+    answer = rpc.post
+
+    def post(url, json=None):
+        key = url.split("api-key=")[-1] if "helius" in url else "PUBLIC"
+        seen.append(key)
+        if key in refused:
+            return SimpleNamespace(status_code=429, text="max usage reached",
+                                   json=lambda: (_ for _ in ()).throw(ValueError("Expecting value")))
+        return answer(url, json)
+    ex.http = SimpleNamespace(post=post)
+    assert "MAIN" in ex.rpc_url
+    assert ex.token_balance(USDC_MINT) == 1_003_067_071   # read on the backup key, not $0
+    assert seen == ["MAIN", "BACKUP"] and hl.KEYS["on_backup"] and "BACKUP" in ex.rpc_url
+    refused.add("BACKUP")                                  # both keys refused: the public RPC answers
+    seen.clear()
+    assert ex.token_balance(USDC_MINT) == 1_003_067_071
+    assert seen == ["BACKUP", "PUBLIC"]
