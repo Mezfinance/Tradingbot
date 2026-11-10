@@ -33,11 +33,11 @@ def _keys(monkeypatch):
 
 def test_switches_to_the_backup_when_the_main_is_out_of_credits_and_back_when_it_answers(monkeypatch):
     http = _Http(empty={"MAIN"})
-    h = hl.Helius(client=http)
+    h = hl.Helius(role=hl.LIVE, client=http)
     h.min_interval_s = 0
     assert h._rpc("getSlot", [], 1) == {"key": "BACKUP"}  # the same call retried on the backup
     assert http.keys == ["MAIN", "BACKUP"] and hl.KEYS["on_backup"] and hl.current_key() == "BACKUP"
-    other = hl.Helius(client=http)  # every default client follows
+    other = hl.Helius(role=hl.LIVE, client=http)  # every default client follows
     other.min_interval_s = 0
     assert other.key() == "BACKUP" and other._rpc("getSlot", [], 1) == {"key": "BACKUP"}
     # an hour later one call probes the main key; still empty: stays on the backup
@@ -60,7 +60,7 @@ def test_a_main_key_refusing_every_retry_moves_to_the_backup(monkeypatch):
             return super().post(url, params, json)
     monkeypatch.setattr(hl.time, "sleep", lambda s: None)
     http = _Busy([])
-    h = hl.Helius(client=http)
+    h = hl.Helius(role=hl.LIVE, client=http)
     h.min_interval_s = 0
     assert h._rpc("getSlot", [], 1) == {"key": "BACKUP"}
     assert http.keys == ["MAIN"] * (hl.RETRIES_429 + 1) + ["BACKUP"]
@@ -76,11 +76,11 @@ def test_explicit_keys_do_not_switch(monkeypatch):
 
 def test_no_main_key_uses_the_backup(monkeypatch):
     monkeypatch.setenv("HELIUS_API_KEY", "")
-    h = hl.Helius(client=_Http(empty=set()))
+    h = hl.Helius(role=hl.LIVE, client=_Http(empty=set()))
     h.min_interval_s = 0
     assert h.enabled and h.key() == "BACKUP" and hl.current_key() == "BACKUP"
     monkeypatch.delenv(hl.BACKUP_ENV)
-    assert not hl.Helius(client=_Http(empty=set())).enabled
+    assert not hl.Helius(role=hl.LIVE, client=_Http(empty=set())).enabled
 
 
 def test_a_rate_limited_method_slows_down_alone_and_recovers(monkeypatch):
@@ -99,7 +99,7 @@ def test_a_rate_limited_method_slows_down_alone_and_recovers(monkeypatch):
             return super().post(url, params, json)
 
     http = _Limited()
-    h = hl.Helius(client=http)
+    h = hl.Helius(role=hl.LIVE, client=http)
     h.min_interval_s = 0.15
     assert h._rpc("getTransactionsForAddress", [], 10) == {"key": "MAIN"}  # two 429s, then answered
     slowed = hl.pace_status()["getTransactionsForAddress"]
@@ -125,7 +125,7 @@ def test_a_cheap_call_answering_on_the_main_key_does_not_move_clients_back(monke
             return super().post(url, params, json)
 
     http = _Partial(empty=())
-    h = hl.Helius(client=http)
+    h = hl.Helius(role=hl.LIVE, client=http)
     h.min_interval_s = 0
     assert h._rpc("getTransactionsForAddress", [], 10) == {"key": "BACKUP"}
     assert hl.KEYS["on_backup"] and hl.key_status()["probe_method"] == "getTransactionsForAddress"
@@ -143,7 +143,7 @@ def test_a_refused_websocket_moves_to_the_backup_then_the_public_node_and_probes
     from tradingbot import launch_live as ll
     from tradingbot.config import Config
     from tradingbot.watcher import WatchStore
-    live = ll.LaunchLive(Config(db_path=":memory:"), WatchStore(":memory:"), helius=hl.Helius())
+    live = ll.LaunchLive(Config(db_path=":memory:"), WatchStore(":memory:"), helius=hl.Helius(role=hl.LIVE))
     assert "api-key=MAIN" in live.ws_url()
     refused = Exception("server rejected WebSocket connection: HTTP 429")
     live._ws_refused(refused)

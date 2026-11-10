@@ -255,6 +255,10 @@ trades and ~0.06 SOL a day). Buys stop by themselves when the wallet holds under
    Show private key). Use `fly secrets import` so it never lands in your shell history:
    `fly secrets import -a supermeme`, then type `TB_KEYPAIR_JSON=<key>` and `TB_LIVE_CONFIRM=I_ACCEPT_TOTAL_LOSS_RISK`
    on two lines and press Ctrl-D.
+   Helius keys (11-10): `HELIUS_API_KEY` is the paid live account, used only by live execution (this canary) and
+   the second-4 scorer; `BACKUP_HELIUS_API_KEY` is the research account (enricher, creator/operator reads,
+   studies, paper-book helpers), which never touch the main key. If the main key refuses a call, live execution
+   retries once on the public RPC (never the backup) and the scorer falls back to the backup.
 3. Smoke test, one tiny real round trip on BONK:
    `fly machine exec <id> "python -m tradingbot canary-smoke --usd 2" -a supermeme`
    Check `buy` and `sell` both say `ok`, the round trip is a few % at most, and the wallet's USDC matches.

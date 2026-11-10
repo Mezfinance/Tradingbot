@@ -555,7 +555,7 @@ class LaunchLive:
         from tradingbot.enrich import Budget
         self.cfg, self.store, self.clock = cfg, store, clock
         self.signals = signals  # the engine's model-signal queue: top-2% / top-5% picks go to the launch books
-        self.helius = helius or Helius()
+        self.helius = helius or Helius(role="live")  # the scorer: main (live) key
         self.budget = Budget(store, "launch_live", cfg.launch_live_daily_credits)
         ensure_schema(store)
         self.lock = threading.Lock()

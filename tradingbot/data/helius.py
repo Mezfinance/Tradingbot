@@ -72,6 +72,13 @@ def backup_key() -> str:
     return os.environ.get(BACKUP_ENV, "")
 
 
+def research_key() -> str:
+    """The key of every research client (enricher, operator/creator reads, studies, paper-book helpers): the backup
+    account; the main key only when no backup is set (local runs, tests). 11-10 (user): the main key is the paid
+    live account, touched only by live trading and the scorer."""
+    return backup_key() or main_key()
+
+
 def current_key() -> str:
     """The key every default client uses now: the backup while the main is out of credits (or missing)."""
     if (KEYS["on_backup"] or not main_key()) and backup_key():
@@ -169,8 +176,16 @@ def pace_status() -> dict:
     return {m: round(g[0], 2) for m, g in _method_pace.items() if g[0] > 0}
 
 
+LIVE, RESEARCH = "live", "research"
+
+
 class Helius:
-    def __init__(self, api_key: str | None = None, client: httpx.Client | None = None):
+    def __init__(self, api_key: str | None = None, client: httpx.Client | None = None, role: str = RESEARCH):
+        # role LIVE (the scorer): the main key, falling back to the backup when the main is refused; role RESEARCH
+        # (the default, every other client): the backup key only, never the main (research_key)
+        self.role = role
+        if api_key is None and role == RESEARCH and backup_key():
+            api_key = backup_key()
         self.fixed_key = api_key is not None  # an explicit key never falls back to the backup
         self.api_key = api_key if api_key is not None else os.environ.get("HELIUS_API_KEY", "")
         self.http = client or httpx.Client(timeout=30)

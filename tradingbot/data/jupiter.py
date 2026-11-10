@@ -235,8 +235,8 @@ class Jupiter:
         return self._decimals.get(mint)
 
     def _decimals_onchain(self, mint: str) -> int | None:
-        from tradingbot.data.helius import current_key
-        key = current_key()  # the backup key while the main is out of credits
+        from tradingbot.data.helius import research_key
+        key = research_key()  # paper books and research: the backup account, never the live key
         url = os.environ.get("SOLANA_RPC_URL") or (f"{HELIUS_RPC}?api-key={key}" if key else PUBLIC_RPC)
         try:
             resp = self.http.post(url, json={"jsonrpc": "2.0", "id": 1, "method": "getTokenSupply", "params": [mint]})

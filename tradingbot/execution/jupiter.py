@@ -50,15 +50,14 @@ CLOSE_BATCH = 8  # empty accounts closed per transaction by the sweep
 DUST_SHARE = 1e-6  # a sale leaving at most this share of the balance sells the rest too
 NOT_SENT = "not sent:"  # note prefix: nothing went out (preflight refused, build failed); retry soon
 DEFAULT_PUBLIC_RPC = "https://api.mainnet-beta.solana.com"
-
-
 def rpc_url(cfg: Config) -> str:
-    """The configured RPC, or Helius when only the public default is set and a key exists (faster landing)."""
-    from tradingbot.data.helius import current_key
-    key = current_key()  # the backup key while the main is out of credits
-    if cfg.solana_rpc_url == DEFAULT_PUBLIC_RPC and key:
-        return f"{HELIUS_RPC}?api-key={key}"
-    return cfg.solana_rpc_url
+    """The configured RPC; else Helius on the main key, the paid live account (11-10, user: the main key is only
+    for live trading and the scorer; the backup is the research account and real money never uses it)."""
+    from tradingbot.data.helius import main_key
+    if cfg.solana_rpc_url != DEFAULT_PUBLIC_RPC:
+        return cfg.solana_rpc_url
+    key = main_key()
+    return f"{HELIUS_RPC}?api-key={key}" if key else cfg.solana_rpc_url
 
 
 def _rpc_name(url: str) -> str:
@@ -66,7 +65,7 @@ def _rpc_name(url: str) -> str:
     if "helius" not in url:
         return url
     from tradingbot.data import helius as hl
-    return "helius (backup key)" if hl.backup_key() and hl.backup_key() in url else "helius (main key)"
+    return "helius (main key)" if hl.main_key() and hl.main_key() in url else "helius (other key)"
 
 
 def load_keypair(text: str):
@@ -128,10 +127,22 @@ class JupiterExecutor:
         # after it ran out of credits and read the funded wallet as $0 (Helius's refusal isn't JSON).
         return rpc_url(self.cfg)
 
+    def _decimals(self, mint: str) -> int | None:
+        """Jupiter's price-list decimals, else the mint's own over this executor's RPC (the live key), so a
+        seconds-old token's buy never depends on the shared research keys."""
+        dec = self.jup.decimals(mint)
+        if dec is not None:
+            return dec
+        res = self._rpc("getTokenSupply", [mint])
+        try:
+            return int(res["value"]["decimals"])
+        except (TypeError, KeyError, ValueError):
+            return None
+
     # --- public -------------------------------------------------------------
     def buy(self, token: str, usd: float, ref_price: float) -> Fill | None:
         """None = declined before sending (reason in `last_note`); a Fill with ok=False = sent and failed."""
-        decimals = self.jup.decimals(token)
+        decimals = self._decimals(token)
         if decimals is None:
             self.last_note = "token decimals unknown"
             return None
@@ -177,7 +188,7 @@ class JupiterExecutor:
                     tx=sent, note="ok")
 
     def sell(self, token: str, qty: float, ref_price: float) -> Fill | None:
-        decimals = self.jup.decimals(token)
+        decimals = self._decimals(token)
         if decimals is None:
             return failed(0.0, "token decimals unknown")
         held = self.token_balance(token)
@@ -400,8 +411,8 @@ class JupiterExecutor:
         return self._rpc_err(method, params)[0]
 
     def _rpc_err(self, method: str, params: list):
-        """One JSON-RPC call. A refused or unreadable answer from Helius moves the default clients to the backup
-        key (credits / rate refusals) and retries; failing that, the public RPC is tried once."""
+        """One JSON-RPC call; a refused or unreadable answer from Helius (the live key) is retried once on the
+        public RPC."""
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
         url, err = self.rpc_url, None
         for _ in range(3):
@@ -434,13 +445,6 @@ class JupiterExecutor:
         return body, None, resp
 
     def _fallback(self, url: str, resp, method: str) -> str | None:
-        """Where to retry a failed call: the backup Helius key after a refusal on the main, else the public RPC."""
-        from tradingbot.data import helius as hl
-        if "helius" not in url:
-            return None  # already on the public (or a configured) RPC
-        status = getattr(resp, "status_code", None) if resp is not None else None
-        if status in (401, 402, 403, 429) and not hl.KEYS["on_backup"] and hl.backup_key() \
-                and hl.backup_key() not in url:
-            hl._switch(True, f"live executor {method} -> HTTP {status}", method=f"executor:{method}")
-            return self.rpc_url
-        return DEFAULT_PUBLIC_RPC
+        """Where to retry a failed call: the public RPC, once. Live execution never moves to (or moves) the shared
+        research key: the backup belongs to the paper books and studies."""
+        return DEFAULT_PUBLIC_RPC if "helius" in url else None

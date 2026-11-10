@@ -441,17 +441,18 @@ def test_canary_can_trade_a_fraction_of_the_twins_band_sizes(cfg, good_pair):
     assert sorted(round(x, 2) for x in live.sizes) == [1.0, 4.0, 10.0]
 
 
-def test_executor_rpc_moves_off_a_refusing_helius_key(monkeypatch):
-    """11-10: the smoke test read a funded wallet as $0: the executor kept the main Helius key (out of credits),
-    whose refusal isn't JSON. Now a refusal moves to the backup key, and failing that to the public RPC."""
+
+def test_live_executor_uses_only_the_main_key_and_never_the_research_backup(monkeypatch):
+    """11-10 (user): the main Helius key is the paid live account, used only by live trading and the scorer; the
+    backup is the research account. The smoke test had read a funded wallet as $0 because a refused key's answer
+    isn't JSON: now a refusal on the main key retries once on the public RPC, and the backup is never used."""
     from tradingbot.data import helius as hl
     monkeypatch.setenv("HELIUS_API_KEY", "MAIN")
     monkeypatch.setenv(hl.BACKUP_ENV, "BACKUP")
     monkeypatch.setattr(hl, "KEYS", {"on_backup": False, "since": None, "switches": 0, "probe_at": 0.0,
                                      "last_reason": None})
     ex, rpc = executor(usdc=1_003_067_071)
-    refused, seen = {"MAIN"}, []
-    answer = rpc.post
+    seen, refused, answer = [], set(), rpc.post
 
     def post(url, json=None):
         key = url.split("api-key=")[-1] if "helius" in url else "PUBLIC"
@@ -461,10 +462,32 @@ def test_executor_rpc_moves_off_a_refusing_helius_key(monkeypatch):
                                    json=lambda: (_ for _ in ()).throw(ValueError("Expecting value")))
         return answer(url, json)
     ex.http = SimpleNamespace(post=post)
-    assert "MAIN" in ex.rpc_url
-    assert ex.token_balance(USDC_MINT) == 1_003_067_071   # read on the backup key, not $0
-    assert seen == ["MAIN", "BACKUP"] and hl.KEYS["on_backup"] and "BACKUP" in ex.rpc_url
-    refused.add("BACKUP")                                  # both keys refused: the public RPC answers
+    assert ex.token_balance(USDC_MINT) == 1_003_067_071 and seen == ["MAIN"]
+    assert jx._rpc_name(ex.rpc_url) == "helius (main key)"
+    refused.add("MAIN")
     seen.clear()
-    assert ex.token_balance(USDC_MINT) == 1_003_067_071
-    assert seen == ["BACKUP", "PUBLIC"]
+    assert ex.token_balance(USDC_MINT) == 1_003_067_071   # not $0: the public RPC answered
+    assert seen == ["MAIN", "PUBLIC"]
+    assert not hl.KEYS["on_backup"] and hl.current_key() == "MAIN"   # nothing switched; backup never used
+    ex.jup.decimals = lambda mint: None   # a seconds-old token Jupiter's price list doesn't know yet
+    refused.clear()
+    seen.clear()
+
+    def supply(url, json=None):
+        seen.append(url.split("api-key=")[-1] if "helius" in url else "PUBLIC")
+        assert json["method"] == "getTokenSupply"
+        return SimpleNamespace(status_code=200, json=lambda: {"jsonrpc": "2.0", "result": {"value": {"decimals": 9}}})
+    ex.http = SimpleNamespace(post=supply)
+    assert ex._decimals(TOKEN) == 9 and seen == ["MAIN"]   # read over the live key, not the research one
+
+
+def test_research_clients_never_touch_the_live_key(monkeypatch):
+    from tradingbot.data import helius as hl
+    monkeypatch.setenv("HELIUS_API_KEY", "MAIN")
+    monkeypatch.setenv(hl.BACKUP_ENV, "BACKUP")
+    monkeypatch.setattr(hl, "KEYS", {"on_backup": False, "since": None, "switches": 0, "probe_at": 0.0,
+                                     "last_reason": None})
+    assert hl.Helius().key() == "BACKUP" and hl.research_key() == "BACKUP"   # enricher, studies, helpers
+    assert hl.Helius(role=hl.LIVE).key() == "MAIN"                          # the scorer
+    monkeypatch.delenv(hl.BACKUP_ENV)
+    assert hl.Helius().key() == "MAIN"   # no backup set (local runs): research falls back to the one key

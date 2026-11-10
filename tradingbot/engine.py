@@ -223,7 +223,8 @@ class Engine:
                 from tradingbot.data.helius import Helius
                 from tradingbot.launch_live import LaunchLive
                 signals = self.model_book.signals if self.model_book is not None and self.cfg.launch_book else None
-                LaunchLive(self.cfg, watcher.store, Helius(client=httpx.Client(timeout=10)), signals=signals).start()
+                LaunchLive(self.cfg, watcher.store, Helius(client=httpx.Client(timeout=10), role="live"),
+                           signals=signals).start()  # the scorer runs on the live (main) key
             if self.cfg.enrich:
                 from tradingbot.enrich import Enricher
                 enricher = Enricher.from_config(self.cfg, watcher.store, watcher)
