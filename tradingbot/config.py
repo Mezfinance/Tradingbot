@@ -105,7 +105,7 @@ class Config:
     launch_canary_every_n: int = 1  # buy 1 in N of the twin's signals (1 = all; each round trip costs ~0.001 SOL)
     launch_canary_priority_fee_sol: float = 0.0005  # cap on the priority fee per transaction
     launch_canary_sell_slippage_bps: int = 1000  # sells must go through on a fast pool
-    launch_canary_route: str = "jupiter"  # 'direct' = swap on the pumpswap pool itself, no Jupiter route (11-10); trades SOL
+    launch_canary_route: str = "jupiter"  # 'direct' = swap on the pumpswap pool; 'lp' = enter as a liquidity provider (11-10); both trade SOL
     shortbook_feed_url: str = ""  # MZF Short Only on the dashboard: the shortbook app's /api/feed (Fly private network)
     # One-off fresh start for some books (comma list): their history is kept as '<book>@<reset_books_id>' and
     # their cash goes back to the starting amount. Runs once per reset_books_id, at engine start.

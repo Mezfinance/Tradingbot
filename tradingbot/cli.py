@@ -19,9 +19,11 @@ from tradingbot.config import LIVE_CONFIRM_PHRASE, Config
 
 
 def canary_executor(cfg: Config, jupiter):
-    """The launch canary's live executor: Jupiter routes, or swaps straight on the pumpswap pool
-    (`launch_canary_route` = 'direct', 11-10)."""
-    if cfg.launch_canary_route == "direct":
+    """The launch canary's live executor: Jupiter routes, swaps straight on the pumpswap pool
+    (`launch_canary_route` = 'direct'), or enters as a liquidity provider ('lp', 11-10)."""
+    if cfg.launch_canary_route == "lp":
+        from tradingbot.execution.lp_pumpswap import LpPumpswapExecutor as cls
+    elif cfg.launch_canary_route == "direct":
         from tradingbot.execution.pumpswap_direct import DirectPumpswapExecutor as cls
     else:
         from tradingbot.execution.jupiter import JupiterExecutor as cls
