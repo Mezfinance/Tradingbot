@@ -9,13 +9,15 @@ The user's package, one rule per liquidity band at second 4, at the canary's own
   $25-40k      launchrw50_25k10's rule (rw_pct < 50)                      $10, held to pool minute 10
   $40k+        sz's rule                                                   $10, minute 6
 
+a twin of it that holds the $25-40k picks to pool minute 15 instead (launchrw50_25k15's exit, "proposed m15"),
 compared with the current canary rules (sz's rule in every band at $25 / $10 / $10, all sold at minute 6), each with
 and without the canary's drawdown pause (no new buys while the full-size paper twin launchrw50_sz_dd24 is down $1,000
 over the past 24 h, `model_book.DD_LIMITS`, scaled to the replay's money like `dd-limits`).
 
 Inputs: the year replay saved by `risk-model --history` (hist.db `hist_replay`; it must carry each pool's `big`
 score, saved since 11-10: otherwise `--fresh` replays now, ~80 min CPU), minute-10 pool states in hist.db
-`hist_path` (sec 600; `--fetch` reads the missing ones, 10 credits each, live key, stable hash order). Every trade
+`hist_path` (sec 600) and minute-15 states (sec 900, mostly from the 11-09 `risk-model --history --hold15` fetch;
+`--fetch` reads the missing ones of both, minute 10 first, 10 credits each, live key, stable hash order). Every trade
 pays sz's measured real-minus-ideal gap (`risk_history.gaps`; at $5-25 the price impact is smaller than at sz's
 $100-250, so this leans pessimistic) and the canary's fixed real cost per round trip (`FEE_USD`, from the 1-cent
 canary's ledger). Each sampled day is rebuilt from its own trades only (`risk_history.expand(k=1)`), so the pause
@@ -32,12 +34,13 @@ import numpy as np
 
 FEE_USD = 0.30          # real cost per canary round trip (~0.003 SOL incl. the pool's fee-account rent), 11-06 ledger
 HOLD10_S = 600
+HOLD15_S = 900
 CAPITAL = 10_000.0      # the paper twin's capital: its $500 limit is 5% of it
 THIN_MAX = 15_000.0
 DEEP_MIN = 40_000.0
 SIZES = {"under $15k": 25.0, "$15-25k": 10.0, "$25-40k": 10.0, "$40k+": 10.0}   # user, 11-10: $5 lost to fees
 BANDS = tuple(SIZES)
-PACKAGES = ("proposed", "current")
+PACKAGES = ("proposed", "proposed m15", "current")
 
 
 def band_of(liq) -> str | None:
@@ -70,12 +73,13 @@ def big_ranks(rows: list[dict]) -> dict:
     return out
 
 
-def records(rows: list[dict], have10: dict, gap: float, liq_share: float) -> tuple[list[dict], dict]:
+def records(rows: list[dict], have10: dict, gap: float, liq_share: float, have15: dict | None = None) -> tuple[list[dict], dict]:
     """One record per pool any of the three books would buy: the paper twin's trade (sz's sizes, minute 6) and both
-    canary packages' trades, sharing the pool's open time so the twin's pause applies to the canary."""
+    canary packages' trades (proposed, its minute-15 twin, current), sharing the pool's open time so the twin's pause applies to the canary."""
     from tradingbot import launch_live as ll
     from tradingbot import model_book as mb
     from tradingbot import risk_history as rh
+    have15 = have15 or {}
     ranks = big_ranks(rows)
     info = collections.Counter()
     out = []
@@ -102,6 +106,7 @@ def records(rows: list[dict], have10: dict, gap: float, liq_share: float) -> tup
             prop, hold = (max(-1.0, r["ret"] - gap - fee) if take else None), ll.EXIT_S
         elif band == "$25-40k":
             prop, hold = None, ll.EXIT_S
+            prop15, hold15 = None, ll.EXIT_S
             if rw50:
                 m10 = rh.hold_ret(r, have10, HOLD10_S)
                 info["$25-40k trades"] += 1
@@ -109,9 +114,17 @@ def records(rows: list[dict], have10: dict, gap: float, liq_share: float) -> tup
                     m10 = r["ret"]
                     info["$25-40k minute-10 states missing (minute 6 used)"] += 1
                 prop, hold = max(-1.0, m10 - gap - fee), HOLD10_S
+                m15 = rh.hold_ret(r, have15, HOLD15_S)
+                if m15 is None:
+                    m15 = r["ret"]
+                    info["$25-40k minute-15 states missing (minute 6 used)"] += 1
+                prop15, hold15 = max(-1.0, m15 - gap - fee), HOLD15_S
         else:
             prop, hold = cur, ll.EXIT_S
         rec["proposed"] = (prop, size if prop is not None else 0.0, hold - 10)
+        if band != "$25-40k":
+            prop15, hold15 = prop, hold
+        rec["proposed m15"] = (prop15, size if prop15 is not None else 0.0, hold15 - 10)
         rec["current"] = (cur, size if cur is not None else 0.0, ll.EXIT_S - 10)
         if rec["cost"] or prop is not None or cur is not None:
             out.append(rec)
@@ -179,11 +192,16 @@ def study(hist_store, watch_store, journal, cfg, fresh: bool = False, helius=Non
         sg.save_replay(hist_store, rows, meta)
         source = f"replayed now ({len(rows):,} pools) and saved"
     cands = rh.hold_candidates(rows)   # sz's kept half in $25-40k: the 25k10 rule's pools
-    fetched = rh.fetch_holds(hist_store, helius, cands, max_credits, progress, sec=HOLD10_S) if helius else None
+    fetched = fetched15 = None
+    if helius:
+        fetched = rh.fetch_holds(hist_store, helius, cands, max_credits, progress, sec=HOLD10_S)
+        left = max_credits - fetched["credits_used"]
+        fetched15 = rh.fetch_holds(hist_store, helius, cands, left, progress, sec=HOLD15_S) if left >= 10 else None
     have10 = rh._have_holds(hist_store, HOLD10_S)
+    have15 = rh._have_holds(hist_store, HOLD15_S)
     g = rh.gaps(journal, watch_store, now)
     gap = g.get("launchrw50_sz", {"gap": rh.DEFAULT_GAP})["gap"]
-    recs, info = records(rows, have10, gap, cfg.model_book_liq_share)
+    recs, info = records(rows, have10, gap, cfg.model_book_liq_share, have15)
     full, exp = rh.expand(recs, k=1.0)
     for t in full:   # the canary's own sale times follow each record's (relocated) open time
         for p in PACKAGES:
@@ -197,7 +215,7 @@ def study(hist_store, watch_store, journal, cfg, fresh: bool = False, helius=Non
     days = max(1, int((max(t["ts"] for t in full) - min(t["opened"] for t in full)) // 86400) + 1) if full else 1
     out = {"source": source, "gap": gap, "fee_usd": FEE_USD, "sizes": SIZES, "expand": exp, "scale": round(scale, 2),
            "pause_usd_scaled": round(_limit() * scale), "days": days, "info": info, "minute10_fetch": fetched,
-           "minute10_states": len(have10), "packages": {}}
+           "minute10_states": len(have10), "minute15_fetch": fetched15, "minute15_states": len(have15), "packages": {}}
     for p in PACKAGES:
         for paused in (False, True):
             tr = [(t[p + "_ts"], t[p][1], t[p][0], t["band"]) for t, m in zip(full, mult)
@@ -218,12 +236,15 @@ def render(out: dict) -> str:
          f"source: {out['source']}; sz's real-minus-ideal gap {100 * out['gap']:.1f} pts and ${out['fee_usd']:.2f} "
          f"real cost per round trip on every trade; days rebuilt from their own trades {out['expand']}",
          "proposed: under $15k sz $25 m6 | $15-25k big15k $10 m6 | $25-40k 25k10 $10 held to minute 10 | $40k+ sz $10 m6",
+         "proposed m15: the same, with the $25-40k picks held to minute 15 (launchrw50_25k15's exit)",
          "current:  sz's rule in every band at $25 / $10 / $10 / $10, all sold at minute 6",
          f"pause: no new buys while the paper twin (sz at its own sizes) is down ${out['pause_usd_scaled']:,} over "
          f"24 h (the live ${_limit():,.0f} x{out['scale']} replay money); it paused {out['twin'].get('paused_share_of_trades_pct')}% "
          "of the picks",
          f"minute-10 states on hand: {out['minute10_states']:,}"
          + (f"; this run's fetch: {out['minute10_fetch']}" if out.get("minute10_fetch") else ""),
+         f"minute-15 states on hand: {out.get('minute15_states', 0):,}"
+         + (f"; this run's fetch: {out['minute15_fetch']}" if out.get("minute15_fetch") else ""),
          f"notes: {out['info']}", ""]
     head = (f"  {'package':<22}{'trades':>9}{'/day':>7}{'$':>10}{'mean':>8}{'max DD':>9}{'worst day':>11}"
             f"{'best day':>10}{'losing d':>9}{'Sharpe':>8}")
@@ -252,7 +273,7 @@ def render(out: dict) -> str:
           *[f"  {k:<12} trades {v.get('trades', 0):,}  $ {v.get('usd', 0):,}  max DD {v.get('max_dd_usd', 0):,}"
             for k, v in tw.items() if isinstance(v, dict)], "",
           "Read: the bands are judged on the replay's cousin of the live rules (replay vs live rank corr ~0.36 on the "
-          "year replay); minute-10 prices only where fetched; the $10 trades carry a fixed fee of ~3%, so those "
+          "year replay); minute-10 / minute-15 prices only where fetched; the $10 trades carry a fixed fee of ~3%, so those "
           "bands need a real edge just to break even."]
     return "\n".join(L)
 
