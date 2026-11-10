@@ -31,11 +31,11 @@ primary_region = "iad"
   TB_LAUNCH_CANARY_USD = "5"  # fallback size when a signal has no liquidity
   TB_LAUNCH_CANARY_MAX_LIQ_USD = "0"  # every pool, all three bands (user, 11-07)
   TB_LAUNCH_CANARY_FLAT_USD = "0"  # off: sizes follow the twin's bands (was 0.01, the 1-cent test)
-  TB_LAUNCH_CANARY_BAND_SCALE = "0"  # off: sizes from model_book.CANARY_SIZE_BANDS, $25 below $15k / $10 above (user, 11-10)
+  TB_LAUNCH_CANARY_BAND_SCALE = "0.1"  # exact replica of launchrw50_sz at 1/10 of its sizes: $25 below $15k / $2.50 at $15-25k / $10 above (user, 11-10)
   TB_LAUNCH_CANARY_BUDGET_USD = "600"  # the USDC in the canary wallet (11-07; was 45)
   TB_LAUNCH_CANARY_DAILY_LOSS_USD = "300"  # no new buys once today's net realized loss reaches $300 (11-07)
   TB_LAUNCH_CANARY_EVERY_N = "1"  # every pick (11-07; 2 = every other, which gives canary-rug-check a skipped control)
-  TB_LAUNCH_CANARY_FOLLOW_DD = "1"  # no new buys while launchrw50_sz_dd24 is paused by its past-24h $1,000 limit (11-10)
+  TB_LAUNCH_CANARY_FOLLOW_DD = "0"  # off: sz has no drawdown pause, so neither does its replica (user, 11-10; "1" = pause with launchrw50_sz_dd24)
   TB_LAUNCH_CANARY_MAX_OPEN = "20"  # ~30 picks/h held ~6 min: open slots should never cause a skip (was 5)
   TB_LAUNCH_RW_BOOK = "1"  # launchrw50 / launchd12rw50: skip the riskiest half by rug-vs-win odds (11-04)
   TB_LAUNCH_SIZED_BOOK = "1"  # launchrw50_sz: launchrw50's signals sized by liquidity band ($250 < $15k, $25 at $15-25k, $100 above), from size-study (11-06)
