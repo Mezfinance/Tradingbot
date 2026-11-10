@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
+import os
 import time
 
 from tradingbot.data.helius import b58encode
@@ -41,6 +43,9 @@ BUY_EXACT_QUOTE_IN = bytes([198, 46, 21, 82, 180, 217, 232, 112])
 CU_LIMIT = 300_000  # real direct swaps use ~80-115k compute units; a first buy on a fresh pool also creates up to 3 fee accounts (~170k simulated 11-10)
 GLOBAL_TTL_S = 600
 ROUTE = "direct"
+POOL_FILE = "canary_pools.json"  # next to the journal: mint -> pool of the canary's buys
+POOL_FILE_KEEP = 500
+LARGEST_CHECKED = 8  # largest holders checked for the pool's vault
 
 
 def pda(seeds: list[bytes], program: str) -> str:
@@ -146,9 +151,28 @@ class DirectPumpswapExecutor(JupiterExecutor):
         super().__init__(*args, **kwargs)
         self.pools: dict[str, str] = {}  # token mint -> pumpswap pool, from the signal (or looked up)
         self._global: tuple[float, dict] | None = None
+        db = getattr(self.cfg, "db_path", ":memory:")
+        self._pool_file = None if db == ":memory:" else os.path.join(os.path.dirname(db) or ".", POOL_FILE)
+        if self._pool_file and os.path.exists(self._pool_file):
+            try:
+                with open(self._pool_file) as fh:
+                    self.pools.update(json.load(fh))
+            except (OSError, ValueError):
+                log.warning("could not read %s", self._pool_file)
 
     def remember_pool(self, mint: str, pool: str) -> None:
+        """Kept on disk too (11-10): a position bought before a restart must still find its pool to sell."""
         self.pools[mint] = pool
+        if not self._pool_file:
+            return
+        keep = dict(list(self.pools.items())[-POOL_FILE_KEEP:])
+        try:
+            tmp = self._pool_file + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(keep, fh)
+            os.replace(tmp, self._pool_file)
+        except OSError:
+            log.warning("could not save %s", self._pool_file, exc_info=True)
 
     # --- pool state -------------------------------------------------------------
     def _accounts(self, addrs: list[str]) -> list[dict | None]:
@@ -166,19 +190,23 @@ class DirectPumpswapExecutor(JupiterExecutor):
         return g
 
     def _find_pool(self, mint: str) -> str | None:
-        """The SOL pool of `mint` with the most SOL, when the signal's pool isn't known (after a restart)."""
+        """The SOL pool of `mint` with the most SOL, when its pool wasn't saved: a pool's token vault is almost
+        always among the token's largest holders, and the vault's owner is the pool (getProgramAccounts over all
+        ~10M pumpswap accounts is refused by Helius, 11-10)."""
+        res = self._rpc("getTokenLargestAccounts", [mint, {"commitment": "confirmed"}]) or {}
+        top = [a["address"] for a in (res.get("value") or [])[:LARGEST_CHECKED]]
+        if not top:
+            return None
+        owners = [b58encode(base64.b64decode(a["data"][0])[32:64]) for a in self._accounts(top) if a]
         found = []
-        for offset in (43, 75):  # base_mint, quote_mint
-            res = self._rpc("getProgramAccounts", [PROGRAM, {"encoding": "base64", "commitment": "confirmed",
-                            "filters": [{"memcmp": {"offset": offset, "bytes": mint}}]}]) or []
-            for r in res if isinstance(res, list) else []:
-                p = parse_pool(base64.b64decode(r["account"]["data"][0]))
+        for addr, acct in zip(owners, self._accounts(owners) if owners else []):
+            if acct and acct.get("owner") == PROGRAM:
+                p = parse_pool(base64.b64decode(acct["data"][0]))
                 if p and p["token_mint"] == mint:
-                    found.append((r["pubkey"], p))
+                    found.append((addr, p))
         if not found:
             return None
-        vaults = self._accounts([p["sol_vault"] for _, p in found])
-        sol = [_token_amount(v) for v in vaults]
+        sol = [_token_amount(v) for v in self._accounts([p["sol_vault"] for _, p in found])]
         return max(zip(sol, [a for a, _ in found]))[1]
 
     def _state(self, mint: str) -> dict | None:
@@ -186,7 +214,8 @@ class DirectPumpswapExecutor(JupiterExecutor):
         if not pool_addr:
             self.last_note = "no pumpswap pool found"
             return None
-        self.pools[mint] = pool_addr
+        if self.pools.get(mint) != pool_addr:
+            self.remember_pool(mint, pool_addr)
         g = self._global_config()
         accts = self._accounts([pool_addr])
         if not g or not accts[0]:
@@ -360,8 +389,8 @@ class DirectPumpswapExecutor(JupiterExecutor):
         if raw_in <= 0:
             return failed(0.0, "no balance")
         st = self._state(token)
-        if st is None:
-            return failed(0.0, f"{NOT_SENT} {self.last_note}")
+        if st is None:  # no pool to sell into: the engine marks the exit blocked and retries every few minutes
+            return failed(0.0, f"no route ({self.last_note})")
         base_amt, quote_amt = st["reserves"]
         sol_res, tok_res = (quote_amt, base_amt) if st["token_is_base"] else (base_amt, quote_amt)
         expected = amount_out(raw_in, tok_res, sol_res, st["fee_bps"])

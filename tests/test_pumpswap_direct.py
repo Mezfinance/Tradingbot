@@ -100,8 +100,8 @@ def acct(raw: bytes, owner: str) -> dict:
     return {"data": [base64.b64encode(raw).decode(), "base64"], "owner": owner}
 
 
-def vault(amount: int) -> bytes:
-    return bytes(64) + amount.to_bytes(8, "little") + bytes(93)
+def vault(amount: int, owner: str = POOL) -> bytes:  # token account: mint, owner @32, amount @64
+    return bytes(32) + bytes(Pubkey.from_string(owner)) + amount.to_bytes(8, "little") + bytes(93)
 
 
 class PoolRpc(FakeRpc):
@@ -120,6 +120,9 @@ class PoolRpc(FakeRpc):
         if m == "getMultipleAccounts":
             body = {"result": {"value": [self.accts.get(a) for a in p[0]]}}
             return SimpleNamespace(json=lambda: body)
+        if m == "getTokenLargestAccounts":
+            body = {"result": {"value": [{"address": QV}]}}  # the pool's token vault holds most of the supply
+            return SimpleNamespace(json=lambda: body)
         if m == "getPriorityFeeEstimate":
             body = {"result": {"priorityFeeEstimate": 1000}}
             return SimpleNamespace(json=lambda: body)
@@ -128,12 +131,13 @@ class PoolRpc(FakeRpc):
         return super().post(url, json)
 
 
-def direct(**kw):
+def direct(remember=True, db=":memory:", **kw):
     kp = Keypair()
     rpc = PoolRpc(str(kp.pubkey()), **kw)
-    ex = d.DirectPumpswapExecutor(Config(max_price_impact_pct=5.0), FakeJup(), http=rpc, keypair=kp,
+    ex = d.DirectPumpswapExecutor(Config(max_price_impact_pct=5.0, db_path=db), FakeJup(), http=rpc, keypair=kp,
                                   sell_slippage_bps=1000, sleep=lambda s: None)
-    ex.remember_pool(MINT, POOL)
+    if remember:
+        ex.remember_pool(MINT, POOL)
     return ex, rpc
 
 
@@ -198,6 +202,26 @@ def test_direct_sale_on_an_emptied_pool_sends_nothing():
     rpc.bal[MINT] = 10**6
     fill = ex.sell(MINT, 1.0, 0.0)
     assert not fill.ok and fill.usd == 0.0 and fill.note == "no route (pool emptied)" and not rpc.sent
+
+
+def test_pools_are_saved_so_a_restart_can_still_sell(tmp_path):
+    db = str(tmp_path / "tradingbot.db")
+    direct(db=db)
+    assert (tmp_path / d.POOL_FILE).exists()
+    again, _ = direct(remember=False, db=db)  # a new process after a deploy
+    assert again.pools == {MINT: POOL}
+
+
+def test_an_unsaved_pool_is_found_from_the_tokens_largest_holders():
+    ex, rpc = direct(remember=False)
+    assert ex._find_pool(MINT) == POOL
+    st = ex._state(MINT)
+    assert st and st["addr"] == POOL and ex.pools == {MINT: POOL}
+    ex, rpc = direct(remember=False)
+    rpc.accts.pop(POOL)  # nothing found: the sale is a blocked exit (retried every few minutes), not a resend loop
+    rpc.bal[MINT] = 10**6
+    fill = ex.sell(MINT, 1.0, 0.0)
+    assert not fill.ok and fill.usd == 0.0 and fill.note.startswith("no route") and not rpc.sent
 
 
 def test_a_reverted_direct_swap_costs_only_its_fee():

@@ -150,6 +150,7 @@ def main(argv: list[str] | None = None) -> None:
                         help="Helius credit cap (defaults: backfills 60000, launch-exit-study 10000, "
                              "launch-late-entry 12000)")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
+    parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
     parser.add_argument("--apply", action="store_true", help="canary-sweep: close the empty accounts (default: list)")
     parser.add_argument("--idea", help="propose: what to build")
     parser.add_argument("--problem", default="", help="propose: what it should fix or improve")
@@ -356,6 +357,8 @@ def main(argv: list[str] | None = None) -> None:
         ex = canary_executor(cfg, Jupiter(cfg.slippage_bps))
         if cfg.launch_canary_route == "direct" and not args.path:
             raise SystemExit("canary-smoke on the direct route needs a token with a pumpswap pool: canary-smoke MINT")
+        if args.pool and hasattr(ex, "remember_pool"):
+            ex.remember_pool(args.path, args.pool)
         print(json.dumps(launch_canary.smoke(ex, args.path or launch_canary.SMOKE_MINT, args.usd), indent=2, default=str))
         return
 
