@@ -27,7 +27,7 @@ primary_region = "iad"
   TB_LAUNCH_HIST_BOOK = "0"  # launch4h_2/5 off (11-04): history model worse every exit minute (launch-exit-study)
   TB_LAUNCH_M5_BOOK = "1"  # launch4_2m5: launch4_2's picks sold at pool minute 5 (11-04)
   # REAL MONEY canary of launchrw50_sz: canary-stop to halt, canary-start to clear the kill switch (DEPLOY.md).
-  TB_LAUNCH_CANARY = "1"  # REAL MONEY ON (user, 11-10: wallet funded with $600): canary_rw50_sz = exact replica of launchrw50_sz at 1/10 size, no drawdown pause, no daily stop
+  TB_LAUNCH_CANARY = "0"  # REAL MONEY canary OFF (user, 11-10); "1" = canary_rw50_sz, exact replica of launchrw50_sz at 1/10 size, no drawdown pause, no daily stop
   TB_LAUNCH_CANARY_USD = "5"  # fallback size when a signal has no liquidity
   TB_LAUNCH_CANARY_MAX_LIQ_USD = "0"  # every pool, all three bands (user, 11-07)
   TB_LAUNCH_CANARY_FLAT_USD = "0"  # off: sizes follow the twin's bands (was 0.01, the 1-cent test)
