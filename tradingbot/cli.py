@@ -328,9 +328,10 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot import launch_canary
         from tradingbot.engine import CANARY_HALT
         from tradingbot.journal import Journal
+        import time as _time  # a later `import time` in main() makes the bare name local here
         journal = Journal(cfg.db_path)
         if args.command == "canary-stop":
-            journal.set_state(CANARY_HALT, repr(time.time()))
+            journal.set_state(CANARY_HALT, repr(_time.time()))
             print("launch canary halted: no new buys (open positions still sell at their pool minute)")
         elif args.command == "canary-start":
             journal.execute("DELETE FROM state WHERE key=?", (CANARY_HALT,))

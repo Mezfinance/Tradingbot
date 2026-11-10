@@ -491,3 +491,17 @@ def test_research_clients_never_touch_the_live_key(monkeypatch):
     assert hl.Helius(role=hl.LIVE).key() == "MAIN"                          # the scorer
     monkeypatch.delenv(hl.BACKUP_ENV)
     assert hl.Helius().key() == "MAIN"   # no backup set (local runs): research falls back to the one key
+
+
+def test_canary_stop_and_start_commands_run_through_the_cli(tmp_path, monkeypatch, capsys):
+    """11-10: canary-stop crashed on Fly (a later `import time` in cli.main() shadowed the name)."""
+    from tradingbot import cli
+    from tradingbot.engine import CANARY_HALT
+    from tradingbot.journal import Journal
+    db = tmp_path / "tradingbot.db"
+    monkeypatch.setenv("TB_DB_PATH", str(db))
+    cli.main(["canary-stop"])
+    assert Journal(str(db)).get_state(CANARY_HALT)
+    cli.main(["canary-start"])
+    assert not Journal(str(db)).get_state(CANARY_HALT)
+    assert "kill switch cleared" in capsys.readouterr().out
