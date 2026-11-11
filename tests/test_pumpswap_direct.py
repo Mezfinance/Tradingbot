@@ -174,6 +174,22 @@ def test_direct_buy_sells_sol_into_the_pool_and_reads_the_fill():
     assert programs[-1] == TOK and ixs[-1][1] == bytes([9])  # the wrapped SOL account is closed again
 
 
+def test_clip_buys_split_into_distinct_back_to_back_swaps():
+    ex, rpc = direct()
+    ex.cfg.launch_canary_clips = 5  # a $5 buy as 5 x $1 into the same pool
+    rpc.next_meta = sol_meta(ex.owner, (0, 4_800_000_000), -(5_000_000 + 5_000 + 2_000_000), new_rent=2_000_000)
+    fill = ex.buy(MINT, 5.0, 0.0)
+    assert fill.ok and len(rpc.raw) == 5  # five separate swaps landed
+    assert fill.qty == pytest.approx(5 * 4_800.0)  # tokens accumulated across the clips
+    assert fill.usd == pytest.approx(5 * (1.0 + fill.fee_usd / 5)) and "5/5 clips" in fill.note
+    prices = []  # each clip must be its own transaction: the set_compute_unit_price (discriminator 3) differs
+    for raw in rpc.raw:
+        cb = [bytes(data) for p, data, _ in decoded(raw)
+              if p == "ComputeBudget111111111111111111111111111111" and data and data[0] == 3]
+        prices.append(cb[0])
+    assert len(set(prices)) == 5
+
+
 def test_direct_buy_declines_without_enough_sol_or_on_a_thin_pool():
     ex, rpc = direct(sol=40_000_000)  # 0.04 SOL: short of the 0.05 SOL buy plus the 0.01 SOL reserve
     assert ex.buy(MINT, 10.0, 0.0) is None and "wallet SOL low" in ex.last_note and not rpc.sent

@@ -255,7 +255,7 @@ class DirectPumpswapExecutor(JupiterExecutor):
             return cap // 2
         return max(1, min(est, cap))
 
-    def _instructions(self, st: dict, side: str, amount_in: int, min_out: int) -> list:
+    def _instructions(self, st: dict, side: str, amount_in: int, min_out: int, bump: int = 0) -> list:
         from solders.compute_budget import (
             set_compute_unit_limit,
             set_compute_unit_price,
@@ -280,7 +280,8 @@ class DirectPumpswapExecutor(JupiterExecutor):
                 AccountMeta(P(mint), False, False), AccountMeta(P(SYSTEM), False, False), AccountMeta(P(prog), False, False)])
 
         ixs = [set_compute_unit_limit(CU_LIMIT),
-               set_compute_unit_price(self._priority_micro([st["addr"], PROGRAM])),
+               # bump distinguishes otherwise-identical clips (same wallet, amount, accounts) so each is its own tx
+               set_compute_unit_price(self._priority_micro([st["addr"], PROGRAM]) + bump),
                create(wsol, WSOL, TOKEN)]
         if side == "buy":
             token = st["pool"]["token_mint"]
@@ -330,6 +331,30 @@ class DirectPumpswapExecutor(JupiterExecutor):
 
     # --- public -------------------------------------------------------------------
     def buy(self, token: str, usd: float, ref_price: float) -> Fill | None:
+        """One direct swap, or, when `launch_canary_clips` > 1, that many equal back-to-back swaps into the same pool
+        (a $5 buy as 5 x $1), accumulated into one position. The clips test whether the running total of our capital
+        triggers the pull (5 x $1 rugs like $5) or each small buy is judged on its own (5 x $1 stays at the $1 rate)."""
+        clips = max(1, int(getattr(self.cfg, "launch_canary_clips", 1) or 1))
+        if clips <= 1:
+            return self._buy_once(token, usd, ref_price)
+        fills: list[Fill] = []
+        last = None
+        for i in range(clips):  # no deliberate spacing; each clip confirms before the next (a few seconds of network latency)
+            f = self._buy_once(token, usd / clips, ref_price, bump=i)
+            last = f
+            if f is None or not getattr(f, "ok", False):
+                break
+            fills.append(f)
+        if not fills:  # nothing landed: propagate the failure/decline from the first clip
+            return last
+        qty = sum(f.qty for f in fills)
+        fee = sum(f.fee_usd for f in fills)
+        usd_net = sum(f.usd for f in fills)
+        self.last_note = f"{len(fills)}/{clips} clips" + ("" if len(fills) == clips else f" ({self.last_note})")
+        return Fill(qty=qty, price=(usd_net - fee) / qty if qty else 0.0, usd=usd_net, fee_usd=fee,
+                    tx=",".join(f.tx for f in fills if f.tx), note=self.last_note)
+
+    def _buy_once(self, token: str, usd: float, ref_price: float, bump: int = 0) -> Fill | None:
         sol_usd = self.jup.sol_price()
         if not sol_usd:
             self.last_note = "SOL price unknown"
@@ -357,7 +382,7 @@ class DirectPumpswapExecutor(JupiterExecutor):
         if min_out <= 0:
             self.last_note = "pool has no tokens to sell"
             return None
-        sent = self._send_ixs(self._instructions(st, "buy", lamports, min_out))
+        sent = self._send_ixs(self._instructions(st, "buy", lamports, min_out, bump))
         if sent.startswith(NOT_SENT):
             self.last_note = sent
             return None

@@ -106,6 +106,8 @@ class Config:
     launch_canary_every_n: int = 1  # buy 1 in N of the twin's signals (1 = all; each round trip costs ~0.001 SOL)
     launch_canary_priority_fee_sol: float = 0.0005  # cap on the priority fee per transaction
     launch_canary_sell_slippage_bps: int = 1000  # sells must go through on a fast pool
+    launch_canary_clips: int = 1  # REAL MONEY: split each canary buy into this many equal back-to-back direct swaps into
+    # the same pool (5 x $1 vs 1 x $5): does the running total of our capital trigger the pull, or is each small buy judged on its own?
     launch_canary_route: str = "jupiter"  # 'direct' = swap on the pumpswap pool; 'lp' = enter as a liquidity provider (11-10); both trade SOL
     # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
@@ -363,6 +365,11 @@ class Config:
                 raise ValueError("The fresh-wallet chain is built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
             if self.launch_canary_fresh_slots < 1:
                 raise ValueError("launch_canary_fresh_slots must be at least 1")
+        if self.launch_canary_clips > 1:
+            if self.live_confirm != LIVE_CONFIRM_PHRASE:
+                raise ValueError(f"Clip buys spend real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+            if self.launch_canary_route != "direct":
+                raise ValueError("Clip buys are built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):
