@@ -100,6 +100,7 @@ A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is th
 - Solana USDC mint: `EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v`.
 - `tests/test_invariants.py` encodes the safety guarantees self-written code must keep; never weaken it, and keep `engineer.PROTECTED` covering risk, config, journal, execution, learning and CLI.
 - Run `python -m pytest -q` before pushing. Run `python -m tradingbot scan` for a live, cost-free smoke test.
+- **Always run `fly machine exec` commands in the background** (user, 11-11). `fly machine exec` cuts long output and times out on slow commands, so a foreground run can report failure while the work actually ran (as a canary top-up did on 11-11). Background every command that does real work — sweeps, transfers, re-provisions, backfills, studies, `canary-stop`/`-start`, any scripted on-chain or SQL job — with `"sh -lc '<cmd> > /tmp/out 2>&1 & echo started'"` (or `nohup ... &`), then read the result with a separate `fly machine exec <id> "cat /tmp/out"`. Only a trivial, instant read (a single `cat`, one small query) may run in the foreground. When handing the user a command to paste, hand the backgrounded form plus its `cat` step.
 
 ## Status / history
 
