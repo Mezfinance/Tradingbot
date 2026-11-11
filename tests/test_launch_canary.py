@@ -336,6 +336,56 @@ def test_canary_book_takes_top2_picks_at_its_own_size_and_limits(cfg, good_pair)
         cfg.launch_canary_daily_loss_usd, cfg.launch_canary_max_open = 50.0, 5
 
 
+def test_fast_canary_buys_on_detection_without_a_jupiter_price(cfg, good_pair):
+    cfg.launch_live = cfg.launch_fast_canary = True
+    cfg.launch_canary_flat_usd = 5.0
+    cfg.launch_canary_follow_dd = False
+
+    class BoomJup:  # a seconds-old token has no Jupiter price; the fast path must never ask
+        def prices(self, mints):
+            raise AssertionError("fast canary must not call Jupiter")
+
+        def quote_price(self, mint):
+            raise AssertionError("fast canary must not call Jupiter")
+
+        def round_trip(self, mint, usd):
+            raise AssertionError("fast canary must not call Jupiter")
+
+    from tradingbot.execution.base import Fill
+
+    class FastExec:  # like the direct executor: ignores ref_price (which is 0 for a fast signal), reads the pool itself
+        def __init__(self):
+            self.sizes, self.pools = [], {}
+
+        def remember_pool(self, mint, pool):
+            self.pools[mint] = pool
+
+        def buy(self, token, usd, ref_price):
+            self.sizes.append(usd)
+            return Fill(qty=usd / 1e-6, price=1e-6, usd=usd, fee_usd=0.0, tx="sig")
+
+    try:
+        j = Journal(":memory:")
+        live = FastExec()
+        eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                     BoomJup(), model_executor=PaperExecutor(cfg), launch_canary_executor=live)
+        book = eng.books[mb.CANARY_FAST]
+        assert book.executor is live and book.cash == cfg.launch_canary_budget_usd
+        created = time.time() - 2
+        # the signal the scorer emits at detection: a pool and mint, but no liquidity or price yet
+        fast = {"pool": "Pfast", "mint": "FAST", "dex": "pumpswap", "name": "", "kind": "fast",
+                "created_ts": created, "ts": time.time()}
+        eng.model_book.signals.put(fast)
+        eng.buy_model_signals()
+        pos = j.open_positions(mb.CANARY_FAST)
+        assert [p.token_address for p in pos] == ["FAST"]  # bought with no Jupiter price (BoomJup never raised)
+        assert live.sizes == [5.0] and live.pools == {"FAST": "Pfast"}  # flat size; the pool was handed to the executor
+        assert eng._deadlines[pos[0].id] == pytest.approx(created + cfg.launch_fast_canary_exit_s)  # 60 s timer exit
+    finally:
+        cfg.launch_live = cfg.launch_fast_canary = False
+        cfg.launch_canary_flat_usd, cfg.launch_canary_follow_dd = 0.0, True
+
+
 def test_calibration_pairs_real_and_simulated_trades():
     from tradingbot.models import Position
     j = Journal(":memory:")

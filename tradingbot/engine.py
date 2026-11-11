@@ -804,12 +804,14 @@ class Engine:
             # the twin's own sizes scaled down (11-07: 1/25 = $10 thin / $1 at $15-25k / $4 above), same ratios
             base = mb.band_usd(mb.CANARY_TWIN, sig["liq"]) * c.launch_canary_band_scale
         else:
-            base = mb.band_usd(book.name, sig["liq"]) or book.fixed_usd or c.model_book_usd
-        usd = min(base, c.model_book_liq_share * sig["liq"], book.cash)
+            base = mb.band_usd(book.name, sig.get("liq")) or book.fixed_usd or c.model_book_usd
+        liq = sig.get("liq")  # a fast signal has none yet (emitted at detection, before the scorer reads the pool)
+        usd = min(base, book.cash) if liq is None else min(base, c.model_book_liq_share * liq, book.cash)
         if usd < (CANARY_MIN_USD if canary else MODEL_MIN_USD):
             return "size too small (cash or liquidity)"
-        trigger = sig["price"]
-        if self.jupiter is not None:
+        trigger = sig.get("price") or 0.0
+        # A seconds-old pool has no Jupiter price; the fast canary's direct executor reads the pool reserves itself.
+        if sig.get("kind") != "fast" and self.jupiter is not None:
             live = self.jupiter.prices([sig["mint"]]).get(sig["mint"])
             live_usd = live.usd if live is not None else self.jupiter.quote_price(sig["mint"])  # too new to list
             if live_usd is None:
@@ -836,7 +838,7 @@ class Engine:
             self._charge_failed(book, sig["mint"], fill)
             return "transaction failed"
         symbol = (sig["name"].split(" / ")[0] or sig["mint"][:6])[:16]
-        pos = self._open_position(book, sig["mint"], symbol, fill, trigger, None)
+        pos = self._open_position(book, sig["mint"], symbol, fill, trigger or fill.price, None)
         if canary and self.journal.get_state(CANARY_ALLOW) is not None:  # used up the trade canary-one allowed
             self.journal.set_state(CANARY_ALLOW, str(max(0, int(self.journal.get_state(CANARY_ALLOW)) - 1)))
         deadline = mb.exit_deadline(self.cfg, book.name, sig)

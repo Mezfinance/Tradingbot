@@ -58,8 +58,11 @@ def build_engine(cfg: Config, with_analyst: bool = True):
         from tradingbot.execution.jupiter import JupiterExecutor
         canary = JupiterExecutor(cfg, jupiter)
     launch_canary = None
-    if cfg.launch_canary and cfg.model_book:
-        launch_canary = canary_executor(replace(cfg, max_price_impact_pct=cfg.model_book_max_impact_pct), jupiter)
+    if (cfg.launch_canary or cfg.launch_fast_canary) and cfg.model_book:
+        # the fast canary buys seconds-old pools, which only the direct pumpswap route can swap (Jupiter can't route them)
+        route = "direct" if cfg.launch_fast_canary and not cfg.launch_canary else cfg.launch_canary_route
+        launch_canary = canary_executor(
+            replace(cfg, max_price_impact_pct=cfg.model_book_max_impact_pct, launch_canary_route=route), jupiter)
     analyst = Analyst(cfg) if with_analyst else None
     triage = None
     if analyst is not None and cfg.triage:
