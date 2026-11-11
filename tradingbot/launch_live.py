@@ -1200,10 +1200,16 @@ class LaunchLive:
             self._ws_public_until = time.time() + WS_PUBLIC_S
             log.warning("launch-live websocket: Helius refused every key; public node for %d s", WS_PUBLIC_S)
 
+    def _subscription(self) -> dict:
+        # 'processed' notifies ~0.5-1 s after creation vs ~1.3 s for 'confirmed' -- earlier detection for the fast
+        # canary. A processed notification can be reorged away, but then the pool read in _new just fails and it's
+        # skipped, and the `seen` LRU dedupes a later confirmed notification of the same mint.
+        return {"jsonrpc": "2.0", "id": 1, "method": "programSubscribe",
+                "params": [ps.TOKEN_2022, {"encoding": "base64", "commitment": self.cfg.launch_live_ws_commitment,
+                                           "filters": [{"dataSize": ps.LP_MINT_SIZE}]}]}
+
     async def _ws_loop(self, stop: threading.Event) -> None:
-        sub = {"jsonrpc": "2.0", "id": 1, "method": "programSubscribe",
-               "params": [ps.TOKEN_2022, {"encoding": "base64", "commitment": "confirmed",
-                                          "filters": [{"dataSize": ps.LP_MINT_SIZE}]}]}
+        sub = self._subscription()
         backoff = 1.0
         while not stop.is_set():
             try:

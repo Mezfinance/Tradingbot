@@ -139,6 +139,14 @@ def test_fast_canary_emits_a_buy_signal_on_detection_before_the_decide(setup, mo
     assert mb.exit_deadline(live.cfg, mb.CANARY_FAST, sig) == sig["created_ts"] + live.cfg.launch_fast_canary_exit_s
 
 
+def test_websocket_commitment_follows_the_config(setup, monkeypatch):
+    cfg, st, hel, clock, live, p, create = setup
+    sub = live._subscription()
+    assert sub["params"][1]["commitment"] == "confirmed" and sub["params"][1]["filters"][0]["dataSize"]
+    monkeypatch.setattr(live.cfg, "launch_live_ws_commitment", "processed")
+    assert live._subscription()["params"][1]["commitment"] == "processed"  # fast canary detects ~0.5 s earlier
+
+
 def test_fast_canary_is_off_by_default_so_detection_alone_emits_nothing(setup):
     cfg, st, hel, clock, live, p, create = setup
     live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))

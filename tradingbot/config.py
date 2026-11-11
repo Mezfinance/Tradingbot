@@ -65,6 +65,7 @@ class Config:
     market_monitor_since: float = 0.0  # unix time: the monitor's baseline starts no earlier (hours before it are kept, not compared)
     launch_live_daily_credits: int = 20_000
     launch_live_decide_delay_s: float = 4.0  # after the websocket notification (~1 s after creation)
+    launch_live_ws_commitment: str = "confirmed"  # LP-mint websocket commitment; 'processed' detects ~0.5 s earlier (fast canary)
     launch_live_track_thin: bool = True  # pools under model_book_min_liq_usd at second 4: still read the fill and
     # minute-6 exit (2 credits) for the pool-size bands; status 'thin' -> 'thin_done', never scored or traded
     launch_train_days: float = 14.0
@@ -336,6 +337,8 @@ class Config:
             raise ValueError(f"The fast launch canary spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
         if self.launch_fast_canary and self.mode == "live":
             raise ValueError("The fast launch canary is for paper mode; live mode already trades for real")
+        if self.launch_live_ws_commitment not in ("processed", "confirmed", "finalized"):
+            raise ValueError("launch_live_ws_commitment must be processed, confirmed or finalized")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):
