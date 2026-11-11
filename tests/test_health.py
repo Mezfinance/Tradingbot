@@ -81,6 +81,28 @@ def test_wallets_endpoint_open(cfg, tmp_path):
         server.shutdown()
 
 
+def test_addressbook_endpoint_open(cfg, tmp_path, monkeypatch):
+    book = {"version": 1, "count": 1, "addresses": {"Abc123": {"label": "treasury-current", "created": "x", "notes": []}}}
+    p = tmp_path / "addressbook.json"
+    p.write_text(json.dumps(book))
+    monkeypatch.setattr(health, "ADDRESSBOOK_PATH", str(p))
+    assert health.address_book() == book
+    cfg.health_port = 18768
+    server = health.start_health_server(Journal(":memory:"), cfg)
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:18768/api/addressbook") as r:
+            got = json.loads(r.read())
+        assert r.status == 200 and got["addresses"]["Abc123"]["label"] == "treasury-current"
+    finally:
+        server.shutdown()
+
+
+def test_addressbook_missing_is_graceful(tmp_path, monkeypatch):
+    monkeypatch.setattr(health, "ADDRESSBOOK_PATH", str(tmp_path / "nope.json"))
+    out = health.address_book()
+    assert out["addresses"] == {} and "note" in out
+
+
 def test_backup_while_open(tmp_path):
     j = Journal(str(tmp_path / "live.db"))
     j.set_state("cash:claude", "123")

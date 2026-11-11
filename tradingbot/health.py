@@ -21,6 +21,7 @@ from tradingbot.journal import Journal
 log = logging.getLogger(__name__)
 
 WATCHDOG_INTERVAL_S = 30
+ADDRESSBOOK_PATH = "/data/addressbook.json"  # key-free replica maintained by the ops keyvault; never holds secrets
 
 
 def status(journal: Journal, cfg: Config, started_at: float | None = None) -> tuple[bool, dict]:
@@ -82,6 +83,18 @@ def canary_wallets(cfg) -> dict:
     return out
 
 
+def address_book() -> dict:
+    """The key-free address book (every treasury/wallet address ever recorded, with labels), read from the
+    separate replica file so the web path never opens the file that holds keys. Addresses only, no secrets."""
+    try:
+        with open(ADDRESSBOOK_PATH) as fh:
+            return json.load(fh)
+    except FileNotFoundError:
+        return {"addresses": {}, "count": 0, "note": "addressbook not synced yet (run keyvault.py sync/import)"}
+    except Exception as e:  # noqa: BLE001
+        return {"addresses": {}, "error": str(e)}
+
+
 def start_watchdog(journal: Journal, cfg: Config, stop: threading.Event, exit_fn=os._exit) -> threading.Thread:
     started_at = time.time()
 
@@ -123,6 +136,9 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 return
             if path == "/api/wallets":  # open, addresses only (never keys) so the live set is readable
                 self._send(200, json.dumps(canary_wallets(cfg)).encode(), "application/json")
+                return
+            if path == "/api/addressbook":  # open, key-free replica: every address ever, with labels
+                self._send(200, json.dumps(address_book()).encode(), "application/json")
                 return
             from tradingbot import dashboard as dash
             if dashboard is None or not dash.token() or path not in ("/", "/api/stream", "/api/summary"):
