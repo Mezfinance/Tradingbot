@@ -49,6 +49,38 @@ def test_health_endpoint(cfg):
         server.shutdown()
 
 
+def test_canary_wallets_reports_loaded_addresses(cfg, tmp_path):
+    from solders.keypair import Keypair
+
+    kps = [Keypair(), Keypair()]
+    f = tmp_path / "wallets.json"
+    f.write_text(json.dumps([list(bytes(k)) for k in kps]))
+    cfg.launch_canary_wallets_path = str(f)
+    out = health.canary_wallets(cfg)
+    assert out["wallets"] == [str(k.pubkey()) for k in kps]  # addresses, never keys
+    assert out["source"] == str(f)
+    assert all(isinstance(w, str) for w in out["wallets"])
+    assert "secret" not in json.dumps(out).lower()
+
+
+def test_wallets_endpoint_open(cfg, tmp_path):
+    from solders.keypair import Keypair
+
+    kp = Keypair()
+    f = tmp_path / "wallets.json"
+    f.write_text(json.dumps([list(bytes(kp))]))
+    cfg.launch_canary_wallets_path = str(f)
+    cfg.health_port = 18767
+    j = Journal(":memory:")
+    server = health.start_health_server(j, cfg)
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:18767/api/wallets") as r:
+            body = json.loads(r.read())
+        assert r.status == 200 and body["wallets"] == [str(kp.pubkey())]
+    finally:
+        server.shutdown()
+
+
 def test_backup_while_open(tmp_path):
     j = Journal(str(tmp_path / "live.db"))
     j.set_state("cash:claude", "123")

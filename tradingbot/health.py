@@ -40,6 +40,48 @@ def status(journal: Journal, cfg: Config, started_at: float | None = None) -> tu
     return healthy, out
 
 
+def canary_wallets(cfg) -> dict:
+    """Addresses only (never private keys) of the canary trading wallets the bot actually loaded, plus the
+    treasury address. Served open at /api/wallets so the live set can be read without pasting anything."""
+    out: dict = {
+        "wallets": [],
+        "treasury": None,
+        "source": None,
+        "rotate": bool(getattr(cfg, "launch_canary_rotate", False)),
+        "route": getattr(cfg, "launch_canary_route", None),
+        "wallets_path": getattr(cfg, "launch_canary_wallets_path", "") or None,
+    }
+    try:
+        from tradingbot.execution.rotating import read_canary_wallets
+
+        out["wallets"] = [str(k.pubkey()) for k in read_canary_wallets(cfg)]
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"wallets: {e}"
+    path = out["wallets_path"]
+    if path and os.path.exists(path):
+        out["source"] = path
+    elif os.path.exists("/run/secrets/canary_wallets.json"):
+        out["source"] = "/run/secrets/canary_wallets.json"
+    elif os.environ.get("TB_CANARY_WALLETS"):
+        out["source"] = "TB_CANARY_WALLETS"
+    try:
+        from solders.keypair import Keypair
+
+        txt = None
+        if os.path.exists("/data/new_treasury.json"):
+            with open("/data/new_treasury.json") as fh:
+                txt = fh.read()
+        elif os.environ.get("TB_TREASURY_KEY"):
+            txt = os.environ["TB_TREASURY_KEY"]
+        if txt:
+            txt = txt.strip().strip('"').strip("'").strip()
+            kp = Keypair.from_bytes(bytes(json.loads(txt))) if txt.startswith("[") else Keypair.from_base58_string(txt)
+            out["treasury"] = str(kp.pubkey())
+    except Exception as e:  # noqa: BLE001
+        out["treasury_error"] = str(e)
+    return out
+
+
 def start_watchdog(journal: Journal, cfg: Config, stop: threading.Event, exit_fn=os._exit) -> threading.Thread:
     started_at = time.time()
 
@@ -78,6 +120,9 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
             if path == "/health":
                 ok, detail = status(journal, cfg, started_at)
                 self._send(200 if ok else 503, json.dumps({"ok": ok, **detail}).encode(), "application/json")
+                return
+            if path == "/api/wallets":  # open, addresses only (never keys) so the live set is readable
+                self._send(200, json.dumps(canary_wallets(cfg)).encode(), "application/json")
                 return
             from tradingbot import dashboard as dash
             if dashboard is None or not dash.token() or path not in ("/", "/api/stream", "/api/summary"):
