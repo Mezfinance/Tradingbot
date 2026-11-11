@@ -111,6 +111,11 @@ class Config:
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
     launch_fast_canary: bool = False  # REAL MONEY: buy on detection, before the scorer's second-4 decide
     launch_fast_canary_exit_s: float = 60.0  # sell each fast-canary position this many seconds after pool creation
+    # Wallet rotation (11-11): spread canary trades across up to 10 wallets, one open trade per wallet, so each buy
+    # enters on a fresh/rested wallet (a brand-new wallet's first trade survives; the operators seem to pull once they
+    # recognise our wallet). Direct route only. Wallets come from the TB_CANARY_WALLETS secret.
+    launch_canary_rotate: bool = False  # REAL MONEY: rotate wallets, one open trade per wallet
+    launch_canary_wallets_path: str = ""  # file of rotation keys (JSON array); default: the entrypoint's secret copy
     shortbook_feed_url: str = ""  # MZF Short Only on the dashboard: the shortbook app's /api/feed (Fly private network)
     # One-off fresh start for some books (comma list): their history is kept as '<book>@<reset_books_id>' and
     # their cash goes back to the starting amount. Runs once per reset_books_id, at engine start.
@@ -339,6 +344,11 @@ class Config:
             raise ValueError("The fast launch canary is for paper mode; live mode already trades for real")
         if self.launch_live_ws_commitment not in ("processed", "confirmed", "finalized"):
             raise ValueError("launch_live_ws_commitment must be processed, confirmed or finalized")
+        if self.launch_canary_rotate:
+            if self.live_confirm != LIVE_CONFIRM_PHRASE:
+                raise ValueError(f"Wallet rotation spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+            if self.launch_canary_route != "direct":
+                raise ValueError("Wallet rotation is built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):

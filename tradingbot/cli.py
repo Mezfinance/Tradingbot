@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 
@@ -27,8 +28,23 @@ def canary_executor(cfg: Config, jupiter):
         from tradingbot.execution.pumpswap_direct import DirectPumpswapExecutor as cls
     else:
         from tradingbot.execution.jupiter import JupiterExecutor as cls
-    return cls(cfg, jupiter, priority_fee_sol=cfg.launch_canary_priority_fee_sol,
-               sell_slippage_bps=cfg.launch_canary_sell_slippage_bps)
+
+    def make(keypair=None):
+        return cls(cfg, jupiter, keypair=keypair, priority_fee_sol=cfg.launch_canary_priority_fee_sol,
+                   sell_slippage_bps=cfg.launch_canary_sell_slippage_bps)
+
+    if cfg.launch_canary_rotate and cfg.launch_canary_route == "direct":
+        from tradingbot.execution.rotating import RotatingExecutor, read_canary_wallets
+
+        wallets = read_canary_wallets(cfg)
+        if len(wallets) >= 2:
+            subs = [make(k) for k in wallets]
+            for s in subs:  # the rotator owns pool persistence; stop the per-wallet executors sharing one pool file
+                s._pool_file = None
+            db = getattr(cfg, "db_path", ":memory:")
+            state = None if db == ":memory:" else os.path.join(os.path.dirname(db) or ".", "canary_rotation.json")
+            return RotatingExecutor(subs, state_path=state)
+    return make()
 
 
 def build_engine(cfg: Config, with_analyst: bool = True):
