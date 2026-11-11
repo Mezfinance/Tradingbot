@@ -116,6 +116,13 @@ class Config:
     # recognise our wallet). Direct route only. Wallets come from the TB_CANARY_WALLETS secret.
     launch_canary_rotate: bool = False  # REAL MONEY: rotate wallets, one open trade per wallet
     launch_canary_wallets_path: str = ""  # file of rotation keys (JSON array); default: the entrypoint's secret copy
+    # Fresh wallet per trade (11-11): every trade on a brand-new wallet, funded through rotating single-use temp
+    # treasuries so no two trade wallets share a funder (defeats per-wallet AND funder flagging). Direct route only.
+    launch_canary_fresh: bool = False  # REAL MONEY: a fresh wallet per trade via the rotating-treasury chain
+    launch_canary_treasury_path: str = ""  # main treasury key file; default: the entrypoint's secret copy
+    launch_canary_fresh_slots: int = 10  # parallel trade slots (each cycles its own fresh wallets)
+    launch_canary_fresh_jitter_usd: float = 2.0  # +-$ of SOL randomised onto each wallet's funding (no uniform balances)
+    launch_canary_fresh_float_sol: float = 0.02  # extra SOL funded per wallet beyond the trade (MIN_SOL + fee headroom)
     shortbook_feed_url: str = ""  # MZF Short Only on the dashboard: the shortbook app's /api/feed (Fly private network)
     # One-off fresh start for some books (comma list): their history is kept as '<book>@<reset_books_id>' and
     # their cash goes back to the starting amount. Runs once per reset_books_id, at engine start.
@@ -349,6 +356,13 @@ class Config:
                 raise ValueError(f"Wallet rotation spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
             if self.launch_canary_route != "direct":
                 raise ValueError("Wallet rotation is built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
+        if self.launch_canary_fresh:
+            if self.live_confirm != LIVE_CONFIRM_PHRASE:
+                raise ValueError(f"The fresh-wallet chain spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+            if self.launch_canary_route != "direct":
+                raise ValueError("The fresh-wallet chain is built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
+            if self.launch_canary_fresh_slots < 1:
+                raise ValueError("launch_canary_fresh_slots must be at least 1")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):
