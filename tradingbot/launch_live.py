@@ -1017,6 +1017,12 @@ class LaunchLive:
                 "token_vault, status, credits) VALUES(?,?,?,?,?,?,?,?,?)",
                 (pool, lp, p["token_mint"], p["creator"], notified, p["sol_vault"], p["token_vault"], "pending",
                  self.helius.credits_used - before))
+            if self.cfg.launch_fast_canary and self.signals is not None:
+                # buy now, at detection (~pool second 2-3), before the second-4 decide: no price/liquidity yet, so the
+                # engine's fast branch skips the Jupiter checks and the direct executor reads the pool itself.
+                self.signals.put_nowait({"pool": pool, "mint": p["token_mint"], "name": "", "kind": "fast",
+                                         "created_ts": notified, "ts": self.clock(), "dex": "pumpswap"})
+                self._count("fast-canary signals sent")
             self._schedule(notified + self.cfg.launch_live_decide_delay_s, "decide", pool)
 
     def _decide(self, pool: str) -> None:

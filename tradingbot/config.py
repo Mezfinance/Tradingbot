@@ -106,6 +106,10 @@ class Config:
     launch_canary_priority_fee_sol: float = 0.0005  # cap on the priority fee per transaction
     launch_canary_sell_slippage_bps: int = 1000  # sells must go through on a fast pool
     launch_canary_route: str = "jupiter"  # 'direct' = swap on the pumpswap pool; 'lp' = enter as a liquidity provider (11-10); both trade SOL
+    # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
+    # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
+    launch_fast_canary: bool = False  # REAL MONEY: buy on detection, before the scorer's second-4 decide
+    launch_fast_canary_exit_s: float = 60.0  # sell each fast-canary position this many seconds after pool creation
     shortbook_feed_url: str = ""  # MZF Short Only on the dashboard: the shortbook app's /api/feed (Fly private network)
     # One-off fresh start for some books (comma list): their history is kept as '<book>@<reset_books_id>' and
     # their cash goes back to the starting amount. Runs once per reset_books_id, at engine start.
@@ -328,6 +332,10 @@ class Config:
             raise ValueError(f"The launch canary spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
         if self.launch_canary and self.mode == "live":
             raise ValueError("The launch canary is for paper mode; live mode already trades for real")
+        if self.launch_fast_canary and self.live_confirm != LIVE_CONFIRM_PHRASE:
+            raise ValueError(f"The fast launch canary spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+        if self.launch_fast_canary and self.mode == "live":
+            raise ValueError("The fast launch canary is for paper mode; live mode already trades for real")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):

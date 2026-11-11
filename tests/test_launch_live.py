@@ -124,6 +124,28 @@ def test_hand_made_pool_scored_filled_and_exited(setup):
     assert out["picks"]["top 5%"] == 1 and out["timing_s"]["decided_after_creation"] == 5.0
 
 
+def test_fast_canary_emits_a_buy_signal_on_detection_before_the_decide(setup, monkeypatch):
+    cfg, st, hel, clock, live, p, create = setup
+    from tradingbot import model_book as mb
+    monkeypatch.setattr(live.cfg, "launch_fast_canary", True)
+    live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+    live.step()  # _new runs now; _decide is only scheduled for later
+    assert live._row(HAND_POOL)["status"] == "pending"  # emitted before any scoring
+    sig = live.signals.get_nowait()
+    assert sig["kind"] == "fast" and sig["pool"] == HAND_POOL and sig["mint"] == p["token_mint"]
+    assert sig["dex"] == "pumpswap" and sig["created_ts"] > 0 and "liq" not in sig and "price" not in sig
+    # the fast canary is a real-money book that takes every fast signal with no filter and exits on a timer
+    assert mb.CANARY_FAST in mb.CANARY_BOOKS and mb.signal_kind(mb.CANARY_FAST) == "fast" and mb.wants(mb.CANARY_FAST, sig)
+    assert mb.exit_deadline(live.cfg, mb.CANARY_FAST, sig) == sig["created_ts"] + live.cfg.launch_fast_canary_exit_s
+
+
+def test_fast_canary_is_off_by_default_so_detection_alone_emits_nothing(setup):
+    cfg, st, hel, clock, live, p, create = setup
+    live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+    live.step()  # _new runs; without the flag no signal goes out until the second-4 decide
+    assert live.signals.empty()
+
+
 def test_pull_during_the_hold_is_minus_100(setup):
     cfg, st, hel, clock, live, p, create = setup
     live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))

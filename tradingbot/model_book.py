@@ -151,12 +151,16 @@ HOLD_CHECK_RISING = True  # ... and no less than at the previous check
 # `launch_canary_max_liq_usd` 0), sized by `CANARY_SIZE_BANDS` (user, 11-10): $25 below $15k, $10 above.
 CANARY4 = "canary_rw50_sz"
 CANARY_TWIN = LAUNCH_SIZED
-CANARY_BOOKS = (CANARY4,)
+# Fast canary (11-11): buys `kind:"fast"` signals (every new hand-made pool, emitted on detection) at the earliest
+# instant; its own exit is time-based (`launch_fast_canary_exit_s` after creation), not a scorer flag.
+CANARY_FAST = "canary_fast"
+CANARY_BOOKS = (CANARY4, CANARY_FAST)
 CANARY_SIZE_BANDS = ((15_000.0, 25.0), (25_000.0, 10.0), (float("inf"), 10.0))  # (liquidity below, $): user, 11-10
 LAUNCH_CUT = {LAUNCH2: "top2", LAUNCH5: "top5", LAUNCH2M5: "top2", LAUNCH5M5: "top5", **LAUNCH_HIST_CUT, **LAUNCH_LOW_CUT,
               **LAUNCH_RW_CUT, **LAUNCH_RW24_CUT, **LAUNCH_SIZED_CUT, **LAUNCH_SIZED_DD_CUT, **LAUNCH_BAND_CUT, **LAUNCH_HOLD_CUT, **LAUNCH_BIG_CUT,
               **LAUNCH_THIN_CUT}
 LAUNCH_CUT[CANARY4] = LAUNCH_CUT[CANARY_TWIN]  # the canary takes its twin's signals
+LAUNCH_CUT[CANARY_FAST] = "fast"  # in LAUNCH_CUT for the no-stop exit + unpriced-position handling; routed by signal_kind
 LAUNCH_EXIT_MIN = {b: 5.0 if b in LAUNCH_M5 else 10.0 if b == LAUNCH_HOLD10 else 15.0 if b in (LAUNCH_HOLD15, LAUNCH_HOLD15_MAX, LAUNCH_BIG) else 6.0
                    for b in LAUNCH_CUT}
 POOL_MINUTE_EXIT = {**EARLY_EXIT_MIN, **LAUNCH_EXIT_MIN}  # books that sell every position by a pool minute
@@ -198,6 +202,8 @@ def is_handmade(dex: str, mint: str) -> bool:
 def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
     """Pool-age exit: the early books sell every position by their pool minute; the 10-min and climb books sell
     hand-made pools by created + `model_book_handmade_exit_age_min`."""
+    if name == CANARY_FAST:  # time-based exit from pool creation, independent of the launch books' pool minutes
+        return sig["created_ts"] + cfg.launch_fast_canary_exit_s if sig.get("created_ts") else None
     if name in POOL_MINUTE_EXIT:
         return sig["created_ts"] + POOL_MINUTE_EXIT[name] * 60 if sig.get("created_ts") else None
     age = cfg.model_book_handmade_exit_age_min
@@ -239,7 +245,8 @@ def _family_books(cfg: Config) -> list[str]:
         + ([LAUNCH_BIG] if cfg.launch_big_book and cfg.launch_live else []) \
         + ([LAUNCH_BIG_MID] if cfg.launch_big_mid_book and cfg.launch_live else []) \
         + (list(LAUNCH_THIN_CUT) if cfg.launch_thin_book and cfg.launch_live else []) \
-        + ([CANARY4] if cfg.launch_canary and cfg.launch_live else [])
+        + ([CANARY4] if cfg.launch_canary and cfg.launch_live else []) \
+        + ([CANARY_FAST] if cfg.launch_fast_canary and cfg.launch_live else [])
 
 
 def early_wants(name: str, sig: dict) -> bool:
@@ -284,11 +291,15 @@ def hold_check_fails(ret: float, last: float | None) -> bool:
 
 
 def signal_kind(name: str) -> str | None:
-    """Which signals a book takes: early (first sight), launch (second-4 scorer) or model5 (None)."""
+    """Which signals a book takes: fast (on detection), early (first sight), launch (second-4 scorer) or model5 (None)."""
+    if name == CANARY_FAST:
+        return "fast"
     return "early" if name in EARLY_BOOKS else "launch" if name in LAUNCH_CUT else None
 
 
 def wants(name: str, sig: dict) -> bool:
+    if name == CANARY_FAST:
+        return True  # no filter: every new hand-made pool
     if name in EARLY_BOOKS:
         return early_wants(name, sig)
     if name in LAUNCH_CUT:
