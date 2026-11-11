@@ -97,6 +97,13 @@ def build_engine(cfg: Config, with_analyst: bool = True):
 
 
 def main(argv: list[str] | None = None) -> None:
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv and argv[0] == "keyvault":  # free-form sub-args, handled outside the main parser
+        from tradingbot import keyvault
+
+        keyvault.main(argv[1:])
+        return
     parser = argparse.ArgumentParser(prog="tradingbot")
     parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup",
                                             "backup-now", "backup-list", "learn-now", "postmortems", "playbook", "optimize-now", "settings",

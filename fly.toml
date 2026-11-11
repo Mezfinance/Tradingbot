@@ -10,6 +10,7 @@ primary_region = "iad"
   TB_MODE = "paper"
   TB_DB_PATH = "/data/tradingbot.db"
   TB_HEALTH_PORT = "8080"
+  TB_KEYVAULT = "1"  # build the key recovery vault + address book on boot (keyvault.py); served at /api/addressbook
   TB_MODEL_BOOK_SLOW = "0"  # 24h model5 book off (10-28: -10%, 61% rugged)
   # All model5 books off (10-31: 10m -13%, climb -6%, ops9/ops10 -8%; rugs 16-30% of picks)
   TB_MODEL_BOOK_FAST = "0"

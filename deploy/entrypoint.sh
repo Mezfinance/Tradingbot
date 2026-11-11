@@ -17,12 +17,24 @@ if [ -n "$TB_KEYPAIR_JSON" ]; then
     unset TB_KEYPAIR_JSON
 fi
 
+log() { echo "[entrypoint] $*"; }
+
+# Recovery vault: record the current keys and (re)build the key-free address book the /api/addressbook
+# endpoint serves. Runs on the image code, before any self-written overlay. Guarded so it never aborts boot;
+# the log holds addresses only, never secrets.
+if [ "${TB_KEYVAULT:-0}" = "1" ]; then
+    KV_LOG="$(dirname "${TB_DB_PATH:-/data/tradingbot.db}")/keyvault.log"
+    if python -m tradingbot keyvault import >> "$KV_LOG" 2>&1; then
+        log "keyvault built (addresses in $KV_LOG)"
+    else
+        log "keyvault build skipped/failed (see $KV_LOG)"
+    fi
+fi
+
 TB_BASE_HASH="$(cat "${TB_BASE_HASH_FILE:-/app/BASE_HASH}" 2>/dev/null || true)"
 export TB_BASE_HASH
 CODE_DIR="${TB_CODE_DIR:-$(dirname "${TB_DB_PATH:-/data/tradingbot.db}")/code}"
 MAX_BOOTS="${TB_MAX_CRASH_BOOTS:-3}"
-
-log() { echo "[entrypoint] $*"; }
 
 fall_back() {  # $1 = version to abandon, $2 = reason
     parent="$(cat "$CODE_DIR/versions/$1/PARENT" 2>/dev/null || true)"
