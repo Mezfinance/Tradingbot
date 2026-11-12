@@ -118,6 +118,8 @@ class Config:
     launch_canary_feint_drop_pct: float = 50.0  # SOL-vault drop vs before the feint that counts as 'pulled'
     launch_canary_feint_hold_s: float = 0.0  # 0 = atomic buy+sell in one tx (never hold); > 0 = buy, hold, then sell
     launch_canary_feint_only: bool = False  # run the feint but never commit: measure the feint's pull-trigger rate only
+    launch_canary_feint_all: bool = False  # feint EVERY liquid pool (>= model_book_min_liq_usd), not just the scorer's
+    # rug-vs-win picks: the feint itself is the signal, so the scorer's ranking no longer decides which pools we probe
     # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
     launch_fast_canary: bool = False  # REAL MONEY: buy on detection, before the scorer's second-4 decide
@@ -384,6 +386,8 @@ class Config:
                 raise ValueError(f"The feint probe spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
             if self.launch_canary_route != "direct":
                 raise ValueError("The feint probe is built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
+        if self.launch_canary_feint_all and not self.launch_canary_feint:
+            raise ValueError("TB_LAUNCH_CANARY_FEINT_ALL needs the feint on; set TB_LAUNCH_CANARY_FEINT=1")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):

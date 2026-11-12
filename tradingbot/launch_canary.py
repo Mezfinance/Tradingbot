@@ -126,3 +126,28 @@ def smoke(executor, mint: str = SMOKE_MINT, usd: float = 2.0) -> dict:
     out["usdc_after"] = executor.token_balance(USDC_MINT) / 1e6
     out["sol_after"] = executor.sol_balance()
     return out
+
+
+def _sol_balance(executor):
+    """SOL of the direct executor, or (under rotation) of the first wallet; best-effort for the smoke summary."""
+    if hasattr(executor, "sol_balance"):
+        return executor.sol_balance()
+    subs = getattr(executor, "subs", None)
+    return subs[0].sol_balance() if subs and hasattr(subs[0], "sol_balance") else None
+
+
+def feint_smoke(executor, mint: str, usd: float, pool: str | None = None) -> dict:
+    """Run one real feint (atomic $usd buy + sell back, re-read the pool) and report the verdict. On a deep, healthy
+    pool this should return 'alive' with sol_after ~ sol_before -- it proves the atomic buy+sell tx lands on-chain,
+    the pool re-read works and the verdict logic fires, before a real-money feint measurement run is armed. commit is
+    False (no follow-on buy), so under rotation it also frees the wallet."""
+    if pool and hasattr(executor, "remember_pool"):
+        executor.remember_pool(mint, pool)
+    out: dict = {"mint": mint, "usd": usd, "sol_before": _sol_balance(executor)}
+    t0 = time.time()
+    out["verdict"] = executor.feint(mint, usd, commit=False)
+    out["seconds"] = round(time.time() - t0, 1)
+    out["last_feint"] = getattr(executor, "last_feint", {})
+    out["note"] = getattr(executor, "last_note", "")
+    out["sol_after"] = _sol_balance(executor)
+    return out

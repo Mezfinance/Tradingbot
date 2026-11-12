@@ -303,6 +303,8 @@ def wants(name: str, sig: dict) -> bool:
     if name in EARLY_BOOKS:
         return early_wants(name, sig)
     if name in LAUNCH_CUT:
+        if name == CANARY4 and sig.get("feint_any"):  # feint_all: the canary probes every liquid pool, not only rw50
+            return True
         return bool(sig.get(LAUNCH_CUT[name]))
     return True
 

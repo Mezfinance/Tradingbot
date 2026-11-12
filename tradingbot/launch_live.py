@@ -1106,18 +1106,21 @@ class LaunchLive:
                  **big_flags(cols.get("liq_usd"), cols.get("big_pct")),
                  **thin_flags(cols.get("liq_usd"), cols.get("rw_pct"), cols.get("rwb_pct"), cols.get("liquid"))}
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
+        # feint_all: the feint is the signal now, so probe every liquid pool (>= min liq), not just the rug-vs-win picks.
+        feint_any = bool(self.cfg.launch_canary_feint_all)  # the pool is already liquid here (not-liquid returned above)
         if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")
                                          or flags["d12"] or flags["rw50"] or flags["d12rw50"]
                                          or flags["rw50_24"] or flags["d12rw50_24"] or flags["rwband"]
                                          or flags["rw50big"] or flags["big30"] or flags["big30m"]
-                                         or flags["thin"]):
+                                         or flags["thin"] or feint_any):
             px = la.chain_price(rows, DECIDE_S)  # SOL per whole token (vault UI amounts)
             if sol_usd and px:
                 self.signals.put_nowait({
                     "pool": pool, "mint": r["token_mint"], "name": "", "score": score, "price": px * sol_usd,
                     "liq": 2 * sol4 * sol_usd, "ts": now, "decided_ts": now, "created_ts": create,
                     "dex": "pumpswap", "kind": "launch", "top2": bool(cols["top2"]), "top5": bool(cols["top5"]),
-                    "top2h": bool(cols.get("top2h")), "top5h": bool(cols.get("top5h")), **flags})
+                    "top2h": bool(cols.get("top2h")), "top5h": bool(cols.get("top5h")), **flags,
+                    "feint_any": feint_any})
                 self._count("signals sent to the launch books")
             else:
                 self._count("pick not sent: no SOL price")

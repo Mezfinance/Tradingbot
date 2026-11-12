@@ -798,6 +798,15 @@ class Engine:
         started = time.time()
         from tradingbot import model_book as mb
         canary = book.name in mb.CANARY_BOOKS
+        if canary and c.launch_canary_feint and c.launch_canary_feint_only and hasattr(book.executor, "feint"):
+            # Measurement run: probe every routed pool and never commit, so run it before the Jupiter price/route
+            # block -- a seconds-old pool Jupiter can't price yet must still be feinted, not dropped as 'no live price'.
+            if sig.get("pool") and hasattr(book.executor, "remember_pool"):
+                book.executor.remember_pool(sig["mint"], sig["pool"])
+            verdict = book.executor.feint(sig["mint"], c.launch_canary_feint_usd, commit=False)
+            self.journal.log_event("canary_feint", sig["mint"], json.dumps(
+                {"verdict": verdict, **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
+            return f"feint only: pool {verdict}"
         if canary and c.launch_canary_flat_usd > 0:
             base = c.launch_canary_flat_usd  # one tiny size for every pick: does any real buy set the operators off?
         elif canary and c.launch_canary_band_scale > 0 and sig.get("liq") is not None:
@@ -831,14 +840,11 @@ class Engine:
                 return f"round-trip loss {rt[0]:.1f}% (honeypot/tax/thin pool)"
         if sig.get("pool") and hasattr(book.executor, "remember_pool"):  # the direct route swaps on this pool
             book.executor.remember_pool(sig["mint"], sig["pool"])
-        if canary and c.launch_canary_feint and hasattr(book.executor, "feint"):
-            # Poke the pool with a $feint buy, sell it straight back, and commit only if it wasn't pulled in reaction.
-            verdict = book.executor.feint(sig["mint"], c.launch_canary_feint_usd,
-                                          commit=not c.launch_canary_feint_only)
+        if canary and c.launch_canary_feint and not c.launch_canary_feint_only and hasattr(book.executor, "feint"):
+            # Commit path: poke the pool, commit only if it wasn't pulled in reaction (feint-only is handled above).
+            verdict = book.executor.feint(sig["mint"], c.launch_canary_feint_usd, commit=True)
             self.journal.log_event("canary_feint", sig["mint"], json.dumps(
                 {"verdict": verdict, **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
-            if c.launch_canary_feint_only:  # measurement run: feint every pool, never commit
-                return f"feint only: pool {verdict}"
             if verdict != "alive":
                 return f"feint: pool {verdict}"
         fill = book.executor.buy(sig["mint"], usd, trigger)

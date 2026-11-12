@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -397,6 +397,20 @@ def main(argv: list[str] | None = None) -> None:
         if args.pool and hasattr(ex, "remember_pool"):
             ex.remember_pool(args.path, args.pool)
         print(json.dumps(launch_canary.smoke(ex, args.path or launch_canary.SMOKE_MINT, args.usd), indent=2, default=str))
+        return
+
+    if args.command == "canary-feint-smoke":  # one real feint (atomic buy+sell + re-read) on a live pool
+        if cfg.live_confirm != LIVE_CONFIRM_PHRASE:
+            raise SystemExit(f"canary-feint-smoke spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+        if cfg.launch_canary_route != "direct":
+            raise SystemExit("the feint is built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
+        if not args.path:
+            raise SystemExit("canary-feint-smoke needs a token with a pumpswap pool: canary-feint-smoke MINT [--pool POOL]")
+        from tradingbot import launch_canary
+        from tradingbot.data.jupiter import Jupiter
+        ex = canary_executor(cfg, Jupiter(cfg.slippage_bps))
+        usd = args.usd if args.usd != 2.0 else cfg.launch_canary_feint_usd  # default to the configured feint size
+        print(json.dumps(launch_canary.feint_smoke(ex, args.path, usd, args.pool), indent=2, default=str))
         return
 
     if args.command == "canary-sweep":  # get the rent back from the wallet's empty token accounts

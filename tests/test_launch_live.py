@@ -139,6 +139,22 @@ def test_fast_canary_emits_a_buy_signal_on_detection_before_the_decide(setup, mo
     assert mb.exit_deadline(live.cfg, mb.CANARY_FAST, sig) == sig["created_ts"] + live.cfg.launch_fast_canary_exit_s
 
 
+def test_feint_all_signals_every_liquid_pool_to_the_canary(setup, monkeypatch):
+    cfg, st, hel, clock, live, p, create = setup
+    from tradingbot import model_book as mb
+    monkeypatch.setattr(live.cfg, "launch_canary_feint_all", True)
+    live.on_lp_mint(HAND_LP, lp_raw(HAND_POOL, 100))
+    live.step()
+    clock.t += cfg.launch_live_decide_delay_s
+    live.step()
+    sig = live.signals.get_nowait()
+    assert sig["feint_any"] is True  # every liquid pool carries it when feint_all is on
+    assert mb.wants(mb.CANARY4, sig)  # so the canary probes it regardless of its rug-vs-win flags
+    assert mb.wants(mb.CANARY4, {"feint_any": True})  # wanted even with no rug-vs-win flag set
+    assert not mb.wants(mb.CANARY4, {})  # nothing set: not wanted
+    assert not mb.wants(mb.LAUNCH2, {"feint_any": True})  # other launch books ignore feint_any
+
+
 def test_websocket_commitment_follows_the_config(setup, monkeypatch):
     cfg, st, hel, clock, live, p, create = setup
     sub = live._subscription()

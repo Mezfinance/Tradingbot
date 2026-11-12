@@ -268,6 +268,35 @@ def test_config_needs_the_confirmation_phrase():
         Config(launch_canary=True, live_confirm=LIVE_CONFIRM_PHRASE, mode="live").validate()
 
 
+def test_feint_all_needs_the_feint_on():
+    Config(launch_canary=True, launch_canary_feint=True, launch_canary_route="direct",
+           launch_canary_feint_all=True, live_confirm=LIVE_CONFIRM_PHRASE).validate()  # feint on: fine
+    with pytest.raises(ValueError):  # feint_all without the feint
+        Config(launch_canary=True, launch_canary_feint_all=True, live_confirm=LIVE_CONFIRM_PHRASE).validate()
+
+
+def test_feint_smoke_runs_one_feint_and_reports_the_verdict():
+    class FakeEx:
+        last_feint = {"pool": "P", "sol_before": 1.0, "sol_after": 1.0}
+        last_note = ""
+
+        def sol_balance(self):
+            return 2.0
+
+        def remember_pool(self, mint, pool):
+            self.pool = pool
+
+        def feint(self, mint, usd, commit=True):
+            self.args = (mint, usd, commit)
+            return "alive"
+
+    ex = FakeEx()
+    out = launch_canary.feint_smoke(ex, "Mint", 25.0, pool="PoolAddr")
+    assert out["verdict"] == "alive" and out["usd"] == 25.0
+    assert ex.args == ("Mint", 25.0, False) and ex.pool == "PoolAddr"  # commit=False, pool remembered first
+    assert out["last_feint"]["sol_after"] == 1.0 and out["sol_before"] == 2.0 and out["sol_after"] == 2.0
+
+
 class Recorder(PaperExecutor):
     def __init__(self, cfg):
         super().__init__(cfg)
