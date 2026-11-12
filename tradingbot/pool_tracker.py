@@ -72,7 +72,10 @@ def feint_pools(jquery, since: float) -> dict:
         except Exception:  # noqa: BLE001
             d = {}
         f = out.get(d.get("pool"))
-        if f is not None:
+        # Only a probe that actually committed money (verdict ok/trapped) can be a survivor/rugger: a honeypot or a
+        # skipped probe never touched the pool, so a "survivor" read on it is meaningless and misleading. Ignore the
+        # survival verdict for those (handles historical rows too, where the watch wrongly ran before the engine fix).
+        if f is not None and (f.get("kind") != "probe" or f.get("verdict") in ("ok", "trapped")):
             f["watch_verdict"] = d.get("verdict")  # rugger / survivor from the survival watch
             if d.get("sol_after") is not None:
                 f["sol_after"] = d.get("sol_after")
@@ -202,9 +205,20 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
         # for a 1-slot probe the meaningful verdict is the survival read (rugger/survivor); fall back to the probe's
         # own result (ok/trapped/...) until the watch fires. Feints keep alive/pulled/inconclusive.
         disp = f.get("watch_verdict") or f.get("verdict") if f.get("kind") == "probe" else f.get("verdict")
+        pv = f.get("verdict")
+        # Did money actually leave the wallet into the pool? A honeypot (sim-blocked, nothing broadcast) and a skipped
+        # probe sent nothing; a feint that was `inconclusive` could not be placed. `committed` = the buy LANDED (a real
+        # position/stake existed), so the dashboard can flag "no money sent" instead of a confusing dash + survivor tag.
+        if f.get("kind") == "probe":
+            sent = pv not in ("honeypot", "skipped", None)
+            committed = pv in ("ok", "trapped")
+        else:
+            sent = pv not in ("inconclusive", None)
+            committed = sent
         out.append({
             "pool": pool, "mint": f.get("mint"), "verdict": disp, "kind": f.get("kind"),
             "watch_verdict": f.get("watch_verdict"), "probe_verdict": f.get("verdict") if f.get("kind") == "probe" else None,
+            "sent": sent, "committed": committed,
             "note": f.get("note"),
             "feint_ts": f["feint_ts"], "created_ts": created,
             "probe_pool_age_s": (f["feint_ts"] - created) if created else None,

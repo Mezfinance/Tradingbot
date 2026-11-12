@@ -812,8 +812,12 @@ class Engine:
                 book.executor.remember_pool(sig["mint"], sig["pool"])
             res = book.executor.probe_1slot(sig["mint"], c.launch_canary_probe_usd)
             res["liq"] = sig.get("liq")
+            # Money LANDED only on ok/trapped; a honeypot (sim-blocked, nothing sent) or a skip committed nothing, so a
+            # survival watch on it would wrongly mark a pool we never touched "survivor". Only watch committed probes.
+            res["committed"] = res.get("verdict") in ("ok", "trapped")
             self.journal.log_event("canary_probe", sig["mint"], json.dumps(res), strategy=book.name)
-            self._schedule_probe_watch(book, sig, res)
+            if res["committed"]:
+                self._schedule_probe_watch(book, sig, res)
             allow = self.journal.get_state(CANARY_ALLOW)
             if allow is not None:  # one probe at a time (canary-one / Execute one probe): this used the allowance
                 self.journal.set_state(CANARY_ALLOW, str(max(0, int(allow) - 1)))

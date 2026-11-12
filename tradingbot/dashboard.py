@@ -149,9 +149,15 @@ def probe_summary(journal, n: int = 500) -> dict:
                            (n,))
     verdicts = journal.query("SELECT token, detail FROM events WHERE kind='canary_probe_verdict' ORDER BY id DESC "
                              "LIMIT ?", (n,))
+    # probe verdict per token (newest first), so a survival read is only honoured for a probe that COMMITTED money.
+    pverdict: dict = {}
+    for r in probes:
+        pverdict.setdefault(r["token"], _probe_detail(r).get("verdict"))
+    committed = {"ok", "trapped"}
     vd: dict = {}
     for r in verdicts:
-        vd.setdefault(r["token"], _probe_detail(r))  # newest verdict per token
+        if pverdict.get(r["token"]) in committed:  # ignore a stale survivor/rugger read on a honeypot/skipped probe
+            vd.setdefault(r["token"], _probe_detail(r))  # newest verdict per token
     counts = {"rugger": 0, "survivor": 0, "unknown": 0}
     for d in vd.values():
         counts[d.get("verdict", "unknown")] = counts.get(d.get("verdict", "unknown"), 0) + 1
@@ -164,10 +170,12 @@ def probe_summary(journal, n: int = 500) -> dict:
     recent = []
     for r in probes[:60]:
         d, v = _probe_detail(r), vd.get(r["token"], {})
+        sent = d.get("verdict") not in ("honeypot", "skipped", None)  # did a buy actually broadcast?
         recent.append({"ts": r["ts"], "token": r["token"], "pool": d.get("pool"), "probe": d.get("verdict"),
+                       "sent": sent,
                        "slot_gap": d.get("slot_gap"), "recovered_sol": d.get("recovered_sol"),
                        "blind_reverted": d.get("blind_reverted"), "used_fallback": d.get("used_fallback"),
-                       "watch": v.get("verdict")})
+                       "watch": v.get("verdict") if sent else None})
     probed_tokens = {r["token"] for r in probes}
     return {"probes": len(probes), "decided": decided, "pending": max(0, len(probed_tokens) - len(vd)),
             "rugger": counts["rugger"], "survivor": counts["survivor"], "unknown": counts.get("unknown", 0),
@@ -1582,8 +1590,10 @@ const PAGE2=s=>s==null?"–":agoStr(Math.round(s));
 const PPCT=r=>r==null?"–":(r>=0?"+":"")+(r*100).toFixed(0)+"%";
 function poolRow(r){const neg=r.pnl25!=null&&r.pnl25<0,win=r.pnl25!=null&&r.pnl25>0;
 const vt=(r.verdict==="alive"||r.verdict==="survivor")?'<span class="tag lime">'+esc(r.verdict)+'</span>':(r.verdict==="pulled"||r.verdict==="rugger"||r.verdict==="trapped")?'<span class="tag neg">'+esc(r.verdict)+'</span>':r.verdict?'<span class="tag">'+esc(r.verdict)+'</span>':"–";
+// A honeypot/skipped probe broadcast nothing (no buy tx), so GAP and recovered SOL are blank BECAUSE $0 was ever sent — say so, or the dashes read as "lost / unknown".
+const ns=r.sent===false?' <span class="tag" style="opacity:.75" title="Nothing was broadcast — the honeypot was caught by the free pre-buy simulation, so $0 was committed.">no money sent</span>':'';
 const lk=r.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(r.pool)}" target="_blank" rel="noopener">${esc((r.mint||r.pool).slice(0,8))}</a>`:esc((r.mint||"").slice(0,8));
-return`<tr><td>${lk}</td><td>${vt}</td><td class="num">${PAGE2(r.pool_age_s)}</td><td class="num">${PAGE2(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PAGE2(r.pull_pool_age_s):"–"}</td><td class="num">${r.pulled?PAGE2(r.pull_after_probe_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–"}<span class="muted"> ${PPCT(r.ret_m6)}</span></td><td class="num"><span class="${r.conf_ret>0?'pos':r.conf_ret<0?'neg':'muted'}">${PPCT(r.conf_ret)}</span></td><td class="num">${r.opt_age_s!=null?PAGE2(r.opt_age_s)+" ":""}<span class="${r.opt_ret>0?'pos':r.opt_ret<0?'neg':'muted'}">${PPCT(r.opt_ret)}</span></td></tr>`}
+return`<tr><td>${lk}</td><td>${vt}${ns}</td><td class="num">${PAGE2(r.pool_age_s)}</td><td class="num">${PAGE2(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PAGE2(r.pull_pool_age_s):"–"}</td><td class="num">${r.pulled?PAGE2(r.pull_after_probe_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–"}<span class="muted"> ${PPCT(r.ret_m6)}</span></td><td class="num"><span class="${r.conf_ret>0?'pos':r.conf_ret<0?'neg':'muted'}">${PPCT(r.conf_ret)}</span></td><td class="num">${r.opt_age_s!=null?PAGE2(r.opt_age_s)+" ":""}<span class="${r.opt_ret>0?'pos':r.opt_ret<0?'neg':'muted'}">${PPCT(r.opt_ret)}</span></td></tr>`}
 function canaryRotate(){const n=+($("rot-n").value||0),s=+($("rot-sol").value||0);
 if(!(n>=1&&n<=10)){alert("Wallets must be between 1 and 10.");return}
 if(!(s>=0.01&&s<=5)){alert("SOL per wallet must be between 0.01 and 5.");return}
@@ -1648,7 +1658,7 @@ function bufToB64url(b){const bytes=new Uint8Array(b);let bin="";for(const x of 
 function probePoll(){if(R.v!=="settings"){window._pbStarted=false;return}renderProbe();clearTimeout(window._pbT);window._pbT=setTimeout(probePoll,5000)}
 function renderProbe(){const t=$("pb-tiles");if(!t)return;fetch("api/canary/probes").then(r=>r.json()).then(d=>{
 t.innerHTML=[["Probed",d.probes],["Rugger",d.rugger],["Survivor",d.survivor],["Trip rate",d.trip_rate==null?"—":(d.trip_rate*100).toFixed(0)+"%"],["Blind revert",d.blind_revert_rate==null?"—":(d.blind_revert_rate*100).toFixed(0)+"%"],["Blind gap",d.blind_median_gap==null?"—":d.blind_median_gap],["Pending",d.pending]].map(([k,v])=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
-const rows=d.recent||[];$("pb-recent").innerHTML="<tr><th>Token</th><th>Probe</th><th>Gap</th><th>Recovered SOL</th><th>Watch</th></tr>"+(rows.length?rows.map(r=>`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${esc(r.probe||"")}</td><td>${r.slot_gap==null?"—":r.slot_gap}</td><td>${r.recovered_sol==null?"—":r.recovered_sol}</td><td class="${r.watch==='rugger'?'neg':r.watch==='survivor'?'pos':''}">${esc(r.watch||"…")}</td></tr>`).join(""):'<tr><td colspan="5" class="sub">No probes yet. Enable the 1-slot probe preset and start the canary.</td></tr>')}).catch(()=>{})}
+const rows=d.recent||[];$("pb-recent").innerHTML="<tr><th>Token</th><th>Probe</th><th>Gap</th><th>Recovered SOL</th><th>Watch</th></tr>"+(rows.length?rows.map(r=>r.sent===false?`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${esc(r.probe||"")}</td><td colspan="3" class="sub" title="Caught by the free pre-buy simulation — no buy was broadcast, so $0 was at risk.">no money sent ($0 at risk)</td></tr>`:`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${esc(r.probe||"")}</td><td>${r.slot_gap==null?"—":r.slot_gap}</td><td>${r.recovered_sol==null?"—":r.recovered_sol}</td><td class="${r.watch==='rugger'?'neg':r.watch==='survivor'?'pos':''}">${esc(r.watch||"…")}</td></tr>`).join(""):'<tr><td colspan="5" class="sub">No probes yet. Enable the 1-slot probe preset and start the canary.</td></tr>')}).catch(()=>{})}
 function probeOne(){const b=$("pb-one");b.disabled=true;$("pb-one-note").textContent="arming…";
 fetch("api/canary/probe-one",{method:"POST"}).then(r=>r.json()).then(d=>{b.disabled=false;$("pb-one-note").textContent=d.msg||"armed."}).catch(e=>{b.disabled=false;$("pb-one-note").textContent="error: "+e})}
 function probeSmoke(){const mint=$("pb-mint").value.trim();if(!mint){$("pb-smoke-note").textContent="enter a token mint";return}

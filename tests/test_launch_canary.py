@@ -637,6 +637,18 @@ def test_probe_mode_measures_every_candidate_and_never_commits(cfg, good_pair):
     assert w["mint"] == "A" and w["sol_before"] == 10.0 and w["due"] > time.time()  # a survival watch is scheduled
 
 
+def test_a_honeypot_probe_commits_nothing_and_is_not_watched_for_survival(cfg, good_pair):
+    # The pre-buy sim caught a honeypot, so no money was sent; a survival watch would wrongly mark a pool we never
+    # touched "survivor". It must not be scheduled, and the event records committed=False.
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    live.verdict = "honeypot"
+    eng._try_model(eng.books[mb.CANARY4], _probe_sig("H"))
+    assert "PH" not in eng._probe_watches and not eng._probe_watches  # no survival watch for a honeypot
+    ev = json.loads(j.query("SELECT detail FROM events WHERE kind='canary_probe'")[0]["detail"])
+    assert ev["verdict"] == "honeypot" and ev["committed"] is False
+
+
 def test_probe_watch_records_survivor_and_rugger(cfg, good_pair):
     import json
     eng, j, live = _probe_engine(cfg, good_pair)

@@ -40,6 +40,22 @@ def test_feint_pools_includes_1slot_probes_and_the_survival_verdict():
     assert out["PB"]["kind"] == "feint" and out["PB"]["watch_verdict"] is None
 
 
+def test_honeypot_probe_never_shows_as_a_survivor_and_flags_no_money_sent():
+    # A honeypot was caught by the free pre-buy sim: nothing broadcast, so a "survivor" survival read on it is
+    # meaningless and dangerous (survivor = a pool to enter for real). It must never carry a survivor/rugger verdict,
+    # and the row must say money was not committed. Covers historical rows where the watch wrongly ran.
+    import json
+    rows = [{"ts": 100.0, "token": "MintH", "kind": "canary_probe",
+             "detail": json.dumps({"pool": "PH", "verdict": "honeypot", "note": "probe: honeypot (sim: ...)"})}]
+    verds = [{"detail": json.dumps({"pool": "PH", "verdict": "survivor", "sol_after": 7})}]  # a stale/bogus read
+    q = lambda sql, p: (verds if "canary_probe_verdict" in sql else [r for r in rows if r["ts"] >= p[0]])
+    out = pt.feint_pools(q, 0.0)
+    assert out["PH"]["watch_verdict"] is None  # the survivor read is ignored for a non-committed probe
+    row = pt.assemble(out, {}, 100.0, {}, 200.0)[0]
+    assert row["verdict"] == "honeypot" and row["watch_verdict"] is None  # shown as honeypot, not survivor
+    assert row["sent"] is False and row["committed"] is False  # $0 ever left the wallet
+
+
 def test_read_vaults_parses_token_amounts_from_base64():
     calls = {}
 
