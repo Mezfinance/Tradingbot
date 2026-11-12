@@ -664,10 +664,12 @@ class DirectPumpswapExecutor(JupiterExecutor):
         empty = {"ok": False, "swap_lamports": 0, "fee_lamports": 0, "note": "no sell"}
         settle_buy = None
         if blind:
-            # Blind fire: submit the pre-signed sell IMMEDIATELY, without waiting for the buy to be visible, so it races
-            # for N+1 (or N) instead of eating the observe-lag. If it reaches the leader before the buy lands the tokens
-            # don't exist yet and it reverts on-chain (final, dead); the confirmed fallback below then recovers the
-            # stake. We record `blind_reverted` so the revert rate can be measured.
+            # Blind fire: submit the pre-signed sell without waiting for the buy to be visible, after a short pause so
+            # it lands ONE slot after the buy (gap 1) instead of the same block (gap 0, which is net-zero at the slot
+            # boundary and so invisible to a reserve-polling rugger). The pause also lets the buy land first, cutting
+            # reverts; if the sell still reaches the leader before the buy, it reverts on-chain (final, dead) and the
+            # confirmed fallback below recovers the stake. We record `blind_reverted` so the revert rate can be measured.
+            self.sleep(max(0.0, getattr(self.cfg, "launch_canary_probe_delay_s", 0.2)))
             sell_sig = self._submit(sell_built, skip_preflight=True)
             out["sell_tx"] = None if sell_sig.startswith(NOT_SENT) else sell_sig
             settle_sell = self._settle_direct(sell_sig, token) if out["sell_tx"] else {**empty, "note": sell_sig}

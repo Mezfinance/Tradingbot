@@ -43,9 +43,12 @@ FIELDS: list[dict] = [
      "lo": 5, "hi": 300, "help": "Watch the pool this long after the probe (the measured max $25 pull age ~48s)."},
     {"key": "launch_canary_probe_margin_s", "label": "Probe margin (s)", "type": "float", "group": "Probe",
      "live": True, "lo": 0, "hi": 120, "help": "Extra margin on the watch before calling a pool a survivor."},
-    {"key": "launch_canary_probe_blind", "label": "Blind sell (race N+1)", "type": "bool", "group": "Probe",
-     "live": True, "help": "Fire the probe's sell blind, without waiting for the buy to be visible, to cut the slot "
-     "gap. A confirmed fallback sell recovers the stake if the blind one reverts. Off = the slower observe-lag path."},
+    {"key": "launch_canary_probe_blind", "label": "Blind sell (target N+1)", "type": "bool", "group": "Probe",
+     "live": True, "help": "Fire the probe's sell blind (after the pause below) to land it one slot after the buy "
+     "(gap 1). A confirmed fallback recovers the stake if it reverts. Off = the observe-lag path (gap 2, no reverts)."},
+    {"key": "launch_canary_probe_delay_s", "label": "Blind sell pause (s)", "type": "float", "group": "Probe",
+     "live": True, "lo": 0, "hi": 1, "help": "Blind only: wait this long after the buy before the sell, so it lands "
+     "in the next slot (gap 1) not the same block (gap 0). ~half a Solana slot (0.2)."},
     # --- sizing ---
     {"key": "launch_canary_flat_usd", "label": "Flat buy size ($)", "type": "float", "group": "Sizing", "live": True,
      "lo": 0, "hi": 500, "help": "> 0: every commit at this size (0 = use the band scale)."},

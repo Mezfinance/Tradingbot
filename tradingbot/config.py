@@ -130,13 +130,15 @@ class Config:
     launch_canary_probe_usd: float = 25.0  # the probe size; must be big enough to trip the size-reacting operators
     launch_canary_probe_watch_s: float = 48.0  # watch the pool this long after the probe (the measured max $25 pull age)
     launch_canary_probe_margin_s: float = 12.0  # extra margin on the watch before calling a pool a survivor
-    launch_canary_probe_blind: bool = False  # fire the probe's SELL blind, the instant the buy is sent, without waiting
-    # for the buy to be visible. OFF by default (11-13): blind reliably lands buy+sell in the SAME block (gap 0), which
-    # is net-zero at the slot boundary -- so a rugger polling the pool's committed reserves reads it exactly like the
-    # atomic feint (the money never persists as a readable committed state), undercutting the probe's whole purpose. The
-    # observe-lag path (blind off) lands committed money readable for a full slot or two before the pull -- which trips a
-    # state-watcher AND still escapes the ~18s reactive pull -- and never reverts. True = the blind race (+ a confirmed
-    # fallback sell on a revert); it only helps if sub-2-slot fast ruggers exist, and the data says they don't.
+    launch_canary_probe_blind: bool = True  # fire the probe's SELL blind (not waiting for the buy to be visible), after
+    # a short `launch_canary_probe_delay_s` pause. Firing INSTANTLY lands buy+sell in the same block (gap 0), which is
+    # net-zero at the slot boundary -- a rugger polling the pool's reserves reads it like the atomic feint, no committed
+    # money persists. The pause (half a slot) pushes the sell into N+1 (gap 1): the buy commits and is readable for a
+    # full slot before the pull -- so it trips a state-watcher AND still escapes the ~18s reactive pull -- while the
+    # pause also lets the buy land first, cutting the revert rate. A confirmed fallback sell still recovers a revert.
+    # False = the observe-lag path (poll until the buy is visible, then sell; gap 2, never reverts).
+    launch_canary_probe_delay_s: float = 0.2  # blind only: wait this long after sending the buy before firing the
+    # pre-signed sell, so it lands one slot after the buy (gap 1) instead of the same block (gap 0). ~half a Solana slot.
     launch_canary_probe_priority_sol: float = 0.0  # the probe's SELL can pay this much priority outright (max out, not
     # the capped estimate) to try to land in the next slot. OFF by default (0 = normal priority): a live test (11-12)
     # showed the gap stays 2-3 whether or not it is paid -- the gap is set by the observe-lag (we wait for the buy to be

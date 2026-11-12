@@ -297,10 +297,12 @@ class SlotRpc(PoolRpc):
 def probe_direct(**kw):
     kp = Keypair()
     rpc = SlotRpc(str(kp.pubkey()), **kw)
+    sleeps: list = []
     ex = d.DirectPumpswapExecutor(
         Config(max_price_impact_pct=5.0, db_path=":memory:", launch_canary_probe_priority_sol=0.005),
-        FakeJup(), http=rpc, keypair=kp, sell_slippage_bps=1000, sleep=lambda s: None)
+        FakeJup(), http=rpc, keypair=kp, sell_slippage_bps=1000, sleep=sleeps.append)
     ex.remember_pool(MINT, POOL)
+    ex._sleeps = sleeps  # the durations the probe slept, so the pause before the blind sell can be asserted
     return ex, rpc
 
 
@@ -366,6 +368,17 @@ def test_probe_1slot_trapped_when_the_blind_sell_and_the_fallback_both_revert():
     out = ex.probe_1slot(MINT, 25.0)
     assert out["verdict"] == "trapped" and out["escaped"] is False and out["recovered_sol"] == 0.0
     assert out["blind_reverted"] is True and out["used_fallback"] is True and len(rpc.raw) == 3
+
+
+def test_probe_blind_pauses_before_the_sell_to_target_gap_1():
+    ex, rpc = probe_direct()
+    ex.cfg.launch_canary_probe_blind = True
+    ex.cfg.launch_canary_probe_delay_s = 0.2  # push the sell into the next slot instead of the buy's own block
+    rpc.next_meta = [sol_meta(ex.owner, (0, 12_000_000), -(125_000_000 + 5_000 + 2_000_000), new_rent=2_000_000),
+                     sol_meta(ex.owner, (12_000_000, 0), 119_995_000)]
+    out = ex.probe_1slot(MINT, 25.0)
+    assert out["verdict"] == "ok" and out["blind"] is True
+    assert 0.2 in ex._sleeps  # the probe slept the pause between the buy and the blind sell
 
 
 def test_probe_1slot_observe_lag_path_waits_then_sells():
