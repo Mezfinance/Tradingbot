@@ -114,6 +114,7 @@ class PoolRpc(FakeRpc):
                       WSOL: acct(bytes(82), TOK), MINT: acct(bytes(82), T22),
                       BV: acct(vault(sol_reserve), TOK), QV: acct(vault(tok_reserve), T22)}
         self.raw = []
+        self.skips = []  # skipPreflight flag of each send, in order
 
     def post(self, url, json=None):
         m, p = json["method"], json["params"]
@@ -129,8 +130,9 @@ class PoolRpc(FakeRpc):
         if m == "simulateTransaction":  # a round-trip honeypot sim: err None = both legs execute (sellable)
             body = {"result": {"value": {"err": getattr(self, "sim_err", None)}}}
             return SimpleNamespace(json=lambda: body)
-        if m == "sendTransaction" and p[1].get("skipPreflight") is False:
+        if m == "sendTransaction":  # record every send (preflight on or skipped: the probe's sell skips it)
             self.raw.append(p[0])
+            self.skips.append(bool(p[1].get("skipPreflight")))
             if getattr(self, "drain_on_send", False):  # model an operator pull that fires in reaction to our feint
                 self.accts[BV] = acct(vault(1), TOK)
         return super().post(url, json)
@@ -312,6 +314,7 @@ def test_probe_1slot_lands_money_then_sells_in_the_next_slot():
     assert out["buy_slot"] == 100 and out["sell_slot"] == 101 and out["slot_gap"] == 1  # money sat one slot, then out
     assert out["spent_sol"] == pytest.approx(0.125) and out["recovered_sol"] == pytest.approx(0.12)
     assert len(rpc.raw) == 2 and not any("JUP" in str(t) for t in rpc.raw)  # TWO separate direct swaps, no Jupiter
+    assert rpc.skips == [False, True]  # buy runs preflight; the pre-signed sell skips it to land in the next slot
     # the sell leg spends exactly the buy's guaranteed-minimum tokens (the pre-signed floor), min out 1
     lamports = int(25.0 / 200 * 1e9)
     buy_min_out = int(d.amount_out(lamports, 10 * 10**9, 10**12, 30) * (10_000 - ex.cfg.slippage_bps) / 10_000)

@@ -43,7 +43,7 @@ BUY_EXACT_QUOTE_IN = bytes([198, 46, 21, 82, 180, 217, 232, 112])
 CU_LIMIT = 300_000  # real direct swaps use ~80-115k compute units; a first buy on a fresh pool also creates up to 3 fee accounts (~170k simulated 11-10)
 FEINT_CU_LIMIT = 500_000  # the feint is two swaps (buy + sell) plus the fee-account creation in one transaction
 PROBE_SLOT_WAIT_S = 2.5   # how long to wait for the probe's buy to be visible on-chain before firing the sell
-PROBE_POLL_S = 0.1        # how often to poll the buy's status while waiting
+PROBE_POLL_S = 0.05       # poll the buy's status this often (tight: fire the pre-signed sell the instant it is seen)
 GLOBAL_TTL_S = 600
 ROUTE = "direct"
 POOL_FILE = "canary_pools.json"  # next to the journal: mint -> pool of the canary's buys
@@ -335,22 +335,37 @@ class DirectPumpswapExecutor(JupiterExecutor):
                 self._swap_ix(st, "sell", buy_min_out, 1),  # tokens -> SOL, min out 1 so it can't revert on slippage
                 self._close_wsol_ix()]
 
-    def _send_ixs(self, ixs: list) -> str:
+    def _build_tx(self, ixs: list):
+        """Compile + sign a transaction from `ixs` and return (raw_b64, signature, last_valid_block_height), or None
+        if there is no blockhash. Building ahead of time lets the probe fire a pre-signed sell the instant the buy is
+        visible, instead of fetching a blockhash and compiling+signing on the critical path (the main latency cost)."""
         from solders.hash import Hash
         from solders.message import MessageV0
         from solders.transaction import VersionedTransaction
 
         latest = (self._rpc("getLatestBlockhash", [{"commitment": "confirmed"}]) or {}).get("value") or {}
         if not latest.get("blockhash"):
-            return f"{NOT_SENT} no blockhash"
+            return None
         msg = MessageV0.try_compile(self.keypair.pubkey(), ixs, [], Hash.from_string(latest["blockhash"]))
-        raw = base64.b64encode(bytes(VersionedTransaction(msg, [self.keypair]))).decode()
-        sig, err = self._rpc_err("sendTransaction", [raw, {"encoding": "base64", "skipPreflight": False, "maxRetries": 0}])
+        tx = VersionedTransaction(msg, [self.keypair])
+        return base64.b64encode(bytes(tx)).decode(), str(tx.signatures[0]), latest.get("lastValidBlockHeight")
+
+    def _submit(self, built, skip_preflight: bool = False) -> str:
+        """Send an already-built (raw, sig, lvbh) transaction. `skip_preflight` drops the preflight simulation round
+        trip — used for the probe's sell, which fires the moment the buy is processed (the tokens already exist)."""
+        if built is None:
+            return f"{NOT_SENT} no blockhash"
+        raw, _sig, lvbh = built
+        sig, err = self._rpc_err("sendTransaction",
+                                 [raw, {"encoding": "base64", "skipPreflight": skip_preflight, "maxRetries": 0}])
         if not sig:
             return f"{NOT_SENT} {str(err)[:120] if err else 'send failed'}"
-        self._pending[sig] = (raw, latest.get("lastValidBlockHeight"))
+        self._pending[sig] = (raw, lvbh)
         log.info("direct swap sent %s", sig)
         return sig
+
+    def _send_ixs(self, ixs: list) -> str:
+        return self._submit(self._build_tx(ixs))
 
     def _simulate_ixs(self, ixs: list) -> tuple[bool, str] | None:
         """Simulate these instructions on-chain and send NOTHING (sigVerify off, blockhash replaced). (ok, note):
@@ -616,6 +631,9 @@ class DirectPumpswapExecutor(JupiterExecutor):
         if buy_min_out <= 0:
             out["note"] = self.last_note = "probe: pool has no tokens"
             return out
+        # Pre-build and sign the sell NOW, before the buy, so firing it after the buy is a bare sendTransaction (no
+        # blockhash fetch, compile, sign or preflight on the critical path). It sells exactly buy_min_out (the floor).
+        sell_built = self._build_tx(self._instructions(st, "sell", buy_min_out, 1))
         buy_sig = self._send_ixs(self._instructions(st, "buy", lamports, buy_min_out))
         if buy_sig.startswith(NOT_SENT):
             out["note"] = self.last_note = f"probe: buy not sent ({buy_sig})"
@@ -633,7 +651,9 @@ class DirectPumpswapExecutor(JupiterExecutor):
                 self.last_note = out["note"]
                 return out
             buy_slot = None  # the buy landed late; its slot is no longer the thing we're racing
-        sell_sig = self._send_ixs(self._instructions(st, "sell", buy_min_out, 1))  # min out 1: recover whatever is there
+        # Fire the pre-signed sell the instant the buy is visible. skip_preflight: the buy is processed so the tokens
+        # exist, and a preflight sim would only add a round trip — this is the race to land in the next slot (N+1).
+        sell_sig = self._submit(sell_built, skip_preflight=True)
         out["sell_tx"] = None if sell_sig.startswith(NOT_SENT) else sell_sig
         settle_buy = settle_buy or self._settle_direct(buy_sig, token)
         settle_sell = self._settle_direct(sell_sig, token) if out["sell_tx"] else {"ok": False, "swap_lamports": 0,
