@@ -156,16 +156,25 @@ def probe_summary(journal, n: int = 500) -> dict:
     for d in vd.values():
         counts[d.get("verdict", "unknown")] = counts.get(d.get("verdict", "unknown"), 0) + 1
     decided = counts["rugger"] + counts["survivor"]
+    # blind-fire measurement: of the probes that fired the sell blind (not the observe-lag path), how many reverted
+    # (needed the confirmed fallback) and how many landed at each slot gap -- so the extra speed can be weighed.
+    blind = [_probe_detail(r) for r in probes if _probe_detail(r).get("blind")]
+    blind_reverted = sum(1 for d in blind if d.get("blind_reverted"))
+    gaps = [d["slot_gap"] for d in blind if d.get("slot_gap") is not None and not d.get("used_fallback")]
     recent = []
     for r in probes[:60]:
         d, v = _probe_detail(r), vd.get(r["token"], {})
         recent.append({"ts": r["ts"], "token": r["token"], "pool": d.get("pool"), "probe": d.get("verdict"),
                        "slot_gap": d.get("slot_gap"), "recovered_sol": d.get("recovered_sol"),
+                       "blind_reverted": d.get("blind_reverted"), "used_fallback": d.get("used_fallback"),
                        "watch": v.get("verdict")})
     probed_tokens = {r["token"] for r in probes}
     return {"probes": len(probes), "decided": decided, "pending": max(0, len(probed_tokens) - len(vd)),
             "rugger": counts["rugger"], "survivor": counts["survivor"], "unknown": counts.get("unknown", 0),
-            "trip_rate": round(counts["rugger"] / decided, 3) if decided else None, "recent": recent}
+            "trip_rate": round(counts["rugger"] / decided, 3) if decided else None,
+            "blind": len(blind), "blind_reverted": blind_reverted,
+            "blind_revert_rate": round(blind_reverted / len(blind), 3) if blind else None,
+            "blind_median_gap": (sorted(gaps)[len(gaps) // 2] if gaps else None), "recent": recent}
 
 
 def canary_one(journal) -> dict:
@@ -1638,7 +1647,7 @@ function b64urlToBuf(s){s=s.replace(/-/g,"+").replace(/_/g,"/");const pad=s.leng
 function bufToB64url(b){const bytes=new Uint8Array(b);let bin="";for(const x of bytes)bin+=String.fromCharCode(x);return btoa(bin).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}
 function probePoll(){if(R.v!=="settings"){window._pbStarted=false;return}renderProbe();clearTimeout(window._pbT);window._pbT=setTimeout(probePoll,5000)}
 function renderProbe(){const t=$("pb-tiles");if(!t)return;fetch("api/canary/probes").then(r=>r.json()).then(d=>{
-t.innerHTML=[["Probed",d.probes],["Rugger",d.rugger],["Survivor",d.survivor],["Trip rate",d.trip_rate==null?"—":(d.trip_rate*100).toFixed(0)+"%"],["Pending",d.pending]].map(([k,v])=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+t.innerHTML=[["Probed",d.probes],["Rugger",d.rugger],["Survivor",d.survivor],["Trip rate",d.trip_rate==null?"—":(d.trip_rate*100).toFixed(0)+"%"],["Blind revert",d.blind_revert_rate==null?"—":(d.blind_revert_rate*100).toFixed(0)+"%"],["Blind gap",d.blind_median_gap==null?"—":d.blind_median_gap],["Pending",d.pending]].map(([k,v])=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
 const rows=d.recent||[];$("pb-recent").innerHTML="<tr><th>Token</th><th>Probe</th><th>Gap</th><th>Recovered SOL</th><th>Watch</th></tr>"+(rows.length?rows.map(r=>`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${esc(r.probe||"")}</td><td>${r.slot_gap==null?"—":r.slot_gap}</td><td>${r.recovered_sol==null?"—":r.recovered_sol}</td><td class="${r.watch==='rugger'?'neg':r.watch==='survivor'?'pos':''}">${esc(r.watch||"…")}</td></tr>`).join(""):'<tr><td colspan="5" class="sub">No probes yet. Enable the 1-slot probe preset and start the canary.</td></tr>')}).catch(()=>{})}
 function probeOne(){const b=$("pb-one");b.disabled=true;$("pb-one-note").textContent="arming…";
 fetch("api/canary/probe-one",{method:"POST"}).then(r=>r.json()).then(d=>{b.disabled=false;$("pb-one-note").textContent=d.msg||"armed."}).catch(e=>{b.disabled=false;$("pb-one-note").textContent="error: "+e})}

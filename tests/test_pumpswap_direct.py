@@ -340,14 +340,40 @@ def test_probe_1slot_sim_gate_blocks_a_honeypot_before_committing():
     assert not rpc.sent and not rpc.raw  # caught for free: not a cent committed
 
 
-def test_probe_1slot_trapped_when_the_sell_cannot_recover():
+def test_probe_1slot_blind_sell_reverts_then_the_confirmed_fallback_recovers():
     ex, rpc = probe_direct()
-    # the buy lands, but the sell reverts (a pull beat our next-slot sell, or a dynamic honeypot): the stake is stuck.
+    rpc.bal[MINT] = 12_000_000  # the buy's tokens are in the wallet after it lands
+    # buy lands (slot 100); the blind sell fired before the buy landed and reverted (slot 101); the confirmed fallback
+    # sell (slot 102) then sells the tokens and recovers the SOL -- the backup that makes blind-fire safe.
     rpc.next_meta = [sol_meta(ex.owner, (0, 12_000_000), -(125_000_000 + 5_000 + 2_000_000), new_rent=2_000_000),
-                     sol_meta(ex.owner, (12_000_000, 12_000_000), -5_000, err={"InstructionError": [6, {"Custom": 6004}]})]
+                     sol_meta(ex.owner, (12_000_000, 12_000_000), -5_000, err={"InstructionError": [6, {"Custom": 6004}]}),
+                     sol_meta(ex.owner, (12_000_000, 0), 119_995_000)]
     out = ex.probe_1slot(MINT, 25.0)
-    assert out["verdict"] == "trapped" and out["escaped"] is False
-    assert out["recovered_sol"] == 0.0 and len(rpc.raw) == 2  # both legs were sent; only the buy landed money
+    assert out["verdict"] == "ok" and out["escaped"] is True
+    assert out["blind"] is True and out["blind_reverted"] is True and out["used_fallback"] is True
+    assert len(rpc.raw) == 3 and out["recovered_sol"] == pytest.approx(0.12)  # buy + blind revert + confirmed fallback
+
+
+def test_probe_1slot_trapped_when_the_blind_sell_and_the_fallback_both_revert():
+    ex, rpc = probe_direct()
+    rpc.bal[MINT] = 12_000_000
+    # buy lands, the blind sell reverts, and the confirmed fallback ALSO reverts (pool drained) -> the stake is stuck.
+    rev = lambda: sol_meta(ex.owner, (12_000_000, 12_000_000), -5_000, err={"InstructionError": [6, {"Custom": 6004}]})
+    rpc.next_meta = [sol_meta(ex.owner, (0, 12_000_000), -(125_000_000 + 5_000 + 2_000_000), new_rent=2_000_000),
+                     rev(), rev()]
+    out = ex.probe_1slot(MINT, 25.0)
+    assert out["verdict"] == "trapped" and out["escaped"] is False and out["recovered_sol"] == 0.0
+    assert out["blind_reverted"] is True and out["used_fallback"] is True and len(rpc.raw) == 3
+
+
+def test_probe_1slot_observe_lag_path_waits_then_sells():
+    ex, rpc = probe_direct()
+    ex.cfg.launch_canary_probe_blind = False  # the old path: wait for the buy to be visible, then fire the sell
+    rpc.next_meta = [sol_meta(ex.owner, (0, 12_000_000), -(125_000_000 + 5_000 + 2_000_000), new_rent=2_000_000),
+                     sol_meta(ex.owner, (12_000_000, 0), 119_995_000)]
+    out = ex.probe_1slot(MINT, 25.0)
+    assert out["verdict"] == "ok" and out["blind"] is False and out.get("used_fallback") is None  # no fallback branch
+    assert len(rpc.raw) == 2 and out["slot_gap"] == 1
 
 
 def test_direct_buy_declines_without_enough_sol_or_on_a_thin_pool():

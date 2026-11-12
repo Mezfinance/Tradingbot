@@ -43,6 +43,9 @@ FIELDS: list[dict] = [
      "lo": 5, "hi": 300, "help": "Watch the pool this long after the probe (the measured max $25 pull age ~48s)."},
     {"key": "launch_canary_probe_margin_s", "label": "Probe margin (s)", "type": "float", "group": "Probe",
      "live": True, "lo": 0, "hi": 120, "help": "Extra margin on the watch before calling a pool a survivor."},
+    {"key": "launch_canary_probe_blind", "label": "Blind sell (race N+1)", "type": "bool", "group": "Probe",
+     "live": True, "help": "Fire the probe's sell blind, without waiting for the buy to be visible, to cut the slot "
+     "gap. A confirmed fallback sell recovers the stake if the blind one reverts. Off = the slower observe-lag path."},
     # --- sizing ---
     {"key": "launch_canary_flat_usd", "label": "Flat buy size ($)", "type": "float", "group": "Sizing", "live": True,
      "lo": 0, "hi": 500, "help": "> 0: every commit at this size (0 = use the band scale)."},

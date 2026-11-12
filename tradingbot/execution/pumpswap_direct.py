@@ -595,6 +595,18 @@ class DirectPumpswapExecutor(JupiterExecutor):
             self.sleep(PROBE_POLL_S)
         return False, None
 
+    def _confirmed_sell(self, st: dict, token: str, min_amount: int = 0) -> tuple[str, dict]:
+        """A plain confirmed sell (preflight on) of the whole token balance back to SOL. The probe's fallback when the
+        blind sell reverts: the buy has landed so the tokens exist, and this recovers the stake. Returns (sig, settle);
+        a sell that reverts (pool emptied / rugged) leaves the stake trapped, the honest outcome."""
+        bal = int(self.token_balance(token) or min_amount or 0)
+        if bal <= 0:
+            return "", {"ok": False, "swap_lamports": 0, "fee_lamports": 0, "note": "fallback: no balance"}
+        sig = self._send_ixs(self._instructions(st, "sell", bal, 1))
+        if sig.startswith(NOT_SENT):
+            return sig, {"ok": False, "swap_lamports": 0, "fee_lamports": 0, "note": f"fallback: {sig}"}
+        return sig, self._settle_direct(sig, token)
+
     def probe_1slot(self, token: str, usd: float) -> dict:
         """Two-transaction probe (11-13, measurement): buy `usd` of the token (slot N) so committed money LANDS in the
         pool, then sell the buy's guaranteed-minimum tokens straight back in the next slot (slot N+1). Landing money and
@@ -642,36 +654,58 @@ class DirectPumpswapExecutor(JupiterExecutor):
         # at max priority so it lands in the next slot (N+1), not N+2 -- the race to escape the rug.
         sell_built = self._build_tx(self._instructions(
             st, "sell", buy_min_out, 1, max_priority_sol=getattr(self.cfg, "launch_canary_probe_priority_sol", 0.0) or None))
+        blind = bool(getattr(self.cfg, "launch_canary_probe_blind", True))
+        out["blind"] = blind
         buy_sig = self._send_ixs(self._instructions(st, "buy", lamports, buy_min_out))
         if buy_sig.startswith(NOT_SENT):
             out["note"] = self.last_note = f"probe: buy not sent ({buy_sig})"
             return out
         out["buy_tx"] = buy_sig
-        buy_ok, buy_slot = self._wait_visible(buy_sig, PROBE_SLOT_WAIT_S)
+        empty = {"ok": False, "swap_lamports": 0, "fee_lamports": 0, "note": "no sell"}
         settle_buy = None
-        if not buy_ok:
-            # Not visible inside the fast window: resolve it (resend + confirm). If it truly reverted / never landed,
-            # no money landed and there is nothing to sell. If it landed slowly, the fast N+1 is lost but we still sell
-            # the floor to get the stake out, rather than leave it exposed.
+        if blind:
+            # Blind fire: submit the pre-signed sell IMMEDIATELY, without waiting for the buy to be visible, so it races
+            # for N+1 (or N) instead of eating the observe-lag. If it reaches the leader before the buy lands the tokens
+            # don't exist yet and it reverts on-chain (final, dead); the confirmed fallback below then recovers the
+            # stake. We record `blind_reverted` so the revert rate can be measured.
+            sell_sig = self._submit(sell_built, skip_preflight=True)
+            out["sell_tx"] = None if sell_sig.startswith(NOT_SENT) else sell_sig
+            settle_sell = self._settle_direct(sell_sig, token) if out["sell_tx"] else {**empty, "note": sell_sig}
             settle_buy = self._settle_direct(buy_sig, token)
-            if not (settle_buy["ok"] and settle_buy["token"] > 0):
-                out["verdict"], out["note"] = "buy_failed", "probe: buy reverted / not visible"
-                self.last_note = out["note"]
-                return out
-            buy_slot = None  # the buy landed late; its slot is no longer the thing we're racing
-        # Fire the pre-signed sell the instant the buy is visible. skip_preflight: the buy is processed so the tokens
-        # exist, and a preflight sim would only add a round trip — this is the race to land in the next slot (N+1).
-        sell_sig = self._submit(sell_built, skip_preflight=True)
-        out["sell_tx"] = None if sell_sig.startswith(NOT_SENT) else sell_sig
-        settle_buy = settle_buy or self._settle_direct(buy_sig, token)
-        settle_sell = self._settle_direct(sell_sig, token) if out["sell_tx"] else {"ok": False, "swap_lamports": 0,
-                                                                                   "fee_lamports": 0, "note": sell_sig}
+            out["blind_reverted"] = not settle_sell["ok"]
+            if not settle_sell["ok"] and settle_buy["ok"] and settle_buy["token"] > 0:
+                # the blind sell did not recover but the buy's money is in the pool: a confirmed sell (preflight on,
+                # the tokens now exist) gets the stake out. This is the backup for a blind revert.
+                out["used_fallback"] = True
+                sell_sig, settle_sell = self._confirmed_sell(st, token, settle_buy["token"])
+            else:
+                out["used_fallback"] = False
+        else:
+            # Observe-lag path: wait for the buy to be visible, then fire the pre-signed sell (lands N+1 at best).
+            buy_ok, _ = self._wait_visible(buy_sig, PROBE_SLOT_WAIT_S)
+            if not buy_ok:
+                settle_buy = self._settle_direct(buy_sig, token)
+                if not (settle_buy["ok"] and settle_buy["token"] > 0):
+                    out["verdict"], out["note"] = "buy_failed", "probe: buy reverted / not visible"
+                    self.last_note = out["note"]
+                    return out
+            sell_sig = self._submit(sell_built, skip_preflight=True)
+            out["sell_tx"] = None if sell_sig.startswith(NOT_SENT) else sell_sig
+            settle_buy = settle_buy or self._settle_direct(buy_sig, token)
+            settle_sell = self._settle_direct(sell_sig, token) if out["sell_tx"] else {**empty, "note": sell_sig}
+        if not (settle_buy["ok"] and settle_buy["token"] > 0):  # the buy never landed: nothing was committed
+            out["verdict"], out["note"] = "buy_failed", "probe: buy reverted / not visible"
+            self.last_note = out["note"]
+            return out
         spent = -settle_buy["swap_lamports"] / 1e9
         recovered = settle_sell["swap_lamports"] / 1e9 if settle_sell["ok"] else 0.0
         fees = (settle_buy["fee_lamports"] + settle_sell["fee_lamports"]) / 1e9
-        out["buy_slot"], sell_tx = buy_slot, self._fetch_tx(sell_sig) if out["sell_tx"] else None
+        buy_tx = self._fetch_tx(buy_sig)
+        out["buy_slot"] = (buy_tx or {}).get("slot")
+        sell_tx = self._fetch_tx(sell_sig) if (sell_sig and not sell_sig.startswith(NOT_SENT)) else None
         out["sell_slot"] = (sell_tx or {}).get("slot")
-        out["slot_gap"] = (out["sell_slot"] - buy_slot) if (out["sell_slot"] is not None and buy_slot is not None) else None
+        out["slot_gap"] = ((out["sell_slot"] - out["buy_slot"])
+                           if (out["sell_slot"] is not None and out["buy_slot"] is not None) else None)
         out["spent_sol"], out["recovered_sol"] = round(spent, 6), round(recovered, 6)
         out["net_usd"] = round((recovered - spent - fees) * sol_usd, 4)
         out["escaped"] = settle_sell["ok"] and recovered > 0
