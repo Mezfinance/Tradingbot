@@ -123,6 +123,61 @@ def canary_switch(journal, action: str) -> dict:
     raise ValueError(f"unknown canary action {action!r}")
 
 
+_ROTATE = {"proc": None, "started": 0.0, "args": None}
+_ROTATE_LOCK = threading.Lock()
+
+
+def _provision_log(cfg) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(cfg.db_path)), "provision.log")
+
+
+def canary_rotate(journal, cfg, wallets, sol) -> dict:
+    """Rotate the canary's trading wallets from the dashboard: halt the canary, then run `provision --apply` as a
+    background process on this machine (it sweeps the current wallets + treasury into a fresh treasury, mints
+    `wallets` new wallets and funds each with `sol` SOL, topping up from the reserve). Keys never reach the page --
+    provision prints only addresses and the plan. The bot must be restarted to trade the new set, then Start."""
+    from tradingbot.engine import CANARY_HALT
+    try:
+        wallets, sol = int(wallets), float(sol)
+    except (TypeError, ValueError):
+        raise ValueError("wallets must be a whole number and sol a number")
+    if not 1 <= wallets <= 10:
+        raise ValueError("wallets must be between 1 and 10")
+    if not 0.01 <= sol <= 5:
+        raise ValueError("sol per wallet must be between 0.01 and 5")
+    with _ROTATE_LOCK:
+        p = _ROTATE["proc"]
+        if p is not None and p.poll() is None:
+            return {"started": False, "msg": "A wallet rotation is already running."}
+        journal.set_state(CANARY_HALT, repr(time.time()))  # stop feints/buys before sweeping the wallets
+        with open(_provision_log(cfg), "w") as fh:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "tradingbot", "provision", "--wallets", str(wallets), "--sol", str(sol),
+                 "--apply"], stdout=fh, stderr=subprocess.STDOUT,
+                env={**os.environ, "TB_DB_PATH": cfg.db_path}, start_new_session=True)
+        _ROTATE.update(proc=proc, started=time.time(), args={"wallets": wallets, "sol": sol})
+    log.info("dashboard: wallet rotation started (%d wallets, %.3f SOL each)", wallets, sol)
+    return {"started": True, "wallets": wallets, "sol": sol,
+            "msg": (f"Rotating to {wallets} fresh wallets at {sol} SOL each. The canary is halted; restart the bot "
+                    "(fly deploy) to trade the new set, then press Start. Watch the log below.")}
+
+
+def rotate_log(cfg, lines: int = 400) -> dict:
+    """The tail of the running (or last) wallet rotation, for the dashboard to show progress. Addresses only."""
+    with _ROTATE_LOCK:
+        p = _ROTATE["proc"]
+        running = p is not None and p.poll() is None
+        code = None if (p is None or running) else p.returncode
+        started, args = _ROTATE["started"], _ROTATE["args"]
+    text = ""
+    try:
+        with open(_provision_log(cfg)) as fh:
+            text = "".join(fh.readlines()[-lines:])
+    except OSError:
+        pass
+    return {"running": running, "returncode": code, "log": text, "started": started, "args": args}
+
+
 WALLETS_POLL_S = 60  # balances change slowly; the public RPC keeps it off the Helius budget
 WALLETS_RPC = os.environ.get("TB_WALLETS_RPC") or "https://api.mainnet-beta.solana.com"
 
@@ -904,6 +959,13 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div id="w-note"></div>
 <div class="stats" id="w-tiles"></div>
 <section class="card"><p class="label eyebrow">Live set</p><h2>Trading wallets, treasury, reserve</h2><p class="sub">Numbered 1..n in rotation order. SOL = current balance; Txs = signatures on the wallet (feints and trades both count; a fresh wallet funds at one tx, a direct-route rug drains it to ~0).</p><div class="scroll"><table id="w-live"></table></div></section>
+<section class="card"><p class="label eyebrow">Rotate · real money</p><h2>Rotate trading wallets</h2>
+<p class="sub">Mint a fresh set of wallets and a new treasury, sweep every current wallet and the treasury into it, and fund each new wallet (topping up from the reserve). This <b>halts the canary</b>; restart the bot (fly deploy) to trade the new set, then press Start on the overview. Keys never appear here — only addresses and the plan.</p>
+<div style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap;margin:4px 0 10px">
+<label style="display:flex;flex-direction:column;gap:4px;font-weight:700">Wallets<input id="rot-n" type="number" min="1" max="10" value="10" style="width:90px;padding:6px 8px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit"></label>
+<label style="display:flex;flex-direction:column;gap:4px;font-weight:700">SOL each<input id="rot-sol" type="number" min="0.01" max="5" step="0.01" value="0.2" style="width:110px;padding:6px 8px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit"></label>
+<button id="rot-go" onclick="canaryRotate()" style="padding:8px 18px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Rotate wallets</button></div>
+<pre id="rot-log" hidden style="white-space:pre-wrap;word-break:break-word;background:var(--sunken);border:2px solid var(--rule-soft);padding:10px;max-height:320px;overflow:auto;font:500 12px/1.5 var(--mono)"></pre></section>
 <section class="card"><p class="label eyebrow">Archive</p><h2>Retired wallets and treasuries</h2><p class="sub">Every other address the key-free address book has recorded, with its label. Old trading wallets and treasuries should read ~0 SOL once swept.</p><div class="scroll"><table id="w-arch"></table></div></section>
 </main>
 <main id="v-pools" hidden>
@@ -1274,6 +1336,7 @@ const live=W.live||[],arch=W.archive||[],trading=live.filter(w=>w.role==="tradin
 const when=W.fetched_ts?new Date(W.fetched_ts*1000).toLocaleTimeString([],{hour12:false}):"–";
 tiles("w-tiles",[["Trading wallets",String(trading.length),W.rotate?"rotating · "+(W.route||"direct"):(W.route||"direct")],["Trading SOL",fmt(W.trading_sol||0,3),"across the live set"],["Treasury",tre?fmt(tre.sol||0,3):"–","SOL · idle funds"],["Reserve",res?fmt(res.sol||0,3):"–","SOL · tops up wallets"],["Updated",when,"public RPC, each minute"]]);
 $("w-live").innerHTML=`<tr><th>#</th><th>Role</th><th>Address</th><th>SOL</th><th>Txs</th><th class="l">Label</th></tr>`+(live.length?live.map(walletRow).join(""):`<tr><td class="muted">No wallets loaded (the canary may be off or no wallets file is set).</td></tr>`);
+checkRotate();
 $("w-arch").innerHTML=`<tr><th>Address</th><th class="l">Label</th><th>SOL</th><th>First recorded</th></tr>`+(arch.length?arch.map(w=>`<tr><td>${walletLink(w.address)}</td><td class="l">${esc(w.label||"")}</td><td class="num">${w.sol!=null?fmt(w.sol,4):"–"}</td><td class="mono">${w.created?esc(String(w.created).slice(0,10)):"–"}</td></tr>`).join(""):`<tr><td class="muted">No archived wallets.</td></tr>`)}
 const PLIQ=v=>v==null?"–":(Math.abs(v)>=1000?"$"+(v/1000).toFixed(1)+"k":"$"+v.toFixed(0));
 const PAGE2=s=>s==null?"–":agoStr(Math.round(s));
@@ -1282,6 +1345,19 @@ function poolRow(r){const neg=r.pnl25!=null&&r.pnl25<0,win=r.pnl25!=null&&r.pnl2
 const vt=r.verdict==="alive"?'<span class="tag lime">alive</span>':r.verdict==="pulled"?'<span class="tag neg">pulled</span>':r.verdict?'<span class="tag">'+esc(r.verdict)+'</span>':"–";
 const lk=r.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(r.pool)}" target="_blank" rel="noopener">${esc((r.mint||r.pool).slice(0,8))}</a>`:esc((r.mint||"").slice(0,8));
 return`<tr><td>${lk}</td><td>${vt}</td><td class="num">${PAGE2(r.pool_age_s)}</td><td class="num">${PAGE2(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PAGE2(r.pull_pool_age_s):"–"}</td><td class="num">${r.pulled?PAGE2(r.pull_after_probe_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–"}<span class="muted"> ${PPCT(r.ret_m6)}</span></td><td class="num">${r.opt_age_s!=null?PAGE2(r.opt_age_s)+" ":""}<span class="${r.opt_ret>0?'pos':r.opt_ret<0?'neg':'muted'}">${PPCT(r.opt_ret)}</span></td></tr>`}
+function canaryRotate(){const n=+($("rot-n").value||0),s=+($("rot-sol").value||0);
+if(!(n>=1&&n<=10)){alert("Wallets must be between 1 and 10.");return}
+if(!(s>=0.01&&s<=5)){alert("SOL per wallet must be between 0.01 and 5.");return}
+if(!confirm(`Rotate to ${n} fresh wallets with ${s} SOL each?\n\nThis sweeps ALL current trading wallets and the treasury into a NEW treasury, mints ${n} new wallets and funds them (topping up from the reserve). The canary will be HALTED. You must restart the bot (fly deploy) to use the new wallets.`))return;
+const go=$("rot-go");go.disabled=true;$("rot-log").hidden=false;$("rot-log").textContent="Starting the rotation…";
+fetch("api/canary/rotate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({wallets:n,sol:s})}).then(r=>r.json()).then(d=>{
+if(d&&d.started){$("rot-log").textContent=(d.msg||"Started.")+"\n\n";pollRotate()}else{go.disabled=false;$("rot-log").textContent=(d&&(d.msg||d.error))||"Could not start the rotation."}
+}).catch(e=>{go.disabled=false;$("rot-log").textContent="Could not reach the rotation endpoint: "+e})}
+let rotPoll=false;
+function pollRotate(){rotPoll=true;fetch("api/canary/rotate/log").then(r=>r.json()).then(d=>{
+$("rot-log").hidden=false;$("rot-log").textContent=(d.log||"(no output yet)")+(d.running?"\n\n… running …":d.returncode===0?"\n\n✓ Done. Restart the bot (fly deploy), then press Start on the overview.":"\n\n✗ Rotation exited with code "+d.returncode+". Nothing was swapped if it failed before the final step — read the log.");
+const lg=$("rot-log");lg.scrollTop=lg.scrollHeight;if(d.running)setTimeout(pollRotate,2000);else{rotPoll=false;$("rot-go").disabled=false}}).catch(()=>setTimeout(pollRotate,3000))}
+function checkRotate(){if(rotPoll)return;fetch("api/canary/rotate/log").then(r=>r.json()).then(d=>{if(d&&d.started){$("rot-log").hidden=false;$("rot-log").textContent=d.log||"";if(d.running){$("rot-go").disabled=true;pollRotate()}}}).catch(()=>{})}
 function renderPools(){const P=S.pools,note=$("p-note");
 if(!P){note.innerHTML='<p class="note">Loading pool reserves…</p>';["p-tiles","p-tbl"].forEach(i=>$(i).innerHTML="");return}
 const s=P.summary||{},rows=P.rows||[];const when=P.fetched_ts?agoStr(Math.max(0,Math.round(Date.now()/1000-P.fetched_ts)))+" ago":"–";

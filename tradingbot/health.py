@@ -141,12 +141,16 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 self._send(200, json.dumps(address_book()).encode(), "application/json")
                 return
             from tradingbot import dashboard as dash
-            if dashboard is None or not dash.token() or path not in ("/", "/api/stream", "/api/summary"):
+            if dashboard is None or not dash.token() \
+                    or path not in ("/", "/api/stream", "/api/summary", "/api/canary/rotate/log"):
                 self.send_error(404)
                 return
             if not dash.authorised(self.headers, query):
                 self._send(401, b"Open this page once with ?key=<DASHBOARD_TOKEN> at the end of the address.",
                            "text/plain; charset=utf-8")
+                return
+            if path == "/api/canary/rotate/log":  # progress of a running wallet rotation (addresses only, no keys)
+                self._send(200, json.dumps(dash.rotate_log(cfg)).encode(), "application/json")
                 return
             if query.get("key"):  # remember the key in a cookie, then drop it from the address bar
                 cookie = f"{dash.COOKIE}={query['key'][0]}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Strict"
@@ -175,19 +179,26 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
             url = urlsplit(self.path)
             path, query = url.path.rstrip("/") or "/", parse_qs(url.query)
             from tradingbot import dashboard as dash
-            if dashboard is None or not dash.token() or path not in ("/api/canary/stop", "/api/canary/start"):
+            if dashboard is None or not dash.token() \
+                    or path not in ("/api/canary/stop", "/api/canary/start", "/api/canary/rotate"):
                 self.send_error(404)
                 return
             if not dash.authorised(self.headers, query):
                 self._send(401, b"unauthorised", "text/plain; charset=utf-8")
                 return
             length = int(self.headers.get("Content-Length") or 0)
-            if length:
-                self.rfile.read(length)  # drain the request body
+            body = self.rfile.read(length) if length else b""
             try:
-                res = dash.canary_switch(journal, "stop" if path.endswith("stop") else "start")
-                log.info("dashboard canary switch: %s", res.get("msg"))
+                if path == "/api/canary/rotate":
+                    data = json.loads(body or b"{}")
+                    res = dash.canary_rotate(journal, cfg, data.get("wallets"), data.get("sol"))
+                    log.info("dashboard wallet rotation: %s", res.get("msg"))
+                else:
+                    res = dash.canary_switch(journal, "stop" if path.endswith("stop") else "start")
+                    log.info("dashboard canary switch: %s", res.get("msg"))
                 self._send(200, json.dumps(res).encode(), "application/json")
+            except ValueError as e:
+                self._send(400, json.dumps({"error": str(e)}).encode(), "application/json")
             except Exception as e:  # noqa: BLE001 (report the failure, never crash the server)
                 self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
 

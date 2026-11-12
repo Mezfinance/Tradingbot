@@ -374,3 +374,74 @@ def test_fetch_pools_joins_feints_to_the_scorer_and_reads_young_reserves(cfg):
 
     board.fetch_pools(lambda m, p: (_ for _ in ()).throw(RuntimeError("rpc down")))
     assert board.pools["stale"] is True and "rpc down" in board.pools["error"] and board.pools["rows"]
+
+
+def test_canary_rotate_validates_halts_and_launches_provision(cfg, tmp_path, monkeypatch):
+    import pytest
+    from tradingbot.engine import CANARY_HALT
+    dash._ROTATE.update(proc=None, started=0.0, args=None)  # module global: start clean
+    cfg.db_path = str(tmp_path / "j.db")
+    j = Journal(cfg.db_path)
+    for bad in [(0, 0.2), (11, 0.2), (5, 0.0), (5, 9.0), ("x", 0.2)]:
+        with pytest.raises(ValueError):
+            dash.canary_rotate(j, cfg, *bad)
+    assert j.get_state(CANARY_HALT) is None  # a rejected request changes nothing
+
+    calls = {}
+
+    class FakeProc:
+        done = False
+        returncode = 0
+
+        def poll(self):
+            return 0 if self.done else None
+
+    fp = FakeProc()
+
+    def fake_popen(argv, **kw):
+        calls["argv"] = argv
+        kw["stdout"].write("provisioning the new wallets…\n")
+        return fp
+
+    monkeypatch.setattr(dash.subprocess, "Popen", fake_popen)
+    res = dash.canary_rotate(j, cfg, 7, 0.25)
+    assert res["started"] is True and res["wallets"] == 7
+    assert j.get_state(CANARY_HALT) is not None  # halted before sweeping
+    assert calls["argv"][:4] == [dash.sys.executable, "-m", "tradingbot", "provision"]
+    assert "7" in calls["argv"] and "0.25" in calls["argv"] and "--apply" in calls["argv"]
+    lg = dash.rotate_log(cfg)
+    assert lg["running"] is True and "provisioning" in lg["log"]
+    assert dash.canary_rotate(j, cfg, 7, 0.25)["started"] is False  # refused while one runs
+    fp.done = True
+    assert dash.rotate_log(cfg)["running"] is False and dash.rotate_log(cfg)["returncode"] == 0
+    dash._ROTATE.update(proc=None, started=0.0, args=None)
+
+
+def test_rotate_endpoint_is_behind_the_password(cfg, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
+    cfg.health_port = 18771
+    j = Journal(":memory:")
+    board = dash.Dashboard(j, cfg)
+    board.refresh()
+    monkeypatch.setattr(dash, "canary_rotate",
+                        lambda journal, c, w, s: {"started": True, "wallets": w, "sol": s, "msg": "ok"})
+    server = health.start_health_server(j, cfg, board)
+
+    def post(body, cookie=None):
+        c = http.client.HTTPConnection("127.0.0.1", 18771, timeout=5)
+        h = {"Content-Type": "application/json"}
+        if cookie:
+            h["Cookie"] = cookie
+        c.request("POST", "/api/canary/rotate", body=body, headers=h)
+        r = c.getresponse()
+        return r.status, r.read()
+    try:
+        assert post(json.dumps({"wallets": 5, "sol": 0.3}).encode())[0] == 401  # no password
+        code, body = post(json.dumps({"wallets": 5, "sol": 0.3}).encode(), cookie="tb_dash=s3cret")
+        assert code == 200 and json.loads(body)["started"] is True and json.loads(body)["wallets"] == 5
+        # a validation error comes back as a 400, not a 500
+        monkeypatch.setattr(dash, "canary_rotate",
+                            lambda journal, c, w, s: (_ for _ in ()).throw(ValueError("bad")))
+        assert post(json.dumps({"wallets": 99, "sol": 1}).encode(), cookie="tb_dash=s3cret")[0] == 400
+    finally:
+        server.shutdown()
