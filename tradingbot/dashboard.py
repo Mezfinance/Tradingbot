@@ -162,6 +162,29 @@ def canary_rotate(journal, cfg, wallets, sol) -> dict:
                     "(fly deploy) to trade the new set, then press Start. Watch the log below.")}
 
 
+def canary_settings_menu(cfg) -> dict:
+    from tradingbot import canary_settings
+    return {**canary_settings.menu(cfg), "overlay": bool(canary_settings.load_overlay(cfg))}
+
+
+def canary_settings_update(cfg, journal, body: dict) -> dict:
+    """Apply a settings change from the dashboard: a preset, a reset, or a {changes} map. Live fields take effect at
+    once (the engine shares this cfg); restart-bound ones are persisted and reported as needing a restart."""
+    from tradingbot import canary_settings
+    if body.get("reset"):
+        canary_settings.reset(cfg)
+        return {"reset": True, "values": canary_settings.current(cfg),
+                "msg": "Canary settings reset to the deploy (fly.toml) values."}
+    if body.get("preset"):
+        name = body["preset"]
+        if name not in canary_settings.PRESETS:
+            raise ValueError(f"unknown preset {name!r}")
+        res = canary_settings.apply(cfg, journal, canary_settings.PRESETS[name]["values"])
+        res["preset"] = name
+        return res
+    return canary_settings.apply(cfg, journal, body.get("changes") or {})
+
+
 def rotate_log(cfg, lines: int = 400) -> dict:
     """The tail of the running (or last) wallet rotation, for the dashboard to show progress. Addresses only."""
     with _ROTATE_LOCK:
@@ -886,7 +909,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <span id="built" class="label muted"></span></div>
 </header>
 <nav class="tabs" aria-label="Programs"><a href="#/" data-v="programs">MZFq</a><a href="#/supermeme" data-v="supermeme" id="tab-meme">Supermeme</a><a href="#/shorts" data-v="shorts">MZF Short Only</a></nav>
-<nav class="tabs sub" id="subtabs" aria-label="Supermeme"><a href="#/supermeme" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a><a href="#/market" data-v="market">Market</a><a href="#/wallets" data-v="wallets">Wallets</a><a href="#/pools" data-v="pools">Pool tracker</a></nav>
+<nav class="tabs sub" id="subtabs" aria-label="Supermeme"><a href="#/supermeme" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a><a href="#/market" data-v="market">Market</a><a href="#/wallets" data-v="wallets">Wallets</a><a href="#/pools" data-v="pools">Pool tracker</a><a href="#/settings" data-v="settings">Canary</a></nav>
 <main id="v-programs" hidden>
 <div><p class="label eyebrow">Quant programs · paper trading</p><h1>MZFq</h1>
 <p class="lead">Each program holds its strategies; Supermeme's are grouped into families of books. Everything here is paper trading.</p></div>
@@ -977,6 +1000,14 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div class="filters"><select id="p-filter" aria-label="Filter"><option value="all">All pools</option><option value="alive">Alive at probe</option><option value="pulled">Pulled</option><option value="live">Still live (&lt;25m)</option><option value="win">$25 in profit</option></select></div>
 <div class="scroll"><table id="p-tbl"></table></div></section>
 </main>
+<main id="v-settings" hidden>
+<div><p class="label eyebrow"><a class="lk" href="#/supermeme">Supermeme</a> · launch canary · real money</p><h1>Canary settings</h1>
+<p class="lead">Preset modes set every setting at once; edit any field below. <b>Probe, sizing and limit</b> changes take effect immediately (the engine shares this config). <b>Route, budget and fees</b> apply after a restart (fly deploy). Every change is confirmed and saved so it survives a redeploy.</p></div>
+<div id="cs-note"></div>
+<section class="card"><p class="label eyebrow">Presets</p><h2>Modes</h2><p class="sub">Each applies a coherent set of settings. You are asked to confirm before anything changes.</p><div id="cs-presets" class="stats"></div></section>
+<div id="cs-groups"></div>
+<section class="card"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center"><button id="cs-save" onclick="canarySave()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Save changes</button><button onclick="canaryReset()" style="padding:9px 20px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);cursor:pointer;font:inherit;font-weight:700">Reset to deploy settings</button><span class="sub" id="cs-dirty"></span></div></section>
+</main>
 <main id="v-ledger" hidden>
 <div><p class="label eyebrow">Every trade of the running books</p><h1>Trade ledger</h1>
 <p class="lead">Newest first. Open trades count at cost until sold; a sale with no route out counts as $0 until a later sale gets through.</p></div>
@@ -1023,7 +1054,7 @@ const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
 /* mean trade weighted by size: total P&L / total cost (a plain average counts a $25 trade like a $250 one) */
 const wmean=tr=>{const c=tr.reduce((a,x)=>a+(x.cost||0),0);return c?100*tr.reduce((a,x)=>a+x.pnl,0)/c:null};
 const median=a=>{if(!a.length)return null;const b=[...a].sort((x,y)=>x-y),m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2};
-const S={market:null,marketEnabled:false,shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null,feints:[],canary:false,canaryHalted:false,wallets:null,pools:null};
+const S={market:null,marketEnabled:false,shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null,feints:[],canary:false,canaryHalted:false,wallets:null,pools:null,cset:null,csetLoading:false};
 let sortKey="return_pct",sortDir=-1,win=21600,pending=false;
 const R={v:"overview",arg:null},LIM={ledger:200,b:200,f:200};
 const now=()=>Date.now()/1000-S.skew;
@@ -1301,9 +1332,9 @@ $("mk-hours").innerHTML="<tr><th>Hour</th>"+HC.map(([,l])=>`<th>${l}</th>`).join
 const imp=m.impaired||[];$("mk-imp").innerHTML=imp.length?`<p class="note">Greyed hours (!) are left out of the comparison, the flags, the band totals and the charts: the scorer itself was impaired, so their pools are a biased subset. `+imp.map(x=>`${when(x.hour).slice(0,8)}h: ${esc(x.why||"")}`).join(" · ")+"</p>":""}
 /* router */
 function route(){const h=decodeURIComponent(location.hash.replace(/^#\/?/,"")),[v,...rest]=h.split("/");const arg=rest.join("/");
-R.v=({supermeme:"overview",ledger:"ledger",books:"books",book:"book",family:"family",shorts:"shorts",market:"market",wallets:"wallets",pools:"pools"})[v]||"programs";R.arg=arg||null;LIM.b=LIM.f=200;
+R.v=({supermeme:"overview",ledger:"ledger",books:"books",book:"book",family:"family",shorts:"shorts",market:"market",wallets:"wallets",pools:"pools",settings:"settings"})[v]||"programs";R.arg=arg||null;LIM.b=LIM.f=200;
 for(const m of document.querySelectorAll("main"))m.hidden=m.id!=="v-"+R.v;
-const meme=["overview","ledger","books","book","family","market","wallets","pools"].includes(R.v);$("subtabs").hidden=!meme;
+const meme=["overview","ledger","books","book","family","market","wallets","pools","settings"].includes(R.v);$("subtabs").hidden=!meme;
 document.querySelectorAll(".tabs:not(.sub) a").forEach(a=>a.classList.toggle("on",a.dataset.v===(meme?"supermeme":R.v)));
 document.querySelectorAll(".tabs.sub a").forEach(a=>a.classList.toggle("on",a.dataset.v===R.v||(a.dataset.v==="books"&&(R.v==="book"||R.v==="family"))));
 alignSub();window.scrollTo(0,0);render()}
@@ -1358,6 +1389,42 @@ function pollRotate(){rotPoll=true;fetch("api/canary/rotate/log").then(r=>r.json
 $("rot-log").hidden=false;$("rot-log").textContent=(d.log||"(no output yet)")+(d.running?"\n\n… running …":d.returncode===0?"\n\n✓ Done. Restart the bot (fly deploy), then press Start on the overview.":"\n\n✗ Rotation exited with code "+d.returncode+". Nothing was swapped if it failed before the final step — read the log.");
 const lg=$("rot-log");lg.scrollTop=lg.scrollHeight;if(d.running)setTimeout(pollRotate,2000);else{rotPoll=false;$("rot-go").disabled=false}}).catch(()=>setTimeout(pollRotate,3000))}
 function checkRotate(){if(rotPoll)return;fetch("api/canary/rotate/log").then(r=>r.json()).then(d=>{if(d&&d.started){$("rot-log").hidden=false;$("rot-log").textContent=d.log||"";if(d.running){$("rot-go").disabled=true;pollRotate()}}}).catch(()=>{})}
+function csVal(f){const el=$("cs-"+f.key);if(!el)return S.cset.current[f.key];
+if(f.type==="bool")return el.checked;if(f.type==="int")return Math.round(+el.value);if(f.type==="float")return +el.value;return el.value}
+function csField(f){const v=S.cset.current[f.key],badge=f.live?'<span class="tag lime" style="font-size:10px">live</span>':'<span class="tag" style="font-size:10px">restart</span>';
+let input;if(f.type==="bool")input=`<input type="checkbox" id="cs-${f.key}" ${v?"checked":""} style="width:20px;height:20px">`;
+else if(f.choices)input=`<select id="cs-${f.key}" style="padding:6px 8px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit">`+f.choices.map(c=>`<option ${c===v?"selected":""}>${esc(c)}</option>`).join("")+`</select>`;
+else input=`<input type="number" id="cs-${f.key}" value="${v}" ${f.lo!=null?`min="${f.lo}"`:""} ${f.hi!=null?`max="${f.hi}"`:""} step="${f.type==="int"?1:"any"}" style="width:130px;padding:6px 8px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit">`;
+return`<div style="display:flex;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid var(--rule-soft)"><div style="flex:1 1 260px;min-width:0"><div style="font-weight:700">${esc(f.label)} ${badge}</div><div class="sub" style="margin:0">${esc(f.help||"")}</div></div><div>${input}</div></div>`}
+let csBuilt=false;
+function renderSettings(){const note=$("cs-note");
+if(!S.cset){if(!S.csetLoading){S.csetLoading=true;fetch("api/canary/settings").then(r=>r.json()).then(d=>{S.cset=d;S.csetLoading=false;csBuilt=false;render()}).catch(e=>{S.csetLoading=false;note.innerHTML='<p class="note neg">Could not load settings: '+esc(""+e)+'</p>'})}
+if(!note.innerHTML)note.innerHTML='<p class="note">Loading settings…</p>';$("cs-presets").innerHTML="";$("cs-groups").innerHTML="";return}
+if(csBuilt){csDirty();return}  // don't rebuild inputs under the user (background re-renders would wipe edits)
+const C=S.cset;if(C.overlay&&!note.dataset.kept)note.innerHTML='<p class="note">Showing saved settings (a dashboard override is active; Reset returns to the deploy values).</p>';
+$("cs-presets").innerHTML=Object.entries(C.presets).map(([k,p])=>`<button onclick="csPreset('${k}')" class="stat" style="text-align:left;border:2px solid var(--rule);cursor:pointer;background:var(--surface)"><span class="label">${esc(p.label)}</span><span class="h" style="white-space:normal">${esc(p.about)}</span></button>`).join("");
+$("cs-groups").innerHTML=C.groups.map(g=>{const fs=C.fields.filter(f=>f.group===g);return`<section class="card"><p class="label eyebrow">${esc(g)}</p><h2>${esc(g)}</h2>${fs.map(csField).join("")}</section>`}).join("");
+$("cs-groups").oninput=csDirty;$("cs-groups").onchange=csDirty;csBuilt=true;csDirty()}
+function csDiff(){const out={};for(const f of S.cset.fields){const v=csVal(f),c=S.cset.current[f.key];if(f.type==="bool"?(!!v!==!!c):(""+v!==""+c))out[f.key]={f,to:v,from:c}}return out}
+function csDirty(){const d=csDiff(),n=Object.keys(d).length;$("cs-dirty").textContent=n?n+" unsaved change"+(n>1?"s":""):"No unsaved changes"}
+function csFmt(f,v){return f.type==="bool"?(v?"on":"off"):""+v}
+function canarySave(){const d=csDiff(),keys=Object.keys(d);if(!keys.length){alert("No changes to save.");return}
+const lines=keys.map(k=>`• ${d[k].f.label}: ${csFmt(d[k].f,d[k].from)} → ${csFmt(d[k].f,d[k].to)}${d[k].f.live?"":"  (after restart)"}`).join("\n");
+if(!confirm("Apply these canary changes?\n\n"+lines+"\n\nLive changes take effect immediately on the real-money canary; restart ones apply after fly deploy."))return;
+const changes={};keys.forEach(k=>changes[k]=d[k].to);
+fetch("api/canary/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({changes})}).then(r=>r.json().then(j=>({ok:r.ok,j}))).then(({ok,j})=>{
+if(!ok){$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">'+esc(j.error||"Rejected.")+'</p>';return}
+const cur={};S.cset.fields.forEach(f=>cur[f.key]=j.values[f.key]);S.cset.current=cur;S.cset.overlay=true;
+const rb=(j.restart_needed||[]);$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note">Saved '+Object.keys(j.changed||{}).length+' change(s).'+(rb.length?" Restart the bot (fly deploy) for: "+rb.map(esc).join(", ")+".":" Live now.")+'</p>';csBuilt=false;render()})
+.catch(e=>{$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">Could not save: '+esc(""+e)+'</p>'})}
+function csPreset(name){const p=S.cset.presets[name];if(!confirm('Apply preset "'+p.label+'"?\n\n'+p.about+'\n\nThis sets several canary settings at once on the real-money canary. You can review and adjust the fields after.'))return;
+fetch("api/canary/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({preset:name})}).then(r=>r.json().then(j=>({ok:r.ok,j}))).then(({ok,j})=>{
+if(!ok){$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">'+esc(j.error||"Rejected.")+'</p>';return}
+const cur={};S.cset.fields.forEach(f=>cur[f.key]=j.values[f.key]);S.cset.current=cur;S.cset.overlay=true;
+const rb=(j.restart_needed||[]);$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note">Preset applied ('+Object.keys(j.changed||{}).length+' change(s)).'+(rb.length?" Restart for: "+rb.map(esc).join(", ")+".":"")+'</p>';csBuilt=false;render()})
+.catch(e=>{$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">Could not apply: '+esc(""+e)+'</p>'})}
+function canaryReset(){if(!confirm("Reset every canary setting to the deploy (fly.toml) values and clear the dashboard override?"))return;
+fetch("api/canary/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reset:true})}).then(r=>r.json()).then(j=>{const cur={};S.cset.fields.forEach(f=>cur[f.key]=j.values[f.key]);S.cset.current=cur;S.cset.overlay=false;$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note">'+esc(j.msg||"Reset.")+'</p>';csBuilt=false;render()}).catch(e=>{$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">Could not reset: '+esc(""+e)+'</p>'})}
 function renderPools(){const P=S.pools,note=$("p-note");
 if(!P){note.innerHTML='<p class="note">Loading pool reserves…</p>';["p-tiles","p-tbl"].forEach(i=>$(i).innerHTML="");return}
 const s=P.summary||{},rows=P.rows||[];const when=P.fetched_ts?agoStr(Math.max(0,Math.round(Date.now()/1000-P.fetched_ts)))+" ago":"–";
@@ -1367,7 +1434,7 @@ const f=($("p-filter")||{}).value||"all";$("p-filter").onchange=render;
 const show=rows.filter(r=>f==="alive"?r.verdict==="alive":f==="pulled"?r.pulled:f==="live"?(r.pool_age_s!=null&&r.pool_age_s<1500&&!r.pulled):f==="win"?(r.pnl25!=null&&r.pnl25>0):true);
 $("p-tbl").innerHTML=`<tr><th class="l">Pool</th><th>Verdict</th><th>Age</th><th>Probe@</th><th>Liq</th><th>Live</th><th>Peak</th><th>Pulled@</th><th>+probe</th><th>$25 @ m6</th><th>Best entry</th></tr>`+(show.length?show.map(poolRow).join(""):`<tr><td class="muted">No feinted pools in the window yet.</td></tr>`)}
 function render(){renderHealth();renderFeints();if(!S.books.length)return;
-if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="market")renderMarket();else if(R.v==="wallets")renderWallets();else if(R.v==="pools")renderPools();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
+if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="market")renderMarket();else if(R.v==="wallets")renderWallets();else if(R.v==="pools")renderPools();else if(R.v==="settings")renderSettings();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
 $("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false})}
 function schedule(){if(!pending){pending=true;setTimeout(()=>{pending=false;render()},300)}}
 function fill(f,isNew){const li=document.createElement("li");if(isNew)li.className="new";

@@ -445,3 +445,39 @@ def test_rotate_endpoint_is_behind_the_password(cfg, monkeypatch):
         assert post(json.dumps({"wallets": 99, "sol": 1}).encode(), cookie="tb_dash=s3cret")[0] == 400
     finally:
         server.shutdown()
+
+
+def test_canary_settings_endpoint_is_behind_the_password(cfg, tmp_path, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
+    cfg.health_port = 18773
+    cfg.db_path = str(tmp_path / "j.db")
+    j = Journal(cfg.db_path)
+    board = dash.Dashboard(j, cfg)
+    board.refresh()
+    server = health.start_health_server(j, cfg, board)
+
+    def req(method, body=None, cookie=None):
+        c = http.client.HTTPConnection("127.0.0.1", 18773, timeout=5)
+        h = {"Content-Type": "application/json"} if body is not None else {}
+        if cookie:
+            h["Cookie"] = cookie
+        c.request(method, "/api/canary/settings", body=(json.dumps(body).encode() if body is not None else None),
+                  headers=h)
+        r = c.getresponse()
+        return r.status, r.read()
+    try:
+        assert req("GET")[0] == 401  # no password
+        code, body = req("GET", cookie="tb_dash=s3cret")
+        menu = json.loads(body)
+        assert code == 200 and "fields" in menu and "presets" in menu and "launch_canary_max_open" in menu["current"]
+        # a live change applies to the shared cfg at once
+        code, body = req("POST", {"changes": {"launch_canary_max_open": 9}}, cookie="tb_dash=s3cret")
+        assert code == 200 and cfg.launch_canary_max_open == 9 and json.loads(body)["changed"]
+        # an incoherent change is a 400, not a 500, and changes nothing
+        code, _ = req("POST", {"changes": {"launch_canary_feint": True}}, cookie="tb_dash=s3cret")
+        assert code == 400 and cfg.launch_canary_feint is False
+        # a preset applies a coherent set
+        code, body = req("POST", {"preset": "clips"}, cookie="tb_dash=s3cret")
+        assert code == 200 and cfg.launch_canary_clips == 5 and json.loads(body)["preset"] == "clips"
+    finally:
+        server.shutdown()

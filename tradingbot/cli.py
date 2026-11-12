@@ -55,6 +55,9 @@ def build_engine(cfg: Config, with_analyst: bool = True):
     from tradingbot.engine import Engine
     from tradingbot.journal import Journal
 
+    from tradingbot import canary_settings
+    canary_settings.apply_overlay(cfg)  # dashboard-saved canary settings persist across restarts (defensive, no-op if none)
+
     jupiter = Jupiter(cfg.slippage_bps)
     if cfg.mode == "live":
         from tradingbot.execution.jupiter import JupiterExecutor
