@@ -102,9 +102,28 @@ def _withdraw(txs: list, after_slot: int | None, ours: set) -> dict | None:
     return min(hits, key=lambda h: (h["slot"], h["ts"] or 0)) if hits else None
 
 
+RUG = -0.9  # lost 90%+ of the stake
+
+
 def _base(t: dict) -> dict:
     return {"book": t["book"], "symbol": t["symbol"], "pool": t["pool"], "ret": t["ret"],
-            "liq": t["liq"], "thin": t["thin"], "buy_tx": t["buy_tx"]}
+            "liq": t["liq"], "thin": t["thin"], "buy_tx": t["buy_tx"],
+            "cost": t.get("cost"), "scorer_pull_s": t.get("pulled_after_fill_s")}
+
+
+def _pull_s(r: dict) -> float | None:
+    """Seconds from our buy to the pull: the exact withdraw-tx gap, else the scorer's pull time
+    (which keeps watching the LP after our exit, so it also catches pulls later than minute 6)."""
+    if r.get("time_gap_s") is not None:
+        return r["time_gap_s"]
+    return r.get("scorer_pull_s")
+
+
+def _bucket(cost) -> str:
+    if cost is None:
+        return "?"
+    c = round(cost)
+    return f"${c}" if c >= 1 else "<$1"
 
 
 def slots(store, journal, helius, cfg, max_credits: int, now: float | None = None) -> dict:
@@ -135,7 +154,33 @@ def slots(store, journal, helius, cfg, max_credits: int, now: float | None = Non
             row["note"] = "no operator withdraw found at/after our buy"
         rows.append(row)
     return {"credits": helius.credits_used - start, "stopped_by_cap": stopped, "wallets": sorted(ours),
-            "trades": rows, "summary": _summary(rows)}
+            "trades": rows, "summary": _summary(rows), "by_size": _by_size(rows)}
+
+
+def _by_size(rows: list) -> dict:
+    """Per trade size: how many were pulled, and when — so the LATEST pull (the safe-zone edge) is clear."""
+    out: dict = {}
+    for r in rows:
+        b = _bucket(r.get("cost"))
+        g = out.setdefault(b, {"n": 0, "pulled": 0, "rugged": 0, "pulls": [], "last": None, "rugged_no_pull": 0})
+        g["n"] += 1
+        ps = _pull_s(r)
+        rug = r.get("ret") is not None and r["ret"] <= RUG
+        if rug:
+            g["rugged"] += 1
+        if ps is not None:
+            g["pulled"] += 1
+            g["pulls"].append(ps)
+            if g["last"] is None or ps > g["last"][0]:
+                g["last"] = (ps, r.get("symbol"))
+        elif rug:
+            g["rugged_no_pull"] += 1  # lost the stake but no pull time on record -> the max could be later
+    for g in out.values():
+        p = g.pop("pulls")
+        g["pull_s_min"] = round(min(p), 1) if p else None
+        g["pull_s_median"] = round(statistics.median(p), 1) if p else None
+        g["pull_s_max"] = round(max(p), 1) if p else None
+    return out
 
 
 def _summary(rows: list) -> dict:
@@ -172,6 +217,24 @@ def render(out: dict) -> str:
               f"2: {d['2']}%   3-5: {d['3_5']}%   6+: {d['6_plus']}%",
               f"UNBEATABLE (<=1 slot): {s['unbeatable_le1_slot_pct']}%    "
               f"a fast exit had a window (>=2 slots): {s['beatable_ge2_slots_pct']}%"]
+    bs = out.get("by_size") or {}
+    if bs:
+        L += ["", "BY TRADE SIZE  (pull s = seconds from our buy to the pull; MAX = the latest rug = safe-zone edge)",
+              f"{'size':>6} {'n':>4} {'pulled':>7} {'rugged':>7} {'min':>6} {'median':>7} {'MAX':>7}  latest rug"]
+
+        def _k(b: str) -> float:
+            try:
+                return float(b.lstrip("$")) if b.startswith("$") else -1
+            except ValueError:
+                return 1e9
+        for b in sorted(bs, key=_k, reverse=True):
+            g = bs[b]
+            last = f"+{g['last'][0]:.0f}s ({g['last'][1]})" if g.get("last") else ""
+            extra = f"   [{g['rugged_no_pull']} rugged, no pull time]" if g.get("rugged_no_pull") else ""
+            L.append(f"{b:>6} {g['n']:>4} {g['pulled']:>7} {g['rugged']:>7} "
+                     f"{str(g['pull_s_min'] if g['pull_s_min'] is not None else ''):>6} "
+                     f"{str(g['pull_s_median'] if g['pull_s_median'] is not None else ''):>7} "
+                     f"{str(g['pull_s_max'] if g['pull_s_max'] is not None else ''):>7}  {last}{extra}")
     L += ["", "TRADES", f"{'symbol':<10} {'$liq':>7} {'ret%':>6} {'buy slot':>12} {'pull slot':>12} "
           f"{'gap':>4} {'s':>5}  note"]
     for r in out["trades"]:

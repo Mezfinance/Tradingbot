@@ -97,3 +97,21 @@ def test_same_slot_pull_is_unbeatable_and_missing_buy_tx_is_handled(monkeypatch)
     assert rows["A"]["slot_gap"] == 0
     assert "note" in rows["B"] and rows["B"].get("slot_gap") is None
     assert out["summary"]["slot_gap_distribution_pct"]["same_slot_0"] == 100.0
+
+
+def test_by_size_reports_the_latest_pull_per_size():
+    rows = [
+        # three $25 trades: two pulled (at 12s via withdraw tx, 45s via scorer), one survivor
+        {"symbol": "A", "cost": 25.0, "ret": -1.0, "time_gap_s": 12.0, "scorer_pull_s": None},
+        {"symbol": "B", "cost": 24.98, "ret": -1.0, "time_gap_s": None, "scorer_pull_s": 45.0},
+        {"symbol": "C", "cost": 25.0, "ret": -0.03, "time_gap_s": None, "scorer_pull_s": None},
+        # a $5 trade pulled at 3s, and one rugged with no pull time on record
+        {"symbol": "D", "cost": 5.0, "ret": -1.0, "time_gap_s": 3.0, "scorer_pull_s": None},
+        {"symbol": "E", "cost": 5.0, "ret": -1.0, "time_gap_s": None, "scorer_pull_s": None},
+    ]
+    bs = cs._by_size(rows)
+    assert bs["$25"]["n"] == 3 and bs["$25"]["pulled"] == 2 and bs["$25"]["rugged"] == 2
+    assert bs["$25"]["pull_s_max"] == 45.0 and bs["$25"]["last"] == (45.0, "B")  # the latest rug
+    assert bs["$25"]["pull_s_min"] == 12.0
+    assert bs["$5"]["pulled"] == 1 and bs["$5"]["rugged"] == 2 and bs["$5"]["rugged_no_pull"] == 1
+    assert cs._bucket(25.0) == "$25" and cs._bucket(0.01) == "<$1" and cs._bucket(None) == "?"
