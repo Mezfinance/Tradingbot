@@ -48,18 +48,30 @@ def token() -> str:
     return os.environ.get("DASHBOARD_TOKEN", "")
 
 
-def authorised(headers, query: dict) -> bool:
-    """True when the request carries the token as ?key= or in the dashboard cookie."""
+def _cookies(headers) -> dict:
+    out: dict = {}
+    for part in (headers.get("Cookie") or "").split(";"):
+        name, _, value = part.strip().partition("=")
+        if name:
+            out[name] = value
+    return out
+
+
+def authorised(headers, query: dict, cfg=None) -> bool:
+    """True when the request carries a valid session: a passkey session cookie, or the
+    break-glass token as ?key= or in the dashboard cookie."""
+    cookies = _cookies(headers)
     secret = token()
-    if not secret:
-        return False
-    given = (query.get("key") or [""])[0]
-    if not given:
-        for part in (headers.get("Cookie") or "").split(";"):
-            name, _, value = part.strip().partition("=")
-            if name == COOKIE:
-                given = value
-    return bool(given) and hmac.compare_digest(given, secret)
+    if secret:
+        given = (query.get("key") or [""])[0] or cookies.get(COOKIE, "")
+        if given and hmac.compare_digest(given, secret):
+            return True
+    if cfg is not None:
+        from tradingbot import dashpasskey
+        sess = cookies.get(dashpasskey.SESS_COOKIE, "")
+        if sess and dashpasskey.valid_session(cfg, sess):
+            return True
+    return False
 
 
 def fills_after(journal, after_id: int, limit: int = 200) -> list[dict]:
@@ -973,7 +985,8 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div class="lockup"><svg viewBox="0 0 100 100" aria-hidden="true"><rect class="mk-sq" width="100" height="100"/><polygon class="mk-z" points="24,26 76,26 76,39 38,61 76,61 76,74 24,74 24,61 62,39 24,39"/></svg>
 <div><div class="word">MZFq</div><div class="desc">QUANT DESK</div></div></div>
 <div class="status"><span id="conn" class="tag"><span class="dot"></span>Connecting</span><span id="health" class="tag">Bot</span>
-<span id="built" class="label muted"></span></div>
+<span id="built" class="label muted"></span>
+<button id="signout" onclick="signOut()" title="Sign out of this device" style="padding:4px 10px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);cursor:pointer;font:inherit;font-weight:700;font-size:12px">Sign out</button></div>
 </header>
 <nav class="tabs" aria-label="Programs"><a href="#/" data-v="programs">MZFq</a><a href="#/supermeme" data-v="supermeme" id="tab-meme">Supermeme</a><a href="#/shorts" data-v="shorts">MZF Short Only</a></nav>
 <nav class="tabs sub" id="subtabs" aria-label="Supermeme"><a href="#/supermeme" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a><a href="#/market" data-v="market">Market</a><a href="#/wallets" data-v="wallets">Wallets</a><a href="#/pools" data-v="pools">Pool tracker</a><a href="#/settings" data-v="settings">Canary</a></nav>
@@ -1078,6 +1091,10 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <p class="sub">Runs the deploy command on this machine (if one is configured) and restarts it — <b>this page will disconnect</b>; reload in a minute. Normally you deploy from your Mac with <code>git pull &amp;&amp; fly deploy</code>. Restart-only settings above (route, budget, fees) take effect on the next deploy.</p>
 <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:4px 0 10px"><button id="dep-go" onclick="flyDeploy()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">fly deploy</button><span class="sub mono" id="dep-cmd"></span></div>
 <pre id="dep-log" hidden style="white-space:pre-wrap;word-break:break-word;background:var(--sunken);border:2px solid var(--rule-soft);padding:10px;max-height:320px;overflow:auto;font:500 12px/1.5 var(--mono)"></pre></section>
+<section class="card"><p class="label eyebrow">Access</p><h2>Passkeys</h2>
+<p class="sub">Sign in with FaceID, TouchID, Windows Hello or a security key instead of the shared link. Add a passkey on each device you use; the private key never leaves that device. The <code>?key=</code> link stays as a break-glass bootstrap and for recovery. Removing every passkey falls back to the link.</p>
+<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:4px 0 10px"><input id="pk-label" placeholder="e.g. iPhone, MacBook" maxlength="40" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:190px"><button id="pk-add" onclick="addPasskey()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Add this device</button><span class="sub" id="pk-note"></span></div>
+<div class="scroll"><table id="pk-list"></table></div></section>
 </main>
 <main id="v-ledger" hidden>
 <div><p class="label eyebrow">Every trade of the running books</p><h1>Trade ledger</h1>
@@ -1477,7 +1494,7 @@ $("cs-presets").innerHTML=Object.entries(C.presets).map(([k,p])=>`<button onclic
 $("cs-groups").innerHTML=C.groups.map(g=>{const fs=C.fields.filter(f=>f.group===g);return`<section class="card"><p class="label eyebrow">${esc(g)}</p><h2>${esc(g)}</h2>${fs.map(csField).join("")}</section>`}).join("");
 $("cs-groups").oninput=csDirty;$("cs-groups").onchange=csDirty;
 $("dep-cmd").textContent=C.deploy_cmd?("will run: "+C.deploy_cmd):"no deploy command on this machine — deploy from your Mac";
-$("dep-go").disabled=!C.deploy_cmd;csBuilt=true;csDirty()}
+$("dep-go").disabled=!C.deploy_cmd;csBuilt=true;csDirty();renderPasskeys()}
 function csDiff(){const out={};for(const f of S.cset.fields){const v=csVal(f),c=S.cset.current[f.key];if(f.type==="bool"?(!!v!==!!c):(""+v!==""+c))out[f.key]={f,to:v,from:c}}return out}
 function csDirty(){const d=csDiff(),n=Object.keys(d).length;$("cs-dirty").textContent=n?n+" unsaved change"+(n>1?"s":""):"No unsaved changes"}
 function csFmt(f,v){return f.type==="bool"?(v?"on":"off"):""+v}
@@ -1504,6 +1521,18 @@ if(!confirm("Deploy now?\n\nThis runs:\n  "+cmd+"\n\nThe machine will restart an
 const go=$("dep-go");go.disabled=true;$("dep-log").hidden=false;$("dep-log").textContent="Starting deploy…";
 fetch("api/deploy",{method:"POST"}).then(r=>r.json()).then(d=>{if(d&&d.started){$("dep-log").textContent=(d.msg||"Started.")+"\n\n";pollDeploy()}else{go.disabled=false;$("dep-log").textContent=(d&&d.msg)||"Could not start the deploy."}}).catch(e=>{go.disabled=false;$("dep-log").textContent="Could not reach the deploy endpoint: "+e})}
 function pollDeploy(){fetch("api/deploy/log").then(r=>r.json()).then(d=>{$("dep-log").textContent=(d.log||"(no output yet)")+(d.running?"\n\n… deploying …":d.returncode===0?"\n\n✓ Submitted. The machine is restarting — reload this page shortly.":"\n\n✗ Deploy exited with code "+d.returncode+".");const lg=$("dep-log");lg.scrollTop=lg.scrollHeight;if(d.running)setTimeout(pollDeploy,2000);else $("dep-go").disabled=false}).catch(()=>{$("dep-log").textContent+="\n\n(connection lost — the machine is likely restarting. Reload the page in a minute.)"})}
+// --- passkeys (WebAuthn) ---
+function b64urlToBuf(s){s=s.replace(/-/g,"+").replace(/_/g,"/");const pad=s.length%4?4-s.length%4:0;s+="=".repeat(pad);const bin=atob(s),b=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)b[i]=bin.charCodeAt(i);return b.buffer}
+function bufToB64url(b){const bytes=new Uint8Array(b);let bin="";for(const x of bytes)bin+=String.fromCharCode(x);return btoa(bin).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}
+function renderPasskeys(){const t=$("pk-list");if(!t)return;fetch("api/auth/passkeys").then(r=>r.json()).then(d=>{const ks=d.passkeys||[];t.innerHTML="<tr><th>Device</th><th>Added</th><th>Last used</th><th></th></tr>"+(ks.length?ks.map(k=>`<tr><td>${esc(k.label)}</td><td class="sub">${k.created?new Date(k.created*1000).toLocaleDateString():"—"}</td><td class="sub">${k.last_used?new Date(k.last_used*1000).toLocaleString():"never"}</td><td><button onclick="removePasskey('${esc(k.id)}')" style="padding:3px 10px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);cursor:pointer;font:inherit;font-size:12px">Remove</button></td></tr>`).join(""):'<tr><td colspan="4" class="sub">No passkeys yet. Add this device to sign in without the link.</td></tr>')}).catch(()=>{})}
+function addPasskey(){const note=$("pk-note"),btn=$("pk-add");if(!window.PublicKeyCredential){note.textContent="This browser has no passkey support.";return}
+const label=($("pk-label").value||"").trim();btn.disabled=true;note.textContent="Follow your device prompt…";
+fetch("api/auth/register/options").then(r=>r.json()).then(o=>{o.challenge=b64urlToBuf(o.challenge);o.user.id=b64urlToBuf(o.user.id);(o.excludeCredentials||[]).forEach(c=>c.id=b64urlToBuf(c.id));return navigator.credentials.create({publicKey:o})}).then(cred=>{
+const body={id:cred.id,rawId:bufToB64url(cred.rawId),type:cred.type,response:{clientDataJSON:bufToB64url(cred.response.clientDataJSON),attestationObject:bufToB64url(cred.response.attestationObject),transports:cred.response.getTransports?cred.response.getTransports():[]},authenticatorAttachment:cred.authenticatorAttachment,clientExtensionResults:cred.getClientExtensionResults?cred.getClientExtensionResults():{}};
+return fetch("api/auth/register/verify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({credential:body,label})})}).then(r=>r.json().then(j=>({ok:r.ok,j}))).then(({ok,j})=>{btn.disabled=false;if(!ok){note.textContent=j.error||"Could not register.";return}note.textContent="Added.";$("pk-label").value="";renderPasskeys()}).catch(e=>{btn.disabled=false;note.textContent=(e&&e.name==="NotAllowedError")?"Cancelled.":("Error: "+e)})}
+function removePasskey(id){if(!confirm("Remove this passkey? That device will no longer sign in."))return;
+fetch("api/auth/passkeys/remove",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({id})}).then(r=>r.json()).then(()=>renderPasskeys()).catch(()=>{})}
+function signOut(){fetch("api/auth/logout",{method:"POST"}).then(()=>location.reload()).catch(()=>location.reload())}
 function renderPools(){const P=S.pools,note=$("p-note");
 if(!P){note.innerHTML='<p class="note">Loading pool reserves…</p>';["p-tiles","p-tbl"].forEach(i=>$(i).innerHTML="");return}
 const s=P.summary||{},rows=P.rows||[];const when=P.fetched_ts?agoStr(Math.max(0,Math.round(Date.now()/1000-P.fetched_ts)))+" ago":"–";
@@ -1546,4 +1575,42 @@ es.addEventListener("fill",e=>fill(JSON.parse(e.data),true));
 es.addEventListener("feintlog",e=>{S.feints=JSON.parse(e.data);schedule()});
 es.addEventListener("feint",e=>{S.feints.push(JSON.parse(e.data));if(S.feints.length>500)S.feints.shift();schedule()})}
 route();connect();
+</script></body></html>"""
+
+
+LOGIN_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>MZFq · Sign in</title>
+<style>
+:root{--ink:#0a0a0a;--surface:#fff;--rule:#0a0a0a;--sub:#555;--lime:#c9f24d}
+@media(prefers-color-scheme:dark){:root{--ink:#f2f2f2;--surface:#121212;--rule:#f2f2f2;--sub:#9a9a9a}}
+*{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--surface);color:var(--ink);
+font:500 15px/1.5 "Archivo",system-ui,-apple-system,sans-serif;padding:24px}
+.card{width:100%;max-width:380px;border:2px solid var(--rule);padding:28px}
+.mk{width:48px;height:48px;margin-bottom:16px}.mk .sq{fill:var(--ink)}.mk .z{fill:var(--surface)}
+h1{font-size:22px;margin:0 0 4px;font-weight:800;letter-spacing:-.01em}
+.sub{color:var(--sub);font-size:13px;margin:0 0 20px}
+button{width:100%;padding:12px;border:2px solid var(--ink);background:var(--lime);color:#000;cursor:pointer;
+font:inherit;font-weight:800;font-size:15px}
+button:disabled{opacity:.5;cursor:default}
+.note{margin-top:14px;font-size:13px;color:var(--sub)}.neg{color:#c0392b}
+code{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+</style></head><body>
+<div class="card">
+<svg class="mk" viewBox="0 0 100 100" aria-hidden="true"><rect class="sq" width="100" height="100"/><polygon class="z" points="24,26 76,26 76,39 38,61 76,61 76,74 24,74 24,61 62,39 24,39"/></svg>
+<h1>MZFq Quant Desk</h1>
+<p class="sub">Sign in with your passkey — FaceID, TouchID, Windows Hello or a security key.</p>
+<button id="go" onclick="login()">Sign in with passkey</button>
+<p class="note" id="note"></p>
+</div>
+<script>
+const $=i=>document.getElementById(i);
+function b64urlToBuf(s){s=s.replace(/-/g,"+").replace(/_/g,"/");const pad=s.length%4?4-s.length%4:0;s+="=".repeat(pad);const bin=atob(s),b=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)b[i]=bin.charCodeAt(i);return b.buffer}
+function bufToB64url(b){const bytes=new Uint8Array(b);let bin="";for(const x of bytes)bin+=String.fromCharCode(x);return btoa(bin).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}
+fetch("api/auth/status").then(r=>r.json()).then(d=>{if(!d.passkeys){$("go").disabled=true;$("note").innerHTML=d.token?'No passkeys registered yet. Open this page once with <code>?key=&lt;DASHBOARD_TOKEN&gt;</code>, then add a passkey under Supermeme → Canary → Passkeys.':'Not set up yet.'}}).catch(()=>{});
+function login(){const go=$("go"),note=$("note");if(!window.PublicKeyCredential){note.textContent="This browser has no passkey support.";return}
+go.disabled=true;note.textContent="Follow your device prompt…";
+fetch("api/auth/login/options").then(r=>r.json()).then(o=>{o.challenge=b64urlToBuf(o.challenge);(o.allowCredentials||[]).forEach(c=>c.id=b64urlToBuf(c.id));return navigator.credentials.get({publicKey:o})}).then(a=>{
+const body={id:a.id,rawId:bufToB64url(a.rawId),type:a.type,response:{clientDataJSON:bufToB64url(a.response.clientDataJSON),authenticatorData:bufToB64url(a.response.authenticatorData),signature:bufToB64url(a.response.signature),userHandle:a.response.userHandle?bufToB64url(a.response.userHandle):null},clientExtensionResults:a.getClientExtensionResults?a.getClientExtensionResults():{}};
+return fetch("api/auth/login/verify",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({credential:body})})}).then(r=>r.json().then(j=>({ok:r.ok,j}))).then(({ok,j})=>{if(ok){location.reload()}else{go.disabled=false;$("note").className="note neg";$("note").textContent=j.error||"Sign-in failed."}}).catch(e=>{go.disabled=false;$("note").className="note neg";$("note").textContent=(e&&e.name==="NotAllowedError")?"Cancelled or timed out.":("Error: "+e)})}
 </script></body></html>"""

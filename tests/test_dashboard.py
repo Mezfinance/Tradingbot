@@ -116,7 +116,9 @@ def test_routes_need_the_password_and_health_stays_open(cfg, monkeypatch):
         return r.status, dict(r.getheaders()), r.read()
     try:
         assert get("/health")[0] == 200
-        assert get("/")[0] == 401 and get("/api/summary")[0] == 401
+        code, _, body = get("/")  # unauthed root serves the sign-in page, not the dashboard
+        assert code == 200 and b"Sign in with passkey" in body and b"QUANT DESK" not in body
+        assert get("/api/summary")[0] == 401
         code, headers, _ = get("/?key=s3cret")
         assert code == 303 and headers["Location"] == "/" and "tb_dash=s3cret" in headers["Set-Cookie"]
         code, _, body = get("/", cookie="tb_dash=s3cret")

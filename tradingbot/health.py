@@ -127,6 +127,20 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
             self.end_headers()
             self.wfile.write(body)
 
+        def _cookie(self, name: str, value: str, max_age: int) -> str:
+            host = (self.headers.get("Host") or "").split(":")[0]
+            secure = "" if host in ("localhost", "127.0.0.1") else " Secure;"
+            if max_age == 0:
+                return f"{name}=; Path=/; Max-Age=0; HttpOnly;{secure} SameSite=Strict"
+            return f"{name}={value}; Path=/; Max-Age={max_age}; HttpOnly;{secure} SameSite=Strict"
+
+        def _dash_on(self) -> bool:
+            """The dashboard is served once a token has ever been set, or passkeys exist (the
+            token can be removed after the first passkey is registered)."""
+            from tradingbot import dashboard as dash
+            from tradingbot import dashpasskey
+            return dashboard is not None and (bool(dash.token()) or dashpasskey.has_passkeys(cfg))
+
         def do_GET(self):  # noqa: N802 (http.server API)
             url = urlsplit(self.path)
             path, query = url.path.rstrip("/") or "/", parse_qs(url.query)
@@ -141,14 +155,57 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 self._send(200, json.dumps(address_book()).encode(), "application/json")
                 return
             from tradingbot import dashboard as dash
-            if dashboard is None or not dash.token() or path not in (
-                    "/", "/api/stream", "/api/summary", "/api/canary/rotate/log", "/api/canary/settings",
-                    "/api/deploy/log"):
+            from tradingbot import dashpasskey
+            host = self.headers.get("Host")
+            if not self._dash_on():
                 self.send_error(404)
                 return
-            if not dash.authorised(self.headers, query):
-                self._send(401, b"Open this page once with ?key=<DASHBOARD_TOKEN> at the end of the address.",
-                           "text/plain; charset=utf-8")
+            authed = dash.authorised(self.headers, query, cfg)
+            # Open sign-in endpoints (no session needed, so you can sign in).
+            if path == "/api/auth/status":
+                self._send(200, json.dumps({
+                    "authed": authed,
+                    "token": bool(dash.token()),
+                    "passkeys": dashpasskey.has_passkeys(cfg),
+                }).encode(), "application/json")
+                return
+            if path == "/api/auth/login/options":
+                try:
+                    opts, chal = dashpasskey.authentication_options(cfg, host)
+                except Exception as e:  # noqa: BLE001
+                    self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
+                    return
+                self._send(200, opts.encode(), "application/json",
+                           {"Cache-Control": "no-store",
+                            "Set-Cookie": self._cookie(dashpasskey.CHAL_COOKIE, chal, dashpasskey.CHALLENGE_MAX_AGE_S)})
+                return
+            if path not in ("/", "/api/stream", "/api/summary", "/api/canary/rotate/log", "/api/canary/settings",
+                            "/api/deploy/log", "/api/auth/passkeys", "/api/auth/register/options"):
+                self.send_error(404)
+                return
+            if query.get("key"):  # remember the break-glass token in a cookie, then drop it from the address bar
+                cookie = self._cookie(dash.COOKIE, query["key"][0], 31536000)
+                self._send(303, b"", "text/plain", {"Location": path, "Set-Cookie": cookie})
+                return
+            if path == "/" and not authed:  # show the sign-in page instead of a bare 401
+                self._send(200, dash.LOGIN_PAGE.encode(), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
+                return
+            if not authed:
+                self._send(401, b"unauthorised", "text/plain; charset=utf-8")
+                return
+            # Authenticated endpoints.
+            if path == "/api/auth/passkeys":
+                self._send(200, json.dumps({"passkeys": dashpasskey.list_passkeys(cfg)}).encode(), "application/json")
+                return
+            if path == "/api/auth/register/options":
+                try:
+                    opts, chal = dashpasskey.registration_options(cfg, host)
+                except Exception as e:  # noqa: BLE001
+                    self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
+                    return
+                self._send(200, opts.encode(), "application/json",
+                           {"Cache-Control": "no-store",
+                            "Set-Cookie": self._cookie(dashpasskey.CHAL_COOKIE, chal, dashpasskey.CHALLENGE_MAX_AGE_S)})
                 return
             if path == "/api/canary/rotate/log":  # progress of a running wallet rotation (addresses only, no keys)
                 self._send(200, json.dumps(dash.rotate_log(cfg)).encode(), "application/json")
@@ -158,10 +215,6 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 return
             if path == "/api/deploy/log":  # progress of a running deploy
                 self._send(200, json.dumps(dash.deploy_log(cfg)).encode(), "application/json")
-                return
-            if query.get("key"):  # remember the key in a cookie, then drop it from the address bar
-                cookie = f"{dash.COOKIE}={query['key'][0]}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Strict"
-                self._send(303, b"", "text/plain", {"Location": path, "Set-Cookie": cookie})
                 return
             if path == "/":
                 self._send(200, dash.PAGE.encode(), "text/html; charset=utf-8", {"Cache-Control": "no-store"})
@@ -186,18 +239,58 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
             url = urlsplit(self.path)
             path, query = url.path.rstrip("/") or "/", parse_qs(url.query)
             from tradingbot import dashboard as dash
-            if dashboard is None or not dash.token() or path not in (
-                    "/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/settings",
-                    "/api/deploy"):
+            from tradingbot import dashpasskey
+            host = self.headers.get("Host")
+            if not self._dash_on():
                 self.send_error(404)
-                return
-            if not dash.authorised(self.headers, query):
-                self._send(401, b"unauthorised", "text/plain; charset=utf-8")
                 return
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else b""
+            # Sign-in verify is the one POST that must work without a session.
+            if path == "/api/auth/login/verify":
+                try:
+                    data = json.loads(body or b"{}")
+                    chal = dashpasskey.open_challenge(cfg, dash._cookies(self.headers).get(dashpasskey.CHAL_COOKIE, ""),
+                                                      "login")
+                    sess = dashpasskey.authentication_verify(cfg, host, data.get("credential"), chal) if chal else None
+                except Exception as e:  # noqa: BLE001
+                    self._send(400, json.dumps({"error": str(e)}).encode(), "application/json")
+                    return
+                if not sess:
+                    self._send(401, json.dumps({"error": "passkey not recognised"}).encode(), "application/json")
+                    return
+                self._send(200, json.dumps({"ok": True}).encode(), "application/json", {"Set-Cookie": self._cookie(
+                    dashpasskey.SESS_COOKIE, sess, dashpasskey.SESSION_MAX_AGE_S)})
+                log.info("dashboard passkey sign-in")
+                return
+            if path == "/api/auth/logout":
+                self._send(200, json.dumps({"ok": True}).encode(), "application/json",
+                           {"Set-Cookie": self._cookie(dashpasskey.SESS_COOKIE, "", 0)})
+                return
+            if path not in ("/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/settings",
+                            "/api/deploy", "/api/auth/register/verify", "/api/auth/passkeys/remove"):
+                self.send_error(404)
+                return
+            if not dash.authorised(self.headers, query, cfg):
+                self._send(401, b"unauthorised", "text/plain; charset=utf-8")
+                return
             try:
-                if path == "/api/deploy":
+                if path == "/api/auth/register/verify":
+                    data = json.loads(body or b"{}")
+                    chal = dashpasskey.open_challenge(cfg, dash._cookies(self.headers).get(dashpasskey.CHAL_COOKIE, ""),
+                                                      "reg")
+                    if not chal:
+                        raise ValueError("the registration window expired, try again")
+                    res = dashpasskey.register_verify(cfg, host, data.get("credential"), chal, data.get("label", ""))
+                    log.info("dashboard passkey registered: %s", data.get("label", ""))
+                    self._send(200, json.dumps(res).encode(), "application/json",
+                               {"Set-Cookie": self._cookie(dashpasskey.CHAL_COOKIE, "", 0)})
+                    return
+                if path == "/api/auth/passkeys/remove":
+                    data = json.loads(body or b"{}")
+                    ok = dashpasskey.remove_passkey(cfg, data.get("id", ""))
+                    res = {"ok": ok, "passkeys": dashpasskey.list_passkeys(cfg)}
+                elif path == "/api/deploy":
                     res = dash.fly_deploy(cfg)
                 elif path == "/api/canary/settings":
                     res = dash.canary_settings_update(cfg, journal, json.loads(body or b"{}"))

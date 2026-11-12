@@ -10,6 +10,7 @@ dependencies = [
     "numpy>=1.26",  # watch_analysis regression
     "pillow>=10",  # enrich: image fingerprints
     "websockets>=12",  # launch_live: LP-mint websocket
+    "webauthn>=3",  # dashboard passkey (FaceID/TouchID) sign-in
 ]
 
 [project.optional-dependencies]
