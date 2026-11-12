@@ -122,6 +122,44 @@ def canary_switch(journal, action: str) -> dict:
     raise ValueError(f"unknown canary action {action!r}")
 
 
+WALLETS_POLL_S = 60  # balances change slowly; the public RPC keeps it off the Helius budget
+WALLETS_RPC = os.environ.get("TB_WALLETS_RPC") or "https://api.mainnet-beta.solana.com"
+
+
+def _solana_rpc(url: str, method: str, params: list, timeout: float = 12.0):
+    import httpx
+    r = httpx.post(url, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=timeout)
+    r.raise_for_status()
+    return r.json().get("result")
+
+
+def wallet_directory(cfg) -> dict:
+    """Addresses only (never keys) of the canary's wallets, with roles and labels: the live trading set numbered
+    1..n, the treasury, the reserve (the canary wallet that funds top-ups), and an archive of every other address
+    the key-free address book has recorded. Balances and tx counts are added from the chain by fetch_wallets."""
+    from tradingbot import health
+    info = health.canary_wallets(cfg)
+    book = (health.address_book() or {}).get("addresses", {}) or {}
+    label_of = {a: (e.get("label") or "") for a, e in book.items()}
+    created_of = {a: e.get("created") for a, e in book.items()}
+    live = [{"n": i, "role": "trading", "address": a, "label": label_of.get(a) or f"wallet-{i}"}
+            for i, a in enumerate(info.get("wallets") or [], 1)]
+    if info.get("treasury"):
+        live.append({"role": "treasury", "address": info["treasury"],
+                     "label": label_of.get(info["treasury"]) or "treasury"})
+    try:
+        from tradingbot.execution.jupiter import read_keypair
+        reserve = str(read_keypair(cfg).pubkey())
+        live.append({"role": "reserve", "address": reserve, "label": label_of.get(reserve) or "reserve (canary)"})
+    except Exception:  # noqa: BLE001 (no reserve key available here: fine)
+        pass
+    seen = {w["address"] for w in live}
+    archive = sorted(({"role": "archive", "address": a, "label": label_of.get(a) or "", "created": created_of.get(a)}
+                      for a in book if a not in seen), key=lambda w: (w["label"], w["address"]))
+    return {"live": live, "archive": archive, "rotate": info.get("rotate"), "route": info.get("route"),
+            "source": info.get("source"), "error": info.get("error")}
+
+
 def build_summary(journal: Journal, cfg: Config, store=None, now: float | None = None) -> dict:
     """The slow-changing extras the page can't compute from the rows: backtest notes, downtime, last backup.
     (Book tables and launch outcomes are computed in the browser from the streamed rows since 11-05.)"""
@@ -152,6 +190,8 @@ class Dashboard:
         self.shorts_ver = 0
         self.market: dict | None = None  # the meme market monitor (market_monitor.payload), every MARKET_POLL_S
         self.market_ver = 0
+        self.wallets: dict | None = None  # the canary wallets with chain balances, every WALLETS_POLL_S
+        self.wallets_ver = 0
         self._mdb = None
 
     def _build_in_child(self) -> dict:
@@ -202,9 +242,15 @@ class Dashboard:
             while not self._stop.is_set():
                 self.fetch_market()
                 self._stop.wait(MARKET_POLL_S)
+        def wallets_loop():
+            while not self._stop.is_set():
+                self.fetch_wallets()
+                self._stop.wait(WALLETS_POLL_S)
         self._external = False
         if self.cfg.market_monitor and self.store is not None:
             threading.Thread(target=market_loop, name="dashboard-market", daemon=True).start()
+        if self.cfg.launch_canary or self.cfg.launch_fast_canary:
+            threading.Thread(target=wallets_loop, name="dashboard-wallets", daemon=True).start()
         threading.Thread(target=loop, name="dashboard", daemon=True).start()
         threading.Thread(target=live_loop, name="dashboard-live", daemon=True).start()
         if self.cfg.shortbook_feed_url:
@@ -254,6 +300,38 @@ class Dashboard:
         with self._lock:
             self.market, self.market_ver = data, self.market_ver + 1
 
+    def fetch_wallets(self, rpc=None) -> None:
+        """Add SOL balances (one getMultipleAccounts for every address) and tx counts (getSignaturesForAddress for
+        the live set only, to bound the calls) to the wallet directory, over the public RPC so no Helius credits are
+        spent. A failure keeps the last good data and marks it stale."""
+        rpc = rpc or (lambda m, p: _solana_rpc(WALLETS_RPC, m, p))
+        try:
+            d = wallet_directory(self.cfg)
+            addrs = [w["address"] for w in d["live"] + d["archive"]]
+            sol = {}
+            for i in range(0, len(addrs), 100):
+                chunk = addrs[i:i + 100]
+                res = rpc("getMultipleAccounts", [chunk, {"encoding": "base64"}]) or {}
+                for a, v in zip(chunk, res.get("value", []) or []):
+                    sol[a] = (v["lamports"] / 1e9) if v else 0.0
+            for w in d["live"] + d["archive"]:
+                w["sol"] = round(sol.get(w["address"], 0.0), 6)
+            for w in d["live"]:  # tx count only for the live set (one call each), newest 1000
+                try:
+                    sigs = rpc("getSignaturesForAddress", [w["address"], {"limit": 1000}])
+                    w["txs"] = len(sigs) if isinstance(sigs, list) else None
+                except Exception:  # noqa: BLE001 (a per-wallet read may be rate-limited)
+                    w["txs"] = None
+            d["trading_sol"] = round(sum(w.get("sol") or 0 for w in d["live"] if w["role"] == "trading"), 6)
+            d["wallets"] = sum(1 for w in d["live"] if w["role"] == "trading")
+            d.update(fetched_ts=time.time(), stale=False)
+        except Exception as exc:  # noqa: BLE001 (keep the last good data; the public RPC can be slow)
+            log.warning("dashboard: wallet balances failed: %s", exc)
+            d = {**(self.wallets or {"live": [], "archive": []}), "stale": True,
+                 "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+        with self._lock:
+            self.wallets, self.wallets_ver = d, self.wallets_ver + 1
+
     def current(self) -> tuple[int, dict | None]:
         with self._lock:
             return self.version, self.summary
@@ -289,6 +367,10 @@ class Dashboard:
         if self.market is not None:
             send("market", self.market)
             market_ver = self.market_ver
+        wallets_ver = 0
+        if self.wallets is not None:
+            send("wallets", self.wallets)
+            wallets_ver = self.wallets_ver
         last_fill = backlog[-1]["id"] if backlog else live.last_fill
         quiet = time.time()
         while not stop.is_set():
@@ -320,6 +402,10 @@ class Dashboard:
             if self.market_ver != market_ver and self.market is not None:
                 send("market", self.market)
                 market_ver = self.market_ver
+                sent = True
+            if self.wallets_ver != wallets_ver and self.wallets is not None:
+                send("wallets", self.wallets)
+                wallets_ver = self.wallets_ver
                 sent = True
             if sent:
                 quiet = time.time()
@@ -690,7 +776,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <span id="built" class="label muted"></span></div>
 </header>
 <nav class="tabs" aria-label="Programs"><a href="#/" data-v="programs">MZFq</a><a href="#/supermeme" data-v="supermeme" id="tab-meme">Supermeme</a><a href="#/shorts" data-v="shorts">MZF Short Only</a></nav>
-<nav class="tabs sub" id="subtabs" aria-label="Supermeme"><a href="#/supermeme" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a><a href="#/market" data-v="market">Market</a></nav>
+<nav class="tabs sub" id="subtabs" aria-label="Supermeme"><a href="#/supermeme" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a><a href="#/market" data-v="market">Market</a><a href="#/wallets" data-v="wallets">Wallets</a></nav>
 <main id="v-programs" hidden>
 <div><p class="label eyebrow">Quant programs · paper trading</p><h1>MZFq</h1>
 <p class="lead">Each program holds its strategies; Supermeme's are grouped into families of books. Everything here is paper trading.</p></div>
@@ -757,6 +843,14 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div class="filters"><select id="mk-bwin" aria-label="Window"></select></div><div class="scroll"><table id="mk-bands"></table></div></section>
 <section class="card"><p class="label eyebrow">Hourly</p><h2>Hour by hour</h2><p class="sub">Newest first, UTC. Liquid pools by liquidity at second 4 in sz's bands; sz = launchrw50_sz's real trades, size-weighted.</p><div id="mk-imp"></div><div class="scroll"><table id="mk-hours"></table></div></section>
 </main>
+<main id="v-wallets" hidden>
+<div><p class="label eyebrow"><a class="lk" href="#/supermeme">Supermeme</a> · launch canary · real money</p><h1>Wallets</h1>
+<p class="lead">The live trading wallets, treasury and reserve with on-chain SOL balances and transaction counts (public RPC, refreshed each minute), and an archive of every wallet and treasury ever used. Addresses only — keys never reach the page.</p></div>
+<div id="w-note"></div>
+<div class="stats" id="w-tiles"></div>
+<section class="card"><p class="label eyebrow">Live set</p><h2>Trading wallets, treasury, reserve</h2><p class="sub">Numbered 1..n in rotation order. SOL = current balance; Txs = signatures on the wallet (feints and trades both count; a fresh wallet funds at one tx, a direct-route rug drains it to ~0).</p><div class="scroll"><table id="w-live"></table></div></section>
+<section class="card"><p class="label eyebrow">Archive</p><h2>Retired wallets and treasuries</h2><p class="sub">Every other address the key-free address book has recorded, with its label. Old trading wallets and treasuries should read ~0 SOL once swept.</p><div class="scroll"><table id="w-arch"></table></div></section>
+</main>
 <main id="v-ledger" hidden>
 <div><p class="label eyebrow">Every trade of the running books</p><h1>Trade ledger</h1>
 <p class="lead">Newest first. Open trades count at cost until sold; a sale with no route out counts as $0 until a later sale gets through.</p></div>
@@ -803,7 +897,7 @@ const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
 /* mean trade weighted by size: total P&L / total cost (a plain average counts a $25 trade like a $250 one) */
 const wmean=tr=>{const c=tr.reduce((a,x)=>a+(x.cost||0),0);return c?100*tr.reduce((a,x)=>a+x.pnl,0)/c:null};
 const median=a=>{if(!a.length)return null;const b=[...a].sort((x,y)=>x-y),m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2};
-const S={market:null,marketEnabled:false,shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null,feints:[],canary:false,canaryHalted:false};
+const S={market:null,marketEnabled:false,shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null,feints:[],canary:false,canaryHalted:false,wallets:null};
 let sortKey="return_pct",sortDir=-1,win=21600,pending=false;
 const R={v:"overview",arg:null},LIM={ledger:200,b:200,f:200};
 const now=()=>Date.now()/1000-S.skew;
@@ -1081,9 +1175,9 @@ $("mk-hours").innerHTML="<tr><th>Hour</th>"+HC.map(([,l])=>`<th>${l}</th>`).join
 const imp=m.impaired||[];$("mk-imp").innerHTML=imp.length?`<p class="note">Greyed hours (!) are left out of the comparison, the flags, the band totals and the charts: the scorer itself was impaired, so their pools are a biased subset. `+imp.map(x=>`${when(x.hour).slice(0,8)}h: ${esc(x.why||"")}`).join(" · ")+"</p>":""}
 /* router */
 function route(){const h=decodeURIComponent(location.hash.replace(/^#\/?/,"")),[v,...rest]=h.split("/");const arg=rest.join("/");
-R.v=({supermeme:"overview",ledger:"ledger",books:"books",book:"book",family:"family",shorts:"shorts",market:"market"})[v]||"programs";R.arg=arg||null;LIM.b=LIM.f=200;
+R.v=({supermeme:"overview",ledger:"ledger",books:"books",book:"book",family:"family",shorts:"shorts",market:"market",wallets:"wallets"})[v]||"programs";R.arg=arg||null;LIM.b=LIM.f=200;
 for(const m of document.querySelectorAll("main"))m.hidden=m.id!=="v-"+R.v;
-const meme=["overview","ledger","books","book","family","market"].includes(R.v);$("subtabs").hidden=!meme;
+const meme=["overview","ledger","books","book","family","market","wallets"].includes(R.v);$("subtabs").hidden=!meme;
 document.querySelectorAll(".tabs:not(.sub) a").forEach(a=>a.classList.toggle("on",a.dataset.v===(meme?"supermeme":R.v)));
 document.querySelectorAll(".tabs.sub a").forEach(a=>a.classList.toggle("on",a.dataset.v===R.v||(a.dataset.v==="books"&&(R.v==="book"||R.v==="family"))));
 alignSub();window.scrollTo(0,0);render()}
@@ -1106,8 +1200,19 @@ const nr=Object.entries(notes).sort((a,b)=>b[1]-a[1]);
 $("feint-notes").innerHTML=`<tr><th class="l">Why inconclusive</th><th>n</th></tr>`+(nr.length?nr.map(([n,c])=>`<tr><td class="l">${esc(n)}</td><td>${c}</td></tr>`).join(""):`<tr><td class="muted">None</td></tr>`);
 const rows=F.slice(-60).reverse();
 $("feint-feed").innerHTML=`<tr><th>Time</th><th>Pool</th><th>Verdict</th><th class="l">Note</th></tr>`+(rows.length?rows.map(f=>{const t=new Date(f.ts*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});const vc=f.verdict==="alive"?"pos":f.verdict==="pulled"?"neg":"muted";const pool=f.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(f.pool)}" target="_blank" rel="noopener">${esc(f.pool.slice(0,8))}</a>`:(f.token?`<span class="mono">${esc(f.token.slice(0,8))}</span>`:"–");return`<tr><td class="mono">${t}</td><td>${pool}</td><td class="${vc}">${esc(f.verdict||"?")}</td><td class="l">${esc(f.note||"")}</td></tr>`}).join(""):`<tr><td class="muted">No feints yet.</td></tr>`)}
+const WRL={trading:"Trading",treasury:"Treasury",reserve:"Reserve"};
+function walletLink(a){return a?`<a class="lk mono" href="https://solscan.io/account/${encodeURIComponent(a)}" target="_blank" rel="noopener">${esc(a.slice(0,4)+"…"+a.slice(-4))}</a>`:"–"}
+function walletRow(w){return`<tr><td>${w.n!=null?w.n:'<span class="muted">—</span>'}</td><td>${esc(WRL[w.role]||w.role||"")}</td><td>${walletLink(w.address)}</td><td class="num">${w.sol!=null?fmt(w.sol,4):"–"}</td><td class="num">${w.txs!=null?w.txs:"–"}</td><td class="l">${esc(w.label||"")}</td></tr>`}
+function renderWallets(){const W=S.wallets,note=$("w-note");
+if(!W){note.innerHTML='<p class="note">Loading wallet balances…</p>';["w-tiles","w-live","w-arch"].forEach(i=>$(i).innerHTML="");return}
+note.innerHTML=W.stale?`<p class="note">Balances may be stale${W.error?": "+esc(W.error):""}.</p>`:(W.error?`<p class="note">${esc(W.error)}</p>`:"");
+const live=W.live||[],arch=W.archive||[],trading=live.filter(w=>w.role==="trading"),tre=live.find(w=>w.role==="treasury"),res=live.find(w=>w.role==="reserve");
+const when=W.fetched_ts?new Date(W.fetched_ts*1000).toLocaleTimeString([],{hour12:false}):"–";
+tiles("w-tiles",[["Trading wallets",String(trading.length),W.rotate?"rotating · "+(W.route||"direct"):(W.route||"direct")],["Trading SOL",fmt(W.trading_sol||0,3),"across the live set"],["Treasury",tre?fmt(tre.sol||0,3):"–","SOL · idle funds"],["Reserve",res?fmt(res.sol||0,3):"–","SOL · tops up wallets"],["Updated",when,"public RPC, each minute"]]);
+$("w-live").innerHTML=`<tr><th>#</th><th>Role</th><th>Address</th><th>SOL</th><th>Txs</th><th class="l">Label</th></tr>`+(live.length?live.map(walletRow).join(""):`<tr><td class="muted">No wallets loaded (the canary may be off or no wallets file is set).</td></tr>`);
+$("w-arch").innerHTML=`<tr><th>Address</th><th class="l">Label</th><th>SOL</th><th>First recorded</th></tr>`+(arch.length?arch.map(w=>`<tr><td>${walletLink(w.address)}</td><td class="l">${esc(w.label||"")}</td><td class="num">${w.sol!=null?fmt(w.sol,4):"–"}</td><td class="mono">${w.created?esc(String(w.created).slice(0,10)):"–"}</td></tr>`).join(""):`<tr><td class="muted">No archived wallets.</td></tr>`)}
 function render(){renderHealth();renderFeints();if(!S.books.length)return;
-if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="market")renderMarket();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
+if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="market")renderMarket();else if(R.v==="wallets")renderWallets();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
 $("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false})}
 function schedule(){if(!pending){pending=true;setTimeout(()=>{pending=false;render()},300)}}
 function fill(f,isNew){const li=document.createElement("li");if(isNew)li.className="new";
@@ -1131,6 +1236,7 @@ es.addEventListener("init",e=>{const d=JSON.parse(e.data);S.books=d.books;S.fams
 S.shortsEnabled=!!d.shorts_enabled;S.marketEnabled=!!d.market_enabled;S.canary=!!d.canary;S.canaryHalted=!!d.canary_halted;S.pos.clear();S.launch.clear();S.health=d.health;merge(d);fillSelects();render()});
 es.addEventListener("shorts",e=>{S.shorts=JSON.parse(e.data);schedule()});
 es.addEventListener("market",e=>{S.market=JSON.parse(e.data);schedule()});
+es.addEventListener("wallets",e=>{S.wallets=JSON.parse(e.data);schedule()});
 es.addEventListener("delta",e=>{merge(JSON.parse(e.data));schedule()});
 es.addEventListener("summary",e=>{S.extra=JSON.parse(e.data);const d=S.extra.downtime;$("foot").textContent=d?`${d.outages} outages, ${fmt(d.hours_offline,1)} h offline since start`:"";schedule()});
 es.addEventListener("backlog",e=>{$("feed").innerHTML="";JSON.parse(e.data).forEach(f=>fill(f,false))});

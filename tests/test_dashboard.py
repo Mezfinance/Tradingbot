@@ -297,3 +297,43 @@ def test_canary_switch_buttons_are_behind_the_password(cfg, monkeypatch):
         assert c.getresponse().status == 404
     finally:
         server.shutdown()
+
+
+def test_wallet_directory_numbers_the_live_set_and_lists_the_archive(cfg, monkeypatch):
+    from tradingbot import health
+    monkeypatch.setattr(health, "canary_wallets", lambda c: {"wallets": ["Aaa", "Bbb"], "treasury": "Ttt",
+                                                             "rotate": True, "route": "direct"})
+    monkeypatch.setattr(health, "address_book", lambda: {"addresses": {
+        "Aaa": {"label": "wallet-1"}, "Old1": {"label": "wallet-old-3", "created": "2026-11-10T00:00:00"},
+        "Ttt": {"label": "treasury-current"}}})
+    d = dash.wallet_directory(cfg)
+    assert [(w.get("n"), w["role"], w["address"]) for w in d["live"][:3]] == [
+        (1, "trading", "Aaa"), (2, "trading", "Bbb"), (None, "treasury", "Ttt")]
+    assert d["live"][2]["label"] == "treasury-current"  # label comes from the address book
+    assert [w["address"] for w in d["archive"]] == ["Old1"] and d["archive"][0]["label"] == "wallet-old-3"
+    assert d["rotate"] is True  # live addresses are excluded from the archive
+
+
+def test_fetch_wallets_adds_balances_and_tx_counts_and_keeps_last_on_failure(cfg, monkeypatch):
+    from tradingbot import health
+    monkeypatch.setattr(health, "canary_wallets", lambda c: {"wallets": ["Aaa", "Bbb"], "treasury": "Ttt"})
+    monkeypatch.setattr(health, "address_book", lambda: {"addresses": {"Old1": {"label": "wallet-old-3"}}})
+    board = dash.Dashboard(Journal(":memory:"), cfg)
+    lam = {"Aaa": 350_000_000, "Bbb": 300_000_000, "Ttt": 10_000_000, "Old1": 0}
+    txn = {"Aaa": 4, "Bbb": 1, "Ttt": 9}
+
+    def rpc(method, params):
+        if method == "getMultipleAccounts":
+            return {"value": [({"lamports": lam[a]} if lam[a] else None) for a in params[0]]}
+        if method == "getSignaturesForAddress":
+            return [{"signature": "s"}] * txn.get(params[0], 0)
+        return None
+    board.fetch_wallets(rpc)
+    w = board.wallets
+    assert w["stale"] is False and w["wallets"] == 2 and board.wallets_ver == 1
+    by = {x["address"]: x for x in w["live"] + w["archive"]}
+    assert by["Aaa"]["sol"] == 0.35 and by["Aaa"]["txs"] == 4 and by["Ttt"]["sol"] == 0.01
+    assert by["Old1"]["sol"] == 0.0 and "txs" not in by["Old1"]  # archive gets a balance, not a tx count
+    assert round(w["trading_sol"], 3) == 0.65
+    board.fetch_wallets(lambda m, p: (_ for _ in ()).throw(RuntimeError("boom")))  # a failed read keeps the data
+    assert board.wallets["stale"] is True and "boom" in board.wallets["error"]
