@@ -25,6 +25,7 @@ MINUTE6_S = 360.0          # the scorer's minute-6 exit
 PULLED_SHARE = 0.10        # pool SOL below this share of its peak = pulled (as launch_analysis.PULLED_SHARE)
 COST = 0.06                # round-trip cost used for the ideal returns
 STAKE_USD = 25.0           # the feint / commit size we size "would have made" on
+CONF_AFTER_S = 60.0        # survival confirmation ≈ probe age + the watch window (48 s) + margin (12 s)
 TRACK_WINDOW_S = 3 * 3600  # how far back the tracker looks by default
 YOUNG_MAX_AGE_S = 1500.0   # keep reading a pool's reserves live for ~25 min after creation
 DEFAULT_RPC = "https://api.mainnet-beta.solana.com"
@@ -152,6 +153,14 @@ def update_path(path: dict | None, now: float, created: float | None, feint_ts: 
         opt_age, opt_px = min(window, key=lambda ap: ap[1])
         path["opt_age"] = opt_age
         path["opt_ret"] = (-1.0 if path["pulled_ts"] else min(exit_px / opt_px - 1 - COST, 3.0)) if opt_px else None
+        # realistic two-stage entry: the first price at or after the survival confirmation (~probe age + the watch
+        # window), held to minute 6 -- what entering a SURVIVOR for real would actually have made, vs opt (the
+        # hindsight-best entry). -100% if the pool was pulled (a survivor that later rugged).
+        conf = next(((a, pr) for (a, lq, pr) in path["pts"]
+                     if pr and a >= probe_age + CONF_AFTER_S and lq >= floor), None)
+        if conf and exit_px:
+            path["conf_age"] = conf[0]
+            path["conf_ret"] = -1.0 if path["pulled_ts"] else min(exit_px / conf[1] - 1 - COST, 3.0)
     return path
 
 
@@ -191,6 +200,7 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
             "pull_after_probe_s": (pulled_ts - f["feint_ts"]) if pulled_ts else None,
             "ret_m6": ret_m6, "pnl25": (STAKE_USD * ret_m6) if ret_m6 is not None else None,
             "opt_age_s": p.get("opt_age"), "opt_ret": p.get("opt_ret"),
+            "conf_age_s": p.get("conf_age"), "conf_ret": p.get("conf_ret"),
             "status": s.get("status") or "pending",
         })
     out.sort(key=lambda r: (r["created_ts"] or r["feint_ts"] or 0), reverse=True)
@@ -200,17 +210,24 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
 def summary(rows: list[dict]) -> dict:
     done = [r for r in rows if r["ret_m6"] is not None]
     pnl = [r["pnl25"] for r in rows if r["pnl25"] is not None]
+    surv = [r for r in rows if r.get("watch_verdict") == "survivor"]
+    entry = [r["conf_ret"] for r in surv if r.get("conf_ret") is not None]  # enter at confirmation, hold to m6
+    best = [r["opt_ret"] for r in surv if r.get("opt_ret") is not None]     # hindsight-best entry
     return {
         "pools": len(rows),
         "alive": sum(1 for r in rows if r["verdict"] == "alive"),
         "pulled_at_probe": sum(1 for r in rows if r["verdict"] == "pulled"),
         "inconclusive": sum(1 for r in rows if r["verdict"] == "inconclusive"),
-        "survivor": sum(1 for r in rows if r.get("watch_verdict") == "survivor"),
+        "survivor": len(surv),
         "rugger": sum(1 for r in rows if r.get("watch_verdict") == "rugger"),
         "pulled_since": sum(1 for r in rows if r["pulled"]),
         "with_outcome": len(done),
         "would_pnl25": round(sum(pnl), 2) if pnl else 0.0,
         "mean_ret_m6": round(sum(r["ret_m6"] for r in done) / len(done), 4) if done else None,
+        # the Section-3 go/no-go: of survivors we measured a path for, what entering at confirmation would have made
+        "survivor_entry_n": len(entry),
+        "survivor_entry_mean": round(sum(entry) / len(entry), 4) if entry else None,
+        "survivor_best_mean": round(sum(best) / len(best), 4) if best else None,
     }
 
 
@@ -262,11 +279,16 @@ def render(rows: list[dict], su: float | None) -> str:
                f"inconclusive {s['inconclusive']}); pulled since {s['pulled_since']}; "
                f"{s['with_outcome']} with a minute-6 outcome, mean ret "
                f"{(s['mean_ret_m6'] * 100):+.1f}% -> $25 would make ${s['would_pnl25']:+.2f}")
+    if s.get("survivor"):
+        em = f"{s['survivor_entry_mean'] * 100:+.1f}%" if s.get("survivor_entry_mean") is not None else "—"
+        bm = f"{s['survivor_best_mean'] * 100:+.1f}%" if s.get("survivor_best_mean") is not None else "—"
+        out.append(f"survivors {s['survivor']} (ruggers {s['rugger']}); entering at confirmation -> {em} "
+                   f"(hindsight best {bm}) over {s['survivor_entry_n']} with a path")
     if su:
         out.append(f"SOL ${su:.2f}")
     out.append("")
-    hdr = f"{'mint':<10} {'verdict':<6} {'age':>7} {'probe@':>6} {'liq':>7} {'live':>7} {'peak':>7} " \
-          f"{'pulled@':>7} {'+probe':>7} {'m6%':>7} {'$25':>7} {'opt@':>6} {'opt%':>7}"
+    hdr = f"{'mint':<10} {'verdict':<8} {'age':>7} {'probe@':>6} {'liq':>7} {'live':>7} {'peak':>7} " \
+          f"{'pulled@':>7} {'+probe':>7} {'m6%':>7} {'$25':>7} {'enter%':>7} {'best%':>7}"
     out.append(hdr)
     out.append("-" * len(hdr))
     for r in rows[:60]:
@@ -274,8 +296,9 @@ def render(rows: list[dict], su: float | None) -> str:
         m6 = f"{r['ret_m6'] * 100:+.0f}%" if r["ret_m6"] is not None else "—"
         pnl = f"${r['pnl25']:+.1f}" if r["pnl25"] is not None else "—"
         opt = f"{r['opt_ret'] * 100:+.0f}%" if r["opt_ret"] is not None else "—"
-        out.append(f"{m:<10} {(r['verdict'] or '')[:6]:<6} {_age(r['pool_age_s']):>7} "
+        enter = f"{r['conf_ret'] * 100:+.0f}%" if r.get("conf_ret") is not None else "—"
+        out.append(f"{m:<10} {(r['verdict'] or '')[:8]:<8} {_age(r['pool_age_s']):>7} "
                    f"{_age(r['probe_pool_age_s']):>6} {_usd(r['liq_probe']):>7} {_usd(r['live_liq']):>7} "
                    f"{_usd(r['peak_liq']):>7} {_age(r['pull_pool_age_s']):>7} {_age(r['pull_after_probe_s']):>7} "
-                   f"{m6:>7} {pnl:>7} {_age(r['opt_age_s']):>6} {opt:>7}")
+                   f"{m6:>7} {pnl:>7} {enter:>7} {opt:>7}")
     return "\n".join(out)

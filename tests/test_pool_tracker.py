@@ -68,6 +68,31 @@ def test_update_path_tracks_peak_detects_pull_and_finds_the_best_entry():
     assert path["live_liq"] == 2 * 2 * 100
 
 
+def test_update_path_measures_the_confirmation_entry_vs_the_best_entry():
+    created = 1000.0
+    feint = created + 6  # probe at pool age 6s; survival confirmation ~ 6 + 60 = 66s
+    path = None
+    # a survivor that climbs and is never pulled: samples at pool age 6 / 70 / 360 (minute 6 = exit)
+    for age, sol in [(6, 50.0), (70, 100.0), (360, 120.0)]:
+        path = pt.update_path(path, created + age, created, feint, sol, 1e12, 100.0, None)
+    assert path["pulled_ts"] is None
+    assert path["opt_age"] == 6 and round(path["opt_ret"], 2) == 1.34   # hindsight best = the 6s low
+    assert path["conf_age"] == 70                                       # first price at/after confirmation (66s)
+    assert round(path["conf_ret"], 2) == 0.14                           # entering at ~60s makes far less than best
+
+
+def test_summary_reports_survivor_entry_vs_best():
+    rows = [
+        {"watch_verdict": "survivor", "conf_ret": 0.14, "opt_ret": 1.34, "ret_m6": None, "pnl25": None, "verdict": "survivor", "pulled": False},
+        {"watch_verdict": "survivor", "conf_ret": -1.0, "opt_ret": 0.5, "ret_m6": None, "pnl25": None, "verdict": "survivor", "pulled": True},
+        {"watch_verdict": "rugger", "conf_ret": None, "opt_ret": None, "ret_m6": None, "pnl25": None, "verdict": "rugger", "pulled": True},
+    ]
+    s = pt.summary(rows)
+    assert s["survivor"] == 2 and s["rugger"] == 1 and s["survivor_entry_n"] == 2
+    assert round(s["survivor_entry_mean"], 3) == round((0.14 - 1.0) / 2, 3)  # a later-rugged survivor counts as -100%
+    assert round(s["survivor_best_mean"], 3) == 0.92
+
+
 def test_assemble_joins_feint_scorer_and_path():
     now = 1000.0
     feints = {"P1": {"pool": "P1", "mint": "MintA", "verdict": "alive", "note": "", "feint_ts": now - 300,
