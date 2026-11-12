@@ -440,8 +440,8 @@ class DirectPumpswapExecutor(JupiterExecutor):
         self.last_note = "ok"
         return Fill(qty=qty, price=swap_usd / qty, usd=swap_usd + fee_usd, fee_usd=fee_usd, tx=sent, note="ok")
 
-    def feint(self, token: str, usd: float) -> str:
-        """Probe before committing (11-12): poke the pool with a $usd buy and sell it straight back, then re-read the
+    def feint(self, token: str, usd: float, commit: bool = True) -> str:
+        """Probe before committing (11-12). `commit` is only meaningful under wallet rotation (see RotatingExecutor). poke the pool with a $usd buy and sell it straight back, then re-read the
         pool and report whether its liquidity was pulled in reaction. Returns 'alive' (commit), 'pulled' (skip) or
         'inconclusive' (the probe could not be placed; skip to be safe). `launch_canary_feint_hold_s` = 0 does one
         atomic buy+sell tx (never hold, ~fee-only cost, but invisible to an operator bot that watches holdings rather

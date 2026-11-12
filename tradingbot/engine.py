@@ -833,7 +833,8 @@ class Engine:
             book.executor.remember_pool(sig["mint"], sig["pool"])
         if canary and c.launch_canary_feint and hasattr(book.executor, "feint"):
             # Poke the pool with a $feint buy, sell it straight back, and commit only if it wasn't pulled in reaction.
-            verdict = book.executor.feint(sig["mint"], c.launch_canary_feint_usd)
+            verdict = book.executor.feint(sig["mint"], c.launch_canary_feint_usd,
+                                          commit=not c.launch_canary_feint_only)
             self.journal.log_event("canary_feint", sig["mint"], json.dumps(
                 {"verdict": verdict, **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
             if c.launch_canary_feint_only:  # measurement run: feint every pool, never commit

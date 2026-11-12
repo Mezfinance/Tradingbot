@@ -23,6 +23,13 @@ class FakeSub:
         self.balances: dict[str, int] = {}
         self.fail_buy = False
         self.fail_sell = False  # True = the pool rugged, the sale finds no route
+        self.feinted: list = []
+        self.feint_verdict = "alive"
+        self.last_feint: dict = {}
+
+    def feint(self, token: str, usd: float, commit: bool = True) -> str:
+        self.feinted.append((token, commit))
+        return self.feint_verdict
 
     def remember_pool(self, mint: str, pool: str) -> None:
         self.pools[mint] = pool
@@ -163,3 +170,18 @@ def test_read_canary_wallets_parses_and_caps(tmp_path, monkeypatch):
     assert len({str(k.pubkey()) for k in out}) == MAX_WALLETS  # deduped
     monkeypatch.delenv("TB_CANARY_WALLETS")
     assert read_canary_wallets(cfg) == []  # nothing configured -> empty
+
+
+def test_feint_keeps_the_wallet_for_a_following_commit():
+    r = rot(2)
+    assert r.feint("A", 25.0, commit=True) == "alive"  # commit coming: hold the wallet for buy()
+    assert list(r._assign) == ["A"]
+    assert r.subs[r._assign["A"]].feinted == [("A", True)]
+
+
+def test_feint_only_frees_the_wallet_each_time():
+    r = rot(2)
+    assert r.feint("A", 25.0, commit=False) == "alive"  # feint-only: no commit, so release the wallet
+    assert r._assign == {}
+    assert r.feint("B", 25.0, commit=False) == "alive"  # a second pool still finds a free wallet
+    assert r._assign == {}

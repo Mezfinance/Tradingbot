@@ -188,9 +188,10 @@ class RotatingExecutor:
                 self._save()
         return fill
 
-    def feint(self, token: str, usd: float) -> str:
+    def feint(self, token: str, usd: float, commit: bool = True) -> str:
         """Probe the pool from the wallet that will hold the commit, so the feint and the real buy come from one
-        wallet. Keeps the wallet assigned on 'alive' (buy() reuses it) and releases it otherwise, to stay fresh."""
+        wallet. Keeps the wallet assigned on 'alive' so buy() reuses it; releases it otherwise -- and always when
+        `commit` is False (feint-only measurement runs make no commit, so the wallet must not stay assigned)."""
         with self._lock:
             idx = self._assign.get(token)
             if idx is None:
@@ -208,7 +209,7 @@ class RotatingExecutor:
         self.last_feint = getattr(sub, "last_feint", {})
         self.last_note = getattr(sub, "last_note", "")
         with self._lock:
-            if verdict != "alive":  # no commit coming: release the wallet, keep it fresh
+            if verdict != "alive" or not commit:  # no commit coming (pulled, inconclusive, or feint-only): free it
                 self._assign.pop(token, None)
                 self._opened.pop(token, None)
                 self._save()
