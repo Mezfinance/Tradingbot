@@ -297,8 +297,9 @@ class SlotRpc(PoolRpc):
 def probe_direct(**kw):
     kp = Keypair()
     rpc = SlotRpc(str(kp.pubkey()), **kw)
-    ex = d.DirectPumpswapExecutor(Config(max_price_impact_pct=5.0, db_path=":memory:"), FakeJup(), http=rpc,
-                                  keypair=kp, sell_slippage_bps=1000, sleep=lambda s: None)
+    ex = d.DirectPumpswapExecutor(
+        Config(max_price_impact_pct=5.0, db_path=":memory:", launch_canary_probe_priority_sol=0.005),
+        FakeJup(), http=rpc, keypair=kp, sell_slippage_bps=1000, sleep=lambda s: None)
     ex.remember_pool(MINT, POOL)
     return ex, rpc
 
