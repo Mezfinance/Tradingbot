@@ -34,6 +34,15 @@ FIELDS: list[dict] = [
      "lo": 0, "hi": 60, "help": "0 = one atomic buy+sell (never hold); > 0 = buy, hold, then sell."},
     {"key": "launch_canary_feint_slippage_bps", "label": "Feint slippage (bps)", "type": "int", "group": "Probe",
      "live": True, "lo": 10, "hi": 1000, "help": "Tighter = less dust left by the feint; too tight just reverts."},
+    {"key": "launch_canary_probe", "label": "1-slot probe (measure, never commit)", "type": "bool", "group": "Probe",
+     "live": True, "help": "Probe every liquid candidate: buy, land money, sell in the next slot (escapes the pull), "
+                           "watch, record rugger/survivor. Never commits. Direct route only."},
+    {"key": "launch_canary_probe_usd", "label": "Probe size ($)", "type": "float", "group": "Probe", "live": True,
+     "lo": 1, "hi": 100, "help": "Big enough to trip the size-reacting operators (~$25)."},
+    {"key": "launch_canary_probe_watch_s", "label": "Probe watch (s)", "type": "float", "group": "Probe", "live": True,
+     "lo": 5, "hi": 300, "help": "Watch the pool this long after the probe (the measured max $25 pull age ~48s)."},
+    {"key": "launch_canary_probe_margin_s", "label": "Probe margin (s)", "type": "float", "group": "Probe",
+     "live": True, "lo": 0, "hi": 120, "help": "Extra margin on the watch before calling a pool a survivor."},
     # --- sizing ---
     {"key": "launch_canary_flat_usd", "label": "Flat buy size ($)", "type": "float", "group": "Sizing", "live": True,
      "lo": 0, "hi": 500, "help": "> 0: every commit at this size (0 = use the band scale)."},
@@ -86,6 +95,15 @@ PRESETS: dict[str, dict] = {
         "values": {"launch_canary_route": "direct", "launch_canary_feint": False, "launch_canary_feint_only": False,
                    "launch_canary_clips": 5, "launch_canary_flat_usd": 5.0, "launch_canary_max_liq_usd": 15000.0,
                    "launch_canary_max_trades": 10}},
+    "probe_measure": {
+        "label": "1-slot probe (measure)",
+        "about": "Probe every liquid candidate with a $25 buy + next-slot sell (lands money, escapes the pull), never "
+                 "commit; watch 48s and record rugger (tripped and dodged) / survivor (a pool to enter).",
+        "values": {"launch_canary_route": "direct", "launch_canary_probe": True, "launch_canary_probe_usd": 25.0,
+                   "launch_canary_probe_watch_s": 48.0, "launch_canary_probe_margin_s": 12.0,
+                   "launch_canary_feint": False, "launch_canary_feint_only": False, "launch_canary_feint_all": False,
+                   "launch_canary_max_liq_usd": 0.0, "launch_canary_every_n": 1, "launch_canary_max_trades": 0,
+                   "launch_canary_follow_dd": False}},
     "sz_replica": {
         "label": "Exact sz replica (1/10)",
         "about": "Trade sz's rule in every band at a tenth of its band sizes, no feint, no daily stop.",
@@ -143,6 +161,8 @@ def _coherent(state: dict) -> None:
         raise ValueError("Feint only needs Feint before buying on.")
     if state.get("launch_canary_clips", 1) > 1 and state.get("launch_canary_route") != "direct":
         raise ValueError("Clip buys need the direct route.")
+    if state.get("launch_canary_probe") and state.get("launch_canary_route") != "direct":
+        raise ValueError("The 1-slot probe needs the direct route — set Route to direct first (takes effect after restart).")
 
 
 def apply(cfg, journal, changes: dict) -> dict:

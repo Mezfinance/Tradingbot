@@ -135,6 +135,67 @@ def canary_switch(journal, action: str) -> dict:
     raise ValueError(f"unknown canary action {action!r}")
 
 
+def _probe_detail(r) -> dict:
+    try:
+        return json.loads(r["detail"] or "{}")
+    except (ValueError, TypeError):
+        return {}
+
+
+def probe_summary(journal, n: int = 500) -> dict:
+    """Readout of the 1-slot probe measurement run: how many pools we probed, and of those watched out to the window,
+    how many rugged (we tripped and dodged) vs survived (a pool to enter), plus the trip rate and the recent probes."""
+    probes = journal.query("SELECT id, ts, token, detail FROM events WHERE kind='canary_probe' ORDER BY id DESC LIMIT ?",
+                           (n,))
+    verdicts = journal.query("SELECT token, detail FROM events WHERE kind='canary_probe_verdict' ORDER BY id DESC "
+                             "LIMIT ?", (n,))
+    vd: dict = {}
+    for r in verdicts:
+        vd.setdefault(r["token"], _probe_detail(r))  # newest verdict per token
+    counts = {"rugger": 0, "survivor": 0, "unknown": 0}
+    for d in vd.values():
+        counts[d.get("verdict", "unknown")] = counts.get(d.get("verdict", "unknown"), 0) + 1
+    decided = counts["rugger"] + counts["survivor"]
+    recent = []
+    for r in probes[:60]:
+        d, v = _probe_detail(r), vd.get(r["token"], {})
+        recent.append({"ts": r["ts"], "token": r["token"], "pool": d.get("pool"), "probe": d.get("verdict"),
+                       "slot_gap": d.get("slot_gap"), "recovered_sol": d.get("recovered_sol"),
+                       "watch": v.get("verdict")})
+    probed_tokens = {r["token"] for r in probes}
+    return {"probes": len(probes), "decided": decided, "pending": max(0, len(probed_tokens) - len(vd)),
+            "rugger": counts["rugger"], "survivor": counts["survivor"], "unknown": counts.get("unknown", 0),
+            "trip_rate": round(counts["rugger"] / decided, 3) if decided else None, "recent": recent}
+
+
+def canary_one(journal) -> dict:
+    """Arm exactly one more canary action (the 'Execute one probe' button): the next liquid candidate is probed (or
+    bought, if committing), then it waits. Writes the same state as the canary-one CLI; the engine reads it next pass."""
+    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
+    journal.set_state(CANARY_ALLOW, "1")
+    journal.execute("DELETE FROM state WHERE key=?", (CANARY_HALT,))
+    return {"armed": True, "msg": "One probe armed: the next liquid candidate is probed, then it waits."}
+
+
+def probe_smoke(cfg, mint: str, usd=None, pool: str | None = None) -> dict:
+    """Run one low-cost real 1-slot probe (buy + next-slot sell) from the dashboard to prove the sell lands on-chain
+    before a $25 run. Real money, direct route only; builds the canary executor like the CLI does."""
+    from tradingbot import cli, launch_canary
+    from tradingbot.config import LIVE_CONFIRM_PHRASE
+    from tradingbot.data.jupiter import Jupiter
+    if cfg.live_confirm != LIVE_CONFIRM_PHRASE:
+        raise ValueError("The probe smoke spends real money; set TB_LIVE_CONFIRM on the machine.")
+    if cfg.launch_canary_route != "direct":
+        raise ValueError("The 1-slot probe needs the direct route (set Route to direct and redeploy).")
+    if not mint:
+        raise ValueError("A token mint with a pumpswap pool is required.")
+    size = float(usd) if usd else 1.0
+    if not 0 < size <= 25:
+        raise ValueError("The probe smoke size must be between 0 and 25.")
+    ex = cli.canary_executor(cfg, Jupiter(cfg.slippage_bps))
+    return launch_canary.probe_smoke(ex, mint, size, pool)
+
+
 _ROTATE = {"proc": None, "started": 0.0, "args": None}
 _ROTATE_LOCK = threading.Lock()
 
@@ -1091,6 +1152,13 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <p class="sub">Runs the deploy command on this machine (if one is configured) and restarts it — <b>this page will disconnect</b>; reload in a minute. Normally you deploy from your Mac with <code>git pull &amp;&amp; fly deploy</code>. Restart-only settings above (route, budget, fees) take effect on the next deploy.</p>
 <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:4px 0 10px"><button id="dep-go" onclick="flyDeploy()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">fly deploy</button><span class="sub mono" id="dep-cmd"></span></div>
 <pre id="dep-log" hidden style="white-space:pre-wrap;word-break:break-word;background:var(--sunken);border:2px solid var(--rule-soft);padding:10px;max-height:320px;overflow:auto;font:500 12px/1.5 var(--mono)"></pre></section>
+<section class="card"><p class="label eyebrow">1-slot probe · real money</p><h2>1-slot probe (measurement)</h2>
+<p class="sub">Probe every liquid candidate: buy $25 so committed money lands, sell it back in the <b>next slot</b> (escapes the pull — every measured rug is ≥2 slots after the buy), watch ~48s and record <b>rugger</b> (tripped and dodged) or <b>survivor</b> (a pool to enter for real). Never commits. Enable with the <b>1-slot probe (measure)</b> preset or the Probe settings above (direct route only). <b>Smoke-test the next-slot sell at low cost first.</b></p>
+<div id="pb-tiles" class="stats"></div>
+<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:8px 0 6px"><button id="pb-one" onclick="probeOne()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Execute one probe</button><span class="sub" id="pb-one-note">Arms one probe at the next liquid candidate, then waits.</span></div>
+<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:6px 0"><input id="pb-mint" placeholder="token mint (deep pool)" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:220px"><input id="pb-pool" placeholder="pool (optional)" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:170px"><input id="pb-usd" type="number" value="1" min="0.1" max="25" step="any" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:80px"><button id="pb-smoke" onclick="probeSmoke()" style="padding:9px 20px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);cursor:pointer;font:inherit;font-weight:700">Smoke test</button><span class="sub" id="pb-smoke-note"></span></div>
+<pre id="pb-smoke-out" hidden style="white-space:pre-wrap;word-break:break-word;background:var(--sunken);border:2px solid var(--rule-soft);padding:10px;max-height:240px;overflow:auto;font:500 12px/1.5 var(--mono)"></pre>
+<div class="scroll"><table id="pb-recent"></table></div></section>
 <section class="card"><p class="label eyebrow">Access</p><h2>Passkeys</h2>
 <p class="sub">Sign in with FaceID, TouchID, Windows Hello or a security key instead of the shared link. Add a passkey on each device you use; the private key never leaves that device. The <code>?key=</code> link stays as a break-glass bootstrap and for recovery. Removing every passkey falls back to the link.</p>
 <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:4px 0 10px"><input id="pk-label" placeholder="e.g. iPhone, MacBook" maxlength="40" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:190px"><button id="pk-add" onclick="addPasskey()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Add this device</button><span class="sub" id="pk-note"></span></div>
@@ -1486,6 +1554,7 @@ else input=`<input type="number" id="cs-${f.key}" value="${v}" ${f.lo!=null?`min
 return`<div style="display:flex;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid var(--rule-soft)"><div style="flex:1 1 260px;min-width:0"><div style="font-weight:700">${esc(f.label)} ${badge}</div><div class="sub" style="margin:0">${esc(f.help||"")}</div></div><div>${input}</div></div>`}
 let csBuilt=false;
 function renderSettings(){const note=$("cs-note");
+if(!window._pbStarted){window._pbStarted=true;probePoll()}
 if(!S.cset){if(!S.csetLoading){S.csetLoading=true;fetch("api/canary/settings").then(r=>r.json()).then(d=>{S.cset=d;S.csetLoading=false;csBuilt=false;render()}).catch(e=>{S.csetLoading=false;note.innerHTML='<p class="note neg">Could not load settings: '+esc(""+e)+'</p>'})}
 if(!note.innerHTML)note.innerHTML='<p class="note">Loading settings…</p>';$("cs-presets").innerHTML="";$("cs-groups").innerHTML="";return}
 if(csBuilt){csDirty();return}  // don't rebuild inputs under the user (background re-renders would wipe edits)
@@ -1524,6 +1593,17 @@ function pollDeploy(){fetch("api/deploy/log").then(r=>r.json()).then(d=>{$("dep-
 // --- passkeys (WebAuthn) ---
 function b64urlToBuf(s){s=s.replace(/-/g,"+").replace(/_/g,"/");const pad=s.length%4?4-s.length%4:0;s+="=".repeat(pad);const bin=atob(s),b=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)b[i]=bin.charCodeAt(i);return b.buffer}
 function bufToB64url(b){const bytes=new Uint8Array(b);let bin="";for(const x of bytes)bin+=String.fromCharCode(x);return btoa(bin).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}
+function probePoll(){if(R.v!=="settings"){window._pbStarted=false;return}renderProbe();clearTimeout(window._pbT);window._pbT=setTimeout(probePoll,5000)}
+function renderProbe(){const t=$("pb-tiles");if(!t)return;fetch("api/canary/probes").then(r=>r.json()).then(d=>{
+t.innerHTML=[["Probed",d.probes],["Rugger",d.rugger],["Survivor",d.survivor],["Trip rate",d.trip_rate==null?"—":(d.trip_rate*100).toFixed(0)+"%"],["Pending",d.pending]].map(([k,v])=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+const rows=d.recent||[];$("pb-recent").innerHTML="<tr><th>Token</th><th>Probe</th><th>Gap</th><th>Recovered SOL</th><th>Watch</th></tr>"+(rows.length?rows.map(r=>`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${esc(r.probe||"")}</td><td>${r.slot_gap==null?"—":r.slot_gap}</td><td>${r.recovered_sol==null?"—":r.recovered_sol}</td><td class="${r.watch==='rugger'?'neg':r.watch==='survivor'?'pos':''}">${esc(r.watch||"…")}</td></tr>`).join(""):'<tr><td colspan="5" class="sub">No probes yet. Enable the 1-slot probe preset and start the canary.</td></tr>')}).catch(()=>{})}
+function probeOne(){const b=$("pb-one");b.disabled=true;$("pb-one-note").textContent="arming…";
+fetch("api/canary/probe-one",{method:"POST"}).then(r=>r.json()).then(d=>{b.disabled=false;$("pb-one-note").textContent=d.msg||"armed."}).catch(e=>{b.disabled=false;$("pb-one-note").textContent="error: "+e})}
+function probeSmoke(){const mint=$("pb-mint").value.trim();if(!mint){$("pb-smoke-note").textContent="enter a token mint";return}
+const usd=parseFloat($("pb-usd").value)||1,pool=$("pb-pool").value.trim()||null;
+if(!confirm("Run one REAL $"+usd+" probe on "+mint+"?\n\nIt buys and sells back in the next slot (~fee cost). Direct route only."))return;
+const b=$("pb-smoke");b.disabled=true;$("pb-smoke-note").textContent="probing…";$("pb-smoke-out").hidden=false;$("pb-smoke-out").textContent="…";
+fetch("api/canary/probe-smoke",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mint,usd,pool})}).then(r=>r.json().then(j=>({ok:r.ok,j}))).then(({ok,j})=>{b.disabled=false;$("pb-smoke-note").textContent=ok?"done":"failed";$("pb-smoke-out").textContent=JSON.stringify(j,null,2);renderProbe()}).catch(e=>{b.disabled=false;$("pb-smoke-note").textContent="error";$("pb-smoke-out").textContent=""+e})}
 function renderPasskeys(){const t=$("pk-list");if(!t)return;fetch("api/auth/passkeys").then(r=>r.json()).then(d=>{const ks=d.passkeys||[];t.innerHTML="<tr><th>Device</th><th>Added</th><th>Last used</th><th></th></tr>"+(ks.length?ks.map(k=>`<tr><td>${esc(k.label)}</td><td class="sub">${k.created?new Date(k.created*1000).toLocaleDateString():"—"}</td><td class="sub">${k.last_used?new Date(k.last_used*1000).toLocaleString():"never"}</td><td><button onclick="removePasskey('${esc(k.id)}')" style="padding:3px 10px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);cursor:pointer;font:inherit;font-size:12px">Remove</button></td></tr>`).join(""):'<tr><td colspan="4" class="sub">No passkeys yet. Add this device to sign in without the link.</td></tr>')}).catch(()=>{})}
 function addPasskey(){const note=$("pk-note"),btn=$("pk-add");if(!window.PublicKeyCredential){note.textContent="This browser has no passkey support.";return}
 const label=($("pk-label").value||"").trim();btn.disabled=true;note.textContent="Follow your device prompt…";

@@ -181,7 +181,8 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                             "Set-Cookie": self._cookie(dashpasskey.CHAL_COOKIE, chal, dashpasskey.CHALLENGE_MAX_AGE_S)})
                 return
             if path not in ("/", "/api/stream", "/api/summary", "/api/canary/rotate/log", "/api/canary/settings",
-                            "/api/deploy/log", "/api/auth/passkeys", "/api/auth/register/options"):
+                            "/api/canary/probes", "/api/deploy/log", "/api/auth/passkeys",
+                            "/api/auth/register/options"):
                 self.send_error(404)
                 return
             if query.get("key"):  # remember the break-glass token in a cookie, then drop it from the address bar
@@ -213,6 +214,9 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 return
             if path == "/api/canary/settings":  # current canary settings + presets for the menu
                 self._send(200, json.dumps(dash.canary_settings_menu(cfg)).encode(), "application/json")
+                return
+            if path == "/api/canary/probes":  # 1-slot probe measurement readout (trip rate, survivors, recent)
+                self._send(200, json.dumps(dash.probe_summary(journal)).encode(), "application/json")
                 return
             if path == "/api/deploy/log":  # progress of a running deploy
                 self._send(200, json.dumps(dash.deploy_log(cfg)).encode(), "application/json")
@@ -270,7 +274,8 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                                            self._cookie(dash.COOKIE, "", 0)]})
                 return
             if path not in ("/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/settings",
-                            "/api/deploy", "/api/auth/register/verify", "/api/auth/passkeys/remove"):
+                            "/api/canary/probe-smoke", "/api/canary/probe-one", "/api/deploy",
+                            "/api/auth/register/verify", "/api/auth/passkeys/remove"):
                 self.send_error(404)
                 return
             if not dash.authorised(self.headers, query, cfg):
@@ -301,6 +306,14 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                     data = json.loads(body or b"{}")
                     res = dash.canary_rotate(journal, cfg, data.get("wallets"), data.get("sol"))
                     log.info("dashboard wallet rotation: %s", res.get("msg"))
+                elif path == "/api/canary/probe-one":  # arm exactly one probe (Execute one probe)
+                    res = dash.canary_one(journal)
+                    log.info("dashboard probe-one: %s", res.get("msg"))
+                elif path == "/api/canary/probe-smoke":  # one low-cost real probe to prove the N+1 sell on-chain
+                    data = json.loads(body or b"{}")
+                    res = dash.probe_smoke(cfg, data.get("mint"), data.get("usd"), data.get("pool"))
+                    log.info("dashboard probe-smoke %s: %s", data.get("mint"),
+                             (res.get("result") or {}).get("verdict"))
                 else:
                     res = dash.canary_switch(journal, "stop" if path.endswith("stop") else "start")
                     log.info("dashboard canary switch: %s", res.get("msg"))

@@ -546,3 +546,54 @@ def test_deploy_endpoint_is_behind_the_password(cfg, monkeypatch):
         assert req("GET", "/api/deploy/log", cookie="tb_dash=s3cret")[0] == 200
     finally:
         server.shutdown()
+
+
+def test_probe_summary_counts_trips_and_survivors():
+    import json as _j
+    j = Journal(":memory:")
+    for mint, pv, slot in (("A", "ok", 1), ("B", "ok", 2), ("C", "trapped", None)):
+        j.log_event("canary_probe", mint, _j.dumps({"verdict": pv, "pool": "P" + mint, "slot_gap": slot,
+                                                    "recovered_sol": 0.12}), strategy="canary_rw50_sz")
+    j.log_event("canary_probe_verdict", "A", '{"pool": "PA", "verdict": "survivor"}', strategy="canary_rw50_sz")
+    j.log_event("canary_probe_verdict", "B", '{"pool": "PB", "verdict": "rugger"}', strategy="canary_rw50_sz")
+    s = dash.probe_summary(j)
+    assert s["probes"] == 3 and s["survivor"] == 1 and s["rugger"] == 1 and s["decided"] == 2
+    assert s["trip_rate"] == 0.5 and s["pending"] == 1  # C probed, no verdict yet
+    rec = {r["token"]: r for r in s["recent"]}
+    assert rec["A"]["watch"] == "survivor" and rec["C"]["watch"] is None and rec["A"]["slot_gap"] == 1
+
+
+def test_canary_one_arms_exactly_one_probe():
+    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
+    j = Journal(":memory:")
+    j.set_state(CANARY_HALT, "1")
+    res = dash.canary_one(j)
+    assert res["armed"] and j.get_state(CANARY_ALLOW) == "1" and j.get_state(CANARY_HALT) is None
+
+
+def test_probe_endpoints_are_behind_the_password(cfg, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
+    cfg.health_port = 18779
+    from tradingbot.engine import CANARY_ALLOW
+    j = Journal(":memory:")
+    board = dash.Dashboard(j, cfg)
+    board.refresh()
+    server = health.start_health_server(j, cfg, board)
+
+    def req(method, path, cookie=None, body=None):
+        c = http.client.HTTPConnection("127.0.0.1", 18779, timeout=5)
+        c.request(method, path, body=body, headers={"Cookie": cookie} if cookie else {})
+        r = c.getresponse()
+        return r.status, r.read()
+    try:
+        assert req("GET", "/api/canary/probes")[0] == 401  # readout needs the password
+        code, body = req("GET", "/api/canary/probes", cookie="tb_dash=s3cret")
+        assert code == 200 and json.loads(body)["probes"] == 0
+        assert req("POST", "/api/canary/probe-one")[0] == 401
+        code, _ = req("POST", "/api/canary/probe-one", cookie="tb_dash=s3cret")
+        assert code == 200 and j.get_state(CANARY_ALLOW) == "1"  # one probe armed
+        # probe-smoke rejects a non-direct / no-live-confirm cfg as a 400 before building any executor
+        code, body = req("POST", "/api/canary/probe-smoke", cookie="tb_dash=s3cret", body=json.dumps({"mint": "X"}))
+        assert code == 400 and "error" in json.loads(body)
+    finally:
+        server.shutdown()
