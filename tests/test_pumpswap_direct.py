@@ -270,6 +270,75 @@ def test_direct_round_trip_flags_a_honeypot_when_the_sell_leg_reverts():
     assert not rpc.sent  # a honeypot is caught for free, before any real buy or feint
 
 
+class SlotRpc(PoolRpc):
+    """PoolRpc that stamps each sent transaction with a slot (sig0 -> 100, sig1 -> 101, ...), so the probe's
+    buy->sell slot gap can be asserted. The real RPC carries the slot on getSignatureStatuses and getTransaction."""
+
+    def post(self, url, json=None):
+        m, p = json["method"], json["params"]
+        if m == "getSignatureStatuses":
+            sig = p[0][0]
+            meta = self.txs.get(sig)
+            slot = 100 + self.sent.index(sig) if sig in self.sent else None
+            body = {"result": {"value": [None if meta is None else
+                                         {"confirmationStatus": "confirmed", "err": meta.get("err"), "slot": slot}]}}
+            return SimpleNamespace(json=lambda: body)
+        if m == "getTransaction":
+            sig = p[0]
+            meta = self.txs.get(sig)
+            slot = 100 + self.sent.index(sig) if sig in self.sent else None
+            body = {"result": None if meta is None else {"meta": meta, "slot": slot}}
+            return SimpleNamespace(json=lambda: body)
+        return super().post(url, json)
+
+
+def probe_direct(**kw):
+    kp = Keypair()
+    rpc = SlotRpc(str(kp.pubkey()), **kw)
+    ex = d.DirectPumpswapExecutor(Config(max_price_impact_pct=5.0, db_path=":memory:"), FakeJup(), http=rpc,
+                                  keypair=kp, sell_slippage_bps=1000, sleep=lambda s: None)
+    ex.remember_pool(MINT, POOL)
+    return ex, rpc
+
+
+def test_probe_1slot_lands_money_then_sells_in_the_next_slot():
+    ex, rpc = probe_direct()
+    # buy lands (slot 100): spends 0.125 SOL, receives 12M tokens, paid 5,000 fee + 0.002 SOL rent;
+    # sell lands next (slot 101): sells the tokens back for ~0.12 SOL.
+    rpc.next_meta = [sol_meta(ex.owner, (0, 12_000_000), -(125_000_000 + 5_000 + 2_000_000), new_rent=2_000_000),
+                     sol_meta(ex.owner, (12_000_000, 0), 119_995_000)]
+    out = ex.probe_1slot(MINT, 25.0)
+    assert out["verdict"] == "ok" and out["escaped"] is True
+    assert out["buy_slot"] == 100 and out["sell_slot"] == 101 and out["slot_gap"] == 1  # money sat one slot, then out
+    assert out["spent_sol"] == pytest.approx(0.125) and out["recovered_sol"] == pytest.approx(0.12)
+    assert len(rpc.raw) == 2 and not any("JUP" in str(t) for t in rpc.raw)  # TWO separate direct swaps, no Jupiter
+    # the sell leg spends exactly the buy's guaranteed-minimum tokens (the pre-signed floor), min out 1
+    lamports = int(25.0 / 200 * 1e9)
+    buy_min_out = int(d.amount_out(lamports, 10 * 10**9, 10**12, 30) * (10_000 - ex.cfg.slippage_bps) / 10_000)
+    sell_ix = next(x for x in decoded(rpc.raw[1]) if x[0] == d.PROGRAM)
+    assert sell_ix[1][:8] == d.BUY_EXACT_QUOTE_IN  # SOL is the base, so selling the token back is buy_exact_quote_in
+    assert int.from_bytes(sell_ix[1][8:16], "little") == buy_min_out
+    assert int.from_bytes(sell_ix[1][16:24], "little") == 1
+
+
+def test_probe_1slot_sim_gate_blocks_a_honeypot_before_committing():
+    ex, rpc = probe_direct()
+    rpc.sim_err = {"InstructionError": [7, "Custom"]}  # the simulated sell reverts: exits are blocked
+    out = ex.probe_1slot(MINT, 25.0)
+    assert out["verdict"] == "honeypot" and "honeypot" in out["note"]
+    assert not rpc.sent and not rpc.raw  # caught for free: not a cent committed
+
+
+def test_probe_1slot_trapped_when_the_sell_cannot_recover():
+    ex, rpc = probe_direct()
+    # the buy lands, but the sell reverts (a pull beat our next-slot sell, or a dynamic honeypot): the stake is stuck.
+    rpc.next_meta = [sol_meta(ex.owner, (0, 12_000_000), -(125_000_000 + 5_000 + 2_000_000), new_rent=2_000_000),
+                     sol_meta(ex.owner, (12_000_000, 12_000_000), -5_000, err={"InstructionError": [6, {"Custom": 6004}]})]
+    out = ex.probe_1slot(MINT, 25.0)
+    assert out["verdict"] == "trapped" and out["escaped"] is False
+    assert out["recovered_sol"] == 0.0 and len(rpc.raw) == 2  # both legs were sent; only the buy landed money
+
+
 def test_direct_buy_declines_without_enough_sol_or_on_a_thin_pool():
     ex, rpc = direct(sol=40_000_000)  # 0.04 SOL: short of the 0.05 SOL buy plus the 0.01 SOL reserve
     assert ex.buy(MINT, 10.0, 0.0) is None and "wallet SOL low" in ex.last_note and not rpc.sent

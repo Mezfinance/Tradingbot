@@ -26,10 +26,16 @@ class FakeSub:
         self.feinted: list = []
         self.feint_verdict = "alive"
         self.last_feint: dict = {}
+        self.probed: list = []
+        self.probe_verdict = "ok"
 
     def feint(self, token: str, usd: float, commit: bool = True) -> str:
         self.feinted.append((token, commit))
         return self.feint_verdict
+
+    def probe_1slot(self, token: str, usd: float) -> dict:
+        self.probed.append(token)
+        return {"token": token, "usd": usd, "verdict": self.probe_verdict}
 
     def round_trip(self, token: str, usd: float):
         self.round_tripped = token
@@ -97,6 +103,26 @@ def test_sell_routes_to_the_wallet_that_holds_the_token():
     r.sell("B", 1000.0, 1e-6)
     assert r.subs[1].sold == ["B"]
     assert r.subs[0].sold == [] and r.subs[2].sold == []
+
+
+def test_probe_rotates_fresh_wallets_and_frees_a_clean_probe():
+    clock = {"t": 100.0}
+    r = rot(3, clock=lambda: clock["t"])
+    out = r.probe_1slot("A", 25.0)       # the freshest free wallet
+    assert out["verdict"] == "ok" and "A" not in r._assign  # a clean probe holds nothing -> wallet freed
+    w = out["wallet"]
+    assert r.subs[w].probed == ["A"]
+    clock["t"] = 200.0
+    out2 = r.probe_1slot("B", 25.0)      # the just-used wallet is now stale -> rotate to a fresher one
+    assert out2["wallet"] != w
+
+
+def test_a_trapped_probe_keeps_the_wallet_assigned():
+    r = rot(2)
+    for s in r.subs:
+        s.probe_verdict = "trapped"      # the sell did not recover: the stake is stuck in that wallet
+    out = r.probe_1slot("A", 25.0)
+    assert out["verdict"] == "trapped" and r._assign.get("A") == out["wallet"]  # kept for sell()/sweep to exit
 
 
 def test_the_freshest_wallet_is_used_first():

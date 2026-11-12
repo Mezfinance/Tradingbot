@@ -42,6 +42,8 @@ SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])
 BUY_EXACT_QUOTE_IN = bytes([198, 46, 21, 82, 180, 217, 232, 112])
 CU_LIMIT = 300_000  # real direct swaps use ~80-115k compute units; a first buy on a fresh pool also creates up to 3 fee accounts (~170k simulated 11-10)
 FEINT_CU_LIMIT = 500_000  # the feint is two swaps (buy + sell) plus the fee-account creation in one transaction
+PROBE_SLOT_WAIT_S = 2.5   # how long to wait for the probe's buy to be visible on-chain before firing the sell
+PROBE_POLL_S = 0.1        # how often to poll the buy's status while waiting
 GLOBAL_TTL_S = 600
 ROUTE = "direct"
 POOL_FILE = "canary_pools.json"  # next to the journal: mint -> pool of the canary's buys
@@ -549,6 +551,98 @@ class DirectPumpswapExecutor(JupiterExecutor):
         sol1 = q1 if st1["token_is_base"] else b1
         self.last_feint = {"pool": st["addr"], "sol_before": sol0 / 1e9, "sol_after": sol1 / 1e9}
         return "pulled" if sol1 < sol0 * (1 - drop / 100) else "alive"
+
+    def _wait_visible(self, sig: str, timeout_s: float) -> tuple[bool, int | None]:
+        """Poll until the transaction is seen on-chain. (ok, slot): ok False = reverted or never appeared.
+        A dependent sell can't be built until the buy's tokens exist, so we fire the sell the moment the buy is
+        visible (processed) — the sell then lands in the next slot at the earliest."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            res = self._rpc("getSignatureStatuses", [[sig], {"searchTransactionHistory": False}])
+            val = ((res or {}).get("value") or [None])[0]
+            if val is not None:
+                return val.get("err") is None, val.get("slot")
+            self.sleep(PROBE_POLL_S)
+        return False, None
+
+    def probe_1slot(self, token: str, usd: float) -> dict:
+        """Two-transaction probe (11-13, measurement): buy `usd` of the token (slot N) so committed money LANDS in the
+        pool, then sell the buy's guaranteed-minimum tokens straight back in the next slot (slot N+1). Landing money and
+        pulling it out one slot later is what trips a size-reacting rugger (the atomic feint never lands money, so it
+        never trips one) while our sell escapes the pull — 100% of the pulls we've measured land >=2 slots after the
+        buy. A free honeypot simulation runs first, so a blocked sell is caught before a cent is committed. This opens
+        NO position and decides no rugger verdict; it returns the mechanical outcome (buy/sell slots, whether we got the
+        stake back). The caller then watches the pool for ~48s: a pull after this = a rugger we tripped and dodged;
+        survival = a legitimate pool to enter for real."""
+        out = {"token": token, "usd": usd, "verdict": "skipped", "note": "", "pool": self.pools.get(token)}
+        rt = self.round_trip(token, usd)  # free sim: nothing is sent
+        if rt is None:
+            out["note"] = self.last_note = "probe: pool unreadable / not simulable"
+            return out
+        loss, note = rt
+        if loss >= 100.0:
+            out["verdict"], out["note"] = "honeypot", f"probe: {note}"
+            self.last_note = out["note"]
+            return out
+        sol_usd = self.jup.sol_price()
+        st = self._state(token)
+        if not sol_usd or st is None:
+            out["note"] = self.last_note = "probe: state unreadable"
+            return out
+        out["pool"] = st["addr"]
+        base_amt, quote_amt = st["reserves"]
+        sol_res, tok_res = (quote_amt, base_amt) if st["token_is_base"] else (base_amt, quote_amt)
+        lamports = int(usd / sol_usd * 1e9)
+        bal = self.sol_balance()
+        if bal is None or bal < lamports / 1e9 + MIN_SOL:
+            out["note"] = self.last_note = "probe: wallet SOL low"
+            return out
+        if not sol_res or lamports / (sol_res + lamports) * 100 > self.cfg.max_price_impact_pct:
+            out["note"] = self.last_note = "probe: impact too high"
+            return out
+        # The pre-signed sell sells exactly buy_min_out — the floor we're certain the buy delivers — so it needs no
+        # read of the real balance and can go the instant the buy is visible; the sliver above the floor is dust.
+        buy_min_out = int(amount_out(lamports, sol_res, tok_res, st["fee_bps"]) * (10_000 - self.cfg.slippage_bps) / 10_000)
+        if buy_min_out <= 0:
+            out["note"] = self.last_note = "probe: pool has no tokens"
+            return out
+        buy_sig = self._send_ixs(self._instructions(st, "buy", lamports, buy_min_out))
+        if buy_sig.startswith(NOT_SENT):
+            out["note"] = self.last_note = f"probe: buy not sent ({buy_sig})"
+            return out
+        out["buy_tx"] = buy_sig
+        buy_ok, buy_slot = self._wait_visible(buy_sig, PROBE_SLOT_WAIT_S)
+        settle_buy = None
+        if not buy_ok:
+            # Not visible inside the fast window: resolve it (resend + confirm). If it truly reverted / never landed,
+            # no money landed and there is nothing to sell. If it landed slowly, the fast N+1 is lost but we still sell
+            # the floor to get the stake out, rather than leave it exposed.
+            settle_buy = self._settle_direct(buy_sig, token)
+            if not (settle_buy["ok"] and settle_buy["token"] > 0):
+                out["verdict"], out["note"] = "buy_failed", "probe: buy reverted / not visible"
+                self.last_note = out["note"]
+                return out
+            buy_slot = None  # the buy landed late; its slot is no longer the thing we're racing
+        sell_sig = self._send_ixs(self._instructions(st, "sell", buy_min_out, 1))  # min out 1: recover whatever is there
+        out["sell_tx"] = None if sell_sig.startswith(NOT_SENT) else sell_sig
+        settle_buy = settle_buy or self._settle_direct(buy_sig, token)
+        settle_sell = self._settle_direct(sell_sig, token) if out["sell_tx"] else {"ok": False, "swap_lamports": 0,
+                                                                                   "fee_lamports": 0, "note": sell_sig}
+        spent = -settle_buy["swap_lamports"] / 1e9
+        recovered = settle_sell["swap_lamports"] / 1e9 if settle_sell["ok"] else 0.0
+        fees = (settle_buy["fee_lamports"] + settle_sell["fee_lamports"]) / 1e9
+        out["buy_slot"], sell_tx = buy_slot, self._fetch_tx(sell_sig) if out["sell_tx"] else None
+        out["sell_slot"] = (sell_tx or {}).get("slot")
+        out["slot_gap"] = (out["sell_slot"] - buy_slot) if (out["sell_slot"] is not None and buy_slot is not None) else None
+        out["spent_sol"], out["recovered_sol"] = round(spent, 6), round(recovered, 6)
+        out["net_usd"] = round((recovered - spent - fees) * sol_usd, 4)
+        out["escaped"] = settle_sell["ok"] and recovered > 0
+        # "ok": money landed and we got it back out (a clean probe, cost ~fees). "trapped": the buy landed but the sell
+        # did not recover — a dynamic honeypot, or a pull that beat our next-slot sell — so the stake is stuck in the
+        # position and the engine must keep trying to exit it.
+        out["verdict"] = "ok" if out["escaped"] else "trapped"
+        out["note"] = self.last_note = "ok" if out["escaped"] else f"probe: sell did not recover ({settle_sell.get('note')})"
+        return out
 
     def sell(self, token: str, qty: float, ref_price: float) -> Fill | None:
         sol_usd = self.jup.sol_price()

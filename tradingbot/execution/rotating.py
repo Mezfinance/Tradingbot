@@ -217,6 +217,36 @@ class RotatingExecutor:
             self._save()
         return verdict
 
+    def probe_1slot(self, token: str, usd: float) -> dict:
+        """Run the two-transaction 1-slot probe from the freshest free wallet (operators track wallets, so each probe
+        rotates to a fresh one, like a feint). A clean probe holds nothing, so the wallet is freed afterwards and the
+        real entry — a later buy() if the pool survives — picks its own fresh wallet. A 'trapped' probe (the sell did
+        not recover) left the stake in this wallet, so it stays assigned for sell()/sweep to exit."""
+        with self._lock:
+            idx = self._assign.get(token)
+            if idx is None:
+                free = self._free_indices()
+                if not free:
+                    self.last_note = f"no free wallet (all {len(self.subs)} busy)"
+                    return {"token": token, "usd": usd, "verdict": "skipped", "note": self.last_note}
+                idx = min(free, key=lambda i: self._used.get(i, 0.0))
+                self._assign[token] = idx
+                self._opened[token] = self.clock()
+                self._save()
+            self._apply_pool(idx, token)
+        sub = self.subs[idx]
+        out = (sub.probe_1slot(token, usd) if hasattr(sub, "probe_1slot")
+               else {"token": token, "usd": usd, "verdict": "skipped", "note": "no direct route"})
+        self.last_note = getattr(sub, "last_note", "")
+        with self._lock:
+            self._used[idx] = self.clock()  # rotate the next probe to a fresher wallet
+            out["wallet"] = idx
+            if out.get("verdict") != "trapped":  # a clean probe holds nothing: free the wallet
+                self._assign.pop(token, None)
+                self._opened.pop(token, None)
+            self._save()
+        return out
+
     def round_trip(self, token: str, usd: float):
         """Delegate the direct-route honeypot/sell-route simulation to a wallet (read-only, nothing sent): the one
         assigned to this mint if any, else the first. The pool is applied so the sub can read it."""
