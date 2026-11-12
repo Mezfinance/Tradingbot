@@ -123,7 +123,8 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             for k, v in (extra or {}).items():
-                self.send_header(k, v)
+                for one in (v if isinstance(v, (list, tuple)) else [v]):
+                    self.send_header(k, one)
             self.end_headers()
             self.wfile.write(body)
 
@@ -263,9 +264,10 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                     dashpasskey.SESS_COOKIE, sess, dashpasskey.SESSION_MAX_AGE_S)})
                 log.info("dashboard passkey sign-in")
                 return
-            if path == "/api/auth/logout":
+            if path == "/api/auth/logout":  # clear the passkey session AND the break-glass token cookie
                 self._send(200, json.dumps({"ok": True}).encode(), "application/json",
-                           {"Set-Cookie": self._cookie(dashpasskey.SESS_COOKIE, "", 0)})
+                           {"Set-Cookie": [self._cookie(dashpasskey.SESS_COOKIE, "", 0),
+                                           self._cookie(dash.COOKIE, "", 0)]})
                 return
             if path not in ("/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/settings",
                             "/api/deploy", "/api/auth/register/verify", "/api/auth/passkeys/remove"):

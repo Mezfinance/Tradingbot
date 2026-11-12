@@ -1581,27 +1581,68 @@ route();connect();
 LOGIN_PAGE = r"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>MZFq · Sign in</title>
 <style>
-:root{--ink:#0a0a0a;--surface:#fff;--rule:#0a0a0a;--sub:#555;--lime:#c9f24d}
-@media(prefers-color-scheme:dark){:root{--ink:#f2f2f2;--surface:#121212;--rule:#f2f2f2;--sub:#9a9a9a}}
+:root{--ink:#0a0a0a;--surface:#fff;--rule:#0a0a0a;--rule-soft:#d8d8d8;--sub:#555;--muted:#888;--lime:#c9f24d;--sunken:#f5f5f3}
+@media(prefers-color-scheme:dark){:root{--ink:#f2f2f2;--surface:#0e0e0e;--rule:#f2f2f2;--rule-soft:#2a2a2a;--sub:#a6a6a6;--muted:#777;--sunken:#161616}}
 *{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--surface);color:var(--ink);
-font:500 15px/1.5 "Archivo",system-ui,-apple-system,sans-serif;padding:24px}
-.card{width:100%;max-width:380px;border:2px solid var(--rule);padding:28px}
-.mk{width:48px;height:48px;margin-bottom:16px}.mk .sq{fill:var(--ink)}.mk .z{fill:var(--surface)}
-h1{font-size:22px;margin:0 0 4px;font-weight:800;letter-spacing:-.01em}
-.sub{color:var(--sub);font-size:13px;margin:0 0 20px}
-button{width:100%;padding:12px;border:2px solid var(--ink);background:var(--lime);color:#000;cursor:pointer;
+body{margin:0;min-height:100vh;background:var(--surface);color:var(--ink);
+font:500 15px/1.6 "Archivo",system-ui,-apple-system,sans-serif;display:flex;justify-content:center}
+.wrap{width:100%;max-width:640px;padding:40px 20px 56px}
+header{display:flex;align-items:center;gap:12px;border-bottom:2px solid var(--rule);padding-bottom:16px}
+.mk{width:44px;height:44px;flex:none}.mk .sq{fill:var(--ink)}.mk .z{fill:var(--surface)}
+.word{font-size:26px;font-weight:800;letter-spacing:-.02em;line-height:1}
+.desc{font-size:11px;font-weight:700;letter-spacing:.16em;color:var(--muted);margin-top:3px}
+.eyebrow{font-size:11px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:var(--muted);margin:30px 0 6px}
+h1{font-size:30px;line-height:1.1;margin:0 0 8px;font-weight:800;letter-spacing:-.02em}
+.lead{font-size:16px;color:var(--sub);margin:0}
+.progs{display:grid;gap:14px;margin-top:14px}
+.prog{border:2px solid var(--rule);padding:16px 18px}
+.prog h2{font-size:17px;margin:0 0 4px;font-weight:800}
+.prog p{font-size:14px;color:var(--sub);margin:0}
+.tag{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.04em;border:2px solid var(--rule-soft);padding:1px 7px;margin-left:8px;vertical-align:middle;color:var(--muted)}
+.pts{list-style:none;padding:0;margin:10px 0 0;display:grid;gap:7px}
+.pts li{font-size:13.5px;color:var(--sub);padding-left:18px;position:relative}
+.pts li::before{content:"";position:absolute;left:0;top:8px;width:7px;height:7px;background:var(--lime);border:1.5px solid var(--ink)}
+.signin{border:2px solid var(--rule);background:var(--sunken);padding:22px;margin-top:30px}
+.signin h2{font-size:16px;margin:0 0 4px;font-weight:800}
+.sub{color:var(--sub);font-size:13px;margin:0 0 16px}
+button{width:100%;padding:13px;border:2px solid var(--ink);background:var(--lime);color:#000;cursor:pointer;
 font:inherit;font-weight:800;font-size:15px}
 button:disabled{opacity:.5;cursor:default}
 .note{margin-top:14px;font-size:13px;color:var(--sub)}.neg{color:#c0392b}
+footer{margin-top:28px;font-size:12px;color:var(--muted);border-top:1px solid var(--rule-soft);padding-top:14px}
 code{font-family:ui-monospace,Menlo,monospace;font-size:12px}
 </style></head><body>
-<div class="card">
+<div class="wrap">
+<header>
 <svg class="mk" viewBox="0 0 100 100" aria-hidden="true"><rect class="sq" width="100" height="100"/><polygon class="z" points="24,26 76,26 76,39 38,61 76,61 76,74 24,74 24,61 62,39 24,39"/></svg>
-<h1>MZFq Quant Desk</h1>
+<div><div class="word">MZFq</div><div class="desc">QUANT DESK</div></div>
+</header>
+
+<p class="eyebrow">Systematic trading</p>
+<h1>Measured, risk-controlled strategies</h1>
+<p class="lead">MZFq is the quant desk: each program holds its own strategies, run as paper books with the numbers tracked trade by trade. The edge comes from risk control and measurement, not hype.</p>
+
+<p class="eyebrow">Programs</p>
+<div class="progs">
+<div class="prog">
+<h2>Supermeme <span class="tag">on-chain</span></h2>
+<p>Solana launch trading: pools are scored in their first seconds, filtered rug-vs-win and by pool size, then run as paper books. A tiny real-money canary probes live execution.</p>
+<ul class="pts"><li>Second-4 launch scoring from on-chain data</li><li>Rug-vs-win and per-size-band filtering</li><li>Always-on meme market monitor</li></ul>
+</div>
+<div class="prog">
+<h2>MZF Short Only <span class="tag">CEX</span></h2>
+<p>Short-only strategies on centralised-exchange events. Strategy 1 shorts new listings into their post-listing decline, sized against open interest and funding.</p>
+</div>
+</div>
+
+<div class="signin">
+<h2>Private dashboard</h2>
 <p class="sub">Sign in with your passkey — FaceID, TouchID, Windows Hello or a security key.</p>
 <button id="go" onclick="login()">Sign in with passkey</button>
 <p class="note" id="note"></p>
+</div>
+
+<footer>MZFq · internal quant desk. Everything here is research and paper trading; the canary trades minimal real size only to measure execution.</footer>
 </div>
 <script>
 const $=i=>document.getElementById(i);

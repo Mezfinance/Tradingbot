@@ -193,8 +193,14 @@ def test_http_login_flow_end_to_end(tmp_path, monkeypatch):
         assert req("GET", "/api/auth/register/options", cookie=None)[0] == 401
         assert req("GET", "/api/auth/register/options", cookie=sess_cookie)[0] == 200
 
-        # logout clears the session
-        code, hdrs, _ = req("POST", "/api/auth/logout", cookie=sess_cookie)
-        assert code == 200 and f"{pk.SESS_COOKIE}=;" in hdrs["Set-Cookie"]
+        # logout clears the passkey session AND the break-glass token cookie (two Set-Cookie headers)
+        c = http.client.HTTPConnection("127.0.0.1", 18782, timeout=5)
+        c.request("POST", "/api/auth/logout", headers={"Cookie": sess_cookie})
+        r = c.getresponse()
+        cookies = r.msg.get_all("Set-Cookie") or []
+        r.read()
+        assert r.status == 200
+        assert any(f"{pk.SESS_COOKIE}=;" in s for s in cookies)
+        assert any(f"{dash.COOKIE}=;" in s for s in cookies)
     finally:
         server.shutdown()
