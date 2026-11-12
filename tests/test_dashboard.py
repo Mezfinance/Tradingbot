@@ -292,6 +292,24 @@ def test_canary_switch_flips_the_kill_switch():
         dash.canary_switch(j, "sideways")
 
 
+def test_canary_probe_all_clears_the_gate_and_warns_when_probe_is_off():
+    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
+    j = Journal(":memory:")
+    j.set_state(CANARY_ALLOW, "1")
+    j.set_state(CANARY_HALT, "123")
+
+    class Cfg:
+        launch_canary_probe = True
+    res = dash.canary_probe_all(j, Cfg())
+    assert res["running"] is True and res["probe_configured"] is True
+    assert j.get_state(CANARY_HALT) is None and j.get_state(CANARY_ALLOW) is None  # both gates cleared
+
+    class Off:
+        launch_canary_probe = False
+    res = dash.canary_probe_all(j, Off())
+    assert res["probe_configured"] is False and "OFF" in res["msg"]  # warns probe mode is not configured
+
+
 def test_canary_switch_buttons_are_behind_the_password(cfg, monkeypatch):
     monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
     cfg.health_port = 18767

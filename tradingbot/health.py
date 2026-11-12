@@ -277,7 +277,8 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                                            self._cookie(dash.COOKIE, "", 0)]})
                 return
             if path not in ("/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/topup",
-                            "/api/canary/settings", "/api/canary/probe-smoke", "/api/canary/probe-one", "/api/deploy",
+                            "/api/canary/settings", "/api/canary/probe-smoke", "/api/canary/probe-one",
+                            "/api/canary/probe-all", "/api/deploy",
                             "/api/auth/register/verify", "/api/auth/passkeys/remove"):
                 self.send_error(404)
                 return
@@ -316,6 +317,9 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 elif path == "/api/canary/probe-one":  # arm exactly one probe (Execute one probe)
                     res = dash.canary_one(journal)
                     log.info("dashboard probe-one: %s", res.get("msg"))
+                elif path == "/api/canary/probe-all":  # probe every liquid pool continuously (clear the one-shot gate + halt)
+                    res = dash.canary_probe_all(journal, cfg)
+                    log.info("dashboard probe-all: %s", res.get("msg"))
                 elif path == "/api/canary/probe-smoke":  # one low-cost real probe to prove the N+1 sell on-chain
                     data = json.loads(body or b"{}")
                     res = dash.probe_smoke(cfg, data.get("mint"), data.get("usd"), data.get("pool"))

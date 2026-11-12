@@ -194,6 +194,20 @@ def canary_one(journal) -> dict:
     return {"armed": True, "msg": "One probe armed: the next liquid candidate is probed, then it waits."}
 
 
+def canary_probe_all(journal, cfg=None) -> dict:
+    """Run the probe continuously on every liquid pool (the 'Probe every liquid pool' button): clear the
+    one-at-a-time allowance and the kill switch, so the engine probes each liquid candidate with no gate.
+    This is the same state canary-start writes. Probing every pool also needs `launch_canary_probe` set on
+    in the config (that is what routes every liquid pool to the canary); the UI warns when it is off."""
+    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
+    journal.execute("DELETE FROM state WHERE key IN (?, ?)", (CANARY_HALT, CANARY_ALLOW))
+    on = bool(getattr(cfg, "launch_canary_probe", False)) if cfg is not None else None
+    msg = "Probing every liquid pool: the kill switch and one-at-a-time gate are cleared."
+    if on is False:
+        msg += " Note: launch_canary_probe is OFF in the config, so no pools will be probed until it is set on and redeployed."
+    return {"running": True, "probe_configured": on, "msg": msg}
+
+
 def probe_smoke(cfg, mint: str, usd=None, pool: str | None = None) -> dict:
     """Run one low-cost real 1-slot probe (buy + next-slot sell) from the dashboard to prove the sell lands on-chain
     before a $25 run. Real money, direct route only; builds the canary executor like the CLI does."""
@@ -1296,7 +1310,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <section class="card"><p class="label eyebrow">1-slot probe · real money</p><h2>1-slot probe (measurement)</h2>
 <p class="sub">Probe every liquid candidate: buy $25 so committed money lands, sell it back in the <b>next slot</b> (escapes the pull — every measured rug is ≥2 slots after the buy), watch ~48s and record <b>rugger</b> (tripped and dodged) or <b>survivor</b> (a pool to enter for real). Never commits. Enable with the <b>1-slot probe (measure)</b> preset or the Probe settings above (direct route only). <b>Smoke-test the next-slot sell at low cost first.</b></p>
 <div id="pb-tiles" class="stats"></div>
-<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:8px 0 6px"><button id="pb-one" onclick="probeOne()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Execute one probe</button><span class="sub" id="pb-one-note">Arms one probe at the next liquid candidate, then waits.</span></div>
+<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:8px 0 6px"><button id="pb-one" onclick="probeOne()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Execute one probe</button><button id="pb-all" onclick="probeAll()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Probe every liquid pool</button><span class="sub" id="pb-one-note">Execute one probe arms a single probe, then waits. Probe every liquid pool runs continuously.</span></div>
 <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:6px 0"><input id="pb-mint" placeholder="token mint (deep pool)" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:220px"><input id="pb-pool" placeholder="pool (optional)" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:170px"><input id="pb-usd" type="number" value="1" min="0.1" max="25" step="any" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:80px"><button id="pb-smoke" onclick="probeSmoke()" style="padding:9px 20px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);cursor:pointer;font:inherit;font-weight:700">Smoke test</button><span class="sub" id="pb-smoke-note"></span></div>
 <pre id="pb-smoke-out" hidden style="white-space:pre-wrap;word-break:break-word;background:var(--sunken);border:2px solid var(--rule-soft);padding:10px;max-height:240px;overflow:auto;font:500 12px/1.5 var(--mono)"></pre>
 <div class="scroll"><table id="pb-recent"></table></div></section>
@@ -1767,6 +1781,8 @@ t.innerHTML=[["Probed",d.probes],["Rugger",d.rugger],["Survivor",d.survivor],["T
 const rows=d.recent||[];$("pb-recent").innerHTML="<tr><th>Token</th><th>Wallet</th><th>Probe</th><th>Gap</th><th>Recovered SOL</th><th>Watch</th></tr>"+(rows.length?rows.map(r=>r.sent===false?`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${walletCell(r.wallet)}</td><td>${esc(r.probe||"")}</td><td colspan="3" class="sub" title="Caught by the free pre-buy simulation — no buy was broadcast, so $0 was at risk.">no money sent ($0 at risk)</td></tr>`:`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${walletCell(r.wallet)}</td><td>${esc(r.probe||"")}</td><td>${r.slot_gap==null?"—":r.slot_gap}</td><td>${r.recovered_sol==null?"—":r.recovered_sol}</td><td class="${r.watch==='rugger'?'neg':r.watch==='survivor'?'pos':''}">${esc(r.watch||"…")}</td></tr>`).join(""):'<tr><td colspan="6" class="sub">No probes yet. Enable the 1-slot probe preset and start the canary.</td></tr>')}).catch(()=>{})}
 function probeOne(){const b=$("pb-one");b.disabled=true;$("pb-one-note").textContent="arming…";
 fetch("api/canary/probe-one",{method:"POST"}).then(r=>r.json()).then(d=>{b.disabled=false;$("pb-one-note").textContent=d.msg||"armed."}).catch(e=>{b.disabled=false;$("pb-one-note").textContent="error: "+e})}
+function probeAll(){if(!confirm("Probe every liquid pool continuously? This clears the kill switch and the one-at-a-time gate, so the canary probes each liquid candidate with real money (~$0.30 each)."))return;const b=$("pb-all");b.disabled=true;$("pb-one-note").textContent="starting…";
+fetch("api/canary/probe-all",{method:"POST"}).then(r=>r.json()).then(d=>{b.disabled=false;$("pb-one-note").textContent=d.msg||"running."}).catch(e=>{b.disabled=false;$("pb-one-note").textContent="error: "+e})}
 function probeSmoke(){const mint=$("pb-mint").value.trim();if(!mint){$("pb-smoke-note").textContent="enter a token mint";return}
 const usd=parseFloat($("pb-usd").value)||1,pool=$("pb-pool").value.trim()||null;
 if(!confirm("Run one REAL $"+usd+" probe on "+mint+"?\n\nIt buys and sells back in the next slot (~fee cost). Direct route only."))return;

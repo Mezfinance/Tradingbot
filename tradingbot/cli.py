@@ -124,7 +124,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -703,6 +703,21 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps({"rows": rows, "summary": _pt.summary(rows), "sol_usd": su}, indent=2, default=str))
         else:
             print(_pt.render(rows, su))
+        return
+
+    if args.command == "probe-exits":  # exit rules for the 1-slot probe's survivors (11-12)
+        from tradingbot import probe_exits as _pe
+        from tradingbot.journal import Journal as _PeJournal
+        from tradingbot.watcher import WatchStore as _PeWS, watch_db_path as _pe_wdp
+        pe_helius = None
+        if args.fetch:
+            import httpx as _pe_httpx
+            from tradingbot.data.helius import Helius as _PeHelius
+            pe_helius = _PeHelius(client=_pe_httpx.Client(timeout=60))  # research (backup) key, never the live key
+            pe_helius.min_interval_s = 1 / max(args.rps, 0.1)
+        out = _pe.study(_PeJournal(cfg.db_path), _PeWS(_pe_wdp(cfg)), cfg=cfg, hours=args.hours or 24.0,
+                        helius=pe_helius, max_credits=int(args.max_credits or 8_000))
+        print(json.dumps(out, indent=2, default=str) if args.json else _pe.render(out))
         return
 
     if args.command == "canary-trades":  # every real canary trade + the pool path after our buy (11-10)
