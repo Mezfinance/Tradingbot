@@ -130,6 +130,24 @@ def test_routes_need_the_password_and_health_stays_open(cfg, monkeypatch):
         server.shutdown()
 
 
+def test_pool_paths_survive_a_restart(cfg, tmp_path):
+    """A fly deploy wipes in-RAM pool paths; without the early (~60s) samples a now-old pool's conf_ret /
+    best entry can never be rebuilt. Persisting them to /data keeps those columns across a restart."""
+    db = str(tmp_path / "bot.db")
+    cfg.db_path = db
+    board = dash.Dashboard(Journal(db), cfg)
+    board._pool_paths = {"P1": {"pts": [[66.0, 14000.0, 1e-7], [360.0, 18000.0, 1.2e-7]],
+                                "peak_liq": 18000.0, "pulled_ts": None, "conf_age": 66.0, "conf_ret": 0.14,
+                                "opt_age": 66.0, "opt_ret": 0.14, "conf_by": {6: 0.14, 15: 0.9}}}
+    board._save_pool_paths()
+    assert (tmp_path / "pool_paths.json").exists()
+    # a fresh Dashboard (= a redeploy) loads them back, with conf_by keys coerced to int for hold_curve
+    reborn = dash.Dashboard(Journal(db), cfg)
+    assert reborn._pool_paths["P1"]["conf_ret"] == 0.14
+    assert reborn._pool_paths["P1"]["conf_by"][15] == 0.9  # int key, not "15"
+    assert dash.Dashboard(Journal(":memory:"), cfg.with_overrides({"db_path": ":memory:"}))._pool_paths == {}
+
+
 def test_summary_is_built_in_a_child_process_for_a_file_journal(cfg, tmp_path, monkeypatch):
     """11-05: building the summary inside the bot delayed the scorer by ~40 s; a file journal uses a child."""
     db = str(tmp_path / "bot.db")

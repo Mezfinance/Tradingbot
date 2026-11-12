@@ -11,5 +11,6 @@ backups/
 canary_pools.json
 canary_settings.json
 canary_rotation.json
+pool_paths.json
 provision.log
 deploy.log

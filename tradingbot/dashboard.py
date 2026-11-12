@@ -413,8 +413,48 @@ class Dashboard:
         self.wallets_ver = 0
         self.pools: dict | None = None  # the pool tracker (feinted pools + live reserves), every POOLS_POLL_S
         self.pools_ver = 0
-        self._pool_paths: dict = {}  # pool -> live reserve path kept between polls
+        # pool -> live reserve path kept between polls. Persisted to /data so a fly deploy does not wipe the early
+        # (~60 s) reserve samples: without them a now-old pool's conf_ret / best entry / live peak can never be
+        # rebuilt (the confirmation-window price is long gone), so those columns would blank out after every deploy.
+        self._pool_paths: dict = self._load_pool_paths()
         self._mdb = None
+
+    def _pool_paths_file(self) -> str | None:
+        if self.cfg.db_path == ":memory:":
+            return None  # tests: no disk
+        return os.path.join(os.path.dirname(os.path.abspath(self.cfg.db_path)), "pool_paths.json")
+
+    def _load_pool_paths(self) -> dict:
+        path = self._pool_paths_file()
+        if not path or not os.path.exists(path):
+            return {}
+        try:
+            with open(path) as fh:
+                raw = json.load(fh)
+            out = {}
+            for pool, p in raw.items():
+                if not isinstance(p, dict):
+                    continue
+                cb = p.get("conf_by")
+                if isinstance(cb, dict):  # JSON stringifies int keys; hold_curve looks them up as ints
+                    p["conf_by"] = {int(k): v for k, v in cb.items()}
+                out[pool] = p
+            return out
+        except Exception as exc:  # noqa: BLE001 (a corrupt file must never stop the dashboard)
+            log.warning("dashboard: could not load pool paths: %s", exc)
+            return {}
+
+    def _save_pool_paths(self) -> None:
+        path = self._pool_paths_file()
+        if not path:
+            return
+        try:
+            tmp = path + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(self._pool_paths, fh)
+            os.replace(tmp, path)  # atomic: a deploy mid-write never leaves a half file
+        except Exception as exc:  # noqa: BLE001
+            log.warning("dashboard: could not save pool paths: %s", exc)
 
     def _build_in_child(self) -> dict:
         path = os.path.join(os.path.dirname(os.path.abspath(self.cfg.db_path)), SUMMARY_FILE)
@@ -588,6 +628,7 @@ class Dashboard:
                        or (scorer.get(pl) and (scorer[pl].get("create_ts") or 0) < cut)]:
                 self._pool_paths.pop(pl, None)
             rows = pt.assemble(feints, scorer, su, self._pool_paths, now)
+            self._save_pool_paths()  # persist so a fly deploy keeps the early samples (conf/best entry survive)
             data = {"rows": rows[:200], "summary": pt.summary(rows), "sol_usd": su,
                     "fetched_ts": now, "stale": False}
         except Exception as exc:  # noqa: BLE001 (keep the last good data; the public RPC can be slow)
