@@ -74,6 +74,13 @@ def read_canary_wallets(cfg) -> list:
     return out
 
 
+def _insufficient(note: str) -> bool:
+    """True when a sub refused because its wallet is out of SOL (the direct executor says 'wallet SOL low'), so the
+    rotator should fall through to the next wallet rather than lose the probe/trade."""
+    n = (note or "").lower()
+    return "sol low" in n or "insufficient" in n
+
+
 class RotatingExecutor:
     """Routes canary trades across sub-executors (one per wallet), one open trade per wallet."""
 
@@ -136,6 +143,15 @@ class RotatingExecutor:
                 self._opened.pop(m, None)
         return [i for i in range(n) if i not in set(self._assign.values())]
 
+    def _candidates(self, token: str) -> tuple[int | None, list[int]]:
+        """Wallets to try for a fresh action on `token`, freshest (lowest `_used`) first. A mint that already holds a
+        stake/position keeps its wallet (no fallthrough); otherwise every free wallet is a candidate, so a drained one
+        is skipped and the rotation moves to the next. Returns (pre-assigned idx or None, ordered candidate list)."""
+        pre = self._assign.get(token)
+        if pre is not None:
+            return pre, [pre]
+        return None, sorted(self._free_indices(), key=lambda i: self._used.get(i, 0.0))
+
     def _holder(self, token: str) -> int:
         idx = self._assign.get(token)
         if idx is not None:
@@ -164,28 +180,32 @@ class RotatingExecutor:
 
     def buy(self, token: str, usd: float, ref_price: float) -> Fill | None:
         with self._lock:
-            idx = self._assign.get(token)
-            if idx is None:
-                free = self._free_indices()
-                if not free:
-                    self.last_note = f"no free wallet (all {len(self.subs)} busy)"
-                    return None
-                idx = min(free, key=lambda i: self._used.get(i, 0.0))  # the freshest free wallet
+            pre, order = self._candidates(token)
+            if not order:
+                self.last_note = f"no free wallet (all {len(self.subs)} busy)"
+                return None
+        fill = None
+        for pos, idx in enumerate(order):
+            with self._lock:
                 self._assign[token] = idx
-                self._opened[token] = self.clock()
+                self._opened.setdefault(token, self.clock())
                 self._save()
             self._apply_pool(idx, token)
-        fill = self.subs[idx].buy(token, usd, ref_price)
-        with self._lock:
-            if fill is None or not getattr(fill, "ok", True):  # the buy never opened: release the wallet, keep it fresh
-                self._assign.pop(token, None)
-                self._opened.pop(token, None)
-                self._save()
-                self.last_note = getattr(self.subs[idx], "last_note", "") or (getattr(fill, "note", "") if fill else "")
-            else:
+            fill = self.subs[idx].buy(token, usd, ref_price)
+            note = getattr(self.subs[idx], "last_note", "") or (getattr(fill, "note", "") if fill else "")
+            with self._lock:
+                if fill is None or not getattr(fill, "ok", True):  # never opened: release the wallet, keep it fresh
+                    self._assign.pop(token, None)
+                    self._opened.pop(token, None)
+                    self._save()
+                    self.last_note = note
+                    if pre is None and pos < len(order) - 1 and _insufficient(note):
+                        continue  # this wallet is out of SOL: try the next funded wallet
+                    return fill
                 self._used[idx] = self.clock()
                 self.last_note = ""
                 self._save()
+                return fill
         return fill
 
     def feint(self, token: str, usd: float, commit: bool = True) -> str:
@@ -193,28 +213,34 @@ class RotatingExecutor:
         wallet. Keeps the wallet assigned on 'alive' so buy() reuses it; releases it otherwise -- and always when
         `commit` is False (feint-only measurement runs make no commit, so the wallet must not stay assigned)."""
         with self._lock:
-            idx = self._assign.get(token)
-            if idx is None:
-                free = self._free_indices()
-                if not free:
-                    self.last_note = f"no free wallet (all {len(self.subs)} busy)"
-                    return "inconclusive"
-                idx = min(free, key=lambda i: self._used.get(i, 0.0))
+            pre, order = self._candidates(token)
+            if not order:
+                self.last_note = f"no free wallet (all {len(self.subs)} busy)"
+                return "inconclusive"
+        verdict = "inconclusive"
+        for pos, idx in enumerate(order):
+            with self._lock:
                 self._assign[token] = idx
-                self._opened[token] = self.clock()
+                self._opened.setdefault(token, self.clock())
                 self._save()
             self._apply_pool(idx, token)
-        sub = self.subs[idx]
-        verdict = sub.feint(token, usd) if hasattr(sub, "feint") else "alive"
-        self.last_feint = getattr(sub, "last_feint", {})
-        self.last_note = getattr(sub, "last_note", "")
-        with self._lock:
-            self._used[idx] = self.clock()  # mark it used so the NEXT feint rotates to a fresher wallet: a feint-only
-            # run must spread across the fresh wallets (operators track wallets), not pile onto one and drain it
-            if verdict != "alive" or not commit:  # no commit coming (pulled, inconclusive, or feint-only): free it
-                self._assign.pop(token, None)
-                self._opened.pop(token, None)
-            self._save()
+            sub = self.subs[idx]
+            verdict = sub.feint(token, usd) if hasattr(sub, "feint") else "alive"
+            self.last_feint = getattr(sub, "last_feint", {})
+            self.last_note = getattr(sub, "last_note", "")
+            with self._lock:
+                self._used[idx] = self.clock()  # mark it used so the NEXT feint rotates to a fresher wallet: a feint-only
+                # run must spread across the fresh wallets (operators track wallets), not pile onto one and drain it
+                if pre is None and pos < len(order) - 1 and _insufficient(self.last_note):
+                    self._assign.pop(token, None)  # this wallet is out of SOL: move to the next funded wallet
+                    self._opened.pop(token, None)
+                    self._save()
+                    continue
+                if verdict != "alive" or not commit:  # no commit coming (pulled, inconclusive, or feint-only): free it
+                    self._assign.pop(token, None)
+                    self._opened.pop(token, None)
+                self._save()
+                return verdict
         return verdict
 
     def probe_1slot(self, token: str, usd: float) -> dict:
@@ -223,28 +249,34 @@ class RotatingExecutor:
         real entry — a later buy() if the pool survives — picks its own fresh wallet. A 'trapped' probe (the sell did
         not recover) left the stake in this wallet, so it stays assigned for sell()/sweep to exit."""
         with self._lock:
-            idx = self._assign.get(token)
-            if idx is None:
-                free = self._free_indices()
-                if not free:
-                    self.last_note = f"no free wallet (all {len(self.subs)} busy)"
-                    return {"token": token, "usd": usd, "verdict": "skipped", "note": self.last_note}
-                idx = min(free, key=lambda i: self._used.get(i, 0.0))
+            pre, order = self._candidates(token)
+            if not order:
+                self.last_note = f"no free wallet (all {len(self.subs)} busy)"
+                return {"token": token, "usd": usd, "verdict": "skipped", "note": self.last_note}
+        out = None
+        for pos, idx in enumerate(order):
+            with self._lock:
                 self._assign[token] = idx
-                self._opened[token] = self.clock()
+                self._opened.setdefault(token, self.clock())
                 self._save()
             self._apply_pool(idx, token)
-        sub = self.subs[idx]
-        out = (sub.probe_1slot(token, usd) if hasattr(sub, "probe_1slot")
-               else {"token": token, "usd": usd, "verdict": "skipped", "note": "no direct route"})
-        self.last_note = getattr(sub, "last_note", "")
-        with self._lock:
-            self._used[idx] = self.clock()  # rotate the next probe to a fresher wallet
-            out["wallet"] = idx
-            if out.get("verdict") != "trapped":  # a clean probe holds nothing: free the wallet
-                self._assign.pop(token, None)
-                self._opened.pop(token, None)
-            self._save()
+            sub = self.subs[idx]
+            out = (sub.probe_1slot(token, usd) if hasattr(sub, "probe_1slot")
+                   else {"token": token, "usd": usd, "verdict": "skipped", "note": "no direct route"})
+            self.last_note = getattr(sub, "last_note", "")
+            with self._lock:
+                self._used[idx] = self.clock()  # rotate the next probe to a fresher wallet
+                out["wallet"] = idx
+                if pre is None and pos < len(order) - 1 and _insufficient(self.last_note):
+                    self._assign.pop(token, None)  # this wallet is out of SOL: move to the next funded wallet
+                    self._opened.pop(token, None)
+                    self._save()
+                    continue
+                if out.get("verdict") != "trapped":  # a clean probe holds nothing: free the wallet
+                    self._assign.pop(token, None)
+                    self._opened.pop(token, None)
+                self._save()
+                return out
         return out
 
     def round_trip(self, token: str, usd: float):

@@ -23,6 +23,7 @@ class FakeSub:
         self.balances: dict[str, int] = {}
         self.fail_buy = False
         self.fail_sell = False  # True = the pool rugged, the sale finds no route
+        self.low = False        # True = this wallet is out of SOL, so every action refuses with "wallet SOL low"
         self.feinted: list = []
         self.feint_verdict = "alive"
         self.last_feint: dict = {}
@@ -30,10 +31,18 @@ class FakeSub:
         self.probe_verdict = "ok"
 
     def feint(self, token: str, usd: float, commit: bool = True) -> str:
+        if self.low:
+            self.last_note = "feint: wallet SOL low"
+            return "inconclusive"
+        self.last_note = ""
         self.feinted.append((token, commit))
         return self.feint_verdict
 
     def probe_1slot(self, token: str, usd: float) -> dict:
+        if self.low:
+            self.last_note = "probe: wallet SOL low"
+            return {"token": token, "usd": usd, "verdict": "skipped", "note": self.last_note}
+        self.last_note = ""
         self.probed.append(token)
         return {"token": token, "usd": usd, "verdict": self.probe_verdict}
 
@@ -45,6 +54,9 @@ class FakeSub:
         self.pools[mint] = pool
 
     def buy(self, token: str, usd: float, ref_price: float) -> Fill | None:
+        if self.low:
+            self.last_note = "wallet SOL low (0.001) for a 0.15 SOL buy"
+            return Fill(qty=0.0, price=0.0, usd=0.0, fee_usd=0.0, ok=False, note=self.last_note)
         if self.fail_buy:
             self.last_note = "boom"
             return Fill(qty=0.0, price=0.0, usd=0.0, fee_usd=0.0, ok=False, note="boom")
@@ -235,3 +247,40 @@ def test_feint_only_rotates_across_the_fresh_wallets():
     clock["t"] += 1
     r.feint("D", 25.0, commit=False)  # a fourth wraps back to the least-recently-used wallet
     assert sorted(len(s.feinted) for s in r.subs) == [1, 1, 2]
+
+
+def test_probe_falls_through_a_drained_wallet_to_a_funded_one():
+    # The freshest wallet is out of SOL: the probe must move to the next wallet and fire there (not skip the signal).
+    clock = {"t": 100.0}
+    r = rot(3, clock=lambda: clock["t"])
+    r.subs[0].low = True   # wallet 0 is the LRU (all _used=0), and it is drained
+    out = r.probe_1slot("A", 25.0)
+    assert out["verdict"] == "ok"          # fired on a funded wallet, not skipped
+    assert out["wallet"] != 0              # rotated off the drained wallet
+    assert r.subs[0].probed == [] and r.subs[out["wallet"]].probed == ["A"]
+    assert "A" not in r._assign            # a clean probe frees its wallet
+
+
+def test_probe_skips_only_when_every_wallet_is_drained():
+    r = rot(3)
+    for s in r.subs:
+        s.low = True
+    out = r.probe_1slot("A", 25.0)
+    assert out["verdict"] == "skipped" and "SOL low" in out["note"]  # genuinely out of funds: now top up
+
+
+def test_feint_falls_through_a_drained_wallet():
+    r = rot(3)
+    r.subs[0].low = True
+    v = r.feint("A", 25.0, commit=False)
+    assert v == "alive"
+    assert r.subs[0].feinted == [] and any(s.feinted for s in r.subs[1:])
+
+
+def test_buy_falls_through_a_drained_wallet_and_opens_on_a_funded_one():
+    r = rot(3)
+    r.subs[0].low = True
+    fill = r.buy("A", 5.0, 1e-6)
+    assert fill is not None and fill.ok
+    assert r.subs[0].bought == [] and r.subs[r._assign["A"]].bought == ["A"]
+    assert r._assign["A"] != 0
