@@ -350,6 +350,56 @@ class DirectPumpswapExecutor(JupiterExecutor):
         log.info("direct swap sent %s", sig)
         return sig
 
+    def _simulate_ixs(self, ixs: list) -> tuple[bool, str] | None:
+        """Simulate these instructions on-chain and send NOTHING (sigVerify off, blockhash replaced). (ok, note):
+        ok True = every leg executed, False = a leg reverted (e.g. a honeypot's sell). None = couldn't simulate."""
+        from solders.hash import Hash
+        from solders.message import MessageV0
+        from solders.transaction import VersionedTransaction
+
+        latest = (self._rpc("getLatestBlockhash", [{"commitment": "confirmed"}]) or {}).get("value") or {}
+        if not latest.get("blockhash"):
+            return None
+        msg = MessageV0.try_compile(self.keypair.pubkey(), ixs, [], Hash.from_string(latest["blockhash"]))
+        raw = base64.b64encode(bytes(VersionedTransaction(msg, [self.keypair]))).decode()
+        res = self._rpc("simulateTransaction",
+                        [raw, {"encoding": "base64", "replaceRecentBlockhash": True, "sigVerify": False}])
+        if not isinstance(res, dict):
+            return None
+        err = (res.get("value") or {}).get("err")
+        return (err is None, "ok" if err is None else str(err)[:100])
+
+    def round_trip(self, mint: str, usd: float) -> tuple[float, str] | None:
+        """Direct-route honeypot / sell-route gate, independent of Jupiter indexing the pool: simulate a buy of `usd`
+        then a sell straight back on the actual pumpswap pool (nothing is sent). Returns (round_trip_loss_pct, note)
+        when the sim succeeds (the pool can be bought AND sold), (100.0, 'honeypot ...') when a leg reverts, or None
+        when the pool can't be read or simulated, so the caller skips the buy to be safe. Mirrors Jupiter.round_trip."""
+        sol_usd = self.jup.sol_price()
+        if not sol_usd:
+            return None
+        st = self._state(mint)
+        if st is None:
+            return None
+        base_amt, quote_amt = st["reserves"]
+        sol0 = quote_amt if st["token_is_base"] else base_amt
+        tok_res = base_amt if st["token_is_base"] else quote_amt
+        lamports = int(usd / sol_usd * 1e9)
+        if not sol0 or lamports <= 0:
+            return None
+        tokens = amount_out(lamports, sol0, tok_res, st["fee_bps"])
+        fslip = getattr(self.cfg, "launch_canary_feint_slippage_bps", 0) or self.cfg.slippage_bps
+        buy_min_out = int(tokens * (10_000 - fslip) / 10_000)
+        if buy_min_out <= 0:
+            return 100.0, "pool has no tokens"
+        sim = self._simulate_ixs(self._feint_instructions(st, lamports, buy_min_out))
+        if sim is None:
+            return None
+        ok, note = sim
+        if not ok:
+            return 100.0, f"honeypot (sim: {note})"
+        sol_back = amount_out(tokens, tok_res - tokens, sol0 + lamports, st["fee_bps"])  # sell the tokens back out
+        return round((1 - sol_back / lamports) * 100, 2), "ok"
+
     def _settle_direct(self, sig: str, mint: str) -> dict:
         """{ok, note, token (raw delta), swap_lamports (SOL into (-) or out of (+) the swap), fee_lamports (network fee
         plus rent of accounts this transaction created and left open)}."""

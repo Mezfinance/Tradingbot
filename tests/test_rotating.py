@@ -31,6 +31,10 @@ class FakeSub:
         self.feinted.append((token, commit))
         return self.feint_verdict
 
+    def round_trip(self, token: str, usd: float):
+        self.round_tripped = token
+        return (2.5, "ok")
+
     def remember_pool(self, mint: str, pool: str) -> None:
         self.pools[mint] = pool
 
@@ -185,6 +189,14 @@ def test_feint_only_frees_the_wallet_each_time():
     assert r._assign == {}
     assert r.feint("B", 25.0, commit=False) == "alive"  # a second pool still finds a free wallet
     assert r._assign == {}
+
+
+def test_round_trip_delegates_to_a_wallet_with_the_pool_applied():
+    r = rot(3)
+    r.remember_pool("A", "poolA")
+    assert r.round_trip("A", 25.0) == (2.5, "ok")  # the honeypot sim is read-only; delegate to a sub
+    done = [s for s in r.subs if getattr(s, "round_tripped", None) == "A"]
+    assert len(done) == 1 and done[0].pools.get("A") == "poolA"  # the pool was applied so the sub can read it
 
 
 def test_feint_only_rotates_across_the_fresh_wallets():

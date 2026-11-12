@@ -217,6 +217,15 @@ class RotatingExecutor:
             self._save()
         return verdict
 
+    def round_trip(self, token: str, usd: float):
+        """Delegate the direct-route honeypot/sell-route simulation to a wallet (read-only, nothing sent): the one
+        assigned to this mint if any, else the first. The pool is applied so the sub can read it."""
+        with self._lock:
+            idx = self._assign.get(token, 0)
+            self._apply_pool(idx, token)
+        sub = self.subs[idx]
+        return sub.round_trip(token, usd) if hasattr(sub, "round_trip") else None
+
     def sell(self, token: str, qty: float, ref_price: float) -> Fill | None:
         idx = self._holder(token)
         self._apply_pool(idx, token)

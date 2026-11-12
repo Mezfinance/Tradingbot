@@ -822,8 +822,20 @@ class Engine:
         if usd < (CANARY_MIN_USD if canary else MODEL_MIN_USD):
             return "size too small (cash or liquidity)"
         trigger = sig.get("price") or 0.0
+        if sig.get("pool") and hasattr(book.executor, "remember_pool"):  # the direct route swaps on this pool
+            book.executor.remember_pool(sig["mint"], sig["pool"])
         # A seconds-old pool has no Jupiter price; the fast canary's direct executor reads the pool reserves itself.
-        if sig.get("kind") != "fast" and self.jupiter is not None:
+        rt_fn = getattr(book.executor, "round_trip", None)  # a direct executor simulates a buy+sell on the pool itself
+        if sig.get("kind") != "fast" and rt_fn is not None:
+            # Direct route: gate the honeypot / sell-route on a simulated round trip on the ACTUAL pumpswap pool (free,
+            # nothing sent), so it never depends on Jupiter having indexed a seconds-old pool. The executor fills from
+            # live reserves, so the signal's chain price stands as the trigger.
+            rt = rt_fn(sig["mint"], usd)
+            if rt is None:
+                return "no direct route (pool unreadable)"
+            if rt[0] > c.max_round_trip_loss_pct:
+                return f"round-trip loss {rt[0]:.1f}% ({rt[1]})"
+        elif sig.get("kind") != "fast" and self.jupiter is not None:
             live = self.jupiter.prices([sig["mint"]]).get(sig["mint"])
             live_usd = live.usd if live is not None else self.jupiter.quote_price(sig["mint"])  # too new to list
             if live_usd is None:
@@ -841,8 +853,6 @@ class Engine:
                 return self._jup_failure("no swap route")
             if rt[0] > c.max_round_trip_loss_pct:
                 return f"round-trip loss {rt[0]:.1f}% (honeypot/tax/thin pool)"
-        if sig.get("pool") and hasattr(book.executor, "remember_pool"):  # the direct route swaps on this pool
-            book.executor.remember_pool(sig["mint"], sig["pool"])
         if canary and c.launch_canary_feint and not c.launch_canary_feint_only and hasattr(book.executor, "feint"):
             # Commit path: poke the pool, commit only if it wasn't pulled in reaction (feint-only is handled above).
             verdict = book.executor.feint(sig["mint"], c.launch_canary_feint_usd, commit=True)

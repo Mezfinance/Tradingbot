@@ -126,6 +126,9 @@ class PoolRpc(FakeRpc):
         if m == "getPriorityFeeEstimate":
             body = {"result": {"priorityFeeEstimate": 1000}}
             return SimpleNamespace(json=lambda: body)
+        if m == "simulateTransaction":  # a round-trip honeypot sim: err None = both legs execute (sellable)
+            body = {"result": {"value": {"err": getattr(self, "sim_err", None)}}}
+            return SimpleNamespace(json=lambda: body)
         if m == "sendTransaction" and p[1].get("skipPreflight") is False:
             self.raw.append(p[0])
             if getattr(self, "drain_on_send", False):  # model an operator pull that fires in reaction to our feint
@@ -249,6 +252,22 @@ def test_sweep_sells_dust_then_reclaims_the_account():
     res = ex.sweep({"OpenMint"})  # OpenMint is an open position: it must be left alone
     assert sold == [("DustA", d.SWEEP_QTY)]  # only the non-kept dust is sold, with the sell-it-all sentinel qty
     assert res["dust_sold"] == 1 and res["dust_usd"] == pytest.approx(0.2)
+
+
+def test_direct_round_trip_simulates_a_buy_and_sell_without_sending():
+    ex, rpc = direct()
+    rt = ex.round_trip(MINT, 25.0)
+    assert rt is not None and rt[1] == "ok"
+    assert 0 < rt[0] < 10  # a healthy pool: a small round-trip loss (2x fee + impact), not a honeypot
+    assert not rpc.sent and not rpc.raw  # simulated only, nothing signed-and-sent
+
+
+def test_direct_round_trip_flags_a_honeypot_when_the_sell_leg_reverts():
+    ex, rpc = direct()
+    rpc.sim_err = {"InstructionError": [7, "Custom"]}  # the simulated sell reverts: sell blocked / transfer-taxed
+    rt = ex.round_trip(MINT, 25.0)
+    assert rt[0] == 100.0 and rt[1].startswith("honeypot")
+    assert not rpc.sent  # a honeypot is caught for free, before any real buy or feint
 
 
 def test_direct_buy_declines_without_enough_sol_or_on_a_thin_pool():
