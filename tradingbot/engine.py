@@ -278,8 +278,10 @@ class Engine:
         def run():
             try:
                 res = ex.sweep(keep)
-                if res["closed"]:
-                    log.info("wallet sweep: closed %d empty token accounts, $%.2f back", res["closed"], res["usd_back"])
+                if res.get("closed") or res.get("dust_sold"):
+                    log.info("wallet sweep: closed %d empty accounts ($%.2f back), sold %d dust ($%.2f)",
+                             res.get("closed", 0), res.get("usd_back", 0.0),
+                             res.get("dust_sold", 0), res.get("dust_usd", 0.0))
                     self.journal.log_event("wallet_sweep", None, json.dumps(res, default=str)[:2000],
                                            strategy=books[0].name)
             except Exception:  # noqa: BLE001 (the sweep must never disturb trading)

@@ -214,6 +214,43 @@ def test_feint_flags_a_pool_pulled_in_reaction():
     assert ex.last_feint["sol_after"] < ex.last_feint["sol_before"] * 0.5
 
 
+def test_tight_feint_slippage_leaves_less_dust():
+    # the sell leg sells buy_min_out, so a tighter slippage raises it (closer to the full output = less dust left)
+    def buy_min_out(slip):
+        ex, rpc = direct()
+        ex.cfg.launch_canary_feint_slippage_bps = slip
+        rpc.next_meta = sol_meta(ex.owner, (0, 0), 0)
+        ex.feint(MINT, 25.0)
+        buy = next(x for x in decoded(rpc.raw[0]) if x[0] == d.PROGRAM)  # first PROGRAM ix = the buy leg (sell SOL)
+        return int.from_bytes(buy[1][16:24], "little")
+    lamports = int(25.0 / 200 * 1e9)  # FakeJup SOL price 200
+    expected = d.amount_out(lamports, 10 * 10**9, 10**12, 30)  # pool: 10 SOL base, 1e12 token quote, 30 bps fee
+    assert buy_min_out(100) == int(expected * (10_000 - 100) / 10_000)  # 1% haircut: little dust
+    assert buy_min_out(1000) < buy_min_out(100)  # looser slippage sells less -> more dust
+
+
+def test_sweep_sells_dust_then_reclaims_the_account():
+    from tradingbot.execution import jupiter as jx
+    ex, rpc = direct()
+    held = {jx.TOKEN_PROGRAMS[0]: [{"pubkey": "D1", "account": {"owner": jx.TOKEN_PROGRAMS[0], "lamports": 2_000_000,
+            "data": {"parsed": {"info": {"mint": "DustA", "tokenAmount": {"amount": "1000"}}}}}}],
+            jx.TOKEN_PROGRAMS[1]: [{"pubkey": "D2", "account": {"owner": jx.TOKEN_PROGRAMS[1], "lamports": 2_000_000,
+            "data": {"parsed": {"info": {"mint": "OpenMint", "tokenAmount": {"amount": "500"}}}}}}]}
+    orig = rpc.post
+
+    def post(url, json=None):
+        p = json["params"]
+        if json["method"] == "getTokenAccountsByOwner" and isinstance(p[1], dict) and "programId" in p[1]:
+            return SimpleNamespace(json=lambda: {"result": {"value": held[p[1]["programId"]]}})
+        return orig(url, json)
+    rpc.post = post
+    sold = []
+    ex.sell = lambda mint, qty, ref: sold.append((mint, qty)) or SimpleNamespace(ok=True, usd=0.2)
+    res = ex.sweep({"OpenMint"})  # OpenMint is an open position: it must be left alone
+    assert sold == [("DustA", d.SWEEP_QTY)]  # only the non-kept dust is sold, with the sell-it-all sentinel qty
+    assert res["dust_sold"] == 1 and res["dust_usd"] == pytest.approx(0.2)
+
+
 def test_direct_buy_declines_without_enough_sol_or_on_a_thin_pool():
     ex, rpc = direct(sol=40_000_000)  # 0.04 SOL: short of the 0.05 SOL buy plus the 0.01 SOL reserve
     assert ex.buy(MINT, 10.0, 0.0) is None and "wallet SOL low" in ex.last_note and not rpc.sent

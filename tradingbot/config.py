@@ -117,6 +117,8 @@ class Config:
     launch_canary_feint_wait_s: float = 4.0  # wait after the feint before re-reading the pool (the $25 reaction is ~1s)
     launch_canary_feint_drop_pct: float = 50.0  # SOL-vault drop vs before the feint that counts as 'pulled'
     launch_canary_feint_hold_s: float = 0.0  # 0 = atomic buy+sell in one tx (never hold); > 0 = buy, hold, then sell
+    launch_canary_feint_slippage_bps: int = 100  # the feint's sell leg sells the buy's guaranteed minimum, so a tight
+    # slippage here means less dust left behind (cheaper feint); too tight and the buy reverts (a free inconclusive)
     launch_canary_feint_only: bool = False  # run the feint but never commit: measure the feint's pull-trigger rate only
     launch_canary_feint_all: bool = False  # feint EVERY liquid pool (>= model_book_min_liq_usd), not just the scorer's
     # rug-vs-win picks: the feint itself is the signal, so the scorer's ranking no longer decides which pools we probe

@@ -47,6 +47,7 @@ ROUTE = "direct"
 POOL_FILE = "canary_pools.json"  # next to the journal: mint -> pool of the canary's buys
 POOL_FILE_KEEP = 500
 LARGEST_CHECKED = 8  # largest holders checked for the pool's vault
+SWEEP_QTY = 1e18  # a sentinel qty for the dust sweep: sell() clamps raw_in to the held balance, so this sells it all
 
 
 def pda(seeds: list[bytes], program: str) -> str:
@@ -466,7 +467,11 @@ class DirectPumpswapExecutor(JupiterExecutor):
         if not sol0 or lamports / (sol0 + lamports) * 100 > self.cfg.max_price_impact_pct:
             self.last_note = "feint: impact too high"
             return "inconclusive"
-        buy_min_out = int(amount_out(lamports, sol0, tok_res, st["fee_bps"]) * (10_000 - self.cfg.slippage_bps) / 10_000)
+        # The sell leg sells exactly buy_min_out, so a tight feint slippage = less dust left as tokens (a cheaper
+        # feint). The buy still succeeds as long as its output clears buy_min_out; if the pool moved, it reverts (a
+        # free inconclusive). Falls back to the general slippage when the feint slippage is 0.
+        fslip = getattr(self.cfg, "launch_canary_feint_slippage_bps", 0) or self.cfg.slippage_bps
+        buy_min_out = int(amount_out(lamports, sol0, tok_res, st["fee_bps"]) * (10_000 - fslip) / 10_000)
         if buy_min_out <= 0:
             self.last_note = "feint: pool has no tokens"
             return "inconclusive"
@@ -535,6 +540,30 @@ class DirectPumpswapExecutor(JupiterExecutor):
         if raw_in >= held:
             fee -= self.close_empty(token)
         return Fill(qty=sold, price=proceeds / sold, usd=proceeds - fee, fee_usd=fee, tx=sent, note="ok")
+
+    def sweep(self, keep: set = frozenset(), apply: bool = True) -> dict:
+        """Reclaim the SOL locked in this wallet's leftover token accounts. Each feint leaves a dust token balance in
+        a fresh ATA (it sells only the buy's guaranteed minimum), so the base sweep's empty-account close never frees
+        it. Here each dust balance is first sold back into its pool on the direct route (a dead/pulled pool returns
+        'no route' unsent, at no cost); a full sale also closes the emptied account and returns its rent. Then the
+        base sweep closes any still-empty accounts. Best effort: a failure on one token never stops the rest."""
+        base = super().sweep(keep, apply=False)  # list held dust + empty accounts without writing
+        sold, usd = 0, 0.0
+        if apply:
+            for h in base.get("holding_tokens", []):
+                mint = h.get("mint")
+                if not mint or mint in keep:  # an open position's token: leave it alone
+                    continue
+                try:
+                    fill = self.sell(mint, SWEEP_QTY, 0.0)  # qty >= balance -> sells the whole balance and closes it
+                    if fill is not None and getattr(fill, "ok", False):
+                        sold += 1
+                        usd += fill.usd
+                except Exception:  # noqa: BLE001 (a sweep must never disturb trading)
+                    log.warning("dust sweep of %s failed", mint, exc_info=True)
+        res = super().sweep(keep, apply)  # close any now-empty accounts (incl. ones the dust sale emptied): rent back
+        res["dust_sold"], res["dust_usd"] = sold, round(usd, 4)
+        return res
 
 
 def _token_amount(acct: dict | None) -> int:

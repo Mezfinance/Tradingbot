@@ -413,16 +413,15 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(launch_canary.feint_smoke(ex, args.path, usd, args.pool), indent=2, default=str))
         return
 
-    if args.command == "canary-sweep":  # get the rent back from the wallet's empty token accounts
+    if args.command == "canary-sweep":  # reclaim rent + dust from the canary's wallets (every rotation wallet on the direct route)
         from tradingbot import model_book as mb
         from tradingbot.data.jupiter import Jupiter
-        from tradingbot.execution.jupiter import JupiterExecutor
         from tradingbot.journal import Journal
         if args.apply and cfg.live_confirm != LIVE_CONFIRM_PHRASE:
             raise SystemExit(f"canary-sweep --apply signs transactions; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
         journal = Journal(cfg.db_path)
         keep = {p.token_address for b in mb.CANARY_BOOKS for p in journal.open_positions(b)}
-        ex = JupiterExecutor(cfg, Jupiter(cfg.slippage_bps))
+        ex = canary_executor(cfg, Jupiter(cfg.slippage_bps))  # the rotator (if on) sweeps every wallet; direct sells dust
         print(json.dumps(ex.sweep(keep, apply=args.apply), indent=2, default=str))
         return
 
