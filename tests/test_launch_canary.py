@@ -584,3 +584,87 @@ def test_canary_stop_and_start_commands_run_through_the_cli(tmp_path, monkeypatc
     cli.main(["canary-start"])
     assert not Journal(str(db)).get_state(CANARY_HALT)
     assert "kill switch cleared" in capsys.readouterr().out
+
+
+class ProbeExec(PaperExecutor):
+    """Stand-in canary executor for the 1-slot probe measurement path."""
+
+    def __init__(self, cfg):
+        super().__init__(cfg)
+        self.probed = []
+        self.verdict = "ok"
+        self.sol_now = {}   # mint -> current pool SOL at the watch read (None = unreadable)
+
+    def probe_1slot(self, token, usd):
+        self.probed.append((token, usd))
+        return {"token": token, "usd": usd, "verdict": self.verdict, "pool": "P" + token, "sol_before": 10.0,
+                "buy_slot": 100, "sell_slot": 101, "slot_gap": 1, "recovered_sol": 0.124}
+
+    def pool_sol(self, token):
+        return self.sol_now.get(token, 10.0)
+
+    def remember_pool(self, mint, pool):
+        pass
+
+
+def _probe_engine(cfg, good_pair):
+    cfg.launch_live = cfg.launch_canary = cfg.launch_canary_probe = True
+    cfg.launch_canary_route, cfg.live_confirm = "direct", LIVE_CONFIRM_PHRASE
+    cfg.launch_canary_probe_watch_s, cfg.launch_canary_probe_margin_s = 48.0, 12.0
+    j = Journal(":memory:")
+    live = ProbeExec(cfg)
+    eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                 model_executor=PaperExecutor(cfg), launch_canary_executor=live)
+    return eng, j, live
+
+
+def _probe_sig(mint="A", liq=12_000.0):
+    return {"pool": "P" + mint, "mint": mint, "dex": "pumpswap", "created_ts": time.time() - 6, "name": "",
+            "price": 1e-5, "liq": liq, "score": 1.0, "ts": time.time(), "decided_ts": time.time(),
+            "kind": "launch", "feint_any": True, "rw50": True, "top5": True}
+
+
+def test_probe_mode_measures_every_candidate_and_never_commits(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    book = eng.books[mb.CANARY4]
+    assert eng._try_model(book, _probe_sig("A")) is False  # a probe is measurement, not a buy
+    assert live.probed == [("A", cfg.launch_canary_probe_usd)]  # $25 probe fired
+    assert not j.open_positions(mb.CANARY4)                     # NEVER commits
+    ev = j.query("SELECT detail FROM events WHERE kind='canary_probe'")
+    assert ev and json.loads(ev[0]["detail"])["slot_gap"] == 1
+    w = eng._probe_watches["PA"]
+    assert w["mint"] == "A" and w["sol_before"] == 10.0 and w["due"] > time.time()  # a survival watch is scheduled
+
+
+def test_probe_watch_records_survivor_and_rugger(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    book = eng.books[mb.CANARY4]
+    eng._try_model(book, _probe_sig("A"))    # survives: SOL intact at the read
+    eng._try_model(book, _probe_sig("B"))    # rugs: SOL drained by the read
+    live.sol_now = {"A": 10.0, "B": 0.2}
+    eng._run_probe_watches()                 # not due yet -> no verdicts
+    assert not j.query("SELECT 1 FROM events WHERE kind='canary_probe_verdict'")
+    for w in eng._probe_watches.values():
+        w["due"] = time.time() - 1          # make both due
+    eng._run_probe_watches()
+    verdicts = {json.loads(r["detail"])["pool"]: json.loads(r["detail"])["verdict"]
+                for r in j.query("SELECT detail FROM events WHERE kind='canary_probe_verdict'")}
+    assert verdicts == {"PA": "survivor", "PB": "rugger"}
+    assert not eng._probe_watches            # both resolved and cleared
+
+
+def test_probe_watches_rearm_after_a_restart(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    eng._try_model(eng.books[mb.CANARY4], _probe_sig("A"))
+    assert "PA" in eng._load_probe_watches()                 # a pending watch is reloaded from the event log
+    j.log_event("canary_probe_verdict", "A", '{"pool": "PA", "verdict": "survivor"}', strategy=mb.CANARY4)
+    assert "PA" not in eng._load_probe_watches()             # once verdicted, it is not re-armed
+
+
+def test_probe_smoke_runs_one_probe_and_reports_the_result(cfg):
+    live = ProbeExec(cfg)
+    out = launch_canary.probe_smoke(live, "A", 1.0)
+    assert live.probed == [("A", 1.0)]  # one low-cost probe
+    assert out["result"]["verdict"] == "ok" and out["result"]["slot_gap"] == 1 and out["usd"] == 1.0

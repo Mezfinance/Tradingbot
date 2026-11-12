@@ -256,6 +256,14 @@ class RotatingExecutor:
         sub = self.subs[idx]
         return sub.round_trip(token, usd) if hasattr(sub, "round_trip") else None
 
+    def pool_sol(self, token: str) -> float | None:
+        """Read the pool's current SOL reserve through a wallet (read-only), for the probe survival watch."""
+        with self._lock:
+            idx = self._assign.get(token, 0)
+            self._apply_pool(idx, token)
+        sub = self.subs[idx]
+        return sub.pool_sol(token) if hasattr(sub, "pool_sol") else None
+
     def sell(self, token: str, qty: float, ref_price: float) -> Fill | None:
         idx = self._holder(token)
         self._apply_pool(idx, token)

@@ -1106,8 +1106,9 @@ class LaunchLive:
                  **big_flags(cols.get("liq_usd"), cols.get("big_pct")),
                  **thin_flags(cols.get("liq_usd"), cols.get("rw_pct"), cols.get("rwb_pct"), cols.get("liquid"))}
         self._update(pool, status="scored", reason=None if model else "no launch4 model yet", **cols)
-        # feint_all: the feint is the signal now, so probe every liquid pool (>= min liq), not just the rug-vs-win picks.
-        feint_any = bool(self.cfg.launch_canary_feint_all)  # the pool is already liquid here (not-liquid returned above)
+        # feint_all / probe: the probe IS the signal now, so route every liquid pool (>= min liq) to the canary, not
+        # just the rug-vs-win picks. The pool is already liquid here (not-liquid returned above).
+        feint_any = bool(self.cfg.launch_canary_feint_all) or bool(getattr(self.cfg, "launch_canary_probe", False))
         if self.signals is not None and (cols["top2"] or cols["top5"] or cols.get("top2h") or cols.get("top5h")
                                          or flags["d12"] or flags["rw50"] or flags["d12rw50"]
                                          or flags["rw50_24"] or flags["d12rw50_24"] or flags["rwband"]

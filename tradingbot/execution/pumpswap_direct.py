@@ -552,6 +552,15 @@ class DirectPumpswapExecutor(JupiterExecutor):
         self.last_feint = {"pool": st["addr"], "sol_before": sol0 / 1e9, "sol_after": sol1 / 1e9}
         return "pulled" if sol1 < sol0 * (1 - drop / 100) else "alive"
 
+    def pool_sol(self, mint: str) -> float | None:
+        """The pool's current SOL reserve (whole SOL), or None if it can't be read. Used by the probe survival watch
+        to tell a pull (SOL drained) from a survivor."""
+        st = self._state(mint)
+        if st is None:
+            return None
+        base_amt, quote_amt = st["reserves"]
+        return (quote_amt if st["token_is_base"] else base_amt) / 1e9
+
     def _wait_visible(self, sig: str, timeout_s: float) -> tuple[bool, int | None]:
         """Poll until the transaction is seen on-chain. (ok, slot): ok False = reverted or never appeared.
         A dependent sell can't be built until the buy's tokens exist, so we fire the sell the moment the buy is
@@ -592,6 +601,7 @@ class DirectPumpswapExecutor(JupiterExecutor):
         out["pool"] = st["addr"]
         base_amt, quote_amt = st["reserves"]
         sol_res, tok_res = (quote_amt, base_amt) if st["token_is_base"] else (base_amt, quote_amt)
+        out["sol_before"] = round(sol_res / 1e9, 6)  # the pool's SOL at the probe, so the survival watch can see a pull
         lamports = int(usd / sol_usd * 1e9)
         bal = self.sol_balance()
         if bal is None or bal < lamports / 1e9 + MIN_SOL:

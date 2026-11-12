@@ -151,3 +151,19 @@ def feint_smoke(executor, mint: str, usd: float, pool: str | None = None) -> dic
     out["note"] = getattr(executor, "last_note", "")
     out["sol_after"] = _sol_balance(executor)
     return out
+
+
+def probe_smoke(executor, mint: str, usd: float, pool: str | None = None) -> dict:
+    """Run one real 1-slot probe (buy + next-slot sell) at a low `usd` on a deep, healthy pool and report the result.
+    On a healthy pool it should return verdict 'ok' with recovered ~ spent and a slot_gap of 1-3 -- it proves the two
+    transactions land, the sell fires in the next slot(s) and the stake comes back, before a real-money probe run is
+    armed. Opens no position; under rotation it frees the wallet (a clean probe holds nothing)."""
+    if pool and hasattr(executor, "remember_pool"):
+        executor.remember_pool(mint, pool)
+    out: dict = {"mint": mint, "usd": usd, "sol_before": _sol_balance(executor)}
+    t0 = time.time()
+    out["result"] = executor.probe_1slot(mint, usd)
+    out["seconds"] = round(time.time() - t0, 1)
+    out["note"] = getattr(executor, "last_note", "")
+    out["sol_after"] = _sol_balance(executor)
+    return out

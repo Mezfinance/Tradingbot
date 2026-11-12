@@ -122,6 +122,14 @@ class Config:
     launch_canary_feint_only: bool = False  # run the feint but never commit: measure the feint's pull-trigger rate only
     launch_canary_feint_all: bool = False  # feint EVERY liquid pool (>= model_book_min_liq_usd), not just the scorer's
     # rug-vs-win picks: the feint itself is the signal, so the scorer's ranking no longer decides which pools we probe
+    # 1-slot commit probe (11-12, measurement only, REAL MONEY): probe every liquid candidate -- buy $usd so committed
+    # money LANDS (slot N, which may SET a size-reacting rugger), then sell the buy's guaranteed floor in the next slot
+    # (N+1), which escapes every measured pull (100% land >=2 slots after the buy). Records only, never commits; the
+    # engine watches the pool for watch_s (the measured max pull age) and logs rugger (tripped and dodged) / survivor.
+    launch_canary_probe: bool = False  # on: run the 1-slot probe on every liquid candidate (direct route), no entry
+    launch_canary_probe_usd: float = 25.0  # the probe size; must be big enough to trip the size-reacting operators
+    launch_canary_probe_watch_s: float = 48.0  # watch the pool this long after the probe (the measured max $25 pull age)
+    launch_canary_probe_margin_s: float = 12.0  # extra margin on the watch before calling a pool a survivor
     # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
     launch_fast_canary: bool = False  # REAL MONEY: buy on detection, before the scorer's second-4 decide
@@ -390,6 +398,11 @@ class Config:
                 raise ValueError("The feint probe is built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
         if self.launch_canary_feint_all and not self.launch_canary_feint:
             raise ValueError("TB_LAUNCH_CANARY_FEINT_ALL needs the feint on; set TB_LAUNCH_CANARY_FEINT=1")
+        if self.launch_canary_probe:
+            if self.live_confirm != LIVE_CONFIRM_PHRASE:
+                raise ValueError(f"The 1-slot probe spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+            if self.launch_canary_route != "direct":
+                raise ValueError("The 1-slot probe is built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):

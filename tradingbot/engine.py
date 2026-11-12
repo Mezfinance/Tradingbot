@@ -39,6 +39,7 @@ MAIN = "claude"
 CANARY = "canary"
 CANARY_HALT = "launch_canary:halted"  # state key: set = the real-money launch canary buys nothing (kill switch)
 CANARY_ALLOW = "launch_canary:allow"  # state key: buys left before the canary waits (canary-one sets 1); absent = no limit
+PROBE_PULLED_SHARE = 0.10  # the probe survival watch calls a pool rugged when its SOL falls below this share of probe-time
 BOOK_PRIORITY = {MAIN: 0, CANARY: 1, "canary_rw50_sz": 1}  # real-money books are exited before simulated baselines
 REANALYSE_AFTER_S = 6 * 3600
 RECHECK_REJECTED_S = 30 * 60
@@ -123,6 +124,7 @@ class Engine:
         self._deadlines = self._load_deadlines()  # position id -> sell by this time (pool-age exit)
         self._climbs = self._load_climbs()  # position id -> [check time, price to reach, best price seen]
         self._holds = self._load_holds()  # position id -> {"at": [check times left], "last": return at the last check}
+        self._probe_watches = self._load_probe_watches()  # pool -> a 1-slot probe awaiting its survival read
         self._model_pool = None  # threads that let every book buy a signal at the same time
         self._sell_pool = None  # threads that sell every due exit of a monitor pass at once
         self._last_snapshot = 0.0
@@ -360,6 +362,7 @@ class Engine:
         prices = self.current_prices(set(held), held)
         now = time.time()
         self.journal.set_state("heartbeat", repr(now))
+        self._run_probe_watches()  # record rugger/survivor for probes whose watch window is up (read only)
         from tradingbot import model_book as mb
         jobs: list[tuple] = []
         for pos in positions:
@@ -800,6 +803,21 @@ class Engine:
         started = time.time()
         from tradingbot import model_book as mb
         canary = book.name in mb.CANARY_BOOKS
+        if canary and c.launch_canary_probe and hasattr(book.executor, "probe_1slot"):
+            # 1-slot probe measurement (11-12): land committed money (slot N) then pull it out next slot, so a
+            # size-reacting rugger is tripped while our sell escapes, and we NEVER commit. Runs before the Jupiter
+            # price/route block, as a seconds-old pool has no Jupiter price. The survival watch scheduled here reads the
+            # pool at probe_ts + the watch window and records rugger (pulled, we dodged) / survivor (a pool to enter).
+            if sig.get("pool") and hasattr(book.executor, "remember_pool"):
+                book.executor.remember_pool(sig["mint"], sig["pool"])
+            res = book.executor.probe_1slot(sig["mint"], c.launch_canary_probe_usd)
+            res["liq"] = sig.get("liq")
+            self.journal.log_event("canary_probe", sig["mint"], json.dumps(res), strategy=book.name)
+            self._schedule_probe_watch(book, sig, res)
+            allow = self.journal.get_state(CANARY_ALLOW)
+            if allow is not None:  # one probe at a time (canary-one / Execute one probe): this used the allowance
+                self.journal.set_state(CANARY_ALLOW, str(max(0, int(allow) - 1)))
+            return f"probe: {res.get('verdict')}"
         if canary and c.launch_canary_feint and c.launch_canary_feint_only and hasattr(book.executor, "feint"):
             # Measurement run: probe every routed pool and never commit, so run it before the Jupiter price/route
             # block -- a seconds-old pool Jupiter can't price yet must still be feinted, not dropped as 'no live price'.
@@ -931,6 +949,60 @@ class Engine:
                 due = [t for t in d["at"] if t <= now]
                 out[d["position_id"]] = {"at": due[-1:] + [t for t in d["at"] if t > now], "last": None}
         return out
+
+    def _load_probe_watches(self) -> dict:
+        """Pending 1-slot-probe survival watches, re-armed after a restart: canary_probe_watch events whose pool has no
+        canary_probe_verdict yet (an overdue one is read on the next monitor pass)."""
+        done = {r["token"] for r in self.journal.query(
+            "SELECT DISTINCT token FROM events WHERE kind='canary_probe_verdict'")}
+        out: dict = {}
+        for r in self.journal.query("SELECT token, detail FROM events WHERE kind='canary_probe_watch'"):
+            d = json.loads(r["detail"] or "{}")
+            pool = d.get("pool")
+            if pool and r["token"] not in done:
+                out[pool] = {"mint": r["token"], "pool": pool, "due": d["due"], "probe_ts": d["probe_ts"],
+                             "sol_before": d.get("sol_before"), "liq": d.get("liq"), "book": d.get("book")}
+        return out
+
+    def _schedule_probe_watch(self, book: Book, sig: dict, res: dict) -> None:
+        """After a probe, schedule a pool read at probe_ts + watch window + margin to decide rugger vs survivor."""
+        pool = res.get("pool") or sig.get("pool")
+        if not pool:
+            return
+        now = time.time()
+        rec = {"mint": sig["mint"], "pool": pool, "probe_ts": now, "sol_before": res.get("sol_before"),
+               "liq": sig.get("liq"), "book": book.name,
+               "due": now + self.cfg.launch_canary_probe_watch_s + self.cfg.launch_canary_probe_margin_s}
+        self._probe_watches[pool] = rec
+        self.journal.log_event("canary_probe_watch", sig["mint"], json.dumps(rec), strategy=book.name)
+
+    def _run_probe_watches(self) -> None:
+        """Read each probe's pool once its watch window is up and record the verdict: the pool's SOL is gone / far below
+        the probe-time level -> `rugger` (we tripped it and dodged); still liquid -> `survivor` (a pool to enter for
+        real). Read only (one reserve read per due watch); never commits."""
+        if not self._probe_watches:
+            return
+        from tradingbot import model_book as mb
+        now = time.time()
+        ex = next((b.executor for b in self.books.values() if b.name in mb.CANARY_BOOKS), None)
+        for pool in [p for p, w in self._probe_watches.items() if now >= w["due"]]:
+            w = self._probe_watches.pop(pool)
+            sol_after, verdict = None, "unknown"
+            if ex is not None and hasattr(ex, "pool_sol"):
+                try:
+                    sol_after = ex.pool_sol(w["mint"])
+                except Exception:  # noqa: BLE001 (a read failure must never stop the monitor loop)
+                    sol_after = None
+                before = w.get("sol_before") or 0.0
+                if sol_after is None:
+                    verdict = "rugger"  # pool unreadable / gone
+                elif before and sol_after < PROBE_PULLED_SHARE * before:
+                    verdict = "rugger"
+                else:
+                    verdict = "survivor"
+            self.journal.log_event("canary_probe_verdict", w["mint"], json.dumps(
+                {"pool": pool, "verdict": verdict, "sol_before": w.get("sol_before"), "sol_after": sol_after,
+                 "liq": w.get("liq"), "watched_s": round(now - w["probe_ts"], 1)}), strategy=w.get("book"))
 
     def _hold_failed(self, pos: Position, now: float) -> bool:
         """At each due check (model_book.HOLD_CHECK_MIN) quote a sale of the position: True (sell) when it would
