@@ -805,7 +805,8 @@ class Engine:
                 book.executor.remember_pool(sig["mint"], sig["pool"])
             verdict = book.executor.feint(sig["mint"], c.launch_canary_feint_usd, commit=False)
             self.journal.log_event("canary_feint", sig["mint"], json.dumps(
-                {"verdict": verdict, **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
+                {"verdict": verdict, "note": getattr(book.executor, "last_note", "") or "",
+                 **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
             return f"feint only: pool {verdict}"
         if canary and c.launch_canary_flat_usd > 0:
             base = c.launch_canary_flat_usd  # one tiny size for every pick: does any real buy set the operators off?
@@ -844,7 +845,8 @@ class Engine:
             # Commit path: poke the pool, commit only if it wasn't pulled in reaction (feint-only is handled above).
             verdict = book.executor.feint(sig["mint"], c.launch_canary_feint_usd, commit=True)
             self.journal.log_event("canary_feint", sig["mint"], json.dumps(
-                {"verdict": verdict, **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
+                {"verdict": verdict, "note": getattr(book.executor, "last_note", "") or "",
+                 **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
             if verdict != "alive":
                 return f"feint: pool {verdict}"
         fill = book.executor.buy(sig["mint"], usd, trigger)
