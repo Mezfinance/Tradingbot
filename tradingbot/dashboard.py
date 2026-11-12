@@ -1134,11 +1134,11 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 </main>
 <main id="v-pools" hidden>
 <div><p class="label eyebrow"><a class="lk" href="#/supermeme">Supermeme</a> · launch canary · real money</p><h1>Pool tracker</h1>
-<p class="lead">Every pool the canary has feinted, with its live state. Liquidity, age and the LP-pull time come from the second-4 scorer; live liquidity and the best entry come from a public-RPC read of the pool's reserves (no Helius credits), refreshed every 20 seconds while a pool is under 25 minutes old.</p></div>
+<p class="lead">Every pool the canary has probed (feint or 1-slot), with its live state and the ~48s survival verdict. Liquidity, age and the LP-pull time come from the second-4 scorer; live liquidity and the best entry come from a public-RPC read of the pool's reserves (no Helius credits), refreshed every 20 seconds while a pool is under 25 minutes old.</p></div>
 <div id="p-note"></div>
 <div class="stats" id="p-tiles"></div>
 <section class="card"><p class="label eyebrow">Feinted pools</p><h2>Live pool state</h2><p class="sub">Newest pool first. <b>Probe@</b> = pool age when we feinted. <b>Liq</b> = liquidity at second 4; <b>Live</b> = latest reserve read; <b>Peak</b> = most liquidity seen after the probe. <b>Pulled@</b> = pool age when the LP was pulled, <b>+probe</b> = how long after our feint. <b>$25 @ m6</b> = what a $25 buy held to pool minute 6 would have returned (scorer trade, net of 6% cost). <b>Best entry</b> = the pool age of the cheapest price before minute 6 and the return it would have given.</p>
-<div class="filters"><select id="p-filter" aria-label="Filter"><option value="all">All pools</option><option value="alive">Alive at probe</option><option value="pulled">Pulled</option><option value="live">Still live (&lt;25m)</option><option value="win">$25 in profit</option></select></div>
+<div class="filters"><select id="p-filter" aria-label="Filter"><option value="all">All pools</option><option value="survivor">Survivor</option><option value="rugger">Rugger</option><option value="alive">Alive at feint</option><option value="pulled">Pulled</option><option value="live">Still live (&lt;25m)</option><option value="win">$25 in profit</option></select></div>
 <div class="scroll"><table id="p-tbl"></table></div></section>
 </main>
 <main id="v-settings" hidden>
@@ -1529,7 +1529,7 @@ const PLIQ=v=>v==null?"–":(Math.abs(v)>=1000?"$"+(v/1000).toFixed(1)+"k":"$"+v
 const PAGE2=s=>s==null?"–":agoStr(Math.round(s));
 const PPCT=r=>r==null?"–":(r>=0?"+":"")+(r*100).toFixed(0)+"%";
 function poolRow(r){const neg=r.pnl25!=null&&r.pnl25<0,win=r.pnl25!=null&&r.pnl25>0;
-const vt=r.verdict==="alive"?'<span class="tag lime">alive</span>':r.verdict==="pulled"?'<span class="tag neg">pulled</span>':r.verdict?'<span class="tag">'+esc(r.verdict)+'</span>':"–";
+const vt=(r.verdict==="alive"||r.verdict==="survivor")?'<span class="tag lime">'+esc(r.verdict)+'</span>':(r.verdict==="pulled"||r.verdict==="rugger"||r.verdict==="trapped")?'<span class="tag neg">'+esc(r.verdict)+'</span>':r.verdict?'<span class="tag">'+esc(r.verdict)+'</span>':"–";
 const lk=r.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(r.pool)}" target="_blank" rel="noopener">${esc((r.mint||r.pool).slice(0,8))}</a>`:esc((r.mint||"").slice(0,8));
 return`<tr><td>${lk}</td><td>${vt}</td><td class="num">${PAGE2(r.pool_age_s)}</td><td class="num">${PAGE2(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PAGE2(r.pull_pool_age_s):"–"}</td><td class="num">${r.pulled?PAGE2(r.pull_after_probe_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–"}<span class="muted"> ${PPCT(r.ret_m6)}</span></td><td class="num">${r.opt_age_s!=null?PAGE2(r.opt_age_s)+" ":""}<span class="${r.opt_ret>0?'pos':r.opt_ret<0?'neg':'muted'}">${PPCT(r.opt_ret)}</span></td></tr>`}
 function canaryRotate(){const n=+($("rot-n").value||0),s=+($("rot-sol").value||0);
@@ -1617,9 +1617,9 @@ function renderPools(){const P=S.pools,note=$("p-note");
 if(!P){note.innerHTML='<p class="note">Loading pool reserves…</p>';["p-tiles","p-tbl"].forEach(i=>$(i).innerHTML="");return}
 const s=P.summary||{},rows=P.rows||[];const when=P.fetched_ts?agoStr(Math.max(0,Math.round(Date.now()/1000-P.fetched_ts)))+" ago":"–";
 note.innerHTML=P.stale?`<p class="note neg">Live reserves stale${P.error?": "+esc(P.error):""}. Showing the last read.</p>`:"";
-tiles("p-tiles",[["Pools",String(s.pools||0),(P.sol_usd?"SOL $"+P.sol_usd.toFixed(0)+" · ":"")+"updated "+when],["Alive at probe",String(s.alive||0),"liquidity held the $25 poke"],["Pulled at probe",String(s.pulled_at_probe||0),"withdrew in reaction"],["Pulled since",String(s.pulled_since||0),"LP gone by now"],["$25 would make",s.would_pnl25!=null?(s.would_pnl25>=0?"+":"")+"$"+s.would_pnl25.toFixed(0):"–","held to minute 6 across "+(s.with_outcome||0)+" finished"]]);
+tiles("p-tiles",[["Pools",String(s.pools||0),(P.sol_usd?"SOL $"+P.sol_usd.toFixed(0)+" · ":"")+"updated "+when],["Survivors",String(s.survivor||0),"alive at the ~48s watch — pools to enter"],["Ruggers",String(s.rugger||0),"pulled — we tripped and dodged"],["Pulled since",String(s.pulled_since||0),"LP gone by now"],["$25 would make",s.would_pnl25!=null?(s.would_pnl25>=0?"+":"")+"$"+s.would_pnl25.toFixed(0):"–","held to minute 6 across "+(s.with_outcome||0)+" finished"]]);
 const f=($("p-filter")||{}).value||"all";$("p-filter").onchange=render;
-const show=rows.filter(r=>f==="alive"?r.verdict==="alive":f==="pulled"?r.pulled:f==="live"?(r.pool_age_s!=null&&r.pool_age_s<1500&&!r.pulled):f==="win"?(r.pnl25!=null&&r.pnl25>0):true);
+const show=rows.filter(r=>f==="survivor"?r.watch_verdict==="survivor":f==="rugger"?r.watch_verdict==="rugger":f==="alive"?r.verdict==="alive":f==="pulled"?r.pulled:f==="live"?(r.pool_age_s!=null&&r.pool_age_s<1500&&!r.pulled):f==="win"?(r.pnl25!=null&&r.pnl25>0):true);
 $("p-tbl").innerHTML=`<tr><th class="l">Pool</th><th>Verdict</th><th>Age</th><th>Probe@</th><th>Liq</th><th>Live</th><th>Peak</th><th>Pulled@</th><th>+probe</th><th>$25 @ m6</th><th>Best entry</th></tr>`+(show.length?show.map(poolRow).join(""):`<tr><td class="muted">No feinted pools in the window yet.</td></tr>`)}
 function render(){renderHealth();renderFeints();if(!S.books.length)return;
 if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="market")renderMarket();else if(R.v==="wallets")renderWallets();else if(R.v==="pools")renderPools();else if(R.v==="settings")renderSettings();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();

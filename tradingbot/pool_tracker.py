@@ -45,9 +45,12 @@ def _sol_usd(wquery) -> float | None:
 
 
 def feint_pools(jquery, since: float) -> dict:
-    """The earliest feint probe per pool since `since` (journal events, kind canary_feint)."""
-    rows = jquery("SELECT ts, token, detail FROM events WHERE kind='canary_feint' AND ts >= ? ORDER BY ts",
-                  (since,))
+    """The earliest probe of each pool since `since`: feint probes (`canary_feint`) AND 1-slot probes
+    (`canary_probe`), with the 1-slot probe's survival verdict (`canary_probe_verdict`, rugger/survivor) overlaid
+    once the watch has read it. `kind` tags which probe it was; `verdict` is the probe's own result (feint:
+    alive/pulled/inconclusive; 1-slot: ok/trapped/honeypot/buy_failed), `watch_verdict` is the ~48s survival read."""
+    rows = jquery("SELECT ts, token, detail, kind FROM events WHERE kind IN ('canary_feint', 'canary_probe') "
+                  "AND ts >= ? ORDER BY ts", (since,))
     out: dict = {}
     for r in rows:
         try:
@@ -57,9 +60,20 @@ def feint_pools(jquery, since: float) -> dict:
         pool = d.get("pool")
         if not pool:
             continue
-        out.setdefault(pool, {"pool": pool, "mint": r["token"], "verdict": d.get("verdict"),
-                              "note": d.get("note") or "", "feint_ts": r["ts"],
-                              "sol_before": d.get("sol_before"), "sol_after": d.get("sol_after")})
+        out.setdefault(pool, {"pool": pool, "mint": r["token"],
+                              "kind": "probe" if r["kind"] == "canary_probe" else "feint",
+                              "verdict": d.get("verdict"), "watch_verdict": None, "note": d.get("note") or "",
+                              "feint_ts": r["ts"], "sol_before": d.get("sol_before"), "sol_after": d.get("sol_after")})
+    for r in jquery("SELECT detail FROM events WHERE kind='canary_probe_verdict' AND ts >= ? ORDER BY ts", (since,)):
+        try:
+            d = json.loads(r["detail"] or "{}")
+        except Exception:  # noqa: BLE001
+            d = {}
+        f = out.get(d.get("pool"))
+        if f is not None:
+            f["watch_verdict"] = d.get("verdict")  # rugger / survivor from the survival watch
+            if d.get("sol_after") is not None:
+                f["sol_after"] = d.get("sol_after")
     return out
 
 
@@ -161,8 +175,13 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
             peak_liq = max(peak_liq or 0.0, p["peak_liq"])
         pulled_ts = p.get("pulled_ts") or s.get("pulled_ts")
         ret_m6 = s.get("ret")
+        # for a 1-slot probe the meaningful verdict is the survival read (rugger/survivor); fall back to the probe's
+        # own result (ok/trapped/...) until the watch fires. Feints keep alive/pulled/inconclusive.
+        disp = f.get("watch_verdict") or f.get("verdict") if f.get("kind") == "probe" else f.get("verdict")
         out.append({
-            "pool": pool, "mint": f.get("mint"), "verdict": f.get("verdict"), "note": f.get("note"),
+            "pool": pool, "mint": f.get("mint"), "verdict": disp, "kind": f.get("kind"),
+            "watch_verdict": f.get("watch_verdict"), "probe_verdict": f.get("verdict") if f.get("kind") == "probe" else None,
+            "note": f.get("note"),
             "feint_ts": f["feint_ts"], "created_ts": created,
             "probe_pool_age_s": (f["feint_ts"] - created) if created else None,
             "pool_age_s": (now - created) if created else None,
@@ -186,6 +205,8 @@ def summary(rows: list[dict]) -> dict:
         "alive": sum(1 for r in rows if r["verdict"] == "alive"),
         "pulled_at_probe": sum(1 for r in rows if r["verdict"] == "pulled"),
         "inconclusive": sum(1 for r in rows if r["verdict"] == "inconclusive"),
+        "survivor": sum(1 for r in rows if r.get("watch_verdict") == "survivor"),
+        "rugger": sum(1 for r in rows if r.get("watch_verdict") == "rugger"),
         "pulled_since": sum(1 for r in rows if r["pulled"]),
         "with_outcome": len(done),
         "would_pnl25": round(sum(pnl), 2) if pnl else 0.0,

@@ -13,15 +13,31 @@ def _acct(amount: int) -> dict:
 def test_feint_pools_keeps_the_earliest_probe_per_pool():
     import json
     rows = [
-        {"ts": 100.0, "token": "MintA", "detail": json.dumps({"pool": "P1", "verdict": "alive", "sol_before": 600})},
-        {"ts": 150.0, "token": "MintA", "detail": json.dumps({"pool": "P1", "verdict": "pulled", "sol_before": 10})},
-        {"ts": 120.0, "token": "MintB", "detail": json.dumps({"pool": "P2", "verdict": "inconclusive", "note": "x"})},
-        {"ts": 130.0, "token": "MintC", "detail": "{}"},  # no pool: dropped
+        {"ts": 100.0, "token": "MintA", "kind": "canary_feint", "detail": json.dumps({"pool": "P1", "verdict": "alive", "sol_before": 600})},
+        {"ts": 150.0, "token": "MintA", "kind": "canary_feint", "detail": json.dumps({"pool": "P1", "verdict": "pulled", "sol_before": 10})},
+        {"ts": 120.0, "token": "MintB", "kind": "canary_feint", "detail": json.dumps({"pool": "P2", "verdict": "inconclusive", "note": "x"})},
+        {"ts": 130.0, "token": "MintC", "kind": "canary_feint", "detail": "{}"},  # no pool: dropped
     ]
-    q = lambda sql, p: [r for r in rows if r["ts"] >= p[0]]
+    q = lambda sql, p: [] if "canary_probe_verdict" in sql else [r for r in rows if r["ts"] >= p[0]]
     out = pt.feint_pools(q, 0.0)
     assert set(out) == {"P1", "P2"}
     assert out["P1"]["verdict"] == "alive" and out["P1"]["feint_ts"] == 100.0  # earliest kept
+    assert out["P1"]["kind"] == "feint"
+
+
+def test_feint_pools_includes_1slot_probes_and_the_survival_verdict():
+    import json
+    rows = [
+        {"ts": 100.0, "token": "MintA", "kind": "canary_probe",
+         "detail": json.dumps({"pool": "PA", "verdict": "ok", "sol_before": 10, "slot_gap": 1})},
+        {"ts": 110.0, "token": "MintB", "kind": "canary_feint", "detail": json.dumps({"pool": "PB", "verdict": "alive"})},
+    ]
+    verds = [{"detail": json.dumps({"pool": "PA", "verdict": "survivor", "sol_after": 11})}]
+    q = lambda sql, p: (verds if "canary_probe_verdict" in sql else [r for r in rows if r["ts"] >= p[0]])
+    out = pt.feint_pools(q, 0.0)
+    assert out["PA"]["kind"] == "probe" and out["PA"]["verdict"] == "ok"  # the probe's own result
+    assert out["PA"]["watch_verdict"] == "survivor" and out["PA"]["sol_after"] == 11  # the ~48s watch read, overlaid
+    assert out["PB"]["kind"] == "feint" and out["PB"]["watch_verdict"] is None
 
 
 def test_read_vaults_parses_token_amounts_from_base64():
