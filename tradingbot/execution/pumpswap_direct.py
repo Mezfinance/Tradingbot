@@ -248,9 +248,13 @@ class DirectPumpswapExecutor(JupiterExecutor):
                 "fee_bps": g["lp_bps"] + g["protocol_bps"] + g["creator_bps"]}
 
     # --- transactions -------------------------------------------------------------
-    def _priority_micro(self, accounts: list[str], cu: int = CU_LIMIT) -> int:
-        """Micro-lamports per compute unit: Helius's 'VeryHigh' estimate for these accounts, capped so the priority
-        fee never passes `priority_fee_sol` over `cu` compute units; half the cap when there is no estimate."""
+    def _priority_micro(self, accounts: list[str], cu: int = CU_LIMIT, max_sol: float | None = None) -> int:
+        """Micro-lamports per compute unit. Normally Helius's 'VeryHigh' estimate, capped so the priority fee never
+        passes `priority_fee_sol` over `cu` compute units (half the cap when there is no estimate). With `max_sol` set,
+        pay that whole budget as priority outright -- no estimate, no capping down -- so the transaction jumps the
+        queue into the next slot (the probe's sell racing to escape the rug)."""
+        if max_sol is not None:
+            return max(1, int(max_sol * 1e9 * 1e6 / cu))
         cap = int(self.priority_fee_sol * 1e9 * 1e6 / cu)
         res = self._rpc("getPriorityFeeEstimate", [{"accountKeys": accounts, "options": {"priorityLevel": "VeryHigh"}}])
         try:
@@ -287,7 +291,8 @@ class DirectPumpswapExecutor(JupiterExecutor):
         return Instruction(P(TOKEN), bytes([9]), [  # CloseAccount: unwrap every lamport back to the wallet
             AccountMeta(P(wsol), False, True), AccountMeta(P(me), False, True), AccountMeta(P(me), True, False)])
 
-    def _instructions(self, st: dict, side: str, amount_in: int, min_out: int, bump: int = 0) -> list:
+    def _instructions(self, st: dict, side: str, amount_in: int, min_out: int, bump: int = 0,
+                      max_priority_sol: float | None = None) -> list:
         from solders.compute_budget import (
             set_compute_unit_limit,
             set_compute_unit_price,
@@ -299,8 +304,9 @@ class DirectPumpswapExecutor(JupiterExecutor):
         P, me = Pubkey.from_string, self.owner
         wsol = ata(me, TOKEN, WSOL)
         ixs = [set_compute_unit_limit(CU_LIMIT),
-               # bump distinguishes otherwise-identical clips (same wallet, amount, accounts) so each is its own tx
-               set_compute_unit_price(self._priority_micro([st["addr"], PROGRAM]) + bump),
+               # bump distinguishes otherwise-identical clips (same wallet, amount, accounts) so each is its own tx;
+               # max_priority_sol pays the full budget as priority (the probe's sell racing into N+1)
+               set_compute_unit_price(self._priority_micro([st["addr"], PROGRAM], max_sol=max_priority_sol) + bump),
                self._create_ata_ix(wsol, WSOL, TOKEN)]
         if side == "buy":
             token = st["pool"]["token_mint"]
@@ -632,8 +638,10 @@ class DirectPumpswapExecutor(JupiterExecutor):
             out["note"] = self.last_note = "probe: pool has no tokens"
             return out
         # Pre-build and sign the sell NOW, before the buy, so firing it after the buy is a bare sendTransaction (no
-        # blockhash fetch, compile, sign or preflight on the critical path). It sells exactly buy_min_out (the floor).
-        sell_built = self._build_tx(self._instructions(st, "sell", buy_min_out, 1))
+        # blockhash fetch, compile, sign or preflight on the critical path). It sells exactly buy_min_out (the floor),
+        # at max priority so it lands in the next slot (N+1), not N+2 -- the race to escape the rug.
+        sell_built = self._build_tx(self._instructions(
+            st, "sell", buy_min_out, 1, max_priority_sol=getattr(self.cfg, "launch_canary_probe_priority_sol", 0.0) or None))
         buy_sig = self._send_ixs(self._instructions(st, "buy", lamports, buy_min_out))
         if buy_sig.startswith(NOT_SENT):
             out["note"] = self.last_note = f"probe: buy not sent ({buy_sig})"

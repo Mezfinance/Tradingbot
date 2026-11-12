@@ -81,6 +81,31 @@ def test_update_path_measures_the_confirmation_entry_vs_the_best_entry():
     assert round(path["conf_ret"], 2) == 0.14                           # entering at ~60s makes far less than best
 
 
+def test_update_path_builds_the_hold_curve_to_catch_ripsnorters():
+    created = 1000.0
+    feint = created + 6  # confirmation ~66s
+    path = None
+    # a survivor that is flat at minute 6 but rips to 3x by minute 15, never pulled
+    for age, sol in [(6, 50.0), (70, 60.0), (900, 180.0)]:  # 900s = minute 15
+        path = pt.update_path(path, created + age, created, feint, sol, 1e12, 100.0, None)
+    assert path["pulled_ts"] is None
+    cb = path["conf_by"]
+    assert round(cb[6], 2) == -0.06                 # flat at minute 6 (just the 6% cost)
+    assert round(cb[15], 2) == 1.94                 # +194% held to minute 15 -- a ripsnorter the minute-6 exit misses
+    assert cb[15] > cb[6]
+
+
+def test_hold_curve_aggregates_survivor_returns_by_horizon():
+    surv = [
+        {"conf_by": {6: 0.1, 10: 0.3, 15: 1.5, 30: -1.0}},  # rips to +150% at 15, then rugs by 30
+        {"conf_by": {6: 0.0, 10: 0.1, 15: 0.2}},            # no 30-min sample yet
+    ]
+    c = pt.hold_curve(surv)
+    assert c["15"]["n"] == 2 and c["15"]["big"] == 0.5      # one of two hit +100% at 15m
+    assert c["30"]["n"] == 1 and c["30"]["mean"] == -1.0    # the only 30m value rugged
+    assert "60" not in c                                     # no survivor has a 60m value
+
+
 def test_summary_reports_survivor_entry_vs_best():
     rows = [
         {"watch_verdict": "survivor", "conf_ret": 0.14, "opt_ret": 1.34, "ret_m6": None, "pnl25": None, "verdict": "survivor", "pulled": False},

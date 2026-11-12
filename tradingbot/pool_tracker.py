@@ -27,7 +27,8 @@ COST = 0.06                # round-trip cost used for the ideal returns
 STAKE_USD = 25.0           # the feint / commit size we size "would have made" on
 CONF_AFTER_S = 60.0        # survival confirmation ≈ probe age + the watch window (48 s) + margin (12 s)
 TRACK_WINDOW_S = 3 * 3600  # how far back the tracker looks by default
-YOUNG_MAX_AGE_S = 1500.0   # keep reading a pool's reserves live for ~25 min after creation
+YOUNG_MAX_AGE_S = 3600.0   # keep reading a pool's reserves live for ~60 min, so the hold curve reaches 30-60 min
+HOLD_MINS = [6, 10, 15, 30, 60]  # exit horizons for the survivor hold curve: does holding past minute 6 pay?
 DEFAULT_RPC = "https://api.mainnet-beta.solana.com"
 
 SCORER_COLS = ("pool", "token_mint", "create_ts", "decided_ts", "liq_usd", "sol_at_decide",
@@ -161,6 +162,20 @@ def update_path(path: dict | None, now: float, created: float | None, feint_ts: 
         if conf and exit_px:
             path["conf_age"] = conf[0]
             path["conf_ret"] = -1.0 if path["pulled_ts"] else min(exit_px / conf[1] - 1 - COST, 3.0)
+            # hold curve: enter at confirmation, sell at each horizon (last live price at/before it while alive);
+            # -100% if pulled by then. Tells us whether holding a survivor past minute 6 pays (ripsnorters) or just
+            # adds rug risk. Capped +1000% (not +300%) so the big winners show.
+            pulled_age = (path["pulled_ts"] - created) if (path["pulled_ts"] and created) else None
+            curve = {}
+            for H in HOLD_MINS:
+                h = H * 60
+                if pulled_age is not None and pulled_age <= h:
+                    curve[H] = -1.0
+                    continue
+                at = [pr for (a, lq, pr) in path["pts"] if pr and conf[0] <= a <= h and lq >= floor]
+                if at:
+                    curve[H] = min(at[-1] / conf[1] - 1 - COST, 10.0)
+            path["conf_by"] = curve
     return path
 
 
@@ -200,7 +215,7 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
             "pull_after_probe_s": (pulled_ts - f["feint_ts"]) if pulled_ts else None,
             "ret_m6": ret_m6, "pnl25": (STAKE_USD * ret_m6) if ret_m6 is not None else None,
             "opt_age_s": p.get("opt_age"), "opt_ret": p.get("opt_ret"),
-            "conf_age_s": p.get("conf_age"), "conf_ret": p.get("conf_ret"),
+            "conf_age_s": p.get("conf_age"), "conf_ret": p.get("conf_ret"), "conf_by": p.get("conf_by"),
             "status": s.get("status") or "pending",
         })
     out.sort(key=lambda r: (r["created_ts"] or r["feint_ts"] or 0), reverse=True)
@@ -228,7 +243,24 @@ def summary(rows: list[dict]) -> dict:
         "survivor_entry_n": len(entry),
         "survivor_entry_mean": round(sum(entry) / len(entry), 4) if entry else None,
         "survivor_best_mean": round(sum(best) / len(best), 4) if best else None,
+        # hold curve: entering a survivor and holding to each horizon -- does a long hold pay (ripsnorters)?
+        "survivor_hold_curve": hold_curve(surv),
     }
+
+
+def hold_curve(surv: list[dict]) -> dict:
+    """Per hold horizon, over survivors with a measured price at that age: n, mean/median return, win rate and the
+    share that hit +100% or more (`big` = the ripsnorters)."""
+    out: dict = {}
+    for H in HOLD_MINS:
+        vals = [r["conf_by"][H] for r in surv if r.get("conf_by") and r["conf_by"].get(H) is not None]
+        if vals:
+            sv = sorted(vals)
+            out[str(H)] = {"n": len(vals), "mean": round(sum(vals) / len(vals), 4),
+                           "median": round(sv[len(sv) // 2], 4),
+                           "win": round(sum(1 for v in vals if v > 0) / len(vals), 3),
+                           "big": round(sum(1 for v in vals if v >= 1.0) / len(vals), 3)}
+    return out
 
 
 # --- CLI / snapshot --------------------------------------------------------------------------------
@@ -284,6 +316,11 @@ def render(rows: list[dict], su: float | None) -> str:
         bm = f"{s['survivor_best_mean'] * 100:+.1f}%" if s.get("survivor_best_mean") is not None else "—"
         out.append(f"survivors {s['survivor']} (ruggers {s['rugger']}); entering at confirmation -> {em} "
                    f"(hindsight best {bm}) over {s['survivor_entry_n']} with a path")
+        curve = s.get("survivor_hold_curve") or {}
+        if curve:
+            out.append("  hold curve (enter at confirmation, sell at minute): " + "  ".join(
+                f"{H}m {c['mean'] * 100:+.0f}% (win {c['win'] * 100:.0f}%, +100% {c['big'] * 100:.0f}%, n{c['n']})"
+                for H, c in curve.items()))
     if su:
         out.append(f"SOL ${su:.2f}")
     out.append("")

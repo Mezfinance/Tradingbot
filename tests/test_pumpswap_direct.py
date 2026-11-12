@@ -315,6 +315,13 @@ def test_probe_1slot_lands_money_then_sells_in_the_next_slot():
     assert out["spent_sol"] == pytest.approx(0.125) and out["recovered_sol"] == pytest.approx(0.12)
     assert len(rpc.raw) == 2 and not any("JUP" in str(t) for t in rpc.raw)  # TWO separate direct swaps, no Jupiter
     assert rpc.skips == [False, True]  # buy runs preflight; the pre-signed sell skips it to land in the next slot
+
+    def cu_price(raw):  # ComputeBudget set_compute_unit_price (discriminator 3) micro-lamports per CU
+        for p, data, _ in decoded(raw):
+            if p == "ComputeBudget111111111111111111111111111111" and data and data[0] == 3:
+                return int.from_bytes(data[1:9], "little")
+        return 0
+    assert cu_price(rpc.raw[1]) > cu_price(rpc.raw[0]) * 100  # the sell maxes out priority to win the next slot
     # the sell leg spends exactly the buy's guaranteed-minimum tokens (the pre-signed floor), min out 1
     lamports = int(25.0 / 200 * 1e9)
     buy_min_out = int(d.amount_out(lamports, 10 * 10**9, 10**12, 30) * (10_000 - ex.cfg.slippage_bps) / 10_000)
