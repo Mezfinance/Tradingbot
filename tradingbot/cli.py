@@ -104,6 +104,11 @@ def main(argv: list[str] | None = None) -> None:
 
         keyvault.main(argv[1:])
         return
+    if argv and argv[0] == "provision":  # re-mint + fund the canary wallets; its own argparse
+        from tradingbot import provision
+
+        provision.main(argv[1:])
+        return
     parser = argparse.ArgumentParser(prog="tradingbot")
     parser.add_argument("command", choices=["scan", "once", "run", "report", "replay", "health", "backup",
                                             "backup-now", "backup-list", "learn-now", "postmortems", "playbook", "optimize-now", "settings",
