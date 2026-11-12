@@ -223,3 +223,77 @@ def test_canary_positions_carry_their_swap_result_and_the_twin(cfg):
     rows = [dict(zip(snap["pos_cols"], r)) for r in snap["positions"]]
     assert round(rows[0]["swap_ret"], 3) == 0.373  # the 11-06 GKRs7p trade: -96% net, +37% on the swap
     assert {b["name"]: b["twin"] for b in snap["books"]}[mb.CANARY4] == mb.CANARY_TWIN
+
+
+def _feint(j, book, mint, verdict, note="", pool=None, sol_before=None, sol_after=None):
+    d = {"verdict": verdict, "note": note}
+    if pool is not None:
+        d.update(pool=pool, sol_before=sol_before, sol_after=sol_after)
+    j.log_event("canary_feint", mint, json.dumps(d), strategy=book)
+
+
+def test_feints_feed_parses_verdict_note_and_pool_and_lists_newest():
+    j = Journal(":memory:")
+    _feint(j, "canary_rw50_sz", "MintA", "alive", pool="PoolA", sol_before=600.0, sol_after=610.0)
+    _feint(j, "canary_rw50_sz", "MintB", "pulled", pool="PoolB", sol_before=60.0, sol_after=1.0)
+    _feint(j, "canary_rw50_sz", "MintC", "inconclusive", note="feint: wallet SOL low")
+    feed = dash.feints_after(j, 0)
+    assert [f["verdict"] for f in feed] == ["alive", "pulled", "inconclusive"]
+    assert feed[0]["pool"] == "PoolA" and feed[0]["sol_after"] == 610.0
+    assert feed[2]["note"] == "feint: wallet SOL low" and feed[2]["pool"] is None
+    assert dash.feints_after(j, feed[1]["id"]) == feed[2:]  # incremental by id
+    assert [f["verdict"] for f in dash.last_feints(j, 2)] == ["pulled", "inconclusive"]  # newest, oldest-first
+
+
+def test_live_poll_surfaces_feints_in_the_snapshot_stream(cfg):
+    cfg.launch_book = cfg.launch_live = cfg.launch_canary = cfg.launch_sized_book = True
+    j = Journal(":memory:")
+    _feint(j, "canary_rw50_sz", "M1", "alive", pool="P1", sol_before=1.0, sol_after=1.0)
+    live = dash.Live(cfg, j)
+    live.poll()
+    assert [f["verdict"] for f in live.feints] == ["alive"]
+    _, snap = live.snapshot()
+    assert snap["canary"] is True and snap["canary_halted"] is False
+    _feint(j, "canary_rw50_sz", "M2", "pulled", pool="P2", sol_before=50.0, sol_after=0.1)
+    live.poll()  # a new feint is picked up incrementally
+    assert [f["verdict"] for f in live.feints] == ["alive", "pulled"]
+
+
+def test_canary_switch_flips_the_kill_switch():
+    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
+    j = Journal(":memory:")
+    j.set_state(CANARY_ALLOW, "1")
+    assert dash.canary_switch(j, "stop") == {"halted": True, "msg": "Canary halted: no new buys or feints."}
+    assert j.get_state(CANARY_HALT) is not None
+    res = dash.canary_switch(j, "start")
+    assert res["halted"] is False and j.get_state(CANARY_HALT) is None and j.get_state(CANARY_ALLOW) is None
+    import pytest
+    with pytest.raises(ValueError):
+        dash.canary_switch(j, "sideways")
+
+
+def test_canary_switch_buttons_are_behind_the_password(cfg, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
+    cfg.health_port = 18767
+    from tradingbot.engine import CANARY_HALT
+    j = Journal(":memory:")
+    board = dash.Dashboard(j, cfg)
+    board.refresh()
+    server = health.start_health_server(j, cfg, board)
+
+    def post(path, cookie=None):
+        c = http.client.HTTPConnection("127.0.0.1", 18767, timeout=5)
+        c.request("POST", path, headers={"Cookie": cookie} if cookie else {})
+        r = c.getresponse()
+        return r.status, r.read()
+    try:
+        assert post("/api/canary/stop")[0] == 401  # no password
+        code, body = post("/api/canary/stop", cookie="tb_dash=s3cret")
+        assert code == 200 and json.loads(body)["halted"] is True and j.get_state(CANARY_HALT) is not None
+        code, body = post("/api/canary/start", cookie="tb_dash=s3cret")
+        assert code == 200 and json.loads(body)["halted"] is False and j.get_state(CANARY_HALT) is None
+        c = http.client.HTTPConnection("127.0.0.1", 18767, timeout=5)  # a GET on the POST-only path is a 404
+        c.request("GET", "/api/canary/stop", headers={"Cookie": "tb_dash=s3cret"})
+        assert c.getresponse().status == 404
+    finally:
+        server.shutdown()

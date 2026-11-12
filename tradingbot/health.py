@@ -171,6 +171,26 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 except (BrokenPipeError, ConnectionResetError, OSError):
                     pass  # the page was closed
 
+        def do_POST(self):  # noqa: N802 (http.server API) -- the dashboard's canary kill-switch buttons
+            url = urlsplit(self.path)
+            path, query = url.path.rstrip("/") or "/", parse_qs(url.query)
+            from tradingbot import dashboard as dash
+            if dashboard is None or not dash.token() or path not in ("/api/canary/stop", "/api/canary/start"):
+                self.send_error(404)
+                return
+            if not dash.authorised(self.headers, query):
+                self._send(401, b"unauthorised", "text/plain; charset=utf-8")
+                return
+            length = int(self.headers.get("Content-Length") or 0)
+            if length:
+                self.rfile.read(length)  # drain the request body
+            try:
+                res = dash.canary_switch(journal, "stop" if path.endswith("stop") else "start")
+                log.info("dashboard canary switch: %s", res.get("msg"))
+                self._send(200, json.dumps(res).encode(), "application/json")
+            except Exception as e:  # noqa: BLE001 (report the failure, never crash the server)
+                self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
+
         def log_message(self, *args):  # keep health probes and page views out of the logs
             pass
 

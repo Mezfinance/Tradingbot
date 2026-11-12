@@ -85,6 +85,43 @@ def last_fills(journal: Journal, n: int = FEED_BACKLOG) -> list[dict]:
     return fills_after(journal, max(0, newest - 5 * n), 5 * n)[-n:]
 
 
+def _feint_row(r) -> dict:
+    try:
+        d = json.loads(r["detail"] or "{}")
+    except (ValueError, TypeError):
+        d = {}
+    return {"id": r["id"], "ts": r["ts"], "book": r["strategy"], "token": r["token"],
+            "verdict": d.get("verdict"), "note": d.get("note") or "", "pool": d.get("pool"),
+            "sol_before": d.get("sol_before"), "sol_after": d.get("sol_after")}
+
+
+def feints_after(journal, after_id: int, limit: int = 300) -> list[dict]:
+    """The launch canary's feint probes (events kind `canary_feint`) with id > after_id, oldest first."""
+    rows = journal.query("SELECT id, ts, strategy, token, detail FROM events WHERE id > ? AND kind='canary_feint' "
+                         "ORDER BY id LIMIT ?", (after_id, limit))
+    return [_feint_row(r) for r in rows]
+
+
+def last_feints(journal, n: int = 300) -> list[dict]:
+    rows = journal.query("SELECT id, ts, strategy, token, detail FROM events WHERE kind='canary_feint' "
+                         "ORDER BY id DESC LIMIT ?", (n,))
+    return [_feint_row(r) for r in reversed(rows)]
+
+
+def canary_switch(journal, action: str) -> dict:
+    """Flip the real-money launch canary's kill switch from the dashboard. It writes the SAME state the canary-stop /
+    canary-start CLI writes; the engine reads it on its next pass (no fly/SSH needed). 'stop' halts every canary buy
+    and feint at once (open positions still sell at their pool minute); 'start' clears the halt."""
+    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
+    if action == "stop":
+        journal.set_state(CANARY_HALT, repr(time.time()))
+        return {"halted": True, "msg": "Canary halted: no new buys or feints."}
+    if action == "start":
+        journal.execute("DELETE FROM state WHERE key IN (?, ?)", (CANARY_HALT, CANARY_ALLOW))
+        return {"halted": False, "msg": "Canary kill switch cleared: buys and feints resume."}
+    raise ValueError(f"unknown canary action {action!r}")
+
+
 def build_summary(journal: Journal, cfg: Config, store=None, now: float | None = None) -> dict:
     """The slow-changing extras the page can't compute from the rows: backtest notes, downtime, last backup.
     (Book tables and launch outcomes are computed in the browser from the streamed rows since 11-05.)"""
@@ -242,6 +279,8 @@ class Dashboard:
             send("summary", summary)
         backlog = live.fills[-FEED_BACKLOG:]
         send("backlog", backlog)
+        send("feintlog", live.feints)
+        last_feint = live.feints[-1]["id"] if live.feints else live.last_feint
         shorts_ver = 0
         if self.cfg.shortbook_feed_url and self.shorts is not None:
             send("shorts", self.shorts)
@@ -264,6 +303,10 @@ class Dashboard:
             for f in [f for f in live.fills if f["id"] > last_fill]:
                 send("fill", f)
                 last_fill = f["id"]
+                sent = True
+            for ft in [ft for ft in live.feints if ft["id"] > last_feint]:
+                send("feint", ft)
+                last_feint = ft["id"]
                 sent = True
             v, summary = self.current()
             if v != version and summary is not None:
@@ -356,6 +399,8 @@ class Live:
         self.blocked: dict[tuple, list[float]] = {}
         self.fills: list[dict] = []
         self.last_fill = 0
+        self.feints: list[dict] = []
+        self.last_feint = 0
         self.last_event = None
         self.health: dict | None = None
         self.health_ver = 0
@@ -388,6 +433,7 @@ class Live:
                 self._poll_events()
                 self._poll_positions()
                 self._poll_fills()
+                self._poll_feints()
                 self._poll_launch()
                 if time.time() - self._health_ts > 10 and self.journal is not None:
                     from tradingbot import health
@@ -450,6 +496,20 @@ class Live:
             self.fills = (self.fills + new)[-300:]
             self.last_fill = new[-1]["id"]
 
+    def _poll_feints(self) -> None:
+        if not self.last_feint:
+            self.feints = last_feints(self, 300)
+            if self.feints:
+                self.last_feint = self.feints[-1]["id"]
+            else:  # no feints yet: start after the newest event so later feints are caught incrementally
+                top = self._q("SELECT MAX(id) AS m FROM events")
+                self.last_feint = (top[0]["m"] if top else None) or 0
+            return
+        new = feints_after(self, self.last_feint)
+        if new:
+            self.feints = (self.feints + new)[-500:]
+            self.last_feint = new[-1]["id"]
+
     def _poll_launch(self) -> None:
         if self.wdb is None:
             return
@@ -491,7 +551,12 @@ class Live:
                 "launch_cols": ["pool", "token", "create_ts", "decided_ts", "liquid", "ret", "status",
                                 "pulled_ts", "liq_usd", "flags"],
                 "launch": [row for _, row in self.launch.values()], "launch_keep_s": LAUNCH_KEEP_S,
+                "canary": bool(self.canary & set(self.books)), "canary_halted": self._canary_halted(),
                 "health": self.health}
+
+    def _canary_halted(self) -> bool:
+        from tradingbot.engine import CANARY_HALT
+        return bool(self._q("SELECT 1 FROM state WHERE key=? LIMIT 1", (CANARY_HALT,)))
 
     def delta(self, since: int) -> tuple[int, dict | None]:
         with self.lock:
@@ -656,6 +721,10 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div class="stat"><span class="label">Closed trades</span><span class="v num" id="s-trades">-</span><span class="h" id="s-trades-h"></span></div>
 <div class="stat"><span class="label">Trades, last hour</span><span class="v num" id="s-rate">0</span><span class="h">Closed in the past 60 minutes</span></div>
 </div>
+<section class="card" id="feint-card" hidden><p class="label eyebrow">Launch canary · real money</p><h2>Feint probes <span id="feint-switch"></span></h2>
+<p class="sub">Every liquid pool gets a $25 buy-and-sell-back probe that keeps nothing. <b>alive</b> = liquidity held, <b>pulled</b> = the operator withdrew in reaction, <b>inconclusive</b> = the probe could not be placed (the note says why; "wallet SOL low" means a wallet needs topping up). Stop the run if pulled climbs, wallets run low, or feints stall.</p>
+<div class="stats" id="feint-tiles"></div>
+<div class="two"><div class="scroll"><table id="feint-notes"></table></div><div class="scroll"><table id="feint-feed"></table></div></div></section>
 <div class="cols">
 <section class="card"><p class="label eyebrow">Books</p><h2>Results by book</h2>
 <p class="sub">Sorted by return. Click a header to sort. Open trades count at cost until sold; a trade with no route out counts as $0 until a later sale gets through. Rugged = closed at −80% or worse.</p>
@@ -734,7 +803,7 @@ const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
 /* mean trade weighted by size: total P&L / total cost (a plain average counts a $25 trade like a $250 one) */
 const wmean=tr=>{const c=tr.reduce((a,x)=>a+(x.cost||0),0);return c?100*tr.reduce((a,x)=>a+x.pnl,0)/c:null};
 const median=a=>{if(!a.length)return null;const b=[...a].sort((x,y)=>x-y),m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2};
-const S={market:null,marketEnabled:false,shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null};
+const S={market:null,marketEnabled:false,shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null,feints:[],canary:false,canaryHalted:false};
 let sortKey="return_pct",sortDir=-1,win=21600,pending=false;
 const R={v:"overview",arg:null},LIM={ledger:200,b:200,f:200};
 const now=()=>Date.now()/1000-S.skew;
@@ -1024,7 +1093,20 @@ const x=t.getBoundingClientRect().left-s.getBoundingClientRect().left-2,w=[...s.
 const cs=getComputedStyle(s);if(x>parseFloat(cs.paddingLeft)&&x+w<=s.clientWidth-parseFloat(cs.paddingRight))s.style.paddingLeft=x+"px"}
 function renderHealth(){const ok=S.health?Object.values(S.health).every(x=>x.ok):null;
 $("health").innerHTML=`<span class="dot"></span>${ok==null?"Bot":ok?"Bot healthy":"Bot stalled"}`;$("health").className="tag "+(ok==null?"":ok?"ink":"neg")}
-function render(){renderHealth();if(!S.books.length)return;
+const SBTN="padding:4px 14px;border:2px solid #000;cursor:pointer;font:inherit;font-weight:700;margin-left:8px";
+function canaryDo(a){if(a==="start"&&!confirm("Resume the real-money launch canary? It will start probing and committing again."))return;
+fetch("api/canary/"+a,{method:"POST"}).then(r=>r.json()).then(d=>{if(d&&typeof d.halted==="boolean"){S.canaryHalted=d.halted;renderFeints()}else alert("Could not switch the canary"+(d&&d.error?": "+d.error:"."))}).catch(e=>alert("Could not reach the canary switch: "+e))}
+function agoStr(s){return s<60?s+"s":s<3600?Math.round(s/60)+"m":Math.round(s/3600)+"h"}
+function renderFeints(){const card=$("feint-card"),F=S.feints||[];if(!S.canary&&!F.length){card.hidden=true;return}card.hidden=false;
+$("feint-switch").innerHTML=S.canaryHalted?`<span class="tag neg">HALTED</span><button onclick="canaryDo('start')" style="${SBTN};background:#c9f24d;color:#000">Start</button>`:`<span class="tag lime">running</span><button onclick="canaryDo('stop')" style="${SBTN};background:#000;color:#fff">Stop</button>`;
+let alive=0,pulled=0,incon=0,last=0;const notes={};for(const f of F){if(f.verdict==="alive")alive++;else if(f.verdict==="pulled")pulled++;else{incon++;const n=f.note||"inconclusive";notes[n]=(notes[n]||0)+1}if(f.ts>last)last=f.ts}
+const dec=alive+pulled,pr=dec?Math.round(100*pulled/dec):null,ago=last?Math.round(Date.now()/1000-last):null;
+tiles("feint-tiles",[["Alive",`<span class="pos">${alive}</span>`,"liquidity held"],["Pulled",`<span class="neg">${pulled}</span>`,"pulled in reaction"],["Pulled rate",pr==null?"–":pr+"%","of alive + pulled"],["Inconclusive",String(incon),"probe not placed"],["Last feint",ago==null?"–":agoStr(ago)+" ago",ago!=null&&ago>600?"stalled? check the run":"since the last probe"],["Probes",String(F.length),"in the live feed"]]);
+const nr=Object.entries(notes).sort((a,b)=>b[1]-a[1]);
+$("feint-notes").innerHTML=`<tr><th class="l">Why inconclusive</th><th>n</th></tr>`+(nr.length?nr.map(([n,c])=>`<tr><td class="l">${esc(n)}</td><td>${c}</td></tr>`).join(""):`<tr><td class="muted">None</td></tr>`);
+const rows=F.slice(-60).reverse();
+$("feint-feed").innerHTML=`<tr><th>Time</th><th>Pool</th><th>Verdict</th><th class="l">Note</th></tr>`+(rows.length?rows.map(f=>{const t=new Date(f.ts*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});const vc=f.verdict==="alive"?"pos":f.verdict==="pulled"?"neg":"muted";const pool=f.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(f.pool)}" target="_blank" rel="noopener">${esc(f.pool.slice(0,8))}</a>`:(f.token?`<span class="mono">${esc(f.token.slice(0,8))}</span>`:"–");return`<tr><td class="mono">${t}</td><td>${pool}</td><td class="${vc}">${esc(f.verdict||"?")}</td><td class="l">${esc(f.note||"")}</td></tr>`}).join(""):`<tr><td class="muted">No feints yet.</td></tr>`)}
+function render(){renderHealth();renderFeints();if(!S.books.length)return;
 if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="market")renderMarket();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
 $("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false})}
 function schedule(){if(!pending){pending=true;setTimeout(()=>{pending=false;render()},300)}}
@@ -1046,12 +1128,14 @@ function connect(){const es=new EventSource("api/stream");
 es.onopen=()=>{$("conn").innerHTML='<span class="dot"></span>Live';$("conn").className="tag lime"};
 es.onerror=()=>{$("conn").innerHTML='<span class="dot"></span>Reconnecting';$("conn").className="tag neg"};
 es.addEventListener("init",e=>{const d=JSON.parse(e.data);S.books=d.books;S.fams=d.families||[];S.cash=d.cash;S.stuck=d.stuck_after_s;S.pc=d.pos_cols;S.lc=d.launch_cols;
-S.shortsEnabled=!!d.shorts_enabled;S.marketEnabled=!!d.market_enabled;S.pos.clear();S.launch.clear();S.health=d.health;merge(d);fillSelects();render()});
+S.shortsEnabled=!!d.shorts_enabled;S.marketEnabled=!!d.market_enabled;S.canary=!!d.canary;S.canaryHalted=!!d.canary_halted;S.pos.clear();S.launch.clear();S.health=d.health;merge(d);fillSelects();render()});
 es.addEventListener("shorts",e=>{S.shorts=JSON.parse(e.data);schedule()});
 es.addEventListener("market",e=>{S.market=JSON.parse(e.data);schedule()});
 es.addEventListener("delta",e=>{merge(JSON.parse(e.data));schedule()});
 es.addEventListener("summary",e=>{S.extra=JSON.parse(e.data);const d=S.extra.downtime;$("foot").textContent=d?`${d.outages} outages, ${fmt(d.hours_offline,1)} h offline since start`:"";schedule()});
 es.addEventListener("backlog",e=>{$("feed").innerHTML="";JSON.parse(e.data).forEach(f=>fill(f,false))});
-es.addEventListener("fill",e=>fill(JSON.parse(e.data),true))}
+es.addEventListener("fill",e=>fill(JSON.parse(e.data),true));
+es.addEventListener("feintlog",e=>{S.feints=JSON.parse(e.data);schedule()});
+es.addEventListener("feint",e=>{S.feints.push(JSON.parse(e.data));if(S.feints.length>500)S.feints.shift();schedule()})}
 route();connect();
 </script></body></html>"""
