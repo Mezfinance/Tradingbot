@@ -41,6 +41,7 @@ NO_KEY = SYSTEM  # 32 zero bytes
 SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])
 BUY_EXACT_QUOTE_IN = bytes([198, 46, 21, 82, 180, 217, 232, 112])
 CU_LIMIT = 300_000  # real direct swaps use ~80-115k compute units; a first buy on a fresh pool also creates up to 3 fee accounts (~170k simulated 11-10)
+FEINT_CU_LIMIT = 500_000  # the feint is two swaps (buy + sell) plus the fee-account creation in one transaction
 GLOBAL_TTL_S = 600
 ROUTE = "direct"
 POOL_FILE = "canary_pools.json"  # next to the journal: mint -> pool of the canary's buys
@@ -244,16 +245,44 @@ class DirectPumpswapExecutor(JupiterExecutor):
                 "fee_bps": g["lp_bps"] + g["protocol_bps"] + g["creator_bps"]}
 
     # --- transactions -------------------------------------------------------------
-    def _priority_micro(self, accounts: list[str]) -> int:
+    def _priority_micro(self, accounts: list[str], cu: int = CU_LIMIT) -> int:
         """Micro-lamports per compute unit: Helius's 'VeryHigh' estimate for these accounts, capped so the priority
-        fee never passes `priority_fee_sol`; half the cap when there is no estimate."""
-        cap = int(self.priority_fee_sol * 1e9 * 1e6 / CU_LIMIT)
+        fee never passes `priority_fee_sol` over `cu` compute units; half the cap when there is no estimate."""
+        cap = int(self.priority_fee_sol * 1e9 * 1e6 / cu)
         res = self._rpc("getPriorityFeeEstimate", [{"accountKeys": accounts, "options": {"priorityLevel": "VeryHigh"}}])
         try:
             est = int(float(res["priorityFeeEstimate"]))
         except (TypeError, KeyError, ValueError):
             return cap // 2
         return max(1, min(est, cap))
+
+    def _swap_ix(self, st: dict, side: str, amount_in: int, min_out: int):
+        from solders.instruction import AccountMeta, Instruction
+        from solders.pubkey import Pubkey
+        P = Pubkey.from_string
+        me, g = self.owner, st["global"]
+        name = plan(side, st["token_is_base"])
+        accs = swap_accounts(name, st["addr"], st["pool"], me, st["base_prog"], st["quote_prog"],
+                             _pick(g["protocol_recipients"], st["addr"]), _pick(g["buyback_recipients"], me),
+                             st["pump_coin"])
+        return Instruction(P(PROGRAM), swap_data(name, amount_in, min_out),
+                           [AccountMeta(P(a), s, w) for a, s, w in accs])
+
+    def _create_ata_ix(self, owner_ata: str, mint: str, prog: str):
+        from solders.instruction import AccountMeta, Instruction
+        from solders.pubkey import Pubkey
+        P, me = Pubkey.from_string, self.owner
+        return Instruction(P(ATA_PROGRAM), bytes([1]), [
+            AccountMeta(P(me), True, True), AccountMeta(P(owner_ata), False, True), AccountMeta(P(me), False, False),
+            AccountMeta(P(mint), False, False), AccountMeta(P(SYSTEM), False, False), AccountMeta(P(prog), False, False)])
+
+    def _close_wsol_ix(self):
+        from solders.instruction import AccountMeta, Instruction
+        from solders.pubkey import Pubkey
+        P, me = Pubkey.from_string, self.owner
+        wsol = ata(me, TOKEN, WSOL)
+        return Instruction(P(TOKEN), bytes([9]), [  # CloseAccount: unwrap every lamport back to the wallet
+            AccountMeta(P(wsol), False, True), AccountMeta(P(me), False, True), AccountMeta(P(me), True, False)])
 
     def _instructions(self, st: dict, side: str, amount_in: int, min_out: int, bump: int = 0) -> list:
         from solders.compute_budget import (
@@ -264,33 +293,44 @@ class DirectPumpswapExecutor(JupiterExecutor):
         from solders.pubkey import Pubkey
         from solders.system_program import TransferParams, transfer
 
-        P = Pubkey.from_string
-        me, g, pool = self.owner, st["global"], st["pool"]
-        name = plan(side, st["token_is_base"])
-        accs = swap_accounts(name, st["addr"], pool, me, st["base_prog"], st["quote_prog"],
-                             _pick(g["protocol_recipients"], st["addr"]), _pick(g["buyback_recipients"], me),
-                             st["pump_coin"])
-        swap = Instruction(P(PROGRAM), swap_data(name, amount_in, min_out),
-                           [AccountMeta(P(a), s, w) for a, s, w in accs])
+        P, me = Pubkey.from_string, self.owner
         wsol = ata(me, TOKEN, WSOL)
-
-        def create(owner_ata: str, mint: str, prog: str):
-            return Instruction(P(ATA_PROGRAM), bytes([1]), [
-                AccountMeta(P(me), True, True), AccountMeta(P(owner_ata), False, True), AccountMeta(P(me), False, False),
-                AccountMeta(P(mint), False, False), AccountMeta(P(SYSTEM), False, False), AccountMeta(P(prog), False, False)])
-
         ixs = [set_compute_unit_limit(CU_LIMIT),
                # bump distinguishes otherwise-identical clips (same wallet, amount, accounts) so each is its own tx
                set_compute_unit_price(self._priority_micro([st["addr"], PROGRAM]) + bump),
-               create(wsol, WSOL, TOKEN)]
+               self._create_ata_ix(wsol, WSOL, TOKEN)]
         if side == "buy":
             token = st["pool"]["token_mint"]
-            ixs += [create(ata(me, st["token_prog"], token), token, st["token_prog"]),
+            ixs += [self._create_ata_ix(ata(me, st["token_prog"], token), token, st["token_prog"]),
                     transfer(TransferParams(from_pubkey=P(me), to_pubkey=P(wsol), lamports=amount_in)),
                     Instruction(P(TOKEN), bytes([17]), [AccountMeta(P(wsol), False, True)])]  # SyncNative
-        ixs += [swap, Instruction(P(TOKEN), bytes([9]), [  # CloseAccount: unwrap every lamport back to the wallet
-            AccountMeta(P(wsol), False, True), AccountMeta(P(me), False, True), AccountMeta(P(me), True, False)])]
+        ixs += [self._swap_ix(st, side, amount_in, min_out), self._close_wsol_ix()]
         return ixs
+
+    def _feint_instructions(self, st: dict, lamports: int, buy_min_out: int) -> list:
+        """One atomic transaction: buy `lamports` of the token, then sell those (guaranteed-minimum) tokens straight
+        back, so the pool ends ~unchanged and we never hold the position. The operator sees a buy swap; we carry nothing
+        into a pull. A token sliver (actual received minus the guaranteed minimum) is left as dust."""
+        from solders.compute_budget import (
+            set_compute_unit_limit,
+            set_compute_unit_price,
+        )
+        from solders.instruction import AccountMeta, Instruction
+        from solders.pubkey import Pubkey
+        from solders.system_program import TransferParams, transfer
+
+        P, me = Pubkey.from_string, self.owner
+        token = st["pool"]["token_mint"]
+        wsol = ata(me, TOKEN, WSOL)
+        return [set_compute_unit_limit(FEINT_CU_LIMIT),
+                set_compute_unit_price(self._priority_micro([st["addr"], PROGRAM], FEINT_CU_LIMIT)),
+                self._create_ata_ix(wsol, WSOL, TOKEN),
+                self._create_ata_ix(ata(me, st["token_prog"], token), token, st["token_prog"]),
+                transfer(TransferParams(from_pubkey=P(me), to_pubkey=P(wsol), lamports=lamports)),
+                Instruction(P(TOKEN), bytes([17]), [AccountMeta(P(wsol), False, True)]),  # SyncNative
+                self._swap_ix(st, "buy", lamports, buy_min_out),  # SOL -> tokens (at least buy_min_out)
+                self._swap_ix(st, "sell", buy_min_out, 1),  # tokens -> SOL, min out 1 so it can't revert on slippage
+                self._close_wsol_ix()]
 
     def _send_ixs(self, ixs: list) -> str:
         from solders.hash import Hash
@@ -399,6 +439,61 @@ class DirectPumpswapExecutor(JupiterExecutor):
         swap_usd = spent / 1e9 * sol_usd
         self.last_note = "ok"
         return Fill(qty=qty, price=swap_usd / qty, usd=swap_usd + fee_usd, fee_usd=fee_usd, tx=sent, note="ok")
+
+    def feint(self, token: str, usd: float) -> str:
+        """Probe before committing (11-12): poke the pool with a $usd buy and sell it straight back, then re-read the
+        pool and report whether its liquidity was pulled in reaction. Returns 'alive' (commit), 'pulled' (skip) or
+        'inconclusive' (the probe could not be placed; skip to be safe). `launch_canary_feint_hold_s` = 0 does one
+        atomic buy+sell tx (never hold, ~fee-only cost, but invisible to an operator bot that watches holdings rather
+        than the trade stream); > 0 buys, holds that long, then sells (visible, but a pull in the gap costs the $usd).
+        The result is a signal only: `_sell_excess`-style dust may remain, and the real commit is a separate buy()."""
+        self.last_feint = {}
+        sol_usd = self.jup.sol_price()
+        if not sol_usd:
+            self.last_note = "feint: SOL price unknown"
+            return "inconclusive"
+        st = self._state(token)
+        if st is None:
+            return "inconclusive"
+        base_amt, quote_amt = st["reserves"]
+        sol0 = quote_amt if st["token_is_base"] else base_amt
+        tok_res = base_amt if st["token_is_base"] else quote_amt
+        lamports = int(usd / sol_usd * 1e9)
+        sol = self.sol_balance()
+        if sol is None or sol < lamports / 1e9 + MIN_SOL:
+            self.last_note = "feint: wallet SOL low"
+            return "inconclusive"
+        if not sol0 or lamports / (sol0 + lamports) * 100 > self.cfg.max_price_impact_pct:
+            self.last_note = "feint: impact too high"
+            return "inconclusive"
+        buy_min_out = int(amount_out(lamports, sol0, tok_res, st["fee_bps"]) * (10_000 - self.cfg.slippage_bps) / 10_000)
+        if buy_min_out <= 0:
+            self.last_note = "feint: pool has no tokens"
+            return "inconclusive"
+        hold = float(getattr(self.cfg, "launch_canary_feint_hold_s", 0.0) or 0.0)
+        if hold <= 0:
+            sent = self._send_ixs(self._feint_instructions(st, lamports, buy_min_out))
+            if sent.startswith(NOT_SENT):
+                self.last_note = f"feint: {sent}"
+                return "inconclusive"
+            self._settle_direct(sent, token)  # the P&L doesn't matter; the pool state after is the signal
+        else:
+            buy = self._buy_once(token, usd, 0.0)
+            if buy is None or not getattr(buy, "ok", False):
+                self.last_note = f"feint: buy did not land ({self.last_note})"
+                return "inconclusive"
+            self.sleep(hold)
+            self.sell(token, buy.qty, 0.0)  # best effort; a pull in the gap returns ~0 and still shows in the re-read
+        self.sleep(float(getattr(self.cfg, "launch_canary_feint_wait_s", 4.0) or 4.0))
+        st1 = self._state(token)
+        drop = float(getattr(self.cfg, "launch_canary_feint_drop_pct", 50.0) or 50.0)
+        if st1 is None:
+            self.last_feint = {"pool": st["addr"], "sol_before": sol0 / 1e9, "sol_after": None}
+            return "pulled"
+        b1, q1 = st1["reserves"]
+        sol1 = q1 if st1["token_is_base"] else b1
+        self.last_feint = {"pool": st["addr"], "sol_before": sol0 / 1e9, "sol_after": sol1 / 1e9}
+        return "pulled" if sol1 < sol0 * (1 - drop / 100) else "alive"
 
     def sell(self, token: str, qty: float, ref_price: float) -> Fill | None:
         sol_usd = self.jup.sol_price()

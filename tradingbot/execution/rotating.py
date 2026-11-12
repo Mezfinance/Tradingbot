@@ -188,6 +188,32 @@ class RotatingExecutor:
                 self._save()
         return fill
 
+    def feint(self, token: str, usd: float) -> str:
+        """Probe the pool from the wallet that will hold the commit, so the feint and the real buy come from one
+        wallet. Keeps the wallet assigned on 'alive' (buy() reuses it) and releases it otherwise, to stay fresh."""
+        with self._lock:
+            idx = self._assign.get(token)
+            if idx is None:
+                free = self._free_indices()
+                if not free:
+                    self.last_note = f"no free wallet (all {len(self.subs)} busy)"
+                    return "inconclusive"
+                idx = min(free, key=lambda i: self._used.get(i, 0.0))
+                self._assign[token] = idx
+                self._opened[token] = self.clock()
+                self._save()
+            self._apply_pool(idx, token)
+        sub = self.subs[idx]
+        verdict = sub.feint(token, usd) if hasattr(sub, "feint") else "alive"
+        self.last_feint = getattr(sub, "last_feint", {})
+        self.last_note = getattr(sub, "last_note", "")
+        with self._lock:
+            if verdict != "alive":  # no commit coming: release the wallet, keep it fresh
+                self._assign.pop(token, None)
+                self._opened.pop(token, None)
+                self._save()
+        return verdict
+
     def sell(self, token: str, qty: float, ref_price: float) -> Fill | None:
         idx = self._holder(token)
         self._apply_pool(idx, token)

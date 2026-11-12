@@ -831,6 +831,13 @@ class Engine:
                 return f"round-trip loss {rt[0]:.1f}% (honeypot/tax/thin pool)"
         if sig.get("pool") and hasattr(book.executor, "remember_pool"):  # the direct route swaps on this pool
             book.executor.remember_pool(sig["mint"], sig["pool"])
+        if canary and c.launch_canary_feint and hasattr(book.executor, "feint"):
+            # Poke the pool with a $feint buy, sell it straight back, and commit only if it wasn't pulled in reaction.
+            verdict = book.executor.feint(sig["mint"], c.launch_canary_feint_usd)
+            self.journal.log_event("canary_feint", sig["mint"], json.dumps(
+                {"verdict": verdict, **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
+            if verdict != "alive":
+                return f"feint: pool {verdict}"
         fill = book.executor.buy(sig["mint"], usd, trigger)
         if fill is None:
             return f"executor declined: {getattr(book.executor, 'last_note', '') or 'no reason given'}"

@@ -128,6 +128,8 @@ class PoolRpc(FakeRpc):
             return SimpleNamespace(json=lambda: body)
         if m == "sendTransaction" and p[1].get("skipPreflight") is False:
             self.raw.append(p[0])
+            if getattr(self, "drain_on_send", False):  # model an operator pull that fires in reaction to our feint
+                self.accts[BV] = acct(vault(1), TOK)
         return super().post(url, json)
 
 
@@ -188,6 +190,28 @@ def test_clip_buys_split_into_distinct_back_to_back_swaps():
               if p == "ComputeBudget111111111111111111111111111111" and data and data[0] == 3]
         prices.append(cb[0])
     assert len(set(prices)) == 5
+
+
+def test_feint_probes_with_one_atomic_buy_and_sell():
+    ex, rpc = direct()  # launch_canary_feint_hold_s defaults to 0: one atomic round-trip
+    rpc.next_meta = sol_meta(ex.owner, (0, 0), 0)  # the settle result is ignored; the pool state after is the signal
+    verdict = ex.feint(MINT, 25.0)
+    assert verdict == "alive"  # the pool's SOL vault was unchanged after the poke
+    assert len(rpc.raw) == 1  # ONE transaction, not a separate buy and sell
+    swaps = [x for x in decoded(rpc.raw[0]) if x[0] == d.PROGRAM]
+    assert len(swaps) == 2  # buy then sell in the same tx
+    assert swaps[0][1][:8] == d.SELL  # SOL is the base here, so the buy leg is a `sell` of SOL for the token
+    assert swaps[1][1][:8] == d.BUY_EXACT_QUOTE_IN  # the sell leg spends the tokens back for SOL
+    assert int.from_bytes(swaps[1][1][16:24], "little") == 1  # min out 1 so the sell can't revert on slippage
+    assert ex.last_feint["sol_after"] == pytest.approx(ex.last_feint["sol_before"])  # 10 SOL on both reads
+
+
+def test_feint_flags_a_pool_pulled_in_reaction():
+    ex, rpc = direct()
+    rpc.drain_on_send = True  # the pool's SOL vault is withdrawn the moment our feint lands
+    rpc.next_meta = sol_meta(ex.owner, (0, 0), 0)
+    assert ex.feint(MINT, 25.0) == "pulled"
+    assert ex.last_feint["sol_after"] < ex.last_feint["sol_before"] * 0.5
 
 
 def test_direct_buy_declines_without_enough_sol_or_on_a_thin_pool():

@@ -109,6 +109,14 @@ class Config:
     launch_canary_clips: int = 1  # REAL MONEY: split each canary buy into this many equal back-to-back direct swaps into
     # the same pool (5 x $1 vs 1 x $5): does the running total of our capital trigger the pull, or is each small buy judged on its own?
     launch_canary_route: str = "jupiter"  # 'direct' = swap on the pumpswap pool; 'lp' = enter as a liquidity provider (11-10); both trade SOL
+    # Feint probe (11-12): before committing, poke the pool with a $launch_canary_feint_usd buy and sell it straight
+    # back, then re-read the pool and commit only if its liquidity wasn't pulled in reaction. $25 is big enough to
+    # trigger the size-sensitive operators a penny probe misses, so surviving it tests the regime the real buy runs in.
+    launch_canary_feint: bool = False  # REAL MONEY (direct route): gate every canary buy behind a feint probe
+    launch_canary_feint_usd: float = 25.0  # the feint (bait) size
+    launch_canary_feint_wait_s: float = 4.0  # wait after the feint before re-reading the pool (the $25 reaction is ~1s)
+    launch_canary_feint_drop_pct: float = 50.0  # SOL-vault drop vs before the feint that counts as 'pulled'
+    launch_canary_feint_hold_s: float = 0.0  # 0 = atomic buy+sell in one tx (never hold); > 0 = buy, hold, then sell
     # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
     launch_fast_canary: bool = False  # REAL MONEY: buy on detection, before the scorer's second-4 decide
@@ -370,6 +378,11 @@ class Config:
                 raise ValueError(f"Clip buys spend real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
             if self.launch_canary_route != "direct":
                 raise ValueError("Clip buys are built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
+        if self.launch_canary_feint:
+            if self.live_confirm != LIVE_CONFIRM_PHRASE:
+                raise ValueError(f"The feint probe spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+            if self.launch_canary_route != "direct":
+                raise ValueError("The feint probe is built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):
