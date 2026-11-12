@@ -185,3 +185,15 @@ def test_feint_only_frees_the_wallet_each_time():
     assert r._assign == {}
     assert r.feint("B", 25.0, commit=False) == "alive"  # a second pool still finds a free wallet
     assert r._assign == {}
+
+
+def test_feint_only_rotates_across_the_fresh_wallets():
+    clock = {"t": 100.0}
+    r = rot(3, clock=lambda: clock["t"])
+    for m in ("A", "B", "C"):  # each freed after its feint, but marked used so the next picks a different wallet
+        clock["t"] += 1
+        r.feint(m, 25.0, commit=False)
+    assert sorted(len(s.feinted) for s in r.subs) == [1, 1, 1]  # one feint each, not three on one wallet
+    clock["t"] += 1
+    r.feint("D", 25.0, commit=False)  # a fourth wraps back to the least-recently-used wallet
+    assert sorted(len(s.feinted) for s in r.subs) == [1, 1, 2]

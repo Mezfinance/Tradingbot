@@ -209,10 +209,12 @@ class RotatingExecutor:
         self.last_feint = getattr(sub, "last_feint", {})
         self.last_note = getattr(sub, "last_note", "")
         with self._lock:
+            self._used[idx] = self.clock()  # mark it used so the NEXT feint rotates to a fresher wallet: a feint-only
+            # run must spread across the fresh wallets (operators track wallets), not pile onto one and drain it
             if verdict != "alive" or not commit:  # no commit coming (pulled, inconclusive, or feint-only): free it
                 self._assign.pop(token, None)
                 self._opened.pop(token, None)
-                self._save()
+            self._save()
         return verdict
 
     def sell(self, token: str, qty: float, ref_price: float) -> Fill | None:
