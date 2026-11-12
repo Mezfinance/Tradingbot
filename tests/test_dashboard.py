@@ -467,6 +467,81 @@ def test_rotate_endpoint_is_behind_the_password(cfg, monkeypatch):
         server.shutdown()
 
 
+def test_canary_topup_validates_and_launches_provision_without_halting(cfg, tmp_path, monkeypatch):
+    import pytest
+    from tradingbot.engine import CANARY_HALT
+    dash._TOPUP.update(proc=None, started=0.0, args=None)
+    dash._ROTATE.update(proc=None, started=0.0, args=None)
+    cfg.db_path = str(tmp_path / "j.db")
+    j = Journal(cfg.db_path)
+    for bad in [("x", "all"), (0.0, "all"), (9.0, "all"), (0.08, [0]), (0.08, [11]), (0.08, [])]:
+        with pytest.raises(ValueError):
+            dash.canary_topup(cfg, *bad)
+
+    calls = {}
+
+    class FakeProc:
+        done = False
+        returncode = 0
+
+        def poll(self):
+            return 0 if self.done else None
+
+    fp = FakeProc()
+
+    def fake_popen(argv, **kw):
+        calls["argv"] = argv
+        kw["stdout"].write("topping up wallets…\n")
+        return fp
+
+    monkeypatch.setattr(dash.subprocess, "Popen", fake_popen)
+    res = dash.canary_topup(cfg, 0.08, [1, 3])
+    assert res["started"] is True and res["pick"] == "1,3"
+    assert j.get_state(CANARY_HALT) is None  # top-up is additive and safe mid-trade: NEVER halts the canary
+    assert calls["argv"][:4] == [dash.sys.executable, "-m", "tradingbot", "provision"]
+    assert "--top-up" in calls["argv"] and "0.08" in calls["argv"] and "1,3" in calls["argv"] and "--apply" in calls["argv"]
+    lg = dash.topup_log(cfg)
+    assert lg["running"] is True and "topping up" in lg["log"]
+    assert dash.canary_topup(cfg, 0.08, "all")["started"] is False  # refused while one runs
+    # a rotation is refused while the top-up runs, and vice versa
+    assert dash.canary_rotate(j, cfg, 5, 0.2)["started"] is False and j.get_state(CANARY_HALT) is None
+    fp.done = True
+    assert dash.topup_log(cfg)["running"] is False and dash.topup_log(cfg)["returncode"] == 0
+    # "all" selection passes pick=all
+    res2 = dash.canary_topup(cfg, 0.1, "all")
+    assert res2["pick"] == "all" and "all" in calls["argv"]
+    dash._TOPUP.update(proc=None, started=0.0, args=None)
+
+
+def test_topup_endpoint_is_behind_the_password(cfg, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
+    cfg.health_port = 18778
+    j = Journal(":memory:")
+    board = dash.Dashboard(j, cfg)
+    board.refresh()
+    monkeypatch.setattr(dash, "canary_topup",
+                        lambda c, level, wallets: {"started": True, "level": level, "pick": "all", "msg": "ok"})
+    server = health.start_health_server(j, cfg, board)
+
+    def post(body, cookie=None):
+        c = http.client.HTTPConnection("127.0.0.1", 18778, timeout=5)
+        h = {"Content-Type": "application/json"}
+        if cookie:
+            h["Cookie"] = cookie
+        c.request("POST", "/api/canary/topup", body=body, headers=h)
+        r = c.getresponse()
+        return r.status, r.read()
+    try:
+        assert post(json.dumps({"level": 0.08, "wallets": "all"}).encode())[0] == 401  # no password
+        code, body = post(json.dumps({"level": 0.08, "wallets": "all"}).encode(), cookie="tb_dash=s3cret")
+        assert code == 200 and json.loads(body)["started"] is True
+        monkeypatch.setattr(dash, "canary_topup",
+                            lambda c, level, wallets: (_ for _ in ()).throw(ValueError("bad")))
+        assert post(json.dumps({"level": 9, "wallets": "all"}).encode(), cookie="tb_dash=s3cret")[0] == 400
+    finally:
+        server.shutdown()
+
+
 def test_canary_settings_endpoint_is_behind_the_password(cfg, tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
     cfg.health_port = 18773

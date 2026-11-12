@@ -566,11 +566,11 @@ class DirectPumpswapExecutor(JupiterExecutor):
         st1 = self._state(token)
         drop = float(getattr(self.cfg, "launch_canary_feint_drop_pct", 50.0) or 50.0)
         if st1 is None:
-            self.last_feint = {"pool": st["addr"], "sol_before": sol0 / 1e9, "sol_after": None}
+            self.last_feint = {"pool": st["addr"], "sol_before": sol0 / 1e9, "sol_after": None, "wallet": self.owner}
             return "pulled"
         b1, q1 = st1["reserves"]
         sol1 = q1 if st1["token_is_base"] else b1
-        self.last_feint = {"pool": st["addr"], "sol_before": sol0 / 1e9, "sol_after": sol1 / 1e9}
+        self.last_feint = {"pool": st["addr"], "sol_before": sol0 / 1e9, "sol_after": sol1 / 1e9, "wallet": self.owner}
         return "pulled" if sol1 < sol0 * (1 - drop / 100) else "alive"
 
     def pool_sol(self, mint: str) -> float | None:
@@ -616,7 +616,8 @@ class DirectPumpswapExecutor(JupiterExecutor):
         NO position and decides no rugger verdict; it returns the mechanical outcome (buy/sell slots, whether we got the
         stake back). The caller then watches the pool for ~48s: a pull after this = a rugger we tripped and dodged;
         survival = a legitimate pool to enter for real."""
-        out = {"token": token, "usd": usd, "verdict": "skipped", "note": "", "pool": self.pools.get(token)}
+        out = {"token": token, "usd": usd, "verdict": "skipped", "note": "", "pool": self.pools.get(token),
+               "wallet_addr": self.owner}  # which wallet executed this probe (for the dashboard "buying wallet" view)
         rt = self.round_trip(token, usd)  # free sim: nothing is sent
         if rt is None:
             out["note"] = self.last_note = "probe: pool unreadable / not simulable"

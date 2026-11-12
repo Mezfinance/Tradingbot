@@ -180,8 +180,8 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                            {"Cache-Control": "no-store",
                             "Set-Cookie": self._cookie(dashpasskey.CHAL_COOKIE, chal, dashpasskey.CHALLENGE_MAX_AGE_S)})
                 return
-            if path not in ("/", "/api/stream", "/api/summary", "/api/canary/rotate/log", "/api/canary/settings",
-                            "/api/canary/probes", "/api/deploy/log", "/api/auth/passkeys",
+            if path not in ("/", "/api/stream", "/api/summary", "/api/canary/rotate/log", "/api/canary/topup/log",
+                            "/api/canary/settings", "/api/canary/probes", "/api/deploy/log", "/api/auth/passkeys",
                             "/api/auth/register/options"):
                 self.send_error(404)
                 return
@@ -211,6 +211,9 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 return
             if path == "/api/canary/rotate/log":  # progress of a running wallet rotation (addresses only, no keys)
                 self._send(200, json.dumps(dash.rotate_log(cfg)).encode(), "application/json")
+                return
+            if path == "/api/canary/topup/log":  # progress of a running wallet top-up (addresses + amounts only)
+                self._send(200, json.dumps(dash.topup_log(cfg)).encode(), "application/json")
                 return
             if path == "/api/canary/settings":  # current canary settings + presets for the menu
                 self._send(200, json.dumps(dash.canary_settings_menu(cfg)).encode(), "application/json")
@@ -273,8 +276,8 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                            {"Set-Cookie": [self._cookie(dashpasskey.SESS_COOKIE, "", 0),
                                            self._cookie(dash.COOKIE, "", 0)]})
                 return
-            if path not in ("/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/settings",
-                            "/api/canary/probe-smoke", "/api/canary/probe-one", "/api/deploy",
+            if path not in ("/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/topup",
+                            "/api/canary/settings", "/api/canary/probe-smoke", "/api/canary/probe-one", "/api/deploy",
                             "/api/auth/register/verify", "/api/auth/passkeys/remove"):
                 self.send_error(404)
                 return
@@ -306,6 +309,10 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                     data = json.loads(body or b"{}")
                     res = dash.canary_rotate(journal, cfg, data.get("wallets"), data.get("sol"))
                     log.info("dashboard wallet rotation: %s", res.get("msg"))
+                elif path == "/api/canary/topup":
+                    data = json.loads(body or b"{}")
+                    res = dash.canary_topup(cfg, data.get("level"), data.get("wallets"))
+                    log.info("dashboard wallet top-up: %s", res.get("msg"))
                 elif path == "/api/canary/probe-one":  # arm exactly one probe (Execute one probe)
                     res = dash.canary_one(journal)
                     log.info("dashboard probe-one: %s", res.get("msg"))

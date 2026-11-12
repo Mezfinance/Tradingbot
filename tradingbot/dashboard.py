@@ -172,7 +172,7 @@ def probe_summary(journal, n: int = 500) -> dict:
         d, v = _probe_detail(r), vd.get(r["token"], {})
         sent = d.get("verdict") not in ("honeypot", "skipped", None)  # did a buy actually broadcast?
         recent.append({"ts": r["ts"], "token": r["token"], "pool": d.get("pool"), "probe": d.get("verdict"),
-                       "sent": sent,
+                       "sent": sent, "wallet": d.get("wallet_addr"),
                        "slot_gap": d.get("slot_gap"), "recovered_sol": d.get("recovered_sol"),
                        "blind_reverted": d.get("blind_reverted"), "used_fallback": d.get("used_fallback"),
                        "watch": v.get("verdict") if sent else None})
@@ -215,10 +215,79 @@ def probe_smoke(cfg, mint: str, usd=None, pool: str | None = None) -> dict:
 
 _ROTATE = {"proc": None, "started": 0.0, "args": None}
 _ROTATE_LOCK = threading.Lock()
+_TOPUP = {"proc": None, "started": 0.0, "args": None}
+_TOPUP_LOCK = threading.Lock()
 
 
 def _provision_log(cfg) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(cfg.db_path)), "provision.log")
+
+
+def _topup_log_path(cfg) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(cfg.db_path)), "topup.log")
+
+
+def _rotation_running() -> bool:
+    with _ROTATE_LOCK:
+        p = _ROTATE["proc"]
+        return p is not None and p.poll() is None
+
+
+def canary_topup(cfg, level, wallets) -> dict:
+    """Top the canary's trading wallets up to `level` SOL each from the treasury (pulling from the reserve if short),
+    as a background `provision --top-up` process on this machine. `wallets` = 'all' or a list of 1-based wallet
+    numbers. Additive and safe mid-trade, so the canary is NOT halted. Keys never reach the page (provision prints
+    addresses + amounts only); the SOL lands straight on-chain, so no restart is needed."""
+    try:
+        level = float(level)
+    except (TypeError, ValueError):
+        raise ValueError("level must be a number")
+    if not 0.01 <= level <= 5:
+        raise ValueError("level must be between 0.01 and 5 SOL")
+    if wallets in (None, "all", "", "ALL"):
+        pick, indices = "all", "all"
+    else:
+        if not isinstance(wallets, (list, tuple)):
+            raise ValueError("wallets must be 'all' or a list of wallet numbers")
+        try:
+            indices = sorted({int(x) for x in wallets})
+        except (TypeError, ValueError):
+            raise ValueError("wallet numbers must be whole numbers")
+        if not indices or not all(1 <= i <= 10 for i in indices):
+            raise ValueError("wallet numbers must be between 1 and 10")
+        pick = ",".join(str(i) for i in indices)
+    if _rotation_running():
+        return {"started": False, "msg": "A wallet rotation is running; wait for it to finish before topping up."}
+    with _TOPUP_LOCK:
+        p = _TOPUP["proc"]
+        if p is not None and p.poll() is None:
+            return {"started": False, "msg": "A top-up is already running."}
+        with open(_topup_log_path(cfg), "w") as fh:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "tradingbot", "provision", "--top-up", "--level", str(level),
+                 "--pick", pick, "--apply"], stdout=fh, stderr=subprocess.STDOUT,
+                env={**os.environ, "TB_DB_PATH": cfg.db_path}, start_new_session=True)
+        _TOPUP.update(proc=proc, started=time.time(), args={"level": level, "pick": pick})
+    log.info("dashboard: wallet top-up started (level %.3f SOL, wallets %s)", level, pick)
+    which = "all trading wallets" if pick == "all" else f"wallets {pick}"
+    return {"started": True, "level": level, "pick": pick,
+            "msg": f"Topping up {which} to {level} SOL each from the treasury (reserve if short). Watch the log below."}
+
+
+def topup_log(cfg, lines: int = 400) -> dict:
+    """The tail of the running (or last) wallet top-up, for the dashboard to show progress. Addresses + amounts only."""
+    with _TOPUP_LOCK:
+        p = _TOPUP["proc"]
+        running = p is not None and p.poll() is None
+        code = None if (p is None or running) else p.returncode
+        started, args = _TOPUP["started"], _TOPUP["args"]
+    text = ""
+    try:
+        with open(_topup_log_path(cfg)) as fh:
+            text = "".join(fh.readlines()[-lines:])
+    except OSError:
+        pass
+    return {"running": running, "returncode": code, "log": text, "started": started, "args": args}
 
 
 def canary_rotate(journal, cfg, wallets, sol) -> dict:
@@ -235,6 +304,10 @@ def canary_rotate(journal, cfg, wallets, sol) -> dict:
         raise ValueError("wallets must be between 1 and 10")
     if not 0.01 <= sol <= 5:
         raise ValueError("sol per wallet must be between 0.01 and 5")
+    with _TOPUP_LOCK:
+        tp = _TOPUP["proc"]
+        if tp is not None and tp.poll() is None:
+            return {"started": False, "msg": "A wallet top-up is running; wait for it to finish before rotating."}
     with _ROTATE_LOCK:
         p = _ROTATE["proc"]
         if p is not None and p.poll() is None:
@@ -1181,6 +1254,14 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div id="w-note"></div>
 <div class="stats" id="w-tiles"></div>
 <section class="card"><p class="label eyebrow">Live set</p><h2>Trading wallets, treasury, reserve</h2><p class="sub">Numbered 1..n in rotation order. SOL = current balance; Txs = signatures on the wallet (feints and trades both count; a fresh wallet funds at one tx, a direct-route rug drains it to ~0).</p><div class="scroll"><table id="w-live"></table></div></section>
+<section class="card"><p class="label eyebrow">Top up · real money</p><h2>Top up trading wallets</h2>
+<p class="sub">Fund the selected trading wallets up to a target SOL level from the <b>treasury</b> (pulling from the <b>reserve</b> if the treasury is short). Additive and safe while the canary trades — no halt, no restart. A wallet already at the target is skipped. Keys never appear here — only addresses and amounts.</p>
+<div style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap;margin:4px 0 8px">
+<label style="display:flex;flex-direction:column;gap:4px;font-weight:700">Target SOL each<input id="tu-level" type="number" min="0.01" max="5" step="0.01" value="0.08" style="width:120px;padding:6px 8px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit"></label>
+<button id="tu-go" onclick="canaryTopUp()" style="padding:8px 18px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Top up</button></div>
+<div style="font-weight:700;font-size:13px;margin:0 0 4px">Which wallets</div>
+<div id="tu-wallets" style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 8px"></div>
+<pre id="tu-log" hidden style="white-space:pre-wrap;word-break:break-word;background:var(--sunken);border:2px solid var(--rule-soft);padding:10px;max-height:320px;overflow:auto;font:500 12px/1.5 var(--mono)"></pre></section>
 <section class="card"><p class="label eyebrow">Rotate · real money</p><h2>Rotate trading wallets</h2>
 <p class="sub">Mint a fresh set of wallets and a new treasury, sweep every current wallet and the treasury into it, and fund each new wallet (topping up from the reserve). This <b>halts the canary</b>; restart the bot (fly deploy) to trade the new set, then press Start on the overview. Keys never appear here — only addresses and the plan.</p>
 <div style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap;margin:4px 0 10px">
@@ -1575,6 +1656,9 @@ const rows=F.slice(-60).reverse();
 $("feint-feed").innerHTML=`<tr><th>Time</th><th>Pool</th><th>Verdict</th><th class="l">Note</th></tr>`+(rows.length?rows.map(f=>{const t=new Date(f.ts*1000).toLocaleTimeString([],{hour:"2-digit",minute:"2-digit",second:"2-digit",hour12:false});const vc=f.verdict==="alive"?"pos":f.verdict==="pulled"?"neg":"muted";const pool=f.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(f.pool)}" target="_blank" rel="noopener">${esc(f.pool.slice(0,8))}</a>`:(f.token?`<span class="mono">${esc(f.token.slice(0,8))}</span>`:"–");return`<tr><td class="mono">${t}</td><td>${pool}</td><td class="${vc}">${esc(f.verdict||"?")}</td><td class="l">${esc(f.note||"")}</td></tr>`}).join(""):`<tr><td class="muted">No feints yet.</td></tr>`)}
 const WRL={trading:"Trading",treasury:"Treasury",reserve:"Reserve"};
 function walletLink(a){return a?`<a class="lk mono" href="https://solscan.io/account/${encodeURIComponent(a)}" target="_blank" rel="noopener">${esc(a.slice(0,4)+"…"+a.slice(-4))}</a>`:"–"}
+// Which rotation wallet executed a probe/trade: show W{n} from the Wallets directory when known, else the short address. Links to solscan.
+function walletNum(a){const live=(S.wallets&&S.wallets.live)||[];for(const w of live){if(w.address===a&&w.n!=null)return w.n}return null}
+function walletCell(a){if(!a)return'<span class="muted">—</span>';const n=walletNum(a);return`<a class="lk mono" href="https://solscan.io/account/${encodeURIComponent(a)}" target="_blank" rel="noopener" title="${esc(a)}">${n!=null?("W"+n):esc(a.slice(0,4))}</a>`}
 function walletRow(w){return`<tr><td>${w.n!=null?w.n:'<span class="muted">—</span>'}</td><td>${esc(WRL[w.role]||w.role||"")}</td><td>${walletLink(w.address)}</td><td class="num">${w.sol!=null?fmt(w.sol,4):"–"}</td><td class="num">${w.txs!=null?w.txs:"–"}</td><td class="l">${esc(w.label||"")}</td></tr>`}
 function renderWallets(){const W=S.wallets,note=$("w-note");
 if(!W){note.innerHTML='<p class="note">Loading wallet balances…</p>';["w-tiles","w-live","w-arch"].forEach(i=>$(i).innerHTML="");return}
@@ -1583,7 +1667,7 @@ const live=W.live||[],arch=W.archive||[],trading=live.filter(w=>w.role==="tradin
 const when=W.fetched_ts?new Date(W.fetched_ts*1000).toLocaleTimeString([],{hour12:false}):"–";
 tiles("w-tiles",[["Trading wallets",String(trading.length),W.rotate?"rotating · "+(W.route||"direct"):(W.route||"direct")],["Trading SOL",fmt(W.trading_sol||0,3),"across the live set"],["Treasury",tre?fmt(tre.sol||0,3):"–","SOL · idle funds"],["Reserve",res?fmt(res.sol||0,3):"–","SOL · tops up wallets"],["Updated",when,"public RPC, each minute"]]);
 $("w-live").innerHTML=`<tr><th>#</th><th>Role</th><th>Address</th><th>SOL</th><th>Txs</th><th class="l">Label</th></tr>`+(live.length?live.map(walletRow).join(""):`<tr><td class="muted">No wallets loaded (the canary may be off or no wallets file is set).</td></tr>`);
-checkRotate();
+tuBuild(trading);checkRotate();checkTopup();
 $("w-arch").innerHTML=`<tr><th>Address</th><th class="l">Label</th><th>SOL</th><th>First recorded</th></tr>`+(arch.length?arch.map(w=>`<tr><td>${walletLink(w.address)}</td><td class="l">${esc(w.label||"")}</td><td class="num">${w.sol!=null?fmt(w.sol,4):"–"}</td><td class="mono">${w.created?esc(String(w.created).slice(0,10)):"–"}</td></tr>`).join(""):`<tr><td class="muted">No archived wallets.</td></tr>`)}
 const PLIQ=v=>v==null?"–":(Math.abs(v)>=1000?"$"+(v/1000).toFixed(1)+"k":"$"+v.toFixed(0));
 const PAGE2=s=>s==null?"–":agoStr(Math.round(s));
@@ -1593,7 +1677,8 @@ const vt=(r.verdict==="alive"||r.verdict==="survivor")?'<span class="tag lime">'
 // A honeypot/skipped probe broadcast nothing (no buy tx), so GAP and recovered SOL are blank BECAUSE $0 was ever sent — say so, or the dashes read as "lost / unknown".
 const ns=r.sent===false?' <span class="tag" style="opacity:.75" title="Nothing was broadcast — the honeypot was caught by the free pre-buy simulation, so $0 was committed.">no money sent</span>':'';
 const lk=r.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(r.pool)}" target="_blank" rel="noopener">${esc((r.mint||r.pool).slice(0,8))}</a>`:esc((r.mint||"").slice(0,8));
-return`<tr><td>${lk}</td><td>${vt}${ns}</td><td class="num">${PAGE2(r.pool_age_s)}</td><td class="num">${PAGE2(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PAGE2(r.pull_pool_age_s):"–"}</td><td class="num">${r.pulled?PAGE2(r.pull_after_probe_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–"}<span class="muted"> ${PPCT(r.ret_m6)}</span></td><td class="num"><span class="${r.conf_ret>0?'pos':r.conf_ret<0?'neg':'muted'}">${PPCT(r.conf_ret)}</span></td><td class="num">${r.opt_age_s!=null?PAGE2(r.opt_age_s)+" ":""}<span class="${r.opt_ret>0?'pos':r.opt_ret<0?'neg':'muted'}">${PPCT(r.opt_ret)}</span></td></tr>`}
+const wal=walletCell(r.wallet);
+return`<tr><td>${lk}</td><td>${wal}</td><td>${vt}${ns}</td><td class="num">${PAGE2(r.pool_age_s)}</td><td class="num">${PAGE2(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PAGE2(r.pull_pool_age_s):"–"}</td><td class="num">${r.pulled?PAGE2(r.pull_after_probe_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–"}<span class="muted"> ${PPCT(r.ret_m6)}</span></td><td class="num"><span class="${r.conf_ret>0?'pos':r.conf_ret<0?'neg':'muted'}">${PPCT(r.conf_ret)}</span></td><td class="num">${r.opt_age_s!=null?PAGE2(r.opt_age_s)+" ":""}<span class="${r.opt_ret>0?'pos':r.opt_ret<0?'neg':'muted'}">${PPCT(r.opt_ret)}</span></td></tr>`}
 function canaryRotate(){const n=+($("rot-n").value||0),s=+($("rot-sol").value||0);
 if(!(n>=1&&n<=10)){alert("Wallets must be between 1 and 10.");return}
 if(!(s>=0.01&&s<=5)){alert("SOL per wallet must be between 0.01 and 5.");return}
@@ -1607,6 +1692,27 @@ function pollRotate(){rotPoll=true;fetch("api/canary/rotate/log").then(r=>r.json
 $("rot-log").hidden=false;$("rot-log").textContent=(d.log||"(no output yet)")+(d.running?"\n\n… running …":d.returncode===0?"\n\n✓ Done. Restart the bot (fly deploy), then press Start on the overview.":"\n\n✗ Rotation exited with code "+d.returncode+". Nothing was swapped if it failed before the final step — read the log.");
 const lg=$("rot-log");lg.scrollTop=lg.scrollHeight;if(d.running)setTimeout(pollRotate,2000);else{rotPoll=false;$("rot-go").disabled=false}}).catch(()=>setTimeout(pollRotate,3000))}
 function checkRotate(){if(rotPoll)return;fetch("api/canary/rotate/log").then(r=>r.json()).then(d=>{if(d&&d.started){$("rot-log").hidden=false;$("rot-log").textContent=d.log||"";if(d.running){$("rot-go").disabled=true;pollRotate()}}}).catch(()=>{})}
+// Top-up: a target SOL level + a wallet picker (All, or individual W1..Wn). Rebuilt only when the wallet set changes, so a background re-render never clears the user's selection.
+function tuBuild(trading){const el=$("tu-wallets");if(!el)return;const sig=trading.map(w=>w.n).join(",");if(el.dataset.sig===sig)return;el.dataset.sig=sig;
+const box=(inner,label)=>`<label style="display:flex;align-items:center;gap:5px;font-weight:700;cursor:pointer"><input type="checkbox" ${inner}>${label}</label>`;
+el.innerHTML=box('id="tu-all" checked onchange="tuAll()"','All')+trading.map(w=>box(`class="tu-w" data-n="${w.n}" disabled onchange="tuOne()"`,"W"+w.n)).join("")}
+function tuAll(){const on=$("tu-all").checked;document.querySelectorAll(".tu-w").forEach(c=>{c.disabled=on;if(on)c.checked=false})}
+function tuOne(){if([...document.querySelectorAll(".tu-w")].some(c=>c.checked))$("tu-all").checked=false}
+function canaryTopUp(){const level=+($("tu-level").value||0);
+if(!(level>=0.01&&level<=5)){alert("Target SOL must be between 0.01 and 5.");return}
+let wallets="all";
+if(!$("tu-all").checked){wallets=[...document.querySelectorAll(".tu-w")].filter(c=>c.checked).map(c=>+c.dataset.n);if(!wallets.length){alert("Pick at least one wallet, or tick All.");return}}
+const which=wallets==="all"?"ALL trading wallets":"wallets "+wallets.join(", ");
+if(!confirm(`Top up ${which} to ${level} SOL each?\n\nFunds come from the treasury (and the reserve if it is short). Safe while trading — no halt, no restart.`))return;
+const go=$("tu-go");go.disabled=true;$("tu-log").hidden=false;$("tu-log").textContent="Starting the top-up…";
+fetch("api/canary/topup",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({level,wallets})}).then(r=>r.json()).then(d=>{
+if(d&&d.started){$("tu-log").textContent=(d.msg||"Started.")+"\n\n";pollTopup()}else{go.disabled=false;$("tu-log").textContent=(d&&(d.msg||d.error))||"Could not start the top-up."}
+}).catch(e=>{go.disabled=false;$("tu-log").textContent="Could not reach the top-up endpoint: "+e})}
+let tuPoll=false;
+function pollTopup(){tuPoll=true;fetch("api/canary/topup/log").then(r=>r.json()).then(d=>{
+$("tu-log").hidden=false;$("tu-log").textContent=(d.log||"(no output yet)")+(d.running?"\n\n… running …":d.returncode===0?"\n\n✓ Done. Balances refresh within a minute.":"\n\n✗ Top-up exited with code "+d.returncode+" — read the log.");
+const lg=$("tu-log");lg.scrollTop=lg.scrollHeight;if(d.running)setTimeout(pollTopup,2000);else{tuPoll=false;$("tu-go").disabled=false}}).catch(()=>setTimeout(pollTopup,3000))}
+function checkTopup(){if(tuPoll)return;fetch("api/canary/topup/log").then(r=>r.json()).then(d=>{if(d&&d.started){$("tu-log").hidden=false;$("tu-log").textContent=d.log||"";if(d.running){$("tu-go").disabled=true;pollTopup()}}}).catch(()=>{})}
 function csVal(f){const el=$("cs-"+f.key);if(!el)return S.cset.current[f.key];
 if(f.type==="bool")return el.checked;if(f.type==="int")return Math.round(+el.value);if(f.type==="float")return +el.value;return el.value}
 function csField(f){const v=S.cset.current[f.key],badge=f.live?'<span class="tag lime" style="font-size:10px">live</span>':'<span class="tag" style="font-size:10px">restart</span>';
@@ -1658,7 +1764,7 @@ function bufToB64url(b){const bytes=new Uint8Array(b);let bin="";for(const x of 
 function probePoll(){if(R.v!=="settings"){window._pbStarted=false;return}renderProbe();clearTimeout(window._pbT);window._pbT=setTimeout(probePoll,5000)}
 function renderProbe(){const t=$("pb-tiles");if(!t)return;fetch("api/canary/probes").then(r=>r.json()).then(d=>{
 t.innerHTML=[["Probed",d.probes],["Rugger",d.rugger],["Survivor",d.survivor],["Trip rate",d.trip_rate==null?"—":(d.trip_rate*100).toFixed(0)+"%"],["Blind revert",d.blind_revert_rate==null?"—":(d.blind_revert_rate*100).toFixed(0)+"%"],["Blind gap",d.blind_median_gap==null?"—":d.blind_median_gap],["Pending",d.pending]].map(([k,v])=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
-const rows=d.recent||[];$("pb-recent").innerHTML="<tr><th>Token</th><th>Probe</th><th>Gap</th><th>Recovered SOL</th><th>Watch</th></tr>"+(rows.length?rows.map(r=>r.sent===false?`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${esc(r.probe||"")}</td><td colspan="3" class="sub" title="Caught by the free pre-buy simulation — no buy was broadcast, so $0 was at risk.">no money sent ($0 at risk)</td></tr>`:`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${esc(r.probe||"")}</td><td>${r.slot_gap==null?"—":r.slot_gap}</td><td>${r.recovered_sol==null?"—":r.recovered_sol}</td><td class="${r.watch==='rugger'?'neg':r.watch==='survivor'?'pos':''}">${esc(r.watch||"…")}</td></tr>`).join(""):'<tr><td colspan="5" class="sub">No probes yet. Enable the 1-slot probe preset and start the canary.</td></tr>')}).catch(()=>{})}
+const rows=d.recent||[];$("pb-recent").innerHTML="<tr><th>Token</th><th>Wallet</th><th>Probe</th><th>Gap</th><th>Recovered SOL</th><th>Watch</th></tr>"+(rows.length?rows.map(r=>r.sent===false?`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${walletCell(r.wallet)}</td><td>${esc(r.probe||"")}</td><td colspan="3" class="sub" title="Caught by the free pre-buy simulation — no buy was broadcast, so $0 was at risk.">no money sent ($0 at risk)</td></tr>`:`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${walletCell(r.wallet)}</td><td>${esc(r.probe||"")}</td><td>${r.slot_gap==null?"—":r.slot_gap}</td><td>${r.recovered_sol==null?"—":r.recovered_sol}</td><td class="${r.watch==='rugger'?'neg':r.watch==='survivor'?'pos':''}">${esc(r.watch||"…")}</td></tr>`).join(""):'<tr><td colspan="6" class="sub">No probes yet. Enable the 1-slot probe preset and start the canary.</td></tr>')}).catch(()=>{})}
 function probeOne(){const b=$("pb-one");b.disabled=true;$("pb-one-note").textContent="arming…";
 fetch("api/canary/probe-one",{method:"POST"}).then(r=>r.json()).then(d=>{b.disabled=false;$("pb-one-note").textContent=d.msg||"armed."}).catch(e=>{b.disabled=false;$("pb-one-note").textContent="error: "+e})}
 function probeSmoke(){const mint=$("pb-mint").value.trim();if(!mint){$("pb-smoke-note").textContent="enter a token mint";return}
@@ -1684,7 +1790,7 @@ const hc=s.survivor_hold_curve||{},hk=Object.keys(hc);
 if(hk.length){$("p-hold-card").style.display="";$("p-hold").innerHTML='<tr><th class="l">Hold to</th><th>n</th><th>Mean</th><th>Median</th><th>Win</th><th>+100%</th></tr>'+hk.map(k=>{const c=hc[k];return `<tr><td class="l">minute ${k}</td><td class="num">${c.n}</td><td class="num ${c.mean>0?"pos":c.mean<0?"neg":"muted"}">${(c.mean>=0?"+":"")+(c.mean*100).toFixed(0)}%</td><td class="num">${(c.median>=0?"+":"")+(c.median*100).toFixed(0)}%</td><td class="num">${(c.win*100).toFixed(0)}%</td><td class="num">${(c.big*100).toFixed(0)}%</td></tr>`}).join("")}else{$("p-hold-card").style.display="none"}
 const f=($("p-filter")||{}).value||"all";$("p-filter").onchange=render;
 const show=rows.filter(r=>f==="survivor"?r.watch_verdict==="survivor":f==="rugger"?r.watch_verdict==="rugger":f==="alive"?r.verdict==="alive":f==="pulled"?r.pulled:f==="live"?(r.pool_age_s!=null&&r.pool_age_s<1500&&!r.pulled):f==="win"?(r.pnl25!=null&&r.pnl25>0):true);
-$("p-tbl").innerHTML=`<tr><th class="l">Pool</th><th>Verdict</th><th>Age</th><th>Probe@</th><th>Liq</th><th>Live</th><th>Peak</th><th>Pulled@</th><th>+probe</th><th>$25 @ m6</th><th>Enter @conf</th><th>Best entry</th></tr>`+(show.length?show.map(poolRow).join(""):`<tr><td class="muted">No feinted pools in the window yet.</td></tr>`)}
+$("p-tbl").innerHTML=`<tr><th class="l">Pool</th><th>Wallet</th><th>Verdict</th><th>Age</th><th>Probe@</th><th>Liq</th><th>Live</th><th>Peak</th><th>Pulled@</th><th>+probe</th><th>$25 @ m6</th><th>Enter @conf</th><th>Best entry</th></tr>`+(show.length?show.map(poolRow).join(""):`<tr><td class="muted">No feinted pools in the window yet.</td></tr>`)}
 function render(){renderHealth();renderFeints();if(!S.books.length)return;
 if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="market")renderMarket();else if(R.v==="wallets")renderWallets();else if(R.v==="pools")renderPools();else if(R.v==="settings")renderSettings();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
 $("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false})}

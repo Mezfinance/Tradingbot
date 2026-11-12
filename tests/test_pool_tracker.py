@@ -56,6 +56,22 @@ def test_honeypot_probe_never_shows_as_a_survivor_and_flags_no_money_sent():
     assert row["sent"] is False and row["committed"] is False  # $0 ever left the wallet
 
 
+def test_rows_carry_the_executing_wallet_from_probe_and_feint_events():
+    # The dashboard shows which rotation wallet ran each probe; probes store `wallet_addr`, feints `wallet`.
+    import json
+    rows = [
+        {"ts": 100.0, "token": "MintP", "kind": "canary_probe",
+         "detail": json.dumps({"pool": "PP", "verdict": "ok", "slot_gap": 1, "wallet_addr": "Wa11etPubkeyAAAA"})},
+        {"ts": 110.0, "token": "MintF", "kind": "canary_feint",
+         "detail": json.dumps({"pool": "PF", "verdict": "alive", "wallet": "Wa11etPubkeyBBBB"})},
+    ]
+    q = lambda sql, p: [] if "canary_probe_verdict" in sql else [r for r in rows if r["ts"] >= p[0]]
+    out = pt.feint_pools(q, 0.0)
+    assert out["PP"]["wallet"] == "Wa11etPubkeyAAAA" and out["PF"]["wallet"] == "Wa11etPubkeyBBBB"
+    by_pool = {r["pool"]: r for r in pt.assemble(out, {}, 100.0, {}, 200.0)}
+    assert by_pool["PP"]["wallet"] == "Wa11etPubkeyAAAA" and by_pool["PF"]["wallet"] == "Wa11etPubkeyBBBB"
+
+
 def test_read_vaults_parses_token_amounts_from_base64():
     calls = {}
 

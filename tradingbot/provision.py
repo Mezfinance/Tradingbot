@@ -283,6 +283,68 @@ class Provisioner:
               "-a supermeme && rm /tmp/t.json /tmp/w.json")
 
 
+    def top_up(self, level: float, indices: list[int] | None) -> None:
+        """Top the trading wallets up to `level` SOL each from the treasury, pulling the shortfall from the reserve
+        first. `indices` are 1-based wallet numbers (as the dashboard shows them); None/empty = all wallets. Never
+        prints a key. Additive and idempotent: a wallet already at or above `level` is skipped, so a re-run is safe."""
+        wallets = self._read_old_wallets()
+        treasury = self._read_old_treasury()
+        reserve = self._read_reserve()
+        mode = "APPLY" if self.apply else "DRY RUN"
+        print(f"=== top-up ({mode}) === target {level:.4f} SOL/wallet", flush=True)
+        if not wallets:
+            print("  ! no trading wallets found"); return
+        if not treasury:
+            print("  ! no treasury key found; cannot fund"); return
+        n = len(wallets)
+        target = int(level * LAMPORTS)
+        sel = sorted({i for i in (indices or range(1, n + 1)) if 1 <= i <= n})
+        if not sel:
+            print("  ! no valid wallet selection"); return
+        print(f"selecting {len(sel)} of {n} wallets: {', '.join('W' + str(i) for i in sel)}")
+        gaps, total = {}, 0
+        for i in sel:
+            kp = wallets[i - 1]
+            cur = self.balance(kp.pubkey())
+            gap = max(0, target - cur)
+            gaps[i] = (kp, cur, gap)
+            total += gap
+            print(f"  W{i} {str(kp.pubkey())[:6]} bal {cur / LAMPORTS:.4f} -> gap {gap / LAMPORTS:.4f}")
+        if total <= 0:
+            print("All selected wallets already at or above the target. Nothing to do."); return
+        need = total + len(sel) * BASE_FEE
+        tb = self.balance(treasury.pubkey())
+        print(f"\n-- treasury {str(treasury.pubkey())[:6]} balance {tb / LAMPORTS:.4f}, need {need / LAMPORTS:.4f} --")
+        if tb < need:
+            short = need - tb
+            if not reserve:
+                print(f"  ! treasury short by {short / LAMPORTS:.4f} SOL and no reserve key; will fund what it can")
+            else:
+                rb = self.balance(reserve.pubkey())
+                top = min(short, rb - int(self.reserve_keep * LAMPORTS) - BASE_FEE)
+                print(f"  reserve {str(reserve.pubkey())[:6]} balance {rb / LAMPORTS:.4f}")
+                if top <= 0:
+                    print(f"  ! reserve too low to cover the shortfall (keeps {self.reserve_keep:.4f} SOL)")
+                else:
+                    self.send(reserve, treasury.pubkey(), top, "top reserve->treasury")
+        if not self.apply:
+            print("\n(DRY RUN -- moved no SOL. Re-run with --apply to execute.)"); return
+        tb = self.balance(treasury.pubkey())
+        print(f"\n-- fund wallets (treasury now {tb / LAMPORTS:.4f}) --")
+        for i in sel:
+            kp, cur, gap = gaps[i]
+            if gap <= 0:
+                continue
+            avail = self.balance(treasury.pubkey()) - BASE_FEE  # re-read so a short treasury can't over-send
+            amt = min(gap, max(0, avail))
+            if amt <= 0:
+                print(f"  ! treasury empty; W{i} not funded"); continue
+            self.send(treasury, kp.pubkey(), amt,
+                      f"fund W{i} {str(kp.pubkey())[:6]} ({cur / LAMPORTS:.4f} -> target {level:.4f})")
+        print(f"\ntreasury final: {self.balance(treasury.pubkey()) / LAMPORTS:.4f} SOL")
+        print("DONE. Trading wallets topped up (keys not shown).")
+
+
 def _ask(prompt: str, cast):
     while True:
         try:
@@ -299,7 +361,22 @@ def main(args: list[str]) -> None:
     p.add_argument("--reserve", help="reserve key file to top up from (default: the canary wallet)")
     p.add_argument("--reserve-keep", type=float, default=RESERVE_KEEP_SOL, help="SOL to leave in the reserve")
     p.add_argument("--apply", action="store_true", help="move the money (default: dry run)")
+    p.add_argument("--top-up", action="store_true", help="top existing trading wallets up to --level (no re-mint)")
+    p.add_argument("--level", type=float, help="target SOL per wallet for --top-up")
+    p.add_argument("--pick", help="--top-up wallet selection: 'all' or comma 1-based indices, e.g. 1,3,5")
     a = p.parse_args(args)
+
+    if a.top_up:
+        if a.level is None or a.level <= 0:
+            p.error("--top-up needs --level X (SOL per wallet, > 0)")
+        indices = None
+        if a.pick and a.pick.strip().lower() != "all":
+            try:
+                indices = [int(x) for x in a.pick.replace(",", " ").split()]
+            except ValueError:
+                p.error("--pick must be 'all' or comma-separated whole numbers, e.g. 1,3,5")
+        Provisioner(apply=a.apply, reserve=a.reserve, reserve_keep=a.reserve_keep).top_up(a.level, indices)
+        return
 
     n, sol = a.wallets, a.sol
     if (n is None or sol is None) and sys.stdin.isatty():

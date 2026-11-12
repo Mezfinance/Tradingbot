@@ -65,6 +65,8 @@ def feint_pools(jquery, since: float) -> dict:
         out.setdefault(pool, {"pool": pool, "mint": r["token"],
                               "kind": "probe" if r["kind"] == "canary_probe" else "feint",
                               "verdict": d.get("verdict"), "watch_verdict": None, "note": d.get("note") or "",
+                              # which of the rotation wallets executed this probe (probes store `wallet_addr`, feints `wallet`)
+                              "wallet": d.get("wallet_addr") or d.get("wallet"),
                               "feint_ts": r["ts"], "sol_before": d.get("sol_before"), "sol_after": d.get("sol_after")})
     for r in jquery("SELECT detail FROM events WHERE kind='canary_probe_verdict' AND ts >= ? ORDER BY ts", (since,)):
         try:
@@ -218,7 +220,7 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
         out.append({
             "pool": pool, "mint": f.get("mint"), "verdict": disp, "kind": f.get("kind"),
             "watch_verdict": f.get("watch_verdict"), "probe_verdict": f.get("verdict") if f.get("kind") == "probe" else None,
-            "sent": sent, "committed": committed,
+            "sent": sent, "committed": committed, "wallet": f.get("wallet"),
             "note": f.get("note"),
             "feint_ts": f["feint_ts"], "created_ts": created,
             "probe_pool_age_s": (f["feint_ts"] - created) if created else None,

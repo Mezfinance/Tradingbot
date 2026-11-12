@@ -87,3 +87,46 @@ def test_requires_wallets_and_sol_when_not_a_tty(env, monkeypatch):
     monkeypatch.setattr(pv.sys.stdin, "isatty", lambda: False)
     with pytest.raises(SystemExit):
         pv.main([])  # no --wallets/--sol and no terminal to ask
+
+
+def test_top_up_funds_selected_wallets_from_the_treasury(env):
+    tmp, old, treasury, reserve = env
+    bal = {k.pubkey(): SOL // 100 for k in old}   # each wallet at 0.01 SOL
+    bal[treasury.pubkey()] = 5 * SOL              # treasury flush
+    prov = FakeProv(bal, apply=True)
+    prov.top_up(0.08, [1, 3])                     # only W1 and W3
+    funded = {to for _frm, to, _amt in prov.sends}
+    assert str(old[0].pubkey()) in funded and str(old[2].pubkey()) in funded
+    assert str(old[1].pubkey()) not in funded     # W2 was not selected
+    assert prov.balance(old[0].pubkey()) == int(0.08 * SOL)   # topped up to the target
+    assert prov.balance(old[1].pubkey()) == SOL // 100         # untouched
+
+
+def test_top_up_pulls_from_the_reserve_when_the_treasury_is_short(env):
+    tmp, old, treasury, reserve = env
+    bal = {k.pubkey(): 0 for k in old}
+    bal[treasury.pubkey()] = SOL // 100   # treasury almost empty
+    bal[reserve.pubkey()] = 5 * SOL
+    prov = FakeProv(bal, apply=True)
+    prov.top_up(0.08, None)               # all wallets
+    assert any(frm == str(reserve.pubkey()) and to == str(treasury.pubkey()) for frm, to, _ in prov.sends)
+    for k in old:
+        assert prov.balance(k.pubkey()) == int(0.08 * SOL)
+
+
+def test_top_up_dry_run_moves_nothing(env):
+    tmp, old, treasury, reserve = env
+    bal = {k.pubkey(): 0 for k in old}
+    bal[treasury.pubkey()] = 5 * SOL
+    prov = FakeProv(bal, apply=False)
+    prov.top_up(0.08, None)
+    assert prov.sends == []
+
+
+def test_top_up_skips_wallets_already_at_the_target(env):
+    tmp, old, treasury, reserve = env
+    bal = {k.pubkey(): int(0.08 * SOL) for k in old}  # all already at target
+    bal[treasury.pubkey()] = 5 * SOL
+    prov = FakeProv(bal, apply=True)
+    prov.top_up(0.08, None)
+    assert prov.sends == []   # nothing to do
