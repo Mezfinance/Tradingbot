@@ -39,6 +39,7 @@ KEEPALIVE_S = 15
 SHORTS_POLL_S = 30  # MZF Short Only feed (another Fly app) is read this often
 SHORTS_TIMEOUT_S = 8
 MARKET_POLL_S = 60  # the market monitor's hourly rows (watch.db market_hours) are re-read this often
+POOLS_POLL_S = 20  # the pool tracker re-reads young feinted pools' reserves this often (public RPC)
 FEED_BACKLOG = 60  # fills sent when a page connects
 COOKIE = "tb_dash"
 
@@ -192,6 +193,9 @@ class Dashboard:
         self.market_ver = 0
         self.wallets: dict | None = None  # the canary wallets with chain balances, every WALLETS_POLL_S
         self.wallets_ver = 0
+        self.pools: dict | None = None  # the pool tracker (feinted pools + live reserves), every POOLS_POLL_S
+        self.pools_ver = 0
+        self._pool_paths: dict = {}  # pool -> live reserve path kept between polls
         self._mdb = None
 
     def _build_in_child(self) -> dict:
@@ -246,11 +250,16 @@ class Dashboard:
             while not self._stop.is_set():
                 self.fetch_wallets()
                 self._stop.wait(WALLETS_POLL_S)
+        def pools_loop():
+            while not self._stop.is_set():
+                self.fetch_pools()
+                self._stop.wait(POOLS_POLL_S)
         self._external = False
         if self.cfg.market_monitor and self.store is not None:
             threading.Thread(target=market_loop, name="dashboard-market", daemon=True).start()
         if self.cfg.launch_canary or self.cfg.launch_fast_canary:
             threading.Thread(target=wallets_loop, name="dashboard-wallets", daemon=True).start()
+            threading.Thread(target=pools_loop, name="dashboard-pools", daemon=True).start()
         threading.Thread(target=loop, name="dashboard", daemon=True).start()
         threading.Thread(target=live_loop, name="dashboard-live", daemon=True).start()
         if self.cfg.shortbook_feed_url:
@@ -332,6 +341,44 @@ class Dashboard:
         with self._lock:
             self.wallets, self.wallets_ver = d, self.wallets_ver + 1
 
+    def fetch_pools(self, rpc=None) -> None:
+        """The pool tracker: every pool the canary has feinted, joined to the scorer's lifecycle row, plus a live
+        reserve read for pools still young. Reads feints from the journal and the scorer rows from watch.db on the
+        Live poller's read-only connections, and the reserves over the public RPC (no Helius credits). Keeps the
+        last good data and marks it stale on a failure."""
+        from tradingbot import pool_tracker as pt
+        rpc = rpc or (lambda m, p: _solana_rpc(WALLETS_RPC, m, p))
+        try:
+            now = time.time()
+            since = now - pt.TRACK_WINDOW_S
+            feints = pt.feint_pools(self.live._q, since)
+            wq = (lambda sql, p: self.live.wdb.execute(sql, p).fetchall()) if self.live.wdb is not None \
+                else (lambda sql, p: [])
+            scorer = pt.scorer_rows(wq, since)
+            su = pt._sol_usd(wq)
+            young = [scorer[pl] for pl in feints
+                     if scorer.get(pl) and scorer[pl].get("create_ts")
+                     and now - scorer[pl]["create_ts"] <= pt.YOUNG_MAX_AGE_S and not scorer[pl].get("pulled_ts")]
+            if young:
+                v = pt.read_vaults(rpc, young)
+                for pl, (sol, tok) in v.items():
+                    s = scorer[pl]
+                    self._pool_paths[pl] = pt.update_path(self._pool_paths.get(pl), now, s["create_ts"],
+                                                          feints[pl]["feint_ts"], sol, tok, su, s.get("exit_px"))
+            cut = now - pt.YOUNG_MAX_AGE_S - 1800  # drop paths for pools long past their window
+            for pl in [pl for pl in self._pool_paths if pl not in feints
+                       or (scorer.get(pl) and (scorer[pl].get("create_ts") or 0) < cut)]:
+                self._pool_paths.pop(pl, None)
+            rows = pt.assemble(feints, scorer, su, self._pool_paths, now)
+            data = {"rows": rows[:200], "summary": pt.summary(rows), "sol_usd": su,
+                    "fetched_ts": now, "stale": False}
+        except Exception as exc:  # noqa: BLE001 (keep the last good data; the public RPC can be slow)
+            log.warning("dashboard: pool tracker failed: %s", exc)
+            data = {**(self.pools or {"rows": [], "summary": {}}), "stale": True,
+                    "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+        with self._lock:
+            self.pools, self.pools_ver = data, self.pools_ver + 1
+
     def current(self) -> tuple[int, dict | None]:
         with self._lock:
             return self.version, self.summary
@@ -371,6 +418,10 @@ class Dashboard:
         if self.wallets is not None:
             send("wallets", self.wallets)
             wallets_ver = self.wallets_ver
+        pools_ver = 0
+        if self.pools is not None:
+            send("pools", self.pools)
+            pools_ver = self.pools_ver
         last_fill = backlog[-1]["id"] if backlog else live.last_fill
         quiet = time.time()
         while not stop.is_set():
@@ -406,6 +457,10 @@ class Dashboard:
             if self.wallets_ver != wallets_ver and self.wallets is not None:
                 send("wallets", self.wallets)
                 wallets_ver = self.wallets_ver
+                sent = True
+            if self.pools_ver != pools_ver and self.pools is not None:
+                send("pools", self.pools)
+                pools_ver = self.pools_ver
                 sent = True
             if sent:
                 quiet = time.time()
@@ -776,7 +831,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <span id="built" class="label muted"></span></div>
 </header>
 <nav class="tabs" aria-label="Programs"><a href="#/" data-v="programs">MZFq</a><a href="#/supermeme" data-v="supermeme" id="tab-meme">Supermeme</a><a href="#/shorts" data-v="shorts">MZF Short Only</a></nav>
-<nav class="tabs sub" id="subtabs" aria-label="Supermeme"><a href="#/supermeme" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a><a href="#/market" data-v="market">Market</a><a href="#/wallets" data-v="wallets">Wallets</a></nav>
+<nav class="tabs sub" id="subtabs" aria-label="Supermeme"><a href="#/supermeme" data-v="overview">Overview</a><a href="#/ledger" data-v="ledger">Trade ledger</a><a href="#/books" data-v="books">Books &amp; families</a><a href="#/market" data-v="market">Market</a><a href="#/wallets" data-v="wallets">Wallets</a><a href="#/pools" data-v="pools">Pool tracker</a></nav>
 <main id="v-programs" hidden>
 <div><p class="label eyebrow">Quant programs · paper trading</p><h1>MZFq</h1>
 <p class="lead">Each program holds its strategies; Supermeme's are grouped into families of books. Everything here is paper trading.</p></div>
@@ -851,6 +906,15 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <section class="card"><p class="label eyebrow">Live set</p><h2>Trading wallets, treasury, reserve</h2><p class="sub">Numbered 1..n in rotation order. SOL = current balance; Txs = signatures on the wallet (feints and trades both count; a fresh wallet funds at one tx, a direct-route rug drains it to ~0).</p><div class="scroll"><table id="w-live"></table></div></section>
 <section class="card"><p class="label eyebrow">Archive</p><h2>Retired wallets and treasuries</h2><p class="sub">Every other address the key-free address book has recorded, with its label. Old trading wallets and treasuries should read ~0 SOL once swept.</p><div class="scroll"><table id="w-arch"></table></div></section>
 </main>
+<main id="v-pools" hidden>
+<div><p class="label eyebrow"><a class="lk" href="#/supermeme">Supermeme</a> · launch canary · real money</p><h1>Pool tracker</h1>
+<p class="lead">Every pool the canary has feinted, with its live state. Liquidity, age and the LP-pull time come from the second-4 scorer; live liquidity and the best entry come from a public-RPC read of the pool's reserves (no Helius credits), refreshed every 20 seconds while a pool is under 25 minutes old.</p></div>
+<div id="p-note"></div>
+<div class="stats" id="p-tiles"></div>
+<section class="card"><p class="label eyebrow">Feinted pools</p><h2>Live pool state</h2><p class="sub">Newest pool first. <b>Probe@</b> = pool age when we feinted. <b>Liq</b> = liquidity at second 4; <b>Live</b> = latest reserve read; <b>Peak</b> = most liquidity seen after the probe. <b>Pulled@</b> = pool age when the LP was pulled, <b>+probe</b> = how long after our feint. <b>$25 @ m6</b> = what a $25 buy held to pool minute 6 would have returned (scorer trade, net of 6% cost). <b>Best entry</b> = the pool age of the cheapest price before minute 6 and the return it would have given.</p>
+<div class="filters"><select id="p-filter" aria-label="Filter"><option value="all">All pools</option><option value="alive">Alive at probe</option><option value="pulled">Pulled</option><option value="live">Still live (&lt;25m)</option><option value="win">$25 in profit</option></select></div>
+<div class="scroll"><table id="p-tbl"></table></div></section>
+</main>
 <main id="v-ledger" hidden>
 <div><p class="label eyebrow">Every trade of the running books</p><h1>Trade ledger</h1>
 <p class="lead">Newest first. Open trades count at cost until sold; a sale with no route out counts as $0 until a later sale gets through.</p></div>
@@ -897,7 +961,7 @@ const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
 /* mean trade weighted by size: total P&L / total cost (a plain average counts a $25 trade like a $250 one) */
 const wmean=tr=>{const c=tr.reduce((a,x)=>a+(x.cost||0),0);return c?100*tr.reduce((a,x)=>a+x.pnl,0)/c:null};
 const median=a=>{if(!a.length)return null;const b=[...a].sort((x,y)=>x-y),m=b.length>>1;return b.length%2?b[m]:(b[m-1]+b[m])/2};
-const S={market:null,marketEnabled:false,shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null,feints:[],canary:false,canaryHalted:false,wallets:null};
+const S={market:null,marketEnabled:false,shorts:null,shortsEnabled:false,pos:new Map(),launch:new Map(),books:[],fams:[],cash:10000,stuck:0,pc:[],lc:[],skew:0,health:null,extra:null,feints:[],canary:false,canaryHalted:false,wallets:null,pools:null};
 let sortKey="return_pct",sortDir=-1,win=21600,pending=false;
 const R={v:"overview",arg:null},LIM={ledger:200,b:200,f:200};
 const now=()=>Date.now()/1000-S.skew;
@@ -1175,9 +1239,9 @@ $("mk-hours").innerHTML="<tr><th>Hour</th>"+HC.map(([,l])=>`<th>${l}</th>`).join
 const imp=m.impaired||[];$("mk-imp").innerHTML=imp.length?`<p class="note">Greyed hours (!) are left out of the comparison, the flags, the band totals and the charts: the scorer itself was impaired, so their pools are a biased subset. `+imp.map(x=>`${when(x.hour).slice(0,8)}h: ${esc(x.why||"")}`).join(" · ")+"</p>":""}
 /* router */
 function route(){const h=decodeURIComponent(location.hash.replace(/^#\/?/,"")),[v,...rest]=h.split("/");const arg=rest.join("/");
-R.v=({supermeme:"overview",ledger:"ledger",books:"books",book:"book",family:"family",shorts:"shorts",market:"market",wallets:"wallets"})[v]||"programs";R.arg=arg||null;LIM.b=LIM.f=200;
+R.v=({supermeme:"overview",ledger:"ledger",books:"books",book:"book",family:"family",shorts:"shorts",market:"market",wallets:"wallets",pools:"pools"})[v]||"programs";R.arg=arg||null;LIM.b=LIM.f=200;
 for(const m of document.querySelectorAll("main"))m.hidden=m.id!=="v-"+R.v;
-const meme=["overview","ledger","books","book","family","market","wallets"].includes(R.v);$("subtabs").hidden=!meme;
+const meme=["overview","ledger","books","book","family","market","wallets","pools"].includes(R.v);$("subtabs").hidden=!meme;
 document.querySelectorAll(".tabs:not(.sub) a").forEach(a=>a.classList.toggle("on",a.dataset.v===(meme?"supermeme":R.v)));
 document.querySelectorAll(".tabs.sub a").forEach(a=>a.classList.toggle("on",a.dataset.v===R.v||(a.dataset.v==="books"&&(R.v==="book"||R.v==="family"))));
 alignSub();window.scrollTo(0,0);render()}
@@ -1211,8 +1275,23 @@ const when=W.fetched_ts?new Date(W.fetched_ts*1000).toLocaleTimeString([],{hour1
 tiles("w-tiles",[["Trading wallets",String(trading.length),W.rotate?"rotating · "+(W.route||"direct"):(W.route||"direct")],["Trading SOL",fmt(W.trading_sol||0,3),"across the live set"],["Treasury",tre?fmt(tre.sol||0,3):"–","SOL · idle funds"],["Reserve",res?fmt(res.sol||0,3):"–","SOL · tops up wallets"],["Updated",when,"public RPC, each minute"]]);
 $("w-live").innerHTML=`<tr><th>#</th><th>Role</th><th>Address</th><th>SOL</th><th>Txs</th><th class="l">Label</th></tr>`+(live.length?live.map(walletRow).join(""):`<tr><td class="muted">No wallets loaded (the canary may be off or no wallets file is set).</td></tr>`);
 $("w-arch").innerHTML=`<tr><th>Address</th><th class="l">Label</th><th>SOL</th><th>First recorded</th></tr>`+(arch.length?arch.map(w=>`<tr><td>${walletLink(w.address)}</td><td class="l">${esc(w.label||"")}</td><td class="num">${w.sol!=null?fmt(w.sol,4):"–"}</td><td class="mono">${w.created?esc(String(w.created).slice(0,10)):"–"}</td></tr>`).join(""):`<tr><td class="muted">No archived wallets.</td></tr>`)}
+const PLIQ=v=>v==null?"–":(Math.abs(v)>=1000?"$"+(v/1000).toFixed(1)+"k":"$"+v.toFixed(0));
+const PAGE2=s=>s==null?"–":agoStr(Math.round(s));
+const PPCT=r=>r==null?"–":(r>=0?"+":"")+(r*100).toFixed(0)+"%";
+function poolRow(r){const neg=r.pnl25!=null&&r.pnl25<0,win=r.pnl25!=null&&r.pnl25>0;
+const vt=r.verdict==="alive"?'<span class="tag lime">alive</span>':r.verdict==="pulled"?'<span class="tag neg">pulled</span>':r.verdict?'<span class="tag">'+esc(r.verdict)+'</span>':"–";
+const lk=r.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(r.pool)}" target="_blank" rel="noopener">${esc((r.mint||r.pool).slice(0,8))}</a>`:esc((r.mint||"").slice(0,8));
+return`<tr><td>${lk}</td><td>${vt}</td><td class="num">${PAGE2(r.pool_age_s)}</td><td class="num">${PAGE2(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PAGE2(r.pull_pool_age_s):"–"}</td><td class="num">${r.pulled?PAGE2(r.pull_after_probe_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–"}<span class="muted"> ${PPCT(r.ret_m6)}</span></td><td class="num">${r.opt_age_s!=null?PAGE2(r.opt_age_s)+" ":""}<span class="${r.opt_ret>0?'pos':r.opt_ret<0?'neg':'muted'}">${PPCT(r.opt_ret)}</span></td></tr>`}
+function renderPools(){const P=S.pools,note=$("p-note");
+if(!P){note.innerHTML='<p class="note">Loading pool reserves…</p>';["p-tiles","p-tbl"].forEach(i=>$(i).innerHTML="");return}
+const s=P.summary||{},rows=P.rows||[];const when=P.fetched_ts?agoStr(Math.max(0,Math.round(Date.now()/1000-P.fetched_ts)))+" ago":"–";
+note.innerHTML=P.stale?`<p class="note neg">Live reserves stale${P.error?": "+esc(P.error):""}. Showing the last read.</p>`:"";
+tiles("p-tiles",[["Pools",String(s.pools||0),(P.sol_usd?"SOL $"+P.sol_usd.toFixed(0)+" · ":"")+"updated "+when],["Alive at probe",String(s.alive||0),"liquidity held the $25 poke"],["Pulled at probe",String(s.pulled_at_probe||0),"withdrew in reaction"],["Pulled since",String(s.pulled_since||0),"LP gone by now"],["$25 would make",s.would_pnl25!=null?(s.would_pnl25>=0?"+":"")+"$"+s.would_pnl25.toFixed(0):"–","held to minute 6 across "+(s.with_outcome||0)+" finished"]]);
+const f=($("p-filter")||{}).value||"all";$("p-filter").onchange=render;
+const show=rows.filter(r=>f==="alive"?r.verdict==="alive":f==="pulled"?r.pulled:f==="live"?(r.pool_age_s!=null&&r.pool_age_s<1500&&!r.pulled):f==="win"?(r.pnl25!=null&&r.pnl25>0):true);
+$("p-tbl").innerHTML=`<tr><th class="l">Pool</th><th>Verdict</th><th>Age</th><th>Probe@</th><th>Liq</th><th>Live</th><th>Peak</th><th>Pulled@</th><th>+probe</th><th>$25 @ m6</th><th>Best entry</th></tr>`+(show.length?show.map(poolRow).join(""):`<tr><td class="muted">No feinted pools in the window yet.</td></tr>`)}
 function render(){renderHealth();renderFeints();if(!S.books.length)return;
-if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="market")renderMarket();else if(R.v==="wallets")renderWallets();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
+if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="market")renderMarket();else if(R.v==="wallets")renderWallets();else if(R.v==="pools")renderPools();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
 $("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false})}
 function schedule(){if(!pending){pending=true;setTimeout(()=>{pending=false;render()},300)}}
 function fill(f,isNew){const li=document.createElement("li");if(isNew)li.className="new";
@@ -1237,6 +1316,7 @@ S.shortsEnabled=!!d.shorts_enabled;S.marketEnabled=!!d.market_enabled;S.canary=!
 es.addEventListener("shorts",e=>{S.shorts=JSON.parse(e.data);schedule()});
 es.addEventListener("market",e=>{S.market=JSON.parse(e.data);schedule()});
 es.addEventListener("wallets",e=>{S.wallets=JSON.parse(e.data);schedule()});
+es.addEventListener("pools",e=>{S.pools=JSON.parse(e.data);schedule()});
 es.addEventListener("delta",e=>{merge(JSON.parse(e.data));schedule()});
 es.addEventListener("summary",e=>{S.extra=JSON.parse(e.data);const d=S.extra.downtime;$("foot").textContent=d?`${d.outages} outages, ${fmt(d.hours_offline,1)} h offline since start`:"";schedule()});
 es.addEventListener("backlog",e=>{$("feed").innerHTML="";JSON.parse(e.data).forEach(f=>fill(f,false))});

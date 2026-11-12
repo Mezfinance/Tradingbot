@@ -337,3 +337,40 @@ def test_fetch_wallets_adds_balances_and_tx_counts_and_keeps_last_on_failure(cfg
     assert round(w["trading_sol"], 3) == 0.65
     board.fetch_wallets(lambda m, p: (_ for _ in ()).throw(RuntimeError("boom")))  # a failed read keeps the data
     assert board.wallets["stale"] is True and "boom" in board.wallets["error"]
+
+
+def _tok_acct(amount):
+    import base64
+    raw = bytearray(165)
+    raw[64:72] = int(amount).to_bytes(8, "little")
+    return {"data": [base64.b64encode(bytes(raw)).decode(), "base64"]}
+
+
+def test_fetch_pools_joins_feints_to_the_scorer_and_reads_young_reserves(cfg):
+    from tradingbot import launch_live
+    from tradingbot.watcher import WatchStore
+    cfg.launch_book = cfg.launch_live = cfg.launch_canary = cfg.launch_sized_book = True
+    now = time.time()
+    j = Journal(":memory:")
+    _feint(j, "canary_rw50_sz", "MintY", "alive", pool="PoolY", sol_before=70.0, sol_after=72.0)
+    store = WatchStore(":memory:")
+    launch_live.ensure_schema(store)
+    store.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, decided_ts, liquid, liq_usd, "
+                  "sol_at_decide, peak_sol, sol_vault, token_vault, exit_px, pulled_ts, ret, status) "
+                  "VALUES(?,?,?,?,1,?,?,?,?,?,?,?,?,?)",
+                  ("PoolY", "MintY", now - 300, now - 296, 14000.0, 70.0, 140.0, "sv", "tv", None, None, 0.2, "scored"))
+    store.execute("INSERT INTO watch_market(ts, sol_usd) VALUES(?, ?)", (now - 10, 100.0))
+    board = dash.Dashboard(j, cfg, store)
+
+    rpc = lambda m, p: {"value": [_tok_acct(90_000_000_000), _tok_acct(1_000_000_000_000)]}  # 90 SOL, 1e12 tok
+    board.fetch_pools(rpc)
+    rows = board.pools["rows"]
+    assert len(rows) == 1
+    r = rows[0]
+    assert r["liq_probe"] == 14000.0 and round(r["pnl25"], 1) == 5.0   # $25 * 0.2
+    assert round(r["peak_liq"]) == 28000                               # liq_usd * peak_sol/sol_at_decide
+    assert round(r["live_liq"]) == 18000                               # 2 * 90 * 100 from the live read
+    assert board.pools["summary"]["pools"] == 1 and board.pools["stale"] is False
+
+    board.fetch_pools(lambda m, p: (_ for _ in ()).throw(RuntimeError("rpc down")))
+    assert board.pools["stale"] is True and "rpc down" in board.pools["error"] and board.pools["rows"]

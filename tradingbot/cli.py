@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -129,6 +129,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--rps", type=float, default=2.0,
                         help="launch-hist-backfill: Helius calls per second (the live scorer shares the plan's limit)")
     parser.add_argument("--json", action="store_true", help="report: print raw JSON")
+    parser.add_argument("--no-live", action="store_true", help="pool-tracker: skip the live reserve read (scorer data only)")
     parser.add_argument("--workers", type=int, default=8, help="history-backfill: parallel Helius calls")
     parser.add_argument("--estimate", action="store_true", help="history-backfill: list the pools and the credits only")
     parser.add_argument("--relist", action="store_true",
@@ -671,6 +672,20 @@ def main(argv: list[str] | None = None) -> None:
         out = sz_stops.study(_SsWS(_ss_wdp(cfg)), _SsJournal(cfg.db_path), book=args.book, hours=args.hours,
                              helius=ss_helius, max_credits=int(args.max_credits or 15_000))
         print(json.dumps(out, indent=2, default=str) if args.json else sz_stops.render(out))
+        return
+
+    if args.command == "pool-tracker":  # live state of every pool the canary has feinted (11-12)
+        from tradingbot import dashboard as _pt_dash
+        from tradingbot import pool_tracker as _pt
+        from tradingbot.journal import Journal as _PtJournal
+        from tradingbot.watcher import WatchStore as _PtWS, watch_db_path as _pt_wdp
+        _pt_rpc = None if args.no_live else (lambda m, p: _pt_dash._solana_rpc(_pt_dash.WALLETS_RPC, m, p))
+        rows, su = _pt.rows_for(_PtJournal(cfg.db_path).query, _PtWS(_pt_wdp(cfg)).query,
+                                hours=args.hours or (_pt.TRACK_WINDOW_S / 3600), rpc=_pt_rpc)
+        if args.json:
+            print(json.dumps({"rows": rows, "summary": _pt.summary(rows), "sol_usd": su}, indent=2, default=str))
+        else:
+            print(_pt.render(rows, su))
         return
 
     if args.command == "canary-trades":  # every real canary trade + the pool path after our buy (11-10)
