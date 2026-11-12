@@ -836,6 +836,8 @@ class Engine:
             verdict = book.executor.feint(sig["mint"], c.launch_canary_feint_usd)
             self.journal.log_event("canary_feint", sig["mint"], json.dumps(
                 {"verdict": verdict, **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
+            if c.launch_canary_feint_only:  # measurement run: feint every pool, never commit
+                return f"feint only: pool {verdict}"
             if verdict != "alive":
                 return f"feint: pool {verdict}"
         fill = book.executor.buy(sig["mint"], usd, trigger)

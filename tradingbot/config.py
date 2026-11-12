@@ -117,6 +117,7 @@ class Config:
     launch_canary_feint_wait_s: float = 4.0  # wait after the feint before re-reading the pool (the $25 reaction is ~1s)
     launch_canary_feint_drop_pct: float = 50.0  # SOL-vault drop vs before the feint that counts as 'pulled'
     launch_canary_feint_hold_s: float = 0.0  # 0 = atomic buy+sell in one tx (never hold); > 0 = buy, hold, then sell
+    launch_canary_feint_only: bool = False  # run the feint but never commit: measure the feint's pull-trigger rate only
     # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
     launch_fast_canary: bool = False  # REAL MONEY: buy on detection, before the scorer's second-4 decide
