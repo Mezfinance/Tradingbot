@@ -130,11 +130,13 @@ class Config:
     launch_canary_probe_usd: float = 25.0  # the probe size; must be big enough to trip the size-reacting operators
     launch_canary_probe_watch_s: float = 48.0  # watch the pool this long after the probe (the measured max $25 pull age)
     launch_canary_probe_margin_s: float = 12.0  # extra margin on the watch before calling a pool a survivor
-    launch_canary_probe_blind: bool = True  # fire the probe's SELL blind, the instant the buy is sent, WITHOUT waiting
-    # for the buy to be visible -- removes the observe-lag that pins the slot gap at >=2 (races for N+1 or N). The risk
-    # is the sell reaching the leader before the buy lands -> tokens don't exist yet -> the sell reverts (a signature
-    # lands once, so a reverted sell is dead); a confirmed fallback sell then recovers the stake. False = the old
-    # observe-lag path (wait for the buy, then sell). Measures `blind_reverted` so the revert rate can be read.
+    launch_canary_probe_blind: bool = False  # fire the probe's SELL blind, the instant the buy is sent, without waiting
+    # for the buy to be visible. OFF by default (11-13): blind reliably lands buy+sell in the SAME block (gap 0), which
+    # is net-zero at the slot boundary -- so a rugger polling the pool's committed reserves reads it exactly like the
+    # atomic feint (the money never persists as a readable committed state), undercutting the probe's whole purpose. The
+    # observe-lag path (blind off) lands committed money readable for a full slot or two before the pull -- which trips a
+    # state-watcher AND still escapes the ~18s reactive pull -- and never reverts. True = the blind race (+ a confirmed
+    # fallback sell on a revert); it only helps if sub-2-slot fast ruggers exist, and the data says they don't.
     launch_canary_probe_priority_sol: float = 0.0  # the probe's SELL can pay this much priority outright (max out, not
     # the capped estimate) to try to land in the next slot. OFF by default (0 = normal priority): a live test (11-12)
     # showed the gap stays 2-3 whether or not it is paid -- the gap is set by the observe-lag (we wait for the buy to be

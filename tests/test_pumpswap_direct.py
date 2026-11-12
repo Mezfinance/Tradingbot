@@ -342,6 +342,7 @@ def test_probe_1slot_sim_gate_blocks_a_honeypot_before_committing():
 
 def test_probe_1slot_blind_sell_reverts_then_the_confirmed_fallback_recovers():
     ex, rpc = probe_direct()
+    ex.cfg.launch_canary_probe_blind = True  # the blind race (off by default); exercise its fallback path
     rpc.bal[MINT] = 12_000_000  # the buy's tokens are in the wallet after it lands
     # buy lands (slot 100); the blind sell fired before the buy landed and reverted (slot 101); the confirmed fallback
     # sell (slot 102) then sells the tokens and recovers the SOL -- the backup that makes blind-fire safe.
@@ -356,6 +357,7 @@ def test_probe_1slot_blind_sell_reverts_then_the_confirmed_fallback_recovers():
 
 def test_probe_1slot_trapped_when_the_blind_sell_and_the_fallback_both_revert():
     ex, rpc = probe_direct()
+    ex.cfg.launch_canary_probe_blind = True  # the blind race (off by default)
     rpc.bal[MINT] = 12_000_000
     # buy lands, the blind sell reverts, and the confirmed fallback ALSO reverts (pool drained) -> the stake is stuck.
     rev = lambda: sol_meta(ex.owner, (12_000_000, 12_000_000), -5_000, err={"InstructionError": [6, {"Custom": 6004}]})
