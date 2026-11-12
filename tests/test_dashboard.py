@@ -481,3 +481,66 @@ def test_canary_settings_endpoint_is_behind_the_password(cfg, tmp_path, monkeypa
         assert code == 200 and cfg.launch_canary_clips == 5 and json.loads(body)["preset"] == "clips"
     finally:
         server.shutdown()
+
+
+def test_fly_deploy_reports_when_no_command_is_available(cfg, tmp_path, monkeypatch):
+    cfg.db_path = str(tmp_path / "j.db")
+    monkeypatch.setattr(dash, "_deploy_command", lambda: None)
+    res = dash.fly_deploy(cfg)
+    assert res["started"] is False and "git pull" in res["msg"]
+    assert dash.deploy_log(cfg)["command"] is None and dash.deploy_log(cfg)["running"] is False
+
+
+def test_fly_deploy_launches_the_configured_command(cfg, tmp_path, monkeypatch):
+    dash._DEPLOY.update(proc=None, started=0.0)
+    cfg.db_path = str(tmp_path / "j.db")
+    monkeypatch.setattr(dash, "_deploy_command", lambda: ["fly", "deploy", "--detach", "-a", "supermeme"])
+
+    class FakeProc:
+        done = False
+        returncode = 0
+
+        def poll(self):
+            return 0 if self.done else None
+
+    fp = FakeProc()
+    calls = {}
+
+    def fake_popen(cmd, **kw):
+        calls["cmd"] = cmd
+        kw["stdout"].write("deploying…\n")
+        return fp
+
+    monkeypatch.setattr(dash.subprocess, "Popen", fake_popen)
+    res = dash.fly_deploy(cfg)
+    assert res["started"] is True and calls["cmd"][:2] == ["fly", "deploy"]
+    lg = dash.deploy_log(cfg)
+    assert lg["running"] is True and "deploying" in lg["log"] and lg["command"].startswith("fly deploy")
+    assert dash.fly_deploy(cfg)["started"] is False  # refused while one runs
+    fp.done = True
+    assert dash.deploy_log(cfg)["running"] is False and dash.deploy_log(cfg)["returncode"] == 0
+    dash._DEPLOY.update(proc=None, started=0.0)
+
+
+def test_deploy_endpoint_is_behind_the_password(cfg, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
+    cfg.health_port = 18775
+    j = Journal(":memory:")
+    board = dash.Dashboard(j, cfg)
+    board.refresh()
+    monkeypatch.setattr(dash, "fly_deploy", lambda c: {"started": True, "msg": "ok"})
+    server = health.start_health_server(j, cfg, board)
+
+    def req(method, path, cookie=None):
+        c = http.client.HTTPConnection("127.0.0.1", 18775, timeout=5)
+        c.request(method, path, headers={"Cookie": cookie} if cookie else {})
+        r = c.getresponse()
+        return r.status, r.read()
+    try:
+        assert req("POST", "/api/deploy")[0] == 401                     # no password
+        assert req("GET", "/api/deploy/log")[0] == 401
+        code, body = req("POST", "/api/deploy", cookie="tb_dash=s3cret")
+        assert code == 200 and json.loads(body)["started"] is True
+        assert req("GET", "/api/deploy/log", cookie="tb_dash=s3cret")[0] == 200
+    finally:
+        server.shutdown()

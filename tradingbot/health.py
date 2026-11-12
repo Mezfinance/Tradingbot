@@ -142,7 +142,8 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 return
             from tradingbot import dashboard as dash
             if dashboard is None or not dash.token() or path not in (
-                    "/", "/api/stream", "/api/summary", "/api/canary/rotate/log", "/api/canary/settings"):
+                    "/", "/api/stream", "/api/summary", "/api/canary/rotate/log", "/api/canary/settings",
+                    "/api/deploy/log"):
                 self.send_error(404)
                 return
             if not dash.authorised(self.headers, query):
@@ -154,6 +155,9 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 return
             if path == "/api/canary/settings":  # current canary settings + presets for the menu
                 self._send(200, json.dumps(dash.canary_settings_menu(cfg)).encode(), "application/json")
+                return
+            if path == "/api/deploy/log":  # progress of a running deploy
+                self._send(200, json.dumps(dash.deploy_log(cfg)).encode(), "application/json")
                 return
             if query.get("key"):  # remember the key in a cookie, then drop it from the address bar
                 cookie = f"{dash.COOKIE}={query['key'][0]}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Strict"
@@ -183,7 +187,8 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
             path, query = url.path.rstrip("/") or "/", parse_qs(url.query)
             from tradingbot import dashboard as dash
             if dashboard is None or not dash.token() or path not in (
-                    "/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/settings"):
+                    "/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/settings",
+                    "/api/deploy"):
                 self.send_error(404)
                 return
             if not dash.authorised(self.headers, query):
@@ -192,7 +197,9 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
             length = int(self.headers.get("Content-Length") or 0)
             body = self.rfile.read(length) if length else b""
             try:
-                if path == "/api/canary/settings":
+                if path == "/api/deploy":
+                    res = dash.fly_deploy(cfg)
+                elif path == "/api/canary/settings":
                     res = dash.canary_settings_update(cfg, journal, json.loads(body or b"{}"))
                     log.info("dashboard canary settings: %s", {k: v["to"] for k, v in res.get("changed", {}).items()})
                 elif path == "/api/canary/rotate":

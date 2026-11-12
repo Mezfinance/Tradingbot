@@ -164,7 +164,9 @@ def canary_rotate(journal, cfg, wallets, sol) -> dict:
 
 def canary_settings_menu(cfg) -> dict:
     from tradingbot import canary_settings
-    return {**canary_settings.menu(cfg), "overlay": bool(canary_settings.load_overlay(cfg))}
+    cmd = _deploy_command()
+    return {**canary_settings.menu(cfg), "overlay": bool(canary_settings.load_overlay(cfg)),
+            "deploy_cmd": " ".join(cmd) if cmd else None}
 
 
 def canary_settings_update(cfg, journal, body: dict) -> dict:
@@ -183,6 +185,71 @@ def canary_settings_update(cfg, journal, body: dict) -> dict:
         res["preset"] = name
         return res
     return canary_settings.apply(cfg, journal, body.get("changes") or {})
+
+
+_DEPLOY = {"proc": None, "started": 0.0}
+_DEPLOY_LOCK = threading.Lock()
+
+
+def _deploy_command() -> list[str] | None:
+    """The command the Deploy button runs: `TB_DEPLOY_CMD` if the operator set it, else `fly deploy --detach` only
+    when a fly/flyctl binary is actually on this machine. None = no way to deploy from here (the normal case)."""
+    cmd = os.environ.get("TB_DEPLOY_CMD", "").strip()
+    if cmd:
+        import shlex
+        return shlex.split(cmd)
+    import shutil
+    for exe in ("fly", "flyctl"):
+        path = shutil.which(exe)
+        if path:
+            app = os.environ.get("FLY_APP_NAME") or "supermeme"
+            return [path, "deploy", "--detach", "-a", app]
+    return None
+
+
+def _deploy_log_path(cfg) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(cfg.db_path)), "deploy.log")
+
+
+def fly_deploy(cfg) -> dict:
+    """Run the deploy command on this machine (best effort, detached) so it survives the machine being replaced.
+    `fly deploy` from inside the machine it replaces is awkward: it needs a fly token + the build context on the
+    machine, and the rollout tears this process down, so `--detach` lets flyctl submit and exit. Normally you
+    deploy from your Mac (`git pull && fly deploy`)."""
+    cmd = _deploy_command()
+    if cmd is None:
+        return {"started": False, "msg": "No deploy command on this machine. Run `git pull && fly deploy` from your "
+                "Mac, or set the TB_DEPLOY_CMD secret (and a fly token) to enable this button."}
+    with _DEPLOY_LOCK:
+        p = _DEPLOY["proc"]
+        if p is not None and p.poll() is None:
+            return {"started": False, "msg": "A deploy is already running."}
+        with open(_deploy_log_path(cfg), "w") as fh:
+            fh.write("$ " + " ".join(cmd) + "\n\n")
+            proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT, start_new_session=True,
+                                    cwd=os.environ.get("TB_DEPLOY_DIR") or None, env={**os.environ})
+        _DEPLOY.update(proc=proc, started=time.time())
+    log.info("dashboard: deploy started (%s)", " ".join(cmd))
+    return {"started": True, "cmd": " ".join(cmd),
+            "msg": "Deploy started. The machine restarts when it lands, so this page will disconnect — reload in a "
+                   "minute or two."}
+
+
+def deploy_log(cfg, lines: int = 400) -> dict:
+    with _DEPLOY_LOCK:
+        p = _DEPLOY["proc"]
+        running = p is not None and p.poll() is None
+        code = None if (p is None or running) else p.returncode
+        started = _DEPLOY["started"]
+    text = ""
+    try:
+        with open(_deploy_log_path(cfg)) as fh:
+            text = "".join(fh.readlines()[-lines:])
+    except OSError:
+        pass
+    cmd = _deploy_command()
+    return {"running": running, "returncode": code, "log": text, "started": started,
+            "command": " ".join(cmd) if cmd else None}
 
 
 def rotate_log(cfg, lines: int = 400) -> dict:
@@ -1007,6 +1074,10 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <section class="card"><p class="label eyebrow">Presets</p><h2>Modes</h2><p class="sub">Each applies a coherent set of settings. You are asked to confirm before anything changes.</p><div id="cs-presets" class="stats"></div></section>
 <div id="cs-groups"></div>
 <section class="card"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center"><button id="cs-save" onclick="canarySave()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Save changes</button><button onclick="canaryReset()" style="padding:9px 20px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);cursor:pointer;font:inherit;font-weight:700">Reset to deploy settings</button><span class="sub" id="cs-dirty"></span></div></section>
+<section class="card"><p class="label eyebrow">Deploy</p><h2>Deploy the bot</h2>
+<p class="sub">Runs the deploy command on this machine (if one is configured) and restarts it — <b>this page will disconnect</b>; reload in a minute. Normally you deploy from your Mac with <code>git pull &amp;&amp; fly deploy</code>. Restart-only settings above (route, budget, fees) take effect on the next deploy.</p>
+<div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:4px 0 10px"><button id="dep-go" onclick="flyDeploy()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">fly deploy</button><span class="sub mono" id="dep-cmd"></span></div>
+<pre id="dep-log" hidden style="white-space:pre-wrap;word-break:break-word;background:var(--sunken);border:2px solid var(--rule-soft);padding:10px;max-height:320px;overflow:auto;font:500 12px/1.5 var(--mono)"></pre></section>
 </main>
 <main id="v-ledger" hidden>
 <div><p class="label eyebrow">Every trade of the running books</p><h1>Trade ledger</h1>
@@ -1401,10 +1472,12 @@ function renderSettings(){const note=$("cs-note");
 if(!S.cset){if(!S.csetLoading){S.csetLoading=true;fetch("api/canary/settings").then(r=>r.json()).then(d=>{S.cset=d;S.csetLoading=false;csBuilt=false;render()}).catch(e=>{S.csetLoading=false;note.innerHTML='<p class="note neg">Could not load settings: '+esc(""+e)+'</p>'})}
 if(!note.innerHTML)note.innerHTML='<p class="note">Loading settings…</p>';$("cs-presets").innerHTML="";$("cs-groups").innerHTML="";return}
 if(csBuilt){csDirty();return}  // don't rebuild inputs under the user (background re-renders would wipe edits)
-const C=S.cset;if(C.overlay&&!note.dataset.kept)note.innerHTML='<p class="note">Showing saved settings (a dashboard override is active; Reset returns to the deploy values).</p>';
+const C=S.cset;if(!note.dataset.kept)note.innerHTML=C.overlay?'<p class="note">Showing saved settings (a dashboard override is active; Reset returns to the deploy values).</p>':'';
 $("cs-presets").innerHTML=Object.entries(C.presets).map(([k,p])=>`<button onclick="csPreset('${k}')" class="stat" style="text-align:left;border:2px solid var(--rule);cursor:pointer;background:var(--surface)"><span class="label">${esc(p.label)}</span><span class="h" style="white-space:normal">${esc(p.about)}</span></button>`).join("");
 $("cs-groups").innerHTML=C.groups.map(g=>{const fs=C.fields.filter(f=>f.group===g);return`<section class="card"><p class="label eyebrow">${esc(g)}</p><h2>${esc(g)}</h2>${fs.map(csField).join("")}</section>`}).join("");
-$("cs-groups").oninput=csDirty;$("cs-groups").onchange=csDirty;csBuilt=true;csDirty()}
+$("cs-groups").oninput=csDirty;$("cs-groups").onchange=csDirty;
+$("dep-cmd").textContent=C.deploy_cmd?("will run: "+C.deploy_cmd):"no deploy command on this machine — deploy from your Mac";
+$("dep-go").disabled=!C.deploy_cmd;csBuilt=true;csDirty()}
 function csDiff(){const out={};for(const f of S.cset.fields){const v=csVal(f),c=S.cset.current[f.key];if(f.type==="bool"?(!!v!==!!c):(""+v!==""+c))out[f.key]={f,to:v,from:c}}return out}
 function csDirty(){const d=csDiff(),n=Object.keys(d).length;$("cs-dirty").textContent=n?n+" unsaved change"+(n>1?"s":""):"No unsaved changes"}
 function csFmt(f,v){return f.type==="bool"?(v?"on":"off"):""+v}
@@ -1425,6 +1498,12 @@ const rb=(j.restart_needed||[]);$("cs-note").dataset.kept=1;$("cs-note").innerHT
 .catch(e=>{$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">Could not apply: '+esc(""+e)+'</p>'})}
 function canaryReset(){if(!confirm("Reset every canary setting to the deploy (fly.toml) values and clear the dashboard override?"))return;
 fetch("api/canary/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reset:true})}).then(r=>r.json()).then(j=>{const cur={};S.cset.fields.forEach(f=>cur[f.key]=j.values[f.key]);S.cset.current=cur;S.cset.overlay=false;$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note">'+esc(j.msg||"Reset.")+'</p>';csBuilt=false;render()}).catch(e=>{$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">Could not reset: '+esc(""+e)+'</p>'})}
+function flyDeploy(){const cmd=(S.cset&&S.cset.deploy_cmd)||null;
+if(!cmd){alert("No deploy command on this machine. Deploy from your Mac with:\n\n  git pull && fly deploy");return}
+if(!confirm("Deploy now?\n\nThis runs:\n  "+cmd+"\n\nThe machine will restart and this page will disconnect. Reload in a minute or two."))return;
+const go=$("dep-go");go.disabled=true;$("dep-log").hidden=false;$("dep-log").textContent="Starting deploy…";
+fetch("api/deploy",{method:"POST"}).then(r=>r.json()).then(d=>{if(d&&d.started){$("dep-log").textContent=(d.msg||"Started.")+"\n\n";pollDeploy()}else{go.disabled=false;$("dep-log").textContent=(d&&d.msg)||"Could not start the deploy."}}).catch(e=>{go.disabled=false;$("dep-log").textContent="Could not reach the deploy endpoint: "+e})}
+function pollDeploy(){fetch("api/deploy/log").then(r=>r.json()).then(d=>{$("dep-log").textContent=(d.log||"(no output yet)")+(d.running?"\n\n… deploying …":d.returncode===0?"\n\n✓ Submitted. The machine is restarting — reload this page shortly.":"\n\n✗ Deploy exited with code "+d.returncode+".");const lg=$("dep-log");lg.scrollTop=lg.scrollHeight;if(d.running)setTimeout(pollDeploy,2000);else $("dep-go").disabled=false}).catch(()=>{$("dep-log").textContent+="\n\n(connection lost — the machine is likely restarting. Reload the page in a minute.)"})}
 function renderPools(){const P=S.pools,note=$("p-note");
 if(!P){note.innerHTML='<p class="note">Loading pool reserves…</p>';["p-tiles","p-tbl"].forEach(i=>$(i).innerHTML="");return}
 const s=P.summary||{},rows=P.rows||[];const when=P.fetched_ts?agoStr(Math.max(0,Math.round(Date.now()/1000-P.fetched_ts)))+" ago":"–";

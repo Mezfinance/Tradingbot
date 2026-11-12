@@ -1,6 +1,0 @@
-{
- "launch_canary_flat_usd": 5.0,
- "launch_canary_clips": 5,
- "launch_canary_max_trades": 10,
- "launch_canary_route": "direct"
-}

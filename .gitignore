@@ -9,3 +9,7 @@ __pycache__/
 keypair.json
 backups/
 canary_pools.json
+canary_settings.json
+canary_rotation.json
+provision.log
+deploy.log
