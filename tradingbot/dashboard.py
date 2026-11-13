@@ -1835,8 +1835,13 @@ if(hk.length){$("p-hold-card").style.display="";$("p-hold").innerHTML='<tr><th c
 const f=($("p-filter")||{}).value||"all";$("p-filter").onchange=render;
 const show=rows.filter(r=>f==="survivor"?r.watch_verdict==="survivor":f==="rugger"?r.watch_verdict==="rugger":f==="alive"?r.verdict==="alive":f==="pulled"?r.pulled:f==="live"?(r.pool_age_s!=null&&r.pool_age_s<1500&&!r.pulled):f==="win"?(r.pnl25!=null&&r.pnl25>0):true);
 $("p-tbl").innerHTML=`<tr><th class="l">Pool</th><th>Wallet</th><th>Verdict</th><th>Age</th><th>Probe@</th><th>Liq</th><th>Live</th><th>Peak</th><th>Pulled@</th><th>+probe</th><th>$25 @ m6</th><th>Enter @conf</th><th>Best entry</th></tr>`+(show.length?show.map(poolRow).join(""):`<tr><td class="muted">No feinted pools in the window yet.</td></tr>`)}
-function render(){renderHealth();renderFeints();if(!S.books.length)return;
-if(R.v==="programs")renderPrograms();else if(R.v==="shorts")renderShorts();else if(R.v==="market")renderMarket();else if(R.v==="wallets")renderWallets();else if(R.v==="pools")renderPools();else if(R.v==="settings")renderSettings();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
+function render(){renderHealth();renderFeints();
+// The pool tracker / wallets / market / shorts / canary settings views do NOT depend on the books list, so they
+// must render even before (or without) books -- gating them on S.books left the Pools tab blank when books were
+// empty while the probe card (its own poller) still showed. Only the book-heavy views wait for books.
+if(R.v==="pools")renderPools();else if(R.v==="wallets")renderWallets();else if(R.v==="market")renderMarket();else if(R.v==="shorts")renderShorts();else if(R.v==="settings")renderSettings();
+else if(!S.books.length){$("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false});return}
+else if(R.v==="programs")renderPrograms();else if(R.v==="ledger")renderLedger();else if(R.v==="books")renderFams();else if(R.v==="book")renderBook(R.arg);else if(R.v==="family")renderFamily(R.arg);else renderOverview();
 $("built").textContent="Updated "+new Date().toLocaleTimeString([],{hour12:false})}
 function schedule(){if(!pending){pending=true;setTimeout(()=>{pending=false;render()},300)}}
 function fill(f,isNew){const li=document.createElement("li");if(isNew)li.className="new";
