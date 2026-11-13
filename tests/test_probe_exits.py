@@ -91,6 +91,29 @@ def test_decline_exit_sweep_reports_rug_dodge_and_clip():
     assert c["vs_hold"] is not None
 
 
+def test_vol_stall_exit_bails_a_flat_pool_but_not_a_pumping_one():
+    # flat-then-rug: ran up, then went dead flat ~1.30 for a full 20s window before the pull at 48s
+    flat_rug = _e([(5, 1.10), (15, 1.30), (25, 1.30), (35, 1.30), (45, 1.30)], pull=48)
+    r = pe._vol_stall_ret(flat_rug, step=5, win=20, thr=0.05, hold=50)
+    assert r > -1.0 and r < 0.30                                # sold on the flat, before the pull (not -100%)
+    # still pumping: makes new highs through the window -> never flat -> rides to the exit
+    pumping = _e([(5, 1.10), (15, 1.30), (25, 1.55), (45, 1.70)])
+    assert pe._vol_stall_ret(pumping, step=5, win=20, thr=0.05, hold=50) == pe._hold_ret(pumping, 50)
+
+
+def test_vol_stall_exit_sweep_reports_rug_dodge_and_clip():
+    survs = [
+        _e([(5, 1.10), (15, 1.30), (25, 1.30), (35, 1.30), (45, 1.30)], pull=48),   # flat-before-pull (dodged)
+        _e([(5, 1.05), (10, 1.06)], pull=15),                                        # one-slot rug (missed: no flat)
+        _e([(5, 1.10), (15, 1.30), (25, 1.55), (45, 1.70)]),                         # clean climber (winner)
+    ]
+    out = {(t["window_s"], t["thr_pct"]): t
+           for t in pe.vol_stall_exit(survs, steps=(5,), windows=(20,), thrs=(0.05,), hold=50)}
+    c = out[(20, 0.05)]
+    assert c["ruggers"] == 2 and c["rug_dodge"] == 0.5          # dodged the flat-then-pull, not the one-slot rug
+    assert c["winners"] >= 1 and c["clip"] == 0.0               # did not clip the still-pumping climber
+
+
 def test_pull_distribution_finds_the_safe_window():
     survs = [{"pull_after_conf": None}, {"pull_after_conf": 200.0}, {"pull_after_conf": 400.0}]
     d = pe.pull_distribution(survs)

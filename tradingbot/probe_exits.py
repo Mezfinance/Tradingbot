@@ -269,6 +269,7 @@ def climb_gate(survs: list[dict], checks=CLIMB_CHECKS_S, gains=CLIMB_GAINS, hold
 POLL_STEP_S = (5, 10, 15)          # poll cadence (s); a step finer than the path's sample spacing adds nothing
 DECLINE_N = (2, 3, 4)              # consecutive down polls that trigger a sell
 DECLINE_MIN_DROP = (0.0, 0.03, 0.05)  # minimum cumulative drop over the run (a tick-noise guard)
+STALL_WINDOW_S = (15, 20, 30)     # trailing window (s) over which the rolling volatility range is measured
 
 
 def _poll_price(series: list[tuple[float, float]], t: float) -> float:
@@ -319,6 +320,56 @@ def decline_exit(survs: list[dict], steps=POLL_STEP_S, ns=DECLINE_N, drops=DECLI
                 clipped = sum(1 for i in winners if rets[i] < holds[i] - 1e-9)
                 out.append({
                     "step_s": step, "n": n, "min_drop_pct": d, "ret": _dist(rets),
+                    "vs_hold": (sum(rets) - sum(holds)) / len(survs) if survs else None,
+                    "ruggers": len(ruggers), "rug_dodge": (dodged / len(ruggers)) if ruggers else None,
+                    "winners": len(winners), "clip": (clipped / len(winners)) if winners else None})
+    return out
+
+
+def _vol_stall_ret(e: dict, step: float, win: float, thr: float, hold: float = CLIMB_HOLD_S) -> float:
+    """Poll every `step` s from entry; sell when the rolling peak-to-trough range over the last `win` s
+    falls below `thr` -- the wash bot going flat before the pull. This is the entry volatility filter
+    (``conf_range``) applied rolling during the hold: it fires on a *flat* stretch, the shape the 30%
+    trailing stop misses (no down-tick). -100% if the pool pulls before it fires; ride to `hold` else."""
+    pull = e["pull_after_conf"]
+    series = e["series"]
+    window: list[tuple[float, float]] = []
+    t = step
+    while t <= hold:
+        if pull is not None and pull <= t:
+            return -1.0  # the pull already landed by this poll
+        m = _poll_price(series, t)
+        window.append((t, m))
+        while len(window) > 1 and window[0][0] < t - win:
+            window.pop(0)
+        if t >= win:  # a full window has elapsed since entry
+            lo = min(x for _, x in window)
+            hi = max(x for _, x in window)
+            if lo > 0 and (hi - lo) / lo < thr:
+                return _clamp(m - 1.0 - COST)  # stalled flat: sell here, before any pull
+        t += step
+    return _hold_ret(e, hold)              # never fired: hold to the end
+
+
+def vol_stall_exit(survs: list[dict], steps=POLL_STEP_S, windows=STALL_WINDOW_S, thrs=VOL_GRID,
+                   hold: float = CLIMB_HOLD_S) -> list[dict]:
+    """Per (poll cadence, window, volatility threshold): the exit's return distribution, its edge over
+    hold-to-`hold` (``vs_hold``), the share of would-be ruggers it dodges (``rug_dodge``), and the share
+    of hold-to-`hold` winners it clips early (``clip``). Re-uses the entry gate's range measure, rolling,
+    so it catches the flat-before-a-pull the trailing stop misses; a high rug-dodge here is the signal."""
+    holds = [_hold_ret(e, hold) for e in survs]
+    ruggers = [i for i, e in enumerate(survs)
+               if e["pull_after_conf"] is not None and e["pull_after_conf"] <= hold]
+    winners = [i for i, h in enumerate(holds) if h > 0]
+    out = []
+    for step in steps:
+        for win in windows:
+            for thr in thrs:
+                rets = [_vol_stall_ret(e, step, win, thr, hold) for e in survs]
+                dodged = sum(1 for i in ruggers if rets[i] > -1.0)
+                clipped = sum(1 for i in winners if rets[i] < holds[i] - 1e-9)
+                out.append({
+                    "step_s": step, "window_s": win, "thr_pct": thr, "ret": _dist(rets),
                     "vs_hold": (sum(rets) - sum(holds)) / len(survs) if survs else None,
                     "ruggers": len(ruggers), "rug_dodge": (dodged / len(ruggers)) if ruggers else None,
                     "winners": len(winners), "clip": (clipped / len(winners)) if winners else None})
@@ -483,6 +534,8 @@ def study(journal, store, cfg=None, hours: float = 24.0, helius=None, max_credit
             "climb_gate": climb_gate(with_path),
             "decline": decline_exit(with_path),
             "kept_decline": decline_exit(kept),
+            "stall": vol_stall_exit(with_path),
+            "kept_stall": vol_stall_exit(kept),
             "rows": survs}
 
 
@@ -675,6 +728,21 @@ def render(r: dict) -> str:
         for t in rows:
             s = t["ret"]
             o.append(f"  {t['step_s']:>4}s {t['n']:>2} {t['min_drop_pct'] * 100:>4.0f}% "
+                     f"{_pct(s.get('mean')):>8} {_pct(s.get('median')):>8} {_pct(s.get('win'), 0):>6} "
+                     f"{_pct(t.get('vs_hold')):>8} {_pct(t.get('rug_dodge'), 0):>10} "
+                     f"{_pct(t.get('clip'), 0):>6} {s['n']:>4}")
+
+    for key, title in (("stall", "ALL SURVIVORS"), ("kept_stall", f"ENTRY-FILTERED (range >= {r['kept_vol_pct'] * 100:.1f}%)")):
+        rows = r.get(key) or []
+        if not rows:
+            continue
+        o.append(f"\nVOLATILITY STALL EXIT, {title} (the entry vol filter rolling; sell when the range over the "
+                 f"window drops below thr -- the flat before a pull; ride to {CLIMB_HOLD_S // 60}m else)")
+        o.append(f"  {'poll':>5} {'win':>4} {'thr':>5} {'mean':>8} {'median':>8} {'win':>6} "
+                 f"{'vs hold':>8} {'rug dodge':>10} {'clip':>6} {'N':>4}")
+        for t in rows:
+            s = t["ret"]
+            o.append(f"  {t['step_s']:>4}s {t['window_s']:>3.0f}s {t['thr_pct'] * 100:>4.1f}% "
                      f"{_pct(s.get('mean')):>8} {_pct(s.get('median')):>8} {_pct(s.get('win'), 0):>6} "
                      f"{_pct(t.get('vs_hold')):>8} {_pct(t.get('rug_dodge'), 0):>10} "
                      f"{_pct(t.get('clip'), 0):>6} {s['n']:>4}")

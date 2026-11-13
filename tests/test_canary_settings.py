@@ -61,6 +61,7 @@ def test_two_stage_preset_turns_on_the_entry_with_the_probe(tmp_path):
     assert cfg.launch_canary_entry_usd == 25.0 and cfg.launch_canary_vol_gate and cfg.launch_canary_vol_min_pct == 5.0
     assert cfg.launch_canary_exit_min == 6.0
     assert cfg.launch_canary_climb_check_s == 0.0 and cfg.launch_canary_trail_pct == 30.0  # climb off, 30% trailing stop
+    assert cfg.launch_canary_stall_window_s == 20.0  # + the rolling-volatility stall exit (flat-before-pull)
 
 
 def test_coherent_rejects_entering_without_the_probe(tmp_path):

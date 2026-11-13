@@ -161,6 +161,8 @@ class Config:
     launch_canary_climb_check_s: float = 60.0  # run the climb check this many seconds after entry
     launch_canary_climb_min_gain_pct: float = 0.0  # at the check, keep only if up at least this % (else bail), then ride
     launch_canary_trail_pct: float = 30.0  # trailing stop: sell when the pool price falls this % off its running peak (0 = off)
+    launch_canary_stall_window_s: float = 0.0  # stall exit: sell when the rolling peak-to-trough range over this trailing
+    # window falls below launch_canary_vol_min_pct (the wash bot stalling flat before a pull); 0 = off. Re-uses the vol gate
     launch_canary_exit_min: float = 6.0  # sell the held position at this pool minute (the hold-to-m6 exit)
     # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.

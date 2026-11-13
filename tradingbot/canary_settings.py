@@ -67,6 +67,9 @@ FIELDS: list[dict] = [
      "live": True, "lo": 0, "hi": 100, "help": "Keep the position at the check only if up at least this much."},
     {"key": "launch_canary_trail_pct", "label": "Trailing stop (% off peak)", "type": "float", "group": "Entry",
      "live": True, "lo": 0, "hi": 90, "help": "Sell when the pool price falls this % off its running peak. 0 = off."},
+    {"key": "launch_canary_stall_window_s", "label": "Stall window (s)", "type": "float", "group": "Entry",
+     "live": True, "lo": 0, "hi": 120, "help": "Sell when the rolling range over this window drops below the vol gate "
+     "(the wash bot going flat before a pull). 0 = off."},
     {"key": "launch_canary_exit_min", "label": "Exit pool minute", "type": "float", "group": "Entry", "live": True,
      "lo": 1, "hi": 60, "help": "Sell the held position at this pool minute (the hold-to-m6 exit)."},
     # --- sizing ---
@@ -139,7 +142,7 @@ PRESETS: dict[str, dict] = {
                    "launch_canary_enter": True, "launch_canary_entry_usd": 25.0, "launch_canary_probe2_usd": 25.0,
                    "launch_canary_vol_gate": True, "launch_canary_vol_min_pct": 5.0,
                    "launch_canary_climb_check_s": 0.0, "launch_canary_climb_min_gain_pct": 0.0,
-                   "launch_canary_trail_pct": 30.0,
+                   "launch_canary_trail_pct": 30.0, "launch_canary_stall_window_s": 20.0,
                    "launch_canary_exit_min": 6.0, "launch_canary_feint": False, "launch_canary_feint_only": False,
                    "launch_canary_feint_all": False, "launch_canary_max_liq_usd": 0.0, "launch_canary_every_n": 1,
                    "launch_canary_max_trades": 0, "launch_canary_follow_dd": False}},

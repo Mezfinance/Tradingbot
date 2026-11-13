@@ -801,19 +801,50 @@ def test_trailing_stop_rides_the_peak_then_fires_on_the_drop(cfg, good_pair):
     eng._canary_enter(_survivor_w(book.name))
     pos = j.open_positions(mb.CANARY4)[0]
     live.price_now["A"] = 1.50                            # new high -> the peak tracks up, does not fire
-    assert eng._canary_trail_hit(book, pos, time.time()) is False
+    assert eng._canary_hold_exit(book, pos, time.time()) is None
     assert eng._canary_trails[pos.id]["peak"] == 1.50
     live.price_now["A"] = 1.20                            # 20% off the 1.50 peak (< 30%) -> hold
-    assert eng._canary_trail_hit(book, pos, time.time()) is False
+    assert eng._canary_hold_exit(book, pos, time.time()) is None
     live.price_now["A"] = 1.00                            # 33% off the 1.50 peak (>= 30%) -> sell
-    assert eng._canary_trail_hit(book, pos, time.time()) is True
+    assert eng._canary_hold_exit(book, pos, time.time()) == "trail_stop"
     assert pos.id not in eng._canary_trails               # one-shot: record cleared
 
 
-def test_trailing_stop_off_when_zero(cfg, good_pair):
+def test_stall_exit_fires_when_the_rolling_range_goes_flat(cfg, good_pair):
     eng, j, live = _probe_engine(cfg, good_pair)
     cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
-    cfg.launch_canary_trail_pct, cfg.launch_canary_climb_check_s = 0.0, 0.0  # both exits off -> nothing armed
+    cfg.launch_canary_trail_pct, cfg.launch_canary_stall_window_s = 0.0, 20.0  # stall only (no trailing stop)
+    cfg.launch_canary_vol_min_pct = 5.0                   # flat = rolling range < 5%
+    book = eng.books[mb.CANARY4]
+    eng._canary_enter(_survivor_w(book.name))
+    pos = j.open_positions(mb.CANARY4)[0]
+    t0 = time.time()
+    live.price_now["A"] = 1.00                            # dead flat for a full 20 s window
+    assert eng._canary_hold_exit(book, pos, t0) is None   # window not full yet
+    assert eng._canary_hold_exit(book, pos, t0 + 10) is None
+    assert eng._canary_hold_exit(book, pos, t0 + 21) == "stall_exit"  # a full flat window -> bail
+    assert pos.id not in eng._canary_trails
+
+
+def test_stall_exit_holds_a_still_volatile_pool(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    cfg.launch_canary_trail_pct, cfg.launch_canary_stall_window_s = 0.0, 20.0
+    cfg.launch_canary_vol_min_pct = 5.0
+    book = eng.books[mb.CANARY4]
+    eng._canary_enter(_survivor_w(book.name))
+    pos = j.open_positions(mb.CANARY4)[0]
+    t0 = time.time()
+    for k, px in ((0, 1.00), (10, 1.10), (21, 1.04)):     # range ~10% over the window -> still pumping
+        live.price_now["A"] = px
+        assert eng._canary_hold_exit(book, pos, t0 + k) is None
+    assert pos.id in eng._canary_trails                   # not sold
+
+
+def test_hold_exits_off_when_zero(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    cfg.launch_canary_trail_pct = cfg.launch_canary_stall_window_s = cfg.launch_canary_climb_check_s = 0.0
     eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
     assert j.open_positions(mb.CANARY4)[0].id not in eng._canary_trails
 
