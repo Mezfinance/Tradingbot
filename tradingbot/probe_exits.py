@@ -196,6 +196,14 @@ def _hold_ret(e: dict, t: float) -> float:
     return _clamp(m - 1.0 - COST)
 
 
+def _median(vals: list[float]) -> float | None:
+    vals = sorted(vals)
+    n = len(vals)
+    if not n:
+        return None
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2
+
+
 def _dist(vals: list[float]) -> dict:
     vals = sorted(vals)
     n = len(vals)
@@ -270,6 +278,7 @@ POLL_STEP_S = (5, 10, 15)          # poll cadence (s); a step finer than the pat
 DECLINE_N = (2, 3, 4)              # consecutive down polls that trigger a sell
 DECLINE_MIN_DROP = (0.0, 0.03, 0.05)  # minimum cumulative drop over the run (a tick-noise guard)
 STALL_WINDOW_S = (15, 20, 30)     # trailing window (s) over which the rolling volatility range is measured
+STALL_SCAN_WINDOWS = (10, 15, 20, 30, 45, 60)  # wider window grid for the per-pool / population stall-gate scan
 
 
 def _poll_price(series: list[tuple[float, float]], t: float) -> float:
@@ -388,6 +397,43 @@ def vol_stall_exit(survs: list[dict], steps=POLL_STEP_S, windows=STALL_WINDOW_S,
                     "vs_hold": (sum(rets) - sum(holds)) / len(survs) if survs else None,
                     "ruggers": len(ruggers), "rug_dodge": (dodged / len(ruggers)) if ruggers else None,
                     "winners": len(winners), "clip": (clipped / len(winners)) if winners else None})
+    return out
+
+
+def stall_grid(survs: list[dict], windows=STALL_SCAN_WINDOWS, thrs=VOL_GRID, step: float = 5.0,
+               hold: float = CLIMB_HOLD_S) -> list[dict]:
+    """The single-pool `_stall_scan` run across every stored pool with a path: per (window x threshold)
+    cell, how many ruggers the gate catches (fires before the pull) with the median lead and caught
+    return, and how many non-rug winners it clips (fires early) with the median forgone return. This is
+    the population view of the per-pool grid -- it names the window/threshold that catches the most rugs
+    while clipping the fewest real climbers. Polls every `step` s (finer = more responsive)."""
+    ruggers = [e for e in survs if e["pull_after_conf"] is not None and e["pull_after_conf"] <= hold]
+    holds = {id(e): _hold_ret(e, hold) for e in survs}
+    winners = [e for e in survs
+               if not (e["pull_after_conf"] is not None and e["pull_after_conf"] <= hold)
+               and holds[id(e)] > 0]
+    out = []
+    for win in windows:
+        for thr in thrs:
+            leads, crets = [], []
+            for e in ruggers:
+                ft, m = _stall_fire(e, step, win, thr, hold)
+                if ft is not None:
+                    leads.append(e["pull_after_conf"] - ft)
+                    crets.append(_clamp(m - 1.0 - COST))
+            clip_costs = []
+            for e in winners:
+                ft, m = _stall_fire(e, step, win, thr, hold)
+                if ft is not None:
+                    clip_costs.append(holds[id(e)] - _clamp(m - 1.0 - COST))
+            out.append({
+                "window_s": win, "thr_pct": thr,
+                "ruggers": len(ruggers), "caught": len(leads),
+                "catch_pct": (len(leads) / len(ruggers)) if ruggers else None,
+                "median_lead_s": _median(leads), "median_caught_ret": _median(crets),
+                "winners": len(winners), "clipped": len(clip_costs),
+                "clip_pct": (len(clip_costs) / len(winners)) if winners else None,
+                "median_clip_cost": _median(clip_costs)})
     return out
 
 
@@ -551,13 +597,11 @@ def study(journal, store, cfg=None, hours: float = 24.0, helius=None, max_credit
             "kept_decline": decline_exit(kept),
             "stall": vol_stall_exit(with_path),
             "kept_stall": vol_stall_exit(kept),
+            "stall_grid": stall_grid(with_path),
             "rows": survs}
 
 
 # --- single-pool path dump -------------------------------------------------------------------------
-
-STALL_SCAN_WINDOWS = (10, 15, 20, 30, 45, 60)  # trailing windows to try against one pull (diagnostic)
-
 
 def _stall_scan(e: dict, windows=STALL_SCAN_WINDOWS, thrs=VOL_GRID, step=DUMP_STEP_S,
                 hold: float = CLIMB_HOLD_S) -> list[dict]:
@@ -828,4 +872,32 @@ def render(r: dict) -> str:
                      f"{_pct(s.get('mean')):>8} {_pct(s.get('median')):>8} {_pct(s.get('win'), 0):>6} "
                      f"{_pct(t.get('vs_hold')):>8} {_pct(t.get('rug_dodge'), 0):>10} "
                      f"{_pct(t.get('clip'), 0):>6} {s['n']:>4}")
+
+    sg = r.get("stall_grid") or []
+    if sg:
+        thrs = sorted({c["thr_pct"] for c in sg})
+        wins = sorted({c["window_s"] for c in sg})
+        cell = {(c["window_s"], c["thr_pct"]): c for c in sg}
+        nr, nw = sg[0]["ruggers"], sg[0]["winners"]
+        o.append(f"\nVOLATILITY STALL GATE — population grid ({nr} ruggers, {nw} real winners; "
+                 f"poll 5s, ride to {CLIMB_HOLD_S // 60}m)")
+        o.append("  the per-pool scan over every stored pool: a gate that catches many ruggers early and "
+                 "clips few real winners is the one to run")
+        o.append("  RUGGERS CAUGHT (gate fires before the pull):  cell = caught% / median lead")
+        o.append("  " + f"{'window':>8}  " + "  ".join(f"{_pct(t, 1):>11}" for t in thrs))
+        for w in wins:
+            row = []
+            for t in thrs:
+                c = cell[(w, t)]
+                row.append((f"{c['catch_pct'] * 100:.0f}%/{c['median_lead_s']:.0f}s" if c["caught"] else "—").rjust(11))
+            o.append("  " + f"{w:>7}s  " + "  ".join(row))
+        o.append("  WINNERS CLIPPED (gate exits a real pool early):  cell = clipped% / median cost (pts)")
+        o.append("  " + f"{'window':>8}  " + "  ".join(f"{_pct(t, 1):>11}" for t in thrs))
+        for w in wins:
+            row = []
+            for t in thrs:
+                c = cell[(w, t)]
+                row.append((f"{c['clip_pct'] * 100:.0f}%/{c['median_clip_cost'] * 100:.0f}pt"
+                            if c["clipped"] else "—").rjust(11))
+            o.append("  " + f"{w:>7}s  " + "  ".join(row))
     return "\n".join(o)

@@ -130,6 +130,18 @@ def test_stall_scan_catches_a_flat_then_pull_and_misses_a_one_slot_rug():
     assert miss["caught"] is False and miss["fires"] is False
 
 
+def test_stall_grid_aggregates_catch_and_clip_across_pools():
+    # a flat-then-pull rugger the gate catches, and a steep climber (new highs clear 5% every window)
+    rugger = _e([(0, 1.0), (10, 1.05), (20, 1.08), (30, 1.08), (40, 1.08), (50, 1.08)], pull=55)
+    climber = _e([(t, 1.0 + 0.01 * t) for t in range(0, 61, 5)])     # +1%/s: never flat under 5%
+    grid = {(c["window_s"], c["thr_pct"]): c for c in pe.stall_grid([rugger, climber], hold=60)}
+    cell = grid[(20, 0.05)]
+    assert cell["ruggers"] == 1 and cell["winners"] == 1
+    assert cell["caught"] == 1 and cell["catch_pct"] == 1.0          # the flat-then-pull rugger is caught
+    assert cell["median_lead_s"] > 0                                 # ...before the pull
+    assert cell["clipped"] == 0 and cell["clip_pct"] == 0.0          # the steep climber is not clipped
+
+
 def test_pull_distribution_finds_the_safe_window():
     survs = [{"pull_after_conf": None}, {"pull_after_conf": 200.0}, {"pull_after_conf": 400.0}]
     d = pe.pull_distribution(survs)
