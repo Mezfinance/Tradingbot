@@ -84,9 +84,22 @@ def feint_pools(jquery, since: float) -> dict:
     return out
 
 
-def scorer_rows(wquery, since: float) -> dict:
-    """The scorer's watch_launch_live rows created since `since`, keyed by pool."""
+def scorer_rows(wquery, since: float, pools: list | None = None) -> dict:
+    """The scorer's watch_launch_live rows, keyed by pool. By default rows created since `since`; pass `pools` to
+    fetch only those pools' rows instead (indexed on the PK, so it stays cheap however large the table grows -- the
+    tracker shows probed pools only, so it never needs a time window over the whole table)."""
     try:
+        if pools is not None:
+            if not pools:
+                return {}
+            out: dict = {}
+            for i in range(0, len(pools), 400):  # keep each IN list well under SQLite's variable limit
+                chunk = pools[i:i + 400]
+                marks = ",".join("?" * len(chunk))
+                rows = wquery(f"SELECT {', '.join(SCORER_COLS)} FROM watch_launch_live WHERE pool IN ({marks})",
+                              tuple(chunk))
+                out.update({r["pool"]: {c: r[c] for c in SCORER_COLS} for r in rows})
+            return out
         rows = wquery(f"SELECT {', '.join(SCORER_COLS)} FROM watch_launch_live WHERE create_ts >= ?", (since,))
     except Exception:  # noqa: BLE001 (no table / missing column on an old db)
         return {}
@@ -305,13 +318,38 @@ def hold_curve(surv: list[dict]) -> dict:
 
 # --- CLI / snapshot --------------------------------------------------------------------------------
 
+def load_paths(db_path: str) -> dict:
+    """Load the dashboard's persisted reserve paths (pool_paths.json next to the db) so the CLI shows the same
+    finalized peak / conf / hold numbers the live tracker kept. int-keys conf_by (JSON stringifies them)."""
+    import os
+    if not db_path or db_path == ":memory:":
+        return {}
+    path = os.path.join(os.path.dirname(os.path.abspath(db_path)), "pool_paths.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path) as fh:
+            raw = json.load(fh)
+    except Exception:  # noqa: BLE001 (a corrupt/absent file must never break the CLI)
+        return {}
+    out = {}
+    for pool, p in raw.items():
+        if not isinstance(p, dict):
+            continue
+        cb = p.get("conf_by")
+        if isinstance(cb, dict):
+            p["conf_by"] = {int(k): v for k, v in cb.items()}
+        out[pool] = p
+    return out
+
+
 def rows_for(jquery, wquery, hours: float = TRACK_WINDOW_S / 3600, now: float | None = None,
              paths: dict | None = None, rpc=None) -> tuple[list[dict], float | None]:
     """Read feints + scorer rows, optionally do one live reserve read for young pools, and assemble."""
     now = now if now is not None else time.time()
     since = now - hours * 3600
     feints = feint_pools(jquery, since)
-    scorer = scorer_rows(wquery, since)
+    scorer = scorer_rows(wquery, since, pools=list(feints))  # by pool: cheap however large --hours
     su = _sol_usd(wquery)
     paths = dict(paths or {})
     if rpc is not None:

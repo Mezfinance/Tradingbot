@@ -728,11 +728,14 @@ class Dashboard:
         rpc = rpc or (lambda m, p: _solana_rpc(WALLETS_RPC, m, p))
         try:
             now = time.time()
-            since = now - pt.TRACK_WINDOW_S
-            feints = pt.feint_pools(self.live._q, since)
+            # The tracker keeps every probed pool forever (no data loss): feints come from the probe events only
+            # (bounded to actual probes), and scorer rows are fetched BY those pools (indexed PK), so neither read
+            # scans the whole watch_launch_live table however long history grows. The reserve path (the one
+            # reconstructable-only piece) is persisted to /data and never dropped by age below.
+            feints = pt.feint_pools(self.live._q, 0.0)
             wq = (lambda sql, p: self.live.wdb.execute(sql, p).fetchall()) if self.live.wdb is not None \
                 else (lambda sql, p: [])
-            scorer = pt.scorer_rows(wq, since)
+            scorer = pt.scorer_rows(wq, 0.0, pools=list(feints))
             su = pt._sol_usd(wq)
             # The live reserve read is BEST-EFFORT: a slow / rate-limited public RPC must never hide the pools
             # themselves (feints + probes come from the journal + watch.db, no RPC) -- it only fills the live liq /
@@ -752,10 +755,18 @@ class Dashboard:
             except Exception as exc:  # noqa: BLE001 (the public RPC can be slow / rate-limited)
                 live_ok = False
                 log.warning("dashboard: pool tracker live reserve read failed (pools still shown): %s", exc)
-            cut = now - pt.YOUNG_MAX_AGE_S - 1800  # drop paths for pools long past their window
-            for pl in [pl for pl in self._pool_paths if pl not in feints
-                       or (scorer.get(pl) and (scorer[pl].get("create_ts") or 0) < cut)]:
-                self._pool_paths.pop(pl, None)
+            # Paths persist FOREVER so no data is lost (the ~20s reserve samples in the first hour can never be
+            # re-fetched once the confirmation-window price is gone). For a pool past the live-sampling window, KEEP
+            # its finalized scalars (peak/live/conf/opt/hold curve -- all final by minute 6) and only clear the big
+            # pts sample list to bound RAM; the scalars are tiny, so the /data file grows slowly. A path with no probe
+            # event at all (should not happen) is dropped as an orphan. Before this, the whole path was dropped at
+            # ~1.5h, so a 2h+ survivor blanked out its peak / live / $25-@-m6 / conf columns.
+            aged = now - pt.YOUNG_MAX_AGE_S
+            for pl in list(self._pool_paths):
+                if pl not in feints:
+                    self._pool_paths.pop(pl, None)  # orphan: a path with no probe event
+                elif scorer.get(pl) and (scorer[pl].get("create_ts") or 0) < aged and self._pool_paths[pl].get("pts"):
+                    self._pool_paths[pl]["pts"] = []  # past live sampling: finalized scalars stay, drop the samples
             rows = pt.assemble(feints, scorer, su, self._pool_paths, now)
             data = {"rows": rows[:200], "summary": pt.summary(rows), "sol_usd": su,
                     "fetched_ts": now, "stale": False, "live_read_ok": live_ok}

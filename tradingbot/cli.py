@@ -698,7 +698,8 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot.watcher import WatchStore as _PtWS, watch_db_path as _pt_wdp
         _pt_rpc = None if args.no_live else (lambda m, p: _pt_dash._solana_rpc(_pt_dash.WALLETS_RPC, m, p))
         rows, su = _pt.rows_for(_PtJournal(cfg.db_path).query, _PtWS(_pt_wdp(cfg)).query,
-                                hours=args.hours or (_pt.TRACK_WINDOW_S / 3600), rpc=_pt_rpc)
+                                hours=args.hours or (_pt.TRACK_WINDOW_S / 3600), rpc=_pt_rpc,
+                                paths=_pt.load_paths(cfg.db_path))  # the dashboard's persisted peak/conf numbers
         if args.json:
             print(json.dumps({"rows": rows, "summary": _pt.summary(rows), "sol_usd": su}, indent=2, default=str))
         else:

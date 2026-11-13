@@ -217,6 +217,34 @@ def test_assemble_falls_back_to_the_feint_reserve_when_there_is_no_scorer_row():
     assert rows[0]["status"] == "pending"
 
 
+def test_scorer_rows_by_pools_fetches_only_the_given_pools():
+    from tradingbot.watcher import WatchStore
+    from tradingbot import launch_live
+    store = WatchStore(":memory:")
+    launch_live.ensure_schema(store)
+    for pool, mint, ts in [("PoolA", "MintA", 100.0), ("PoolB", "MintB", 200.0), ("PoolC", "MintC", 300.0)]:
+        store.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, decided_ts, liquid, status) "
+                      "VALUES(?,?,?,?,1,'scored')", (pool, mint, ts, ts + 4))
+    # by pools: only the asked-for pools, regardless of create_ts (a probed pool from long ago still resolves)
+    got = pt.scorer_rows(store.query, 0.0, pools=["PoolA", "PoolC"])
+    assert set(got) == {"PoolA", "PoolC"}
+    assert pt.scorer_rows(store.query, 0.0, pools=[]) == {}
+    # the time-window form still works for the other callers
+    assert set(pt.scorer_rows(store.query, 250.0)) == {"PoolC"}
+
+
+def test_load_paths_reads_the_persisted_file_and_int_keys_conf_by(tmp_path):
+    import json
+    db = str(tmp_path / "bot.db")
+    (tmp_path / "pool_paths.json").write_text(json.dumps(
+        {"P1": {"pts": [], "peak_liq": 34800.0, "conf_ret": 0.12, "conf_by": {"6": 0.12, "15": 0.3}},
+         "bad": "not a dict"}))
+    got = pt.load_paths(db)
+    assert got["P1"]["peak_liq"] == 34800.0 and got["P1"]["conf_by"][15] == 0.3  # int key, not "15"
+    assert "bad" not in got
+    assert pt.load_paths(":memory:") == {} and pt.load_paths(str(tmp_path / "empty" / "bot.db")) == {}  # no file
+
+
 def test_summary_counts_verdicts_and_pnl():
     rows = [{"verdict": "alive", "pulled": False, "ret_m6": 0.2, "pnl25": 5.0},
             {"verdict": "pulled", "pulled": True, "ret_m6": -1.0, "pnl25": -25.0},

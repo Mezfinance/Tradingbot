@@ -168,6 +168,37 @@ def test_fetch_pools_persists_to_data_even_when_the_live_read_fails(cfg, tmp_pat
         assert "P1" in _json.load(fh)
 
 
+def test_fetch_pools_keeps_finalized_scalars_for_aged_pools_and_only_drops_the_samples(cfg):
+    """A pool past the live-sampling window (but still in the tracker's window) keeps its finalized peak / conf / opt
+    scalars so the 2h+ survivor row still shows them; only the big pts sample list is cleared. A pool out of the
+    window entirely is dropped."""
+    from tradingbot import launch_live, pool_tracker as pt
+    from tradingbot.watcher import WatchStore
+    cfg.launch_canary = True
+    now = time.time()
+    j = Journal(":memory:")
+    _feint(j, "canary_rw50_sz", "MintA", "alive", pool="PoolA", sol_before=70.0)
+    store = WatchStore(":memory:")
+    launch_live.ensure_schema(store)
+    store.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, decided_ts, liquid, liq_usd, "
+                  "sol_at_decide, status) VALUES(?,?,?,?,1,?,?,?)",
+                  ("PoolA", "MintA", now - 7200, now - 7196, 14000.0, 70.0, "scored"))  # 2h old: past young, in window
+    store.execute("INSERT INTO watch_market(ts, sol_usd) VALUES(?, ?)", (now - 10, 100.0))
+    board = dash.Dashboard(j, cfg, store)
+    board._pool_paths = {
+        "PoolA": {"pts": [[66.0, 14000.0, 1e-7]], "peak_liq": 34800.0, "live_liq": 35100.0,
+                  "conf_ret": 0.12, "conf_age": 66.0, "opt_ret": 0.2, "opt_age": 41.0, "conf_by": {6: 0.12},
+                  "pulled_ts": None},
+        "GhostPool": {"pts": [[1.0, 1.0, 1.0]], "peak_liq": 1.0},  # not in feints -> dropped
+    }
+    board.fetch_pools(rpc=lambda m, p: {})
+    assert "GhostPool" not in board._pool_paths                      # out of window: dropped entirely
+    kept = board._pool_paths["PoolA"]
+    assert kept["pts"] == [] and kept["peak_liq"] == 34800.0 and kept["conf_ret"] == 0.12  # scalars survive, samples go
+    r = next(x for x in board.pools["rows"] if x["pool"] == "PoolA")
+    assert round(r["peak_liq"]) == 34800 and round(r["pnl25"], 2) == round(pt.STAKE_USD * 0.12, 2)  # still rendered
+
+
 def test_summary_is_built_in_a_child_process_for_a_file_journal(cfg, tmp_path, monkeypatch):
     """11-05: building the summary inside the bot delayed the scorer by ~40 s; a file journal uses a child."""
     db = str(tmp_path / "bot.db")
