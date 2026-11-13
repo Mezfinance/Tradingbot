@@ -164,6 +164,13 @@ class Config:
     launch_canary_stall_window_s: float = 0.0  # stall exit: sell when the rolling peak-to-trough range over this trailing
     # window falls below launch_canary_vol_min_pct (the wash bot stalling flat before a pull); 0 = off. Re-uses the vol gate
     launch_canary_exit_min: float = 6.0  # sell the held position at this pool minute (the hold-to-m6 exit)
+    # LP deposit entry (11-13): the two probes stay direct round-trips; on a confirmed double-survivor, ENTER as a
+    # liquidity provider (atomic buy + deposit) instead of a plain buyer. Operators pull by WITHDRAWING their own LP,
+    # which is proportional and leaves a fellow LP's SOL share untouched, so a rug recovers ~50% (the SOL half) instead
+    # of -100% (a buyer holds only the token, worthless after the pull; on-chain 11-10: a real rug recovered -51%). The
+    # exit withdraws + sells at the pool-minute / trailing-stop exit. Reuses LpPumpswapExecutor. Needs enter + the
+    # direct route. REAL MONEY. OFF by default.
+    launch_canary_lp_entry: bool = False
     # Wallet-pattern selection gate (11-13): on a probe SURVIVOR, before the second probe, read the pool's first-~66s
     # trade stream (live Helius) and skip it when its wallet fingerprint ranks in the riskiest k% of recent probed pools
     # -- the creator trading its own pool, few distinct wallets / trades = rug; a deep organic crowd + a fixed-size bot =
@@ -447,6 +454,12 @@ class Config:
                 raise ValueError("The 1-slot probe is built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
         if self.launch_canary_enter and not self.launch_canary_probe:
             raise ValueError("The two-stage entry runs after the 1-slot probe; set TB_LAUNCH_CANARY_PROBE=1")
+        if self.launch_canary_lp_entry:
+            if self.live_confirm != LIVE_CONFIRM_PHRASE:
+                raise ValueError(f"The LP deposit entry spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+            if not self.launch_canary_enter:
+                raise ValueError("The LP deposit entry is the two-stage entry's commit step; set "
+                                 "TB_LAUNCH_CANARY_ENTER=1 (and the probe). Probes stay direct; only the entry is LP.")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):

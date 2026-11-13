@@ -21,8 +21,11 @@ from tradingbot.config import LIVE_CONFIRM_PHRASE, Config
 
 def canary_executor(cfg: Config, jupiter):
     """The launch canary's live executor: Jupiter routes, swaps straight on the pumpswap pool
-    (`launch_canary_route` = 'direct'), or enters as a liquidity provider ('lp', 11-10)."""
-    if cfg.launch_canary_route == "lp":
+    (`launch_canary_route` = 'direct'), or enters as a liquidity provider ('lp', 11-10). With `launch_canary_lp_entry`
+    on, the route stays 'direct' (so the 1-slot probes are direct round-trips) but the per-wallet sub is the LP
+    executor, so only the two-stage entry's commit (`buy`) and its exit (`sell`) are LP deposit/withdraw; `probe_1slot`
+    is the inherited direct method, so probes are unchanged."""
+    if cfg.launch_canary_route == "lp" or (cfg.launch_canary_route == "direct" and cfg.launch_canary_lp_entry):
         from tradingbot.execution.lp_pumpswap import LpPumpswapExecutor as cls
     elif cfg.launch_canary_route == "direct":
         from tradingbot.execution.pumpswap_direct import DirectPumpswapExecutor as cls

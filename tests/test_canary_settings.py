@@ -81,6 +81,24 @@ def test_coherent_rejects_the_wallet_gate_without_the_entry(tmp_path):
     assert cfg.launch_canary_wallet_gate is False
 
 
+def test_two_stage_lp_preset_and_coherence(tmp_path):
+    cfg = _cfg(tmp_path)
+    cs.apply(cfg, None, cs.PRESETS["two_stage_lp"]["values"])
+    assert cfg.launch_canary_lp_entry and cfg.launch_canary_enter and cfg.launch_canary_route == "direct"
+    assert cfg.launch_canary_probe  # the LP entry is the two-stage entry's commit, so the probe is still on
+    with pytest.raises(ValueError):  # the LP entry is the commit step — it needs the two-stage entry on
+        cs.apply(_cfg(tmp_path), None, {"launch_canary_lp_entry": True, "launch_canary_enter": False})
+
+
+def test_lp_entry_validation_needs_the_two_stage_entry():
+    from tradingbot.config import LIVE_CONFIRM_PHRASE, Config
+    with pytest.raises(ValueError, match="LP deposit entry"):  # lp_entry on, enter off
+        Config(launch_canary_lp_entry=True, live_confirm=LIVE_CONFIRM_PHRASE).validate()
+    # the full two-stage LP combo validates (probes direct, entry LP)
+    Config(launch_canary_route="direct", launch_canary_probe=True, launch_canary_enter=True,
+           launch_canary_lp_entry=True, live_confirm=LIVE_CONFIRM_PHRASE).validate()
+
+
 def test_apply_overlay_is_defensive_at_boot(tmp_path):
     cfg = _cfg(tmp_path)
     with open(cs.settings_path(cfg), "w") as fh:

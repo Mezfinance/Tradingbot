@@ -526,8 +526,33 @@ def test_the_canary_route_setting_picks_the_executor(monkeypatch):
     monkeypatch.setattr(d.DirectPumpswapExecutor, "__init__", lambda self, *a, **k: None)
     from tradingbot.execution import jupiter as jx
     monkeypatch.setattr(jx.JupiterExecutor, "__init__", lambda self, *a, **k: None)
+    from tradingbot.execution.lp_pumpswap import LpPumpswapExecutor
     assert type(cli.canary_executor(Config(launch_canary_route="direct"), None)) is d.DirectPumpswapExecutor
     assert type(cli.canary_executor(Config(), None)) is jx.JupiterExecutor
+    assert type(cli.canary_executor(Config(launch_canary_route="lp"), None)) is LpPumpswapExecutor
+    # LP deposit entry keeps the route 'direct' (direct probes) but builds the LP sub for the entry/exit.
+    assert type(cli.canary_executor(
+        Config(launch_canary_route="direct", launch_canary_lp_entry=True), None)) is LpPumpswapExecutor
+
+
+def test_lp_entry_under_rotation_keeps_direct_probes(monkeypatch):
+    import json
+
+    from solders.keypair import Keypair
+
+    from tradingbot import cli
+    from tradingbot.execution.lp_pumpswap import LpPumpswapExecutor
+    from tradingbot.execution.rotating import RotatingExecutor
+    monkeypatch.setattr(d.DirectPumpswapExecutor, "__init__", lambda self, *a, **k: None)
+    monkeypatch.setenv("TB_CANARY_WALLETS", json.dumps([list(bytes(Keypair())) for _ in range(2)]))
+    ex = cli.canary_executor(
+        Config(launch_canary_route="direct", launch_canary_lp_entry=True, launch_canary_rotate=True,
+               db_path=":memory:"), None)
+    assert isinstance(ex, RotatingExecutor) and len(ex.subs) == 2
+    assert all(isinstance(s, LpPumpswapExecutor) for s in ex.subs)
+    assert ex.subs[0].buy.__func__ is LpPumpswapExecutor.buy            # the entry commit is an LP deposit
+    assert ex.subs[0].sell.__func__ is LpPumpswapExecutor.sell          # the exit is an LP withdraw + sell
+    assert ex.subs[0].probe_1slot.__func__ is d.DirectPumpswapExecutor.probe_1slot  # the probes stay direct round-trips
 
 
 def test_canary_one_allows_exactly_one_buy_then_waits(cfg, good_pair, tmp_path, monkeypatch, capsys):

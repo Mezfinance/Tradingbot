@@ -81,6 +81,10 @@ FIELDS: list[dict] = [
      "help": "Skip a survivor whose wallet-pattern score is in the riskiest this % of recent probed pools."},
     {"key": "launch_canary_wallet_entry_s", "label": "Wallet gate read window (s)", "type": "float", "group": "Entry",
      "live": True, "lo": 10, "hi": 180, "help": "Read the pool's trades up to this pool age (the selection-usable cut)."},
+    {"key": "launch_canary_lp_entry", "label": "LP deposit entry", "type": "bool", "group": "Entry", "live": False,
+     "help": "The commit enters as a liquidity provider (atomic buy + deposit) instead of a buyer, so an operator's "
+     "proportional LP withdrawal leaves our SOL half (a rug recovers ~50% vs -100%). Probes stay direct. Needs Enter + "
+     "direct route; takes effect after restart."},
     # --- sizing ---
     {"key": "launch_canary_flat_usd", "label": "Flat buy size ($)", "type": "float", "group": "Sizing", "live": True,
      "lo": 0, "hi": 500, "help": "> 0: every commit at this size (0 = use the band scale)."},
@@ -164,6 +168,14 @@ PRESETS: dict[str, dict] = {
                    "launch_canary_feint_all": False, "launch_canary_flat_usd": 0.0, "launch_canary_band_scale": 0.1,
                    "launch_canary_clips": 1, "launch_canary_max_liq_usd": 0.0, "launch_canary_daily_loss_usd": 0.0}},
 }
+# The two-stage entry, but the commit enters as a liquidity provider: an operator's proportional LP withdrawal leaves
+# our SOL half, so a minute-2 rug recovers ~50% instead of -100%. Probes stay direct; only the entry/exit are LP.
+PRESETS["two_stage_lp"] = {
+    "label": "Two-stage LP entry (recover the SOL half)",
+    "about": "The two-stage entry, but the commit enters as a liquidity provider (atomic buy + deposit) instead of a "
+             "buyer. Operators pull by withdrawing their own LP, which leaves our SOL half, so a minute-2 rug recovers "
+             "~50% instead of -100%. The probes stay direct round-trips. Takes effect after a restart.",
+    "values": {**PRESETS["two_stage"]["values"], "launch_canary_lp_entry": True}}
 
 
 def settings_path(cfg) -> str:
@@ -220,6 +232,10 @@ def _coherent(state: dict) -> None:
         raise ValueError("Enter double-survivors needs the 1-slot probe on (it runs after the probe).")
     if state.get("launch_canary_wallet_gate") and not state.get("launch_canary_enter"):
         raise ValueError("The wallet-pattern gate only runs on the two-stage entry — turn Enter double-survivors on.")
+    if state.get("launch_canary_lp_entry") and not state.get("launch_canary_enter"):
+        raise ValueError("The LP deposit entry is the two-stage entry's commit — turn Enter double-survivors on.")
+    if state.get("launch_canary_lp_entry") and state.get("launch_canary_route") != "direct":
+        raise ValueError("The LP deposit entry keeps direct probes; set Route to direct (the entry itself is LP).")
 
 
 def apply(cfg, journal, changes: dict) -> dict:
