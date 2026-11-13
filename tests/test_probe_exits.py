@@ -54,6 +54,43 @@ def test_climb_gate_bails_a_flat_pool_before_its_later_rug():
     assert pe._climb_ret(pulled_early, check=60, gain=0.05) == -1.0      # pulled before the check
 
 
+def test_decline_exit_dodges_a_slow_fade_rug_but_not_a_one_slot_rug():
+    # 9KaQvM4Z shape: climbs, fades for 3 polls, then the LP is pulled.
+    fade_rug = _e([(10, 1.10), (20, 1.12), (30, 1.10), (40, 1.08), (50, 1.06)], pull=55)
+    r = pe._decline_ret(fade_rug, step=10, n=3, min_drop=0.0)
+    assert abs(r - pe._clamp(1.06 - 1.0 - pe.COST)) < 1e-9   # sold at 1.06 at t=50, before the 55s pull
+    assert pe._hold_ret(fade_rug, pe.CLIMB_HOLD_S) == -1.0   # holding to m6 eats the rug
+    # a one-slot rug has no fade to catch -> still -100%
+    one_slot = _e([(10, 1.05), (20, 1.06)], pull=25)
+    assert pe._decline_ret(one_slot, step=10, n=3, min_drop=0.0) == -1.0
+
+
+def test_decline_exit_does_not_clip_a_dip_and_recover_winner():
+    # one deep dip then it recovers and climbs: a trailing stop would clip it, the run rule does not.
+    winner = _e([(10, 1.05), (20, 0.80), (30, 1.10), (40, 1.20)])
+    assert pe._decline_ret(winner, step=10, n=3, min_drop=0.0) == pe._hold_ret(winner, pe.CLIMB_HOLD_S)
+    assert pe._trail_ret(winner, 0.20) < pe._hold_ret(winner, pe.CLIMB_HOLD_S)  # the trail does clip it
+
+
+def test_decline_min_drop_ignores_a_shallow_fade():
+    shallow = _e([(10, 1.20), (20, 1.19), (30, 1.18), (40, 1.17), (60, 1.50)])
+    assert pe._decline_ret(shallow, step=10, n=3, min_drop=0.0) == pe._clamp(1.17 - 1.0 - pe.COST)  # fires on the 3-run
+    assert pe._decline_ret(shallow, step=10, n=3, min_drop=0.05) == pe._hold_ret(shallow, pe.CLIMB_HOLD_S)  # 2.5% < 5%: rides to 1.50
+
+
+def test_decline_exit_sweep_reports_rug_dodge_and_clip():
+    survs = [
+        _e([(10, 1.10), (20, 1.12), (30, 1.10), (40, 1.08), (50, 1.06)], pull=55),  # slow-fade rug (dodged)
+        _e([(10, 1.05), (20, 1.06)], pull=25),                                       # one-slot rug (caught)
+        _e([(10, 1.05), (20, 1.10), (30, 1.20), (360, 1.30)]),                       # clean climber (winner)
+    ]
+    out = {(t["step_s"], t["n"], t["min_drop_pct"]): t for t in pe.decline_exit(survs, steps=(10,), ns=(3,), drops=(0.0,))}
+    c = out[(10, 3, 0.0)]
+    assert c["ruggers"] == 2 and c["rug_dodge"] == 0.5          # dodged the fade, not the one-slot rug
+    assert c["winners"] >= 1 and c["clip"] == 0.0               # did not clip the clean climber
+    assert c["vs_hold"] is not None
+
+
 def test_pull_distribution_finds_the_safe_window():
     survs = [{"pull_after_conf": None}, {"pull_after_conf": 200.0}, {"pull_after_conf": 400.0}]
     d = pe.pull_distribution(survs)

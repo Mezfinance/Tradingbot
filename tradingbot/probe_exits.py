@@ -259,6 +259,72 @@ def climb_gate(survs: list[dict], checks=CLIMB_CHECKS_S, gains=CLIMB_GAINS, hold
     return out
 
 
+# Consecutive-decline exit (the owner's idea, 11-13): poll the pool price during the hold and sell
+# when it has fallen for a sustained stretch, BEFORE the pull — unlike a trailing stop (which fires on
+# any single dip off the peak, clipping a dip-and-recover winner), this only exits on a *run* of
+# declines, so it catches the slow-fade-then-rug (9KaQvM4Z faded ~15 s / 3 polls from its +11.8% peak
+# before the drain) without taxing the climbers. A one-slot rug (no fade) is still -100%: the pull
+# lands before any run can register. Value depends on how many ruggers fade first, which only the
+# population tells us — this sweep measures it.
+POLL_STEP_S = (5, 10, 15)          # poll cadence (s); a step finer than the path's sample spacing adds nothing
+DECLINE_N = (2, 3, 4)              # consecutive down polls that trigger a sell
+DECLINE_MIN_DROP = (0.0, 0.03, 0.05)  # minimum cumulative drop over the run (a tick-noise guard)
+
+
+def _poll_price(series: list[tuple[float, float]], t: float) -> float:
+    """Last observed multiple at or before poll time `t` (as a live reserve poll would read)."""
+    at = [m for (ts, m) in series if ts <= t]
+    return at[-1] if at else series[0][1]
+
+
+def _decline_ret(e: dict, step: float, n: int, min_drop: float, hold: float = CLIMB_HOLD_S) -> float:
+    """Poll every `step` s from entry; sell when the price has fallen for `n` consecutive polls (and,
+    if min_drop > 0, the cumulative drop over that run is >= min_drop). -100% if the pool pulls before
+    the rule fires (we poll into a dead pool); ride to `hold` if it never fires."""
+    pull = e["pull_after_conf"]
+    series = e["series"]
+    run, run_top, prev, t = 0, None, None, step
+    while t <= hold:
+        if pull is not None and pull <= t:
+            return -1.0  # the pull already landed by this poll
+        m = _poll_price(series, t)
+        if prev is not None and m < prev:
+            if run == 0:
+                run_top = prev          # price at the top of this decline run
+            run += 1
+            if run >= n and (min_drop <= 0 or (run_top - m) / run_top >= min_drop):
+                return _clamp(m - 1.0 - COST)  # sustained decline: sell here, before any pull
+        else:
+            run, run_top = 0, None
+        prev, t = m, t + step
+    return _hold_ret(e, hold)              # never fired: hold to the end
+
+
+def decline_exit(survs: list[dict], steps=POLL_STEP_S, ns=DECLINE_N, drops=DECLINE_MIN_DROP,
+                 hold: float = CLIMB_HOLD_S) -> list[dict]:
+    """Per (poll cadence, consecutive downs, min drop): the exit's return distribution, its edge over
+    hold-to-`hold` (``vs_hold``), the share of would-be ruggers it dodges (``rug_dodge``), and the
+    share of hold-to-`hold` winners it clips early (``clip``). A good cell beats hold on ``vs_hold``
+    with a high rug-dodge and a low clip."""
+    holds = [_hold_ret(e, hold) for e in survs]
+    ruggers = [i for i, e in enumerate(survs)
+               if e["pull_after_conf"] is not None and e["pull_after_conf"] <= hold]
+    winners = [i for i, h in enumerate(holds) if h > 0]
+    out = []
+    for step in steps:
+        for n in ns:
+            for d in drops:
+                rets = [_decline_ret(e, step, n, d, hold) for e in survs]
+                dodged = sum(1 for i in ruggers if rets[i] > -1.0)
+                clipped = sum(1 for i in winners if rets[i] < holds[i] - 1e-9)
+                out.append({
+                    "step_s": step, "n": n, "min_drop_pct": d, "ret": _dist(rets),
+                    "vs_hold": (sum(rets) - sum(holds)) / len(survs) if survs else None,
+                    "ruggers": len(ruggers), "rug_dodge": (dodged / len(ruggers)) if ruggers else None,
+                    "winners": len(winners), "clip": (clipped / len(winners)) if winners else None})
+    return out
+
+
 def volatility_filter(entered: list[dict], committed: int, vol_grid=VOL_GRID,
                       probe_cost: float = PROBE_COST, entry_usd: float = ENTRY_USD,
                       hold: float = CLIMB_HOLD_S) -> dict:
@@ -415,6 +481,8 @@ def study(journal, store, cfg=None, hours: float = 24.0, helius=None, max_credit
             "trailing": trailing(with_path),
             "fixed_hold": fixed_hold(with_path),
             "climb_gate": climb_gate(with_path),
+            "decline": decline_exit(with_path),
+            "kept_decline": decline_exit(kept),
             "rows": survs}
 
 
@@ -595,4 +663,19 @@ def render(r: dict) -> str:
         s = t["ret"]
         o.append(f"  {t['check_s']:>5}s {t['gain_pct'] * 100:>4.0f}% {_pct(s.get('mean')):>8} "
                  f"{_pct(s.get('median')):>8} {_pct(s.get('win'), 0):>6} {s['n']:>4}")
+
+    for key, title in (("decline", "ALL SURVIVORS"), ("kept_decline", f"ENTRY-FILTERED (range >= {r['kept_vol_pct'] * 100:.1f}%)")):
+        rows = r.get(key) or []
+        if not rows:
+            continue
+        o.append(f"\nCONSECUTIVE-DECLINE EXIT, {title} (poll the price; sell after n down polls before a pull; "
+                 f"ride to {CLIMB_HOLD_S // 60}m if it never fires)")
+        o.append(f"  {'poll':>5} {'n':>2} {'drop':>5} {'mean':>8} {'median':>8} {'win':>6} "
+                 f"{'vs hold':>8} {'rug dodge':>10} {'clip':>6} {'N':>4}")
+        for t in rows:
+            s = t["ret"]
+            o.append(f"  {t['step_s']:>4}s {t['n']:>2} {t['min_drop_pct'] * 100:>4.0f}% "
+                     f"{_pct(s.get('mean')):>8} {_pct(s.get('median')):>8} {_pct(s.get('win'), 0):>6} "
+                     f"{_pct(t.get('vs_hold')):>8} {_pct(t.get('rug_dodge'), 0):>10} "
+                     f"{_pct(t.get('clip'), 0):>6} {s['n']:>4}")
     return "\n".join(o)
