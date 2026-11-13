@@ -179,6 +179,16 @@ class Config:
     launch_canary_wallet_gate: bool = False  # OFF by default
     launch_canary_wallet_skip_pct: float = 50.0  # skip the riskiest k% by wallet-pattern score
     launch_canary_wallet_entry_s: float = 66.0  # read the stream up to this pool age (the selection-usable cut)
+    # Safe-zone hold-probe (11-13): the holding rug fires ~1m40 after a gentle wash-crawl that peaks ~1m30, so after
+    # the two 1-slot probes clear the insta-rug, use the HELD position as a third probe to clear the HOLDING rug:
+    # enter at confirmation, ride to the safe-zone age below (~90s, before the ~1m40 cluster) and sell -- banking the
+    # peak and dodging the pull. A watch at `reentry_watch_s` then reads the pool: rugged = a holding rugger we induced
+    # and dodged (don't re-enter); survived = clean through both waves. With `reentry` on, a survivor gets the real
+    # minute-6 entry (the profit hold). REAL MONEY, needs enter. OFF by default (measure the holding-rug rate first).
+    launch_canary_safe_zone: bool = False
+    launch_canary_safe_zone_s: float = 90.0  # sell the hold-probe at this pool age (before the ~1m40 holding-rug cluster)
+    launch_canary_reentry_watch_s: float = 120.0  # read the pool at this pool age: holding rugger vs clean survivor
+    launch_canary_reentry: bool = False  # REAL MONEY: re-enter a clean survivor and hold to minute 6 (else measure only)
     # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
     launch_fast_canary: bool = False  # REAL MONEY: buy on detection, before the scorer's second-4 decide
@@ -460,6 +470,13 @@ class Config:
             if not self.launch_canary_enter:
                 raise ValueError("The LP deposit entry is the two-stage entry's commit step; set "
                                  "TB_LAUNCH_CANARY_ENTER=1 (and the probe). Probes stay direct; only the entry is LP.")
+        if self.launch_canary_safe_zone:
+            if self.live_confirm != LIVE_CONFIRM_PHRASE:
+                raise ValueError(f"The safe-zone hold-probe spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
+            if not self.launch_canary_enter:
+                raise ValueError("The safe-zone hold-probe is part of the two-stage entry; set TB_LAUNCH_CANARY_ENTER=1")
+        if self.launch_canary_reentry and not self.launch_canary_safe_zone:
+            raise ValueError("Re-entry runs after the safe-zone hold-probe; set TB_LAUNCH_CANARY_SAFE_ZONE=1")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):

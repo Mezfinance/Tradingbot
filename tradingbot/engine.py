@@ -125,6 +125,7 @@ class Engine:
         self._climbs = self._load_climbs()  # position id -> [check time, price to reach, best price seen]
         self._holds = self._load_holds()  # position id -> {"at": [check times left], "last": return at the last check}
         self._probe_watches = self._load_probe_watches()  # pool -> a 1-slot probe awaiting its survival read
+        self._reentry_watches = self._load_reentry_watches()  # pool -> a safe-zone hold-probe awaiting its re-entry read
         self._canary_climbs = self._load_canary_climbs()  # position id -> the two-stage entry's reserve-priced climb check
         self._canary_trails = self._load_canary_trails()  # position id -> the two-stage entry's reserve-priced trailing stop
         self._canary_helius = None  # lazy live Helius client for the entry volatility gate (main key)
@@ -366,6 +367,7 @@ class Engine:
         now = time.time()
         self.journal.set_state("heartbeat", repr(now))
         self._run_probe_watches()  # record rugger/survivor for probes whose watch window is up (read only)
+        self._run_reentry_watches()  # safe-zone hold-probes whose watch is up: holding-rug (dodged) vs clean -> re-enter
         from tradingbot import model_book as mb
         jobs: list[tuple] = []
         for pos in positions:
@@ -915,8 +917,9 @@ class Engine:
             self.journal.log_event("model_climb_check", sig["mint"],
                                    json.dumps({"position_id": pos.id, "at": check[0], "price": check[1]}),
                                    strategy=book.name)
-        if canary and sig.get("entry") and (c.launch_canary_climb_check_s > 0 or c.launch_canary_trail_pct > 0
-                                             or c.launch_canary_stall_window_s > 0):
+        if canary and sig.get("entry") and not sig.get("safe_zone") \
+                and (c.launch_canary_climb_check_s > 0 or c.launch_canary_trail_pct > 0
+                     or c.launch_canary_stall_window_s > 0):
             # Two-stage entry exits (11-13), all priced from the pool's own reserves via the paid Helius RPC (Jupiter
             # can't quote a ~2-min-old pool), so the raw entry price from the fill is the baseline. One read here.
             entry_px = book.executor.pool_price(sig["mint"]) if hasattr(book.executor, "pool_price") else None
@@ -1032,6 +1035,72 @@ class Engine:
         self._probe_watches[pool] = rec
         self.journal.log_event("canary_probe_watch", sig["mint"], json.dumps(rec), strategy=book.name)
 
+    def _schedule_reentry_watch(self, cbook, w: dict) -> None:
+        """After a safe-zone hold-probe, schedule a pool read at the re-entry-watch pool age to decide holding-rug vs
+        clean survivor (the hold-probe has already sold by then)."""
+        pool = w.get("pool")
+        if not pool:
+            return
+        created = w.get("created_ts")
+        now = time.time()
+        due = (created + self.cfg.launch_canary_reentry_watch_s) if created \
+            else now + self.cfg.launch_canary_reentry_watch_s
+        rec = {"mint": w["mint"], "pool": pool, "created_ts": created, "liq": w.get("liq"),
+               "sol_before": w.get("sol_before"), "due": due, "book": cbook.name}
+        self._reentry_watches[pool] = rec
+        self.journal.log_event("canary_reentry_watch", w["mint"], json.dumps(rec), strategy=cbook.name)
+
+    def _run_reentry_watches(self) -> None:
+        """At each due re-entry watch read the pool once: SOL gone / far below the probe level -> `holding_rug` (we
+        induced it by holding and dodged by selling at the safe zone); still liquid -> `clean` (survived both waves).
+        A clean survivor gets the real minute-6 entry when re-entry is on. Read only until it re-enters."""
+        if not self._reentry_watches:
+            return
+        from tradingbot import model_book as mb
+        now = time.time()
+        cbook = next((b for b in self.books.values() if b.name in mb.CANARY_BOOKS), None)
+        ex = cbook.executor if cbook else None
+        for pool in [p for p, w in self._reentry_watches.items() if now >= w["due"]]:
+            w = self._reentry_watches.pop(pool)
+            sol_after, verdict = None, "unknown"
+            if ex is not None and hasattr(ex, "pool_sol"):
+                try:
+                    sol_after = ex.pool_sol(w["mint"])
+                except Exception:  # noqa: BLE001 (a read failure must never stop the monitor loop)
+                    sol_after = None
+                before = w.get("sol_before") or 0.0
+                if sol_after is None or (before and sol_after < PROBE_PULLED_SHARE * before):
+                    verdict = "holding_rug"  # pulled after our safe-zone sell: we induced it and dodged
+                else:
+                    verdict = "clean"
+            self.journal.log_event("canary_reentry_verdict", w["mint"], json.dumps(
+                {"pool": pool, "verdict": verdict, "sol_before": w.get("sol_before"), "sol_after": sol_after}),
+                strategy=w.get("book"))
+            if verdict != "clean" or not self.cfg.launch_canary_reentry or cbook is None \
+                    or self.journal.get_state(CANARY_HALT):
+                continue
+            open_ = self.journal.open_positions(cbook.name)
+            if len(open_) >= self.cfg.launch_canary_max_open or any(p.token_address == w["mint"] for p in open_):
+                continue
+            try:
+                self._canary_final_entry(cbook, w)  # the profit hold on a pool clean through both rug waves
+            except Exception:  # noqa: BLE001 (a re-entry failure must never stop the monitor loop)
+                log.exception("canary re-entry failed")
+
+    def _load_reentry_watches(self) -> dict:
+        """Pending safe-zone re-entry watches, re-armed after a restart: canary_reentry_watch events whose pool has no
+        canary_reentry_verdict yet."""
+        done = {r["token"] for r in self.journal.query(
+            "SELECT DISTINCT token FROM events WHERE kind='canary_reentry_verdict'")}
+        out: dict = {}
+        for r in self.journal.query("SELECT token, detail FROM events WHERE kind='canary_reentry_watch'"):
+            d = json.loads(r["detail"] or "{}")
+            pool = d.get("pool")
+            if pool and r["token"] not in done:
+                out[pool] = {"mint": r["token"], "pool": pool, "due": d["due"], "created_ts": d.get("created_ts"),
+                             "liq": d.get("liq"), "sol_before": d.get("sol_before"), "book": d.get("book")}
+        return out
+
     def _run_probe_watches(self) -> None:
         """Read each probe's pool once its watch window is up and record the verdict: the pool's SOL is gone / far below
         the probe-time level -> `rugger` (we tripped it and dodged); still liquid -> `survivor` (a pool to enter for
@@ -1111,12 +1180,33 @@ class Engine:
         self.journal.log_event("canary_probe2", mint, json.dumps({**res2, "pool": pool}), strategy=cbook.name)
         if res2.get("verdict") != "ok":  # trapped / honeypot / buy_failed: it insta-rugged on the second hit, skip
             return
-        entry_sig = {"mint": mint, "pool": pool, "name": (mint or "")[:10], "score": 0.0,
-                     "liq": w.get("liq") or 0.0, "price": 0.0, "created_ts": w.get("created_ts"),
-                     "kind": "canary_entry", "entry": True, "rw50": True}
-        note = self._buy_model(cbook, entry_sig)
-        self.journal.log_event("canary_entry", mint, json.dumps(
-            {"pool": pool, "result": note or "bought"}), strategy=cbook.name)
+        if c.launch_canary_safe_zone:  # a third, held probe: ride to the safe-zone age, dodge the holding rug, then watch
+            self._canary_hold_probe(cbook, w)
+        else:
+            self._canary_final_entry(cbook, w)  # commit straight to the minute-6 hold
+
+    def _canary_entry_sig(self, w: dict, exit_age_s: float | None = None, safe_zone: bool = False) -> dict:
+        mint = w["mint"]
+        return {"mint": mint, "pool": w.get("pool"), "name": (mint or "")[:10], "score": 0.0,
+                "liq": w.get("liq") or 0.0, "price": 0.0, "created_ts": w.get("created_ts"),
+                "kind": "canary_entry", "entry": True, "rw50": True,
+                "exit_age_s": exit_age_s, "safe_zone": safe_zone}
+
+    def _canary_final_entry(self, cbook, w: dict) -> None:
+        """The real commit: buy and hold to the pool-minute-6 exit with the trailing/stall exits armed."""
+        note = self._buy_model(cbook, self._canary_entry_sig(w))  # exit_age_s None -> hold to minute 6
+        self.journal.log_event("canary_entry", w["mint"], json.dumps(
+            {"pool": w.get("pool"), "result": note or "bought", "stage": "final"}), strategy=cbook.name)
+
+    def _canary_hold_probe(self, cbook, w: dict) -> None:
+        """Buy and sell at the safe-zone age (before the ~1m40 holding-rug cluster) -- a held third probe that induces
+        and dodges the holding rug while banking the pre-cluster peak. Schedules a watch to read the pool afterwards."""
+        sig = self._canary_entry_sig(w, exit_age_s=self.cfg.launch_canary_safe_zone_s, safe_zone=True)
+        note = self._buy_model(cbook, sig)  # time-based exit at the safe zone; no trail/stall (skipped for safe_zone)
+        self.journal.log_event("canary_entry", w["mint"], json.dumps(
+            {"pool": w.get("pool"), "result": note or "bought", "stage": "hold_probe"}), strategy=cbook.name)
+        if note is None:  # the hold-probe opened: watch the pool for the holding rug after our safe-zone sell
+            self._schedule_reentry_watch(cbook, w)
 
     def _canary_wallet_ok(self, cbook, pool, mint, created_ts) -> bool:
         """Wallet-pattern selection gate (11-13): read the pool's first-~66s trade stream (live Helius) and skip a

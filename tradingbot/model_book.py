@@ -204,8 +204,12 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
     hand-made pools by created + `model_book_handmade_exit_age_min`."""
     if name == CANARY_FAST:  # time-based exit from pool creation, independent of the launch books' pool minutes
         return sig["created_ts"] + cfg.launch_fast_canary_exit_s if sig.get("created_ts") else None
-    if name == CANARY4:  # the two-stage entry's hold-to-m6 exit, at the configurable pool minute
-        return sig["created_ts"] + cfg.launch_canary_exit_min * 60 if sig.get("created_ts") else None
+    if name == CANARY4:  # the two-stage entry's exit, at the configurable pool minute
+        if sig.get("created_ts") is None:
+            return None
+        # the safe-zone hold-probe sets exit_age_s (sell at ~90s); the real entry has none (hold to minute 6)
+        age_s = sig.get("exit_age_s")
+        return sig["created_ts"] + (age_s if age_s is not None else cfg.launch_canary_exit_min * 60)
     if name in POOL_MINUTE_EXIT:
         return sig["created_ts"] + POOL_MINUTE_EXIT[name] * 60 if sig.get("created_ts") else None
     age = cfg.model_book_handmade_exit_age_min

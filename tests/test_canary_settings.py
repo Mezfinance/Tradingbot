@@ -99,6 +99,29 @@ def test_lp_entry_validation_needs_the_two_stage_entry():
            launch_canary_lp_entry=True, live_confirm=LIVE_CONFIRM_PHRASE).validate()
 
 
+def test_safe_zone_preset_and_coherence(tmp_path):
+    cfg = _cfg(tmp_path)
+    cs.apply(cfg, None, cs.PRESETS["safe_zone"]["values"])
+    assert cfg.launch_canary_safe_zone and cfg.launch_canary_enter and cfg.launch_canary_probe
+    assert cfg.launch_canary_reentry is False  # measure first: re-entry money is not committed by the preset
+    assert cfg.launch_canary_safe_zone_s == 90.0 and cfg.launch_canary_reentry_watch_s == 120.0
+    with pytest.raises(ValueError):  # the hold-probe is part of the two-stage entry
+        cs.apply(_cfg(tmp_path), None, {"launch_canary_safe_zone": True, "launch_canary_enter": False})
+    with pytest.raises(ValueError):  # re-entry needs the hold-probe on
+        cs.apply(_cfg(tmp_path), None, {"launch_canary_reentry": True, "launch_canary_safe_zone": False})
+
+
+def test_safe_zone_validation_needs_enter_and_reentry_needs_safe_zone():
+    from tradingbot.config import LIVE_CONFIRM_PHRASE, Config
+    with pytest.raises(ValueError, match="safe-zone hold-probe"):  # safe_zone on, enter off
+        Config(launch_canary_safe_zone=True, live_confirm=LIVE_CONFIRM_PHRASE).validate()
+    with pytest.raises(ValueError, match="Re-entry runs after"):   # reentry on, safe_zone off
+        Config(launch_canary_reentry=True, live_confirm=LIVE_CONFIRM_PHRASE).validate()
+    # the full safe-zone + re-entry combo validates
+    Config(launch_canary_route="direct", launch_canary_probe=True, launch_canary_enter=True,
+           launch_canary_safe_zone=True, launch_canary_reentry=True, live_confirm=LIVE_CONFIRM_PHRASE).validate()
+
+
 def test_apply_overlay_is_defensive_at_boot(tmp_path):
     cfg = _cfg(tmp_path)
     with open(cs.settings_path(cfg), "w") as fh:

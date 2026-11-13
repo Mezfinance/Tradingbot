@@ -85,6 +85,15 @@ FIELDS: list[dict] = [
      "help": "The commit enters as a liquidity provider (atomic buy + deposit) instead of a buyer, so an operator's "
      "proportional LP withdrawal leaves our SOL half (a rug recovers ~50% vs -100%). Probes stay direct. Needs Enter + "
      "direct route; takes effect after restart."},
+    {"key": "launch_canary_safe_zone", "label": "Safe-zone hold-probe", "type": "bool", "group": "Entry", "live": True,
+     "help": "Use the held position as a third probe: enter at confirmation, sell at the safe-zone age below (dodging "
+     "the ~1m40 holding rug), then watch the pool. Measures the holding-rug rate until Re-entry is on. Needs Enter."},
+    {"key": "launch_canary_safe_zone_s", "label": "Safe-zone sell (pool age s)", "type": "float", "group": "Entry",
+     "live": True, "lo": 30, "hi": 180, "help": "Sell the hold-probe at this pool age, before the ~1m40 holding-rug cluster."},
+    {"key": "launch_canary_reentry_watch_s", "label": "Re-entry watch (pool age s)", "type": "float", "group": "Entry",
+     "live": True, "lo": 60, "hi": 360, "help": "Read the pool at this pool age: rugged = holding rugger dodged; survived = clean."},
+    {"key": "launch_canary_reentry", "label": "Re-enter clean survivors (REAL)", "type": "bool", "group": "Entry",
+     "live": True, "help": "A pool clean through the watch gets the real minute-6 entry. Needs the safe-zone hold-probe on."},
     # --- sizing ---
     {"key": "launch_canary_flat_usd", "label": "Flat buy size ($)", "type": "float", "group": "Sizing", "live": True,
      "lo": 0, "hi": 500, "help": "> 0: every commit at this size (0 = use the band scale)."},
@@ -176,6 +185,16 @@ PRESETS["two_stage_lp"] = {
              "buyer. Operators pull by withdrawing their own LP, which leaves our SOL half, so a minute-2 rug recovers "
              "~50% instead of -100%. The probes stay direct round-trips. Takes effect after a restart.",
     "values": {**PRESETS["two_stage"]["values"], "launch_canary_lp_entry": True}}
+# The two-stage entry, but the commit is a safe-zone hold-probe: enter at confirmation, sell at ~90s (before the ~1m40
+# holding-rug cluster), then watch the pool to tell a holding rugger from a clean survivor. Re-entry off, so it measures
+# the holding-rug rate without committing re-entry money (turn Re-enter on once the induce-and-dodge is confirmed).
+PRESETS["safe_zone"] = {
+    "label": "Safe-zone hold-probe (measure)",
+    "about": "The two-stage entry, but the commit is a hold-probe: enter at confirmation, sell at ~90s (before the "
+             "~1m40 holding-rug cluster), then watch the pool to separate a holding rugger (dodged) from a clean "
+             "survivor. Re-entry is off, so it measures the holding-rug rate before any re-entry money is committed.",
+    "values": {**PRESETS["two_stage"]["values"], "launch_canary_safe_zone": True, "launch_canary_safe_zone_s": 90.0,
+               "launch_canary_reentry_watch_s": 120.0, "launch_canary_reentry": False}}
 
 
 def settings_path(cfg) -> str:
@@ -236,6 +255,10 @@ def _coherent(state: dict) -> None:
         raise ValueError("The LP deposit entry is the two-stage entry's commit — turn Enter double-survivors on.")
     if state.get("launch_canary_lp_entry") and state.get("launch_canary_route") != "direct":
         raise ValueError("The LP deposit entry keeps direct probes; set Route to direct (the entry itself is LP).")
+    if state.get("launch_canary_safe_zone") and not state.get("launch_canary_enter"):
+        raise ValueError("The safe-zone hold-probe is part of the two-stage entry — turn Enter double-survivors on.")
+    if state.get("launch_canary_reentry") and not state.get("launch_canary_safe_zone"):
+        raise ValueError("Re-entry runs after the safe-zone hold-probe — turn Safe-zone hold-probe on.")
 
 
 def apply(cfg, journal, changes: dict) -> dict:

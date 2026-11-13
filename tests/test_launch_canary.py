@@ -930,3 +930,80 @@ def test_probe_smoke_runs_one_probe_and_reports_the_result(cfg):
     out = launch_canary.probe_smoke(live, "A", 1.0)
     assert live.probed == [("A", 1.0)]  # one low-cost probe
     assert out["result"]["verdict"] == "ok" and out["result"]["slot_gap"] == 1 and out["usd"] == 1.0
+
+
+# --- safe-zone hold-probe (11-13): a third, held probe that induces and dodges the ~1m40 holding rug ---
+def test_safe_zone_hold_probe_sells_at_the_safe_zone_and_schedules_a_watch(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_safe_zone, cfg.launch_canary_vol_gate = True, True, False
+    cfg.launch_canary_safe_zone_s = 90.0  # trail/climb are >0 by default, so the safe_zone skip is exercised
+    book = eng.books[mb.CANARY4]
+    w = _survivor_w(book.name)
+    eng._canary_enter(w)
+    pos = j.open_positions(mb.CANARY4)
+    assert pos and pos[0].token_address == "A"                       # the hold-probe opened
+    assert abs(eng._deadlines[pos[0].id] - (w["created_ts"] + 90.0)) < 1  # time-based exit at the safe zone
+    assert pos[0].id not in eng._canary_climbs and pos[0].id not in eng._canary_trails  # no price exits on a hold-probe
+    assert "PA" in eng._reentry_watches                             # a re-entry watch is scheduled
+    stage = json.loads(j.query("SELECT detail FROM events WHERE kind='canary_entry'")[-1]["detail"])["stage"]
+    assert stage == "hold_probe"
+
+
+def test_safe_zone_reentry_enters_a_clean_survivor_to_minute_6(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_safe_zone, cfg.launch_canary_reentry, cfg.launch_canary_vol_gate = True, True, False
+    book = eng.books[mb.CANARY4]
+    w = _survivor_w(book.name)
+    eng._schedule_reentry_watch(book, w)         # the hold-probe has sold by the watch (not modelled here)
+    live.sol_now = {"A": 10.0}                    # pool still liquid -> clean through both waves
+    for r in eng._reentry_watches.values():
+        r["due"] = time.time() - 1
+    eng._run_reentry_watches()
+    verdict = json.loads(j.query("SELECT detail FROM events WHERE kind='canary_reentry_verdict'")[0]["detail"])
+    assert verdict["verdict"] == "clean"
+    pos = j.open_positions(mb.CANARY4)
+    assert pos and pos[0].token_address == "A"                       # re-entered for real
+    assert abs(eng._deadlines[pos[0].id] - (w["created_ts"] + cfg.launch_canary_exit_min * 60)) < 1  # minute-6 hold
+    assert not eng._reentry_watches
+
+
+def test_safe_zone_reentry_does_not_enter_a_holding_rug(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_safe_zone, cfg.launch_canary_reentry, cfg.launch_canary_vol_gate = True, True, False
+    book = eng.books[mb.CANARY4]
+    eng._schedule_reentry_watch(book, _survivor_w(book.name))
+    live.sol_now = {"A": 0.2}                     # drained after our safe-zone sell -> holding rug, we dodged
+    for r in eng._reentry_watches.values():
+        r["due"] = time.time() - 1
+    eng._run_reentry_watches()
+    verdict = json.loads(j.query("SELECT detail FROM events WHERE kind='canary_reentry_verdict'")[0]["detail"])
+    assert verdict["verdict"] == "holding_rug"
+    assert not j.open_positions(mb.CANARY4)                          # did NOT re-enter into the rug
+
+
+def test_safe_zone_measure_only_logs_a_clean_survivor_without_reentering(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_safe_zone, cfg.launch_canary_reentry = True, False  # measure the holding-rug rate, no re-entry money
+    book = eng.books[mb.CANARY4]
+    eng._schedule_reentry_watch(book, _survivor_w(book.name))
+    live.sol_now = {"A": 10.0}
+    for r in eng._reentry_watches.values():
+        r["due"] = time.time() - 1
+    eng._run_reentry_watches()
+    verdict = json.loads(j.query("SELECT detail FROM events WHERE kind='canary_reentry_verdict'")[0]["detail"])
+    assert verdict["verdict"] == "clean"
+    assert not j.open_positions(mb.CANARY4)                          # re-entry off -> no commit
+
+
+def test_safe_zone_reentry_watch_rearms_after_restart_until_resolved(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_safe_zone = True
+    eng._schedule_reentry_watch(eng.books[mb.CANARY4], _survivor_w(eng.books[mb.CANARY4].name))
+    assert eng._load_reentry_watches()["PA"]["mint"] == "A"          # reloaded from the event
+    j.log_event("canary_reentry_verdict", "A", json.dumps({"pool": "PA", "verdict": "clean"}), strategy=mb.CANARY4)
+    assert "PA" not in eng._load_reentry_watches()                   # resolved -> not re-armed
