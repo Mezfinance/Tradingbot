@@ -786,6 +786,45 @@ def test_two_stage_climb_check_rides_a_climber_and_bails_a_flat_entry(cfg, good_
     assert eng._canary_climb_failed(book, pos, time.time()) is True
 
 
+def test_two_stage_entry_arms_a_trailing_stop(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate, cfg.launch_canary_trail_pct = True, False, 30.0
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))   # entry_px = pool_price("A") = 1.0
+    rec = eng._canary_trails[j.open_positions(mb.CANARY4)[0].id]
+    assert rec["peak"] == 1.0 and rec["trail"] == 0.30
+
+
+def test_trailing_stop_rides_the_peak_then_fires_on_the_drop(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate, cfg.launch_canary_trail_pct = True, False, 30.0
+    book = eng.books[mb.CANARY4]
+    eng._canary_enter(_survivor_w(book.name))
+    pos = j.open_positions(mb.CANARY4)[0]
+    live.price_now["A"] = 1.50                            # new high -> the peak tracks up, does not fire
+    assert eng._canary_trail_hit(book, pos, time.time()) is False
+    assert eng._canary_trails[pos.id]["peak"] == 1.50
+    live.price_now["A"] = 1.20                            # 20% off the 1.50 peak (< 30%) -> hold
+    assert eng._canary_trail_hit(book, pos, time.time()) is False
+    live.price_now["A"] = 1.00                            # 33% off the 1.50 peak (>= 30%) -> sell
+    assert eng._canary_trail_hit(book, pos, time.time()) is True
+    assert pos.id not in eng._canary_trails               # one-shot: record cleared
+
+
+def test_trailing_stop_off_when_zero(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    cfg.launch_canary_trail_pct, cfg.launch_canary_climb_check_s = 0.0, 0.0  # both exits off -> nothing armed
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert j.open_positions(mb.CANARY4)[0].id not in eng._canary_trails
+
+
+def test_trailing_stops_rearm_after_a_restart(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate, cfg.launch_canary_trail_pct = True, False, 30.0
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert j.open_positions(mb.CANARY4)[0].id in eng._load_canary_trails()  # reloaded from the arm event
+
+
 def test_canary_exit_deadline_uses_the_configured_minute(cfg):
     cfg.launch_canary_exit_min = 6.0
     assert mb.exit_deadline(cfg, mb.CANARY4, {"created_ts": 1000.0}) == 1000.0 + 360

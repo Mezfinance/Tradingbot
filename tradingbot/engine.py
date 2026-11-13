@@ -126,6 +126,7 @@ class Engine:
         self._holds = self._load_holds()  # position id -> {"at": [check times left], "last": return at the last check}
         self._probe_watches = self._load_probe_watches()  # pool -> a 1-slot probe awaiting its survival read
         self._canary_climbs = self._load_canary_climbs()  # position id -> the two-stage entry's reserve-priced climb check
+        self._canary_trails = self._load_canary_trails()  # position id -> the two-stage entry's reserve-priced trailing stop
         self._canary_helius = None  # lazy live Helius client for the entry volatility gate (main key)
         self._model_pool = None  # threads that let every book buy a signal at the same time
         self._sell_pool = None  # threads that sell every due exit of a monitor pass at once
@@ -400,6 +401,8 @@ class Engine:
                 exits = [(pos.qty, "no_climb")]  # flat after the first minutes: pulled pools mostly look like this
             if not exits and self._canary_climb_failed(book, pos, now):
                 exits = [(pos.qty, "no_climb")]  # two-stage entry: not up by the check (reserve-priced), bail
+            if not exits and self._canary_trail_hit(book, pos, now):
+                exits = [(pos.qty, "trail_stop")]  # two-stage entry: pool price fell the trail % off its running peak
             if not exits and self._hold_failed(pos, now):
                 exits = [(pos.qty, "hold_check")]  # not up (or falling) at a pool-minute check: out now
             if any(r.startswith("take_profit") for _, r in exits):
@@ -910,17 +913,22 @@ class Engine:
             self.journal.log_event("model_climb_check", sig["mint"],
                                    json.dumps({"position_id": pos.id, "at": check[0], "price": check[1]}),
                                    strategy=book.name)
-        if canary and sig.get("entry") and c.launch_canary_climb_check_s > 0:
-            # Two-stage entry climb check (11-13): at entry + climb_check_s, bail unless the pool price (read from the
-            # pool's own reserves, via the paid Helius RPC -- Jupiter can't quote a ~2-min-old pool) is up by
-            # climb_min_gain_pct over the entry price, else ride to the pool-minute exit. Priced reserve-to-reserve, so
-            # the raw entry price from the fill is the baseline.
+        if canary and sig.get("entry") and (c.launch_canary_climb_check_s > 0 or c.launch_canary_trail_pct > 0):
+            # Two-stage entry exits (11-13), both priced from the pool's own reserves via the paid Helius RPC (Jupiter
+            # can't quote a ~2-min-old pool), so the raw entry price from the fill is the baseline. One read here.
             entry_px = book.executor.pool_price(sig["mint"]) if hasattr(book.executor, "pool_price") else None
-            if entry_px:
+            if entry_px and c.launch_canary_climb_check_s > 0:
+                # Climb check: at entry + climb_check_s, bail unless up by climb_min_gain_pct, else ride to the exit.
                 rec = {"position_id": pos.id, "at": pos.opened_at + c.launch_canary_climb_check_s,
                        "entry_px": entry_px, "min_gain": c.launch_canary_climb_min_gain_pct / 100.0}
                 self._canary_climbs[pos.id] = rec
                 self.journal.log_event("canary_climb_check", sig["mint"], json.dumps(rec), strategy=book.name)
+            if entry_px and c.launch_canary_trail_pct > 0:
+                # Trailing stop: track the running peak price and sell when it falls trail_pct off it. The study's
+                # strongest survivor exit -- it banks a climber's peak before a fade (an atomic rug still beats it).
+                rec = {"position_id": pos.id, "peak": entry_px, "trail": c.launch_canary_trail_pct / 100.0}
+                self._canary_trails[pos.id] = rec
+                self.journal.log_event("canary_trail_arm", sig["mint"], json.dumps(rec), strategy=book.name)
         checks = mb.hold_checks(book.name, sig)
         if checks:
             self._holds[pos.id] = {"at": list(checks), "last": None}
@@ -993,6 +1001,17 @@ class Engine:
         for r in self.journal.query("SELECT detail FROM events WHERE kind='canary_climb_check'"):
             d = json.loads(r["detail"])
             if d.get("position_id") in open_ids and d.get("entry_px"):
+                out[d["position_id"]] = d
+        return out
+
+    def _load_canary_trails(self) -> dict[int, dict]:
+        """Pending two-stage-entry trailing stops of open positions, re-armed after a restart. The peak resets to the
+        last armed peak (the real high between arm and restart is lost), but the pool-minute deadline backstops."""
+        open_ids = {p.id for p in self.journal.open_positions(strategy=None)}
+        out: dict[int, dict] = {}
+        for r in self.journal.query("SELECT detail FROM events WHERE kind='canary_trail_arm'"):
+            d = json.loads(r["detail"])
+            if d.get("position_id") in open_ids and d.get("peak"):
                 out[d["position_id"]] = d
         return out
 
@@ -1150,6 +1169,28 @@ class Engine:
             strategy=book.name)
         return not kept
 
+    def _canary_trail_hit(self, book: Book, pos: Position, now: float) -> bool:
+        """Two-stage entry trailing stop: track the pool's running peak price (reserve ratio, read from the paid Helius
+        RPC each pass, since Jupiter can't quote a ~2-min-old pool) and sell when it falls `trail` off that peak. Banks
+        a climber's peak before a fade; an atomic rug still beats it. An unreadable price is skipped (the pool-minute
+        deadline backstops)."""
+        rec = self._canary_trails.get(pos.id)
+        if rec is None:
+            return False
+        px = book.executor.pool_price(pos.token_address) if hasattr(book.executor, "pool_price") else None
+        if not px:
+            return False  # can't read the pool now; try again next pass
+        if px > rec["peak"]:
+            rec["peak"] = px
+            return False  # new high; keep riding
+        if px <= rec["peak"] * (1.0 - rec["trail"]):
+            self._canary_trails.pop(pos.id, None)
+            self.journal.log_event("canary_trail_result", pos.token_address, json.dumps(
+                {"position_id": pos.id, "peak": rec["peak"], "price": px, "drawdown": 1.0 - px / rec["peak"]}),
+                strategy=book.name)
+            return True
+        return False
+
     def _jup_failure(self, default: str) -> str:
         """Skip reason for a failed Jupiter lookup: a refused request is not a missing route."""
         return RATE_LIMITED if getattr(self.jupiter, "last_failure", lambda: "")() == RATE_LIMITED else default
@@ -1222,6 +1263,7 @@ class Engine:
                 pos.closed_at = time.time()
                 pos.exit_reason = reason
                 self._canary_climbs.pop(pos.id, None)  # drop the two-stage climb record on close
+                self._canary_trails.pop(pos.id, None)  # drop the two-stage trailing stop on close
         log.info("[%s] SELL %s %s qty=%.6g @ %.10g -> $%.2f",
                  book.name, pos.symbol, reason, fill.qty, fill.price, fill.usd)
         if pos.closed_at is not None and pos.realized_usd < pos.cost_usd:
