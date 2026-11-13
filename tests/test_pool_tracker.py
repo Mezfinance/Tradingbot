@@ -163,7 +163,8 @@ def test_assemble_joins_feint_scorer_and_path():
     assert round(r["probe_pool_age_s"]) == 6
     assert r["liq_probe"] == 14000
     assert round(r["peak_liq"]) == 28000            # liq_usd * peak_sol/sol_at_decide = 14000 * 2
-    assert round(r["pnl25"], 1) == 5.5              # $25 * 0.22
+    assert r["ret_m6"] == 0.22                       # the scorer's second-6 ideal, kept for context
+    assert r["pnl25"] is None                        # $25 @ m6 is the confirmation entry: no reserve path -> no number
     assert r["pulled"] is False and r["status"] == "done"
 
 
@@ -184,6 +185,7 @@ def test_assemble_scores_a_scorer_pull_as_minus_100_even_when_the_path_froze_pre
     row = pt.assemble(feints, scorer, 100.0, paths, now)[0]
     assert row["pulled"] is True and round(row["pull_pool_age_s"]) == 120
     assert row["conf_ret"] == -1.0 and row["opt_ret"] == -1.0           # the full rug, not the stale -8%
+    assert row["pnl25"] == -25.0                                        # $25 @ m6 = the confirmation entry = -$25
     assert row["conf_by"][6] == -1.0 and row["conf_by"][15] == -1.0     # every horizon past the 2m pull is -100%
     s = pt.summary([row])
     assert s["survivor_entry_n"] == 1 and s["survivor_entry_mean"] == -1.0  # the go/no-go number reflects the rug
@@ -202,6 +204,7 @@ def test_assemble_keeps_a_post_m6_pull_from_zeroing_the_hold_to_m6_entry():
                    "conf_by": {6: 0.25, 10: -1.0, 15: -1.0}}}
     row = pt.assemble(feints, scorer, 100.0, paths, now)[0]
     assert row["conf_ret"] == 0.25 and row["opt_ret"] == 0.6           # the m6 exit beat the minute-8 pull
+    assert row["pnl25"] == 25.0 * 0.25                                 # $25 @ m6 = the confirmation entry (+$6.25)
     assert row["conf_by"][6] == 0.25 and row["conf_by"][10] == -1.0    # holding to 10m past the 8m pull is -100%
 
 

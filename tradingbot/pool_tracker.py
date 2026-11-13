@@ -250,7 +250,9 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
             "pulled": pulled_ts is not None,
             "pull_pool_age_s": (pulled_ts - created) if (pulled_ts and created) else None,
             "pull_after_probe_s": (pulled_ts - f["feint_ts"]) if pulled_ts else None,
-            "ret_m6": ret_m6, "pnl25": (STAKE_USD * ret_m6) if ret_m6 is not None else None,
+            # the headline "$25 @ m6" $ is the realistic CONFIRMATION entry held to minute 6 (conf_ret), not the
+            # scorer's second-6 ideal (ret_m6, kept for context) -- so a rug reads -$25 and a winner the real dollars.
+            "ret_m6": ret_m6, "pnl25": (STAKE_USD * conf_ret) if conf_ret is not None else None,
             "opt_age_s": p.get("opt_age"), "opt_ret": opt_ret,
             "conf_age_s": p.get("conf_age"), "conf_ret": conf_ret, "conf_by": conf_by,
             "status": s.get("status") or "pending",
@@ -274,7 +276,8 @@ def summary(rows: list[dict]) -> dict:
         "rugger": sum(1 for r in rows if r.get("watch_verdict") == "rugger"),
         "pulled_since": sum(1 for r in rows if r["pulled"]),
         "with_outcome": len(done),
-        "would_pnl25": round(sum(pnl), 2) if pnl else 0.0,
+        "would_pnl25": round(sum(pnl), 2) if pnl else 0.0,  # sum of the per-pool confirmation-entry $25 results
+        "would_pnl25_n": len(pnl),                          # pools with a confirmation price (a reserve path)
         "mean_ret_m6": round(sum(r["ret_m6"] for r in done) / len(done), 4) if done else None,
         # the Section-3 go/no-go: of survivors we measured a path for, what entering at confirmation would have made
         "survivor_entry_n": len(entry),
@@ -344,10 +347,11 @@ def _usd(v) -> str:
 def render(rows: list[dict], su: float | None) -> str:
     out = ["POOL TRACKER — feinted pools"]
     s = summary(rows)
+    mean = f"{(s['mean_ret_m6'] * 100):+.1f}%" if s.get("mean_ret_m6") is not None else "—"
     out.append(f"{s['pools']} pools (alive {s['alive']}, pulled-at-probe {s['pulled_at_probe']}, "
                f"inconclusive {s['inconclusive']}); pulled since {s['pulled_since']}; "
-               f"{s['with_outcome']} with a minute-6 outcome, mean ret "
-               f"{(s['mean_ret_m6'] * 100):+.1f}% -> $25 would make ${s['would_pnl25']:+.2f}")
+               f"{s['with_outcome']} with a minute-6 outcome (scorer mean {mean}); "
+               f"a $25 confirmation entry would make ${s['would_pnl25']:+.2f} over {s['would_pnl25_n']} with a path")
     if s.get("survivor"):
         em = f"{s['survivor_entry_mean'] * 100:+.1f}%" if s.get("survivor_entry_mean") is not None else "—"
         bm = f"{s['survivor_best_mean'] * 100:+.1f}%" if s.get("survivor_best_mean") is not None else "—"

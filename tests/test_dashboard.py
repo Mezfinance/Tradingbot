@@ -425,7 +425,9 @@ def test_fetch_pools_joins_feints_to_the_scorer_and_reads_young_reserves(cfg):
     rows = board.pools["rows"]
     assert len(rows) == 1
     r = rows[0]
-    assert r["liq_probe"] == 14000.0 and round(r["pnl25"], 1) == 5.0   # $25 * 0.2
+    # $25 @ m6 is the confirmation entry now: one late reserve read has no pre-confirmation sample, so there is no
+    # conf price yet (pnl25 None); ret_m6 keeps the scorer's second-6 ideal for context.
+    assert r["liq_probe"] == 14000.0 and r["ret_m6"] == 0.2 and r["pnl25"] is None
     assert round(r["peak_liq"]) == 28000                               # liq_usd * peak_sol/sol_at_decide
     assert round(r["live_liq"]) == 18000                               # 2 * 90 * 100 from the live read
     assert board.pools["summary"]["pools"] == 1 and board.pools["stale"] is False
