@@ -72,6 +72,15 @@ FIELDS: list[dict] = [
      "(the wash bot going flat before a pull). 0 = off."},
     {"key": "launch_canary_exit_min", "label": "Exit pool minute", "type": "float", "group": "Entry", "live": True,
      "lo": 1, "hi": 60, "help": "Sell the held position at this pool minute (the hold-to-m6 exit)."},
+    {"key": "launch_canary_wallet_gate", "label": "Wallet-pattern gate", "type": "bool", "group": "Entry",
+     "live": True, "help": "Before the second probe, read the pool's first-~66s trade stream (live Helius) and skip "
+     "a survivor whose wallet fingerprint ranks in the riskiest k% of recent probed pools (creator trading its own "
+     "pool, few distinct wallets = rug). Fails open when there is too little history to rank."},
+    {"key": "launch_canary_wallet_skip_pct", "label": "Wallet gate skip riskiest (%)", "type": "float",
+     "group": "Entry", "live": True, "lo": 0, "hi": 100,
+     "help": "Skip a survivor whose wallet-pattern score is in the riskiest this % of recent probed pools."},
+    {"key": "launch_canary_wallet_entry_s", "label": "Wallet gate read window (s)", "type": "float", "group": "Entry",
+     "live": True, "lo": 10, "hi": 180, "help": "Read the pool's trades up to this pool age (the selection-usable cut)."},
     # --- sizing ---
     {"key": "launch_canary_flat_usd", "label": "Flat buy size ($)", "type": "float", "group": "Sizing", "live": True,
      "lo": 0, "hi": 500, "help": "> 0: every commit at this size (0 = use the band scale)."},
@@ -135,14 +144,16 @@ PRESETS: dict[str, dict] = {
                    "launch_canary_follow_dd": False}},
     "two_stage": {
         "label": "Two-stage entry (probe → enter)",
-        "about": "Probe every liquid pool; on a survivor, check the confirmation-window volatility (Helius), fire a "
-                 "second probe, and if it survives too, enter $25 for real and ride to pool minute 6 with a 30% trailing stop.",
+        "about": "Probe every liquid pool; on a survivor, check the confirmation-window volatility (Helius), skip a "
+                 "rug-like wallet pattern, fire a second probe, and if it survives too, enter $25 for real and ride "
+                 "to pool minute 6 with a 30% trailing stop.",
         "values": {"launch_canary_route": "direct", "launch_canary_probe": True, "launch_canary_probe_usd": 25.0,
                    "launch_canary_probe_watch_s": 48.0, "launch_canary_probe_margin_s": 12.0,
                    "launch_canary_enter": True, "launch_canary_entry_usd": 25.0, "launch_canary_probe2_usd": 25.0,
                    "launch_canary_vol_gate": True, "launch_canary_vol_min_pct": 5.0,
                    "launch_canary_climb_check_s": 0.0, "launch_canary_climb_min_gain_pct": 0.0,
                    "launch_canary_trail_pct": 30.0, "launch_canary_stall_window_s": 20.0,
+                   "launch_canary_wallet_gate": True, "launch_canary_wallet_skip_pct": 50.0,
                    "launch_canary_exit_min": 6.0, "launch_canary_feint": False, "launch_canary_feint_only": False,
                    "launch_canary_feint_all": False, "launch_canary_max_liq_usd": 0.0, "launch_canary_every_n": 1,
                    "launch_canary_max_trades": 0, "launch_canary_follow_dd": False}},
@@ -207,6 +218,8 @@ def _coherent(state: dict) -> None:
         raise ValueError("The 1-slot probe needs the direct route — set Route to direct first (takes effect after restart).")
     if state.get("launch_canary_enter") and not state.get("launch_canary_probe"):
         raise ValueError("Enter double-survivors needs the 1-slot probe on (it runs after the probe).")
+    if state.get("launch_canary_wallet_gate") and not state.get("launch_canary_enter"):
+        raise ValueError("The wallet-pattern gate only runs on the two-stage entry — turn Enter double-survivors on.")
 
 
 def apply(cfg, journal, changes: dict) -> dict:
