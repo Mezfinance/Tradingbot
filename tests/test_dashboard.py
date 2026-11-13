@@ -430,8 +430,11 @@ def test_fetch_pools_joins_feints_to_the_scorer_and_reads_young_reserves(cfg):
     assert round(r["live_liq"]) == 18000                               # 2 * 90 * 100 from the live read
     assert board.pools["summary"]["pools"] == 1 and board.pools["stale"] is False
 
+    # a thrown live reserve read is best-effort now: the pools still render (not stale), only the live columns
+    # are skipped -- a flaky public RPC must never hide the probe/feint pools (which come from events + watch.db).
     board.fetch_pools(lambda m, p: (_ for _ in ()).throw(RuntimeError("rpc down")))
-    assert board.pools["stale"] is True and "rpc down" in board.pools["error"] and board.pools["rows"]
+    assert board.pools["stale"] is False and board.pools["live_read_ok"] is False
+    assert board.pools["rows"] and board.pools["rows"][0]["pool"] == "PoolY"
 
 
 def test_canary_rotate_validates_halts_and_launches_provision(cfg, tmp_path, monkeypatch):

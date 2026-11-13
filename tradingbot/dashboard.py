@@ -726,22 +726,31 @@ class Dashboard:
                 else (lambda sql, p: [])
             scorer = pt.scorer_rows(wq, since)
             su = pt._sol_usd(wq)
-            young = [scorer[pl] for pl in feints
-                     if scorer.get(pl) and scorer[pl].get("create_ts")
-                     and now - scorer[pl]["create_ts"] <= pt.YOUNG_MAX_AGE_S and not scorer[pl].get("pulled_ts")]
-            if young:
-                v = pt.read_vaults(rpc, young)
-                for pl, (sol, tok) in v.items():
-                    s = scorer[pl]
-                    self._pool_paths[pl] = pt.update_path(self._pool_paths.get(pl), now, s["create_ts"],
-                                                          feints[pl]["feint_ts"], sol, tok, su, s.get("exit_px"))
+            # The live reserve read is BEST-EFFORT: a slow / rate-limited public RPC must never hide the pools
+            # themselves (feints + probes come from the journal + watch.db, no RPC) -- it only fills the live liq /
+            # conf / best-entry columns. Before this, a thrown read failed the whole poll, so the tab froze on stale
+            # rows while new probes never appeared (the CLI --no-live and the probe card kept working).
+            live_ok = True
+            try:
+                young = [scorer[pl] for pl in feints
+                         if scorer.get(pl) and scorer[pl].get("create_ts")
+                         and now - scorer[pl]["create_ts"] <= pt.YOUNG_MAX_AGE_S and not scorer[pl].get("pulled_ts")]
+                if young:
+                    v = pt.read_vaults(rpc, young)
+                    for pl, (sol, tok) in v.items():
+                        s = scorer[pl]
+                        self._pool_paths[pl] = pt.update_path(self._pool_paths.get(pl), now, s["create_ts"],
+                                                              feints[pl]["feint_ts"], sol, tok, su, s.get("exit_px"))
+            except Exception as exc:  # noqa: BLE001 (the public RPC can be slow / rate-limited)
+                live_ok = False
+                log.warning("dashboard: pool tracker live reserve read failed (pools still shown): %s", exc)
             cut = now - pt.YOUNG_MAX_AGE_S - 1800  # drop paths for pools long past their window
             for pl in [pl for pl in self._pool_paths if pl not in feints
                        or (scorer.get(pl) and (scorer[pl].get("create_ts") or 0) < cut)]:
                 self._pool_paths.pop(pl, None)
             rows = pt.assemble(feints, scorer, su, self._pool_paths, now)
             data = {"rows": rows[:200], "summary": pt.summary(rows), "sol_usd": su,
-                    "fetched_ts": now, "stale": False}
+                    "fetched_ts": now, "stale": False, "live_read_ok": live_ok}
         except Exception as exc:  # noqa: BLE001 (keep the last good data; the public RPC can be slow)
             log.warning("dashboard: pool tracker failed: %s", exc)
             data = {**(self.pools or {"rows": [], "summary": {}}), "stale": True,
