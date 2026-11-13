@@ -167,6 +167,44 @@ def test_assemble_joins_feint_scorer_and_path():
     assert r["pulled"] is False and r["status"] == "done"
 
 
+def test_assemble_scores_a_scorer_pull_as_minus_100_even_when_the_path_froze_pre_rug():
+    # 9KaQvM4Z: a survivor whose dashboard path froze at a pre-rug sample (so conf_ret looked like a small -8% loss),
+    # but the scorer flagged a full LP pull at minute 2. The hold-to-m6 entry must score -100%, not the stale loss --
+    # otherwise a full rug inflates survivor_entry_mean (the go/no-go number for committing real money).
+    now = 1000.0
+    created = now - 300
+    feints = {"P": {"pool": "P", "mint": "M", "kind": "probe", "verdict": "ok", "watch_verdict": "survivor",
+                    "note": "", "feint_ts": created + 6, "sol_before": 65}}
+    scorer = {"P": {"pool": "P", "token_mint": "M", "create_ts": created, "liq_usd": 32600, "sol_at_decide": 100,
+                    "peak_sol": 108, "pulled_ts": created + 120, "ret": None, "status": "done"}}  # pull at minute 2
+    # the frozen path: the dashboard never saw the drain (path pulled_ts None), so conf_ret/opt_ret look like small moves
+    paths = {"P": {"pts": [], "peak_liq": 35100, "live_liq": 34800, "pulled_ts": None,
+                   "conf_age": 60.0, "conf_ret": -0.08, "opt_age": 41.0, "opt_ret": 0.07,
+                   "conf_by": {6: -0.08, 10: -0.08, 15: -0.08}}}
+    row = pt.assemble(feints, scorer, 100.0, paths, now)[0]
+    assert row["pulled"] is True and round(row["pull_pool_age_s"]) == 120
+    assert row["conf_ret"] == -1.0 and row["opt_ret"] == -1.0           # the full rug, not the stale -8%
+    assert row["conf_by"][6] == -1.0 and row["conf_by"][15] == -1.0     # every horizon past the 2m pull is -100%
+    s = pt.summary([row])
+    assert s["survivor_entry_n"] == 1 and s["survivor_entry_mean"] == -1.0  # the go/no-go number reflects the rug
+
+
+def test_assemble_keeps_a_post_m6_pull_from_zeroing_the_hold_to_m6_entry():
+    # a pool pulled AFTER minute 6: a hold-to-m6 entry exits before the pull, so conf_ret/opt_ret stay as measured.
+    now = 1000.0
+    created = now - 600
+    feints = {"P": {"pool": "P", "mint": "M", "kind": "probe", "verdict": "ok", "watch_verdict": "survivor",
+                    "note": "", "feint_ts": created + 6, "sol_before": 65}}
+    scorer = {"P": {"pool": "P", "token_mint": "M", "create_ts": created, "liq_usd": 20000, "sol_at_decide": 100,
+                    "peak_sol": 120, "pulled_ts": created + 480, "ret": 0.3, "status": "done"}}  # pull at minute 8
+    paths = {"P": {"pts": [], "peak_liq": 24000, "live_liq": 23000, "pulled_ts": None,
+                   "conf_age": 60.0, "conf_ret": 0.25, "opt_age": 40.0, "opt_ret": 0.6,
+                   "conf_by": {6: 0.25, 10: -1.0, 15: -1.0}}}
+    row = pt.assemble(feints, scorer, 100.0, paths, now)[0]
+    assert row["conf_ret"] == 0.25 and row["opt_ret"] == 0.6           # the m6 exit beat the minute-8 pull
+    assert row["conf_by"][6] == 0.25 and row["conf_by"][10] == -1.0    # holding to 10m past the 8m pull is -100%
+
+
 def test_assemble_falls_back_to_the_feint_reserve_when_there_is_no_scorer_row():
     now = 1000.0
     feints = {"P9": {"pool": "P9", "mint": "M", "verdict": "pulled", "note": "", "feint_ts": now - 10,

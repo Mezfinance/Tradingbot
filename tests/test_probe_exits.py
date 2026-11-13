@@ -140,6 +140,64 @@ def test_conf_range_measures_the_window_and_the_filter_splits_movers_from_the_fl
     assert b5["kept"]["n"] == 1                                    # the ~5.3% range still clears 5%
 
 
+def test_dump_pool_reconstructs_the_path_and_marks_the_pull():
+    now = 1000.0
+    created = 700.0
+    feint_ts = 706.0                                 # probe at pool age 6
+    conf_age = feint_ts + pe.CONF_AFTER_S - created  # 72
+    events = [{"ts": feint_ts, "token": "M9", "kind": "canary_probe",
+               "detail": json.dumps({"pool": "P9", "verdict": "ok"})}]
+
+    class J:
+        def query(self, sql, p=()):
+            if "canary_probe_verdict" in sql:
+                return [{"detail": json.dumps({"pool": "P9", "verdict": "survivor"})}]
+            return [r for r in events if r["ts"] >= p[0]]
+
+    from tradingbot import pool_tracker as pt
+    base = {c: None for c in pt.SCORER_COLS}
+    scorer = {"P9": {**base, "pool": "P9", "token_mint": "M9", "create_ts": created,
+                     "pulled_ts": created + 120}}  # full rug at minute 2
+
+    class S:
+        def query(self, sql, p=()):
+            if "watch_market" in sql:
+                return [{"sol_usd": 200.0}]
+            if "watch_probe_exit" in sql:
+                return []
+            return [r for r in scorer.values() if r["create_ts"] >= p[0]]
+
+        def execute(self, *a):
+            pass
+
+    # dashboard pts: dips at 41s, climbs through confirmation, comes off, then the reserves crater at the 2m pull
+    paths = {"P9": {"pts": [(20, 32600, 1.0), (41, 31000, 0.95), (conf_age, 35100, 1.15),
+                            (conf_age + 30, 34000, 1.10), (conf_age + 60, 600, 0.02)]}}
+    out = pe.dump_pool(J(), S(), cfg=None, pool="P9", helius=None, paths=paths, now=now)
+    assert out["pull_pool_age_s"] == 120 and abs(out["conf_age_s"] - conf_age) < 0.1
+    assert out["entry_px"] == 1.15 and out["peak_px"] == 1.15          # entry = first price at/after confirmation
+    by = {round(sm["pool_age_s"]): sm for sm in out["samples"]}
+    assert round(by[41]["px_rel_conf"], 3) == round(0.95 / 1.15, 3)    # the 41s dip is below the conf entry
+    assert by[20]["liq_usd"] == 32600                                  # liq from the pts
+    assert pe.render_dump(out).startswith("PATH DUMP") and "scorer LP pull at 120" in pe.render_dump(out)
+
+
+def test_dump_pool_reports_when_the_pool_is_unknown():
+    class J:
+        def query(self, sql, p=()):
+            return []
+
+    class S:
+        def query(self, sql, p=()):
+            return []
+
+        def execute(self, *a):
+            pass
+
+    out = pe.dump_pool(J(), S(), cfg=None, pool="nope", helius=None, paths={}, now=1000.0)
+    assert out["error"].startswith("no probe/feint event")
+
+
 def test_conf_range_from_a_fetched_series_splits_the_window_at_sec_zero():
     created = 1000.0
     feint_ts = 1007.0

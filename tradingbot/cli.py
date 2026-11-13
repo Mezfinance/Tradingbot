@@ -715,6 +715,11 @@ def main(argv: list[str] | None = None) -> None:
             from tradingbot.data.helius import Helius as _PeHelius
             pe_helius = _PeHelius(client=_pe_httpx.Client(timeout=60))  # research (backup) key, never the live key
             pe_helius.min_interval_s = 1 / max(args.rps, 0.1)
+        if args.pool:  # reconstruct one pool's reserve path (climb-peak timing / stall before a pull)
+            out = _pe.dump_pool(_PeJournal(cfg.db_path), _PeWS(_pe_wdp(cfg)), cfg, args.pool,
+                                helius=pe_helius, max_credits=int(args.max_credits or 4_000))
+            print(json.dumps(out, indent=2, default=str) if args.json else _pe.render_dump(out))
+            return
         out = _pe.study(_PeJournal(cfg.db_path), _PeWS(_pe_wdp(cfg)), cfg=cfg, hours=args.hours or 24.0,
                         helius=pe_helius, max_credits=int(args.max_credits or 8_000))
         print(json.dumps(out, indent=2, default=str) if args.json else _pe.render(out))

@@ -61,6 +61,8 @@ PULL_GRID_S = (15, 30, 45, 60, 90, 120, 180, 240, 300, 360, 420, 480, 600, 900, 
 CONF_FETCH_OFFSETS = (-58, -44, -30, -16, 0)
 VOL_GRID = (0.015, 0.02, 0.03, 0.05)   # confirmation-window peak-to-trough thresholds to sweep
 DEFAULT_VOL = 0.02                      # the entry filter we run the deployed climb gate on top of
+DUMP_STEP_S = 5                         # dense grid step for a single-pool --pool path dump
+DUMP_AFTER_CONF_S = 420                 # dump through ~minute 6 after confirmation, plus margin to catch a late pull
 
 SCHEMA = "CREATE TABLE IF NOT EXISTS watch_probe_exit(pool TEXT, sec INTEGER, sol REAL, tok REAL, ts REAL, " \
          "PRIMARY KEY(pool, sec))"
@@ -414,6 +416,99 @@ def study(journal, store, cfg=None, hours: float = 24.0, helius=None, max_credit
             "fixed_hold": fixed_hold(with_path),
             "climb_gate": climb_gate(with_path),
             "rows": survs}
+
+
+# --- single-pool path dump -------------------------------------------------------------------------
+
+def _dump_grid(probe_age: float, conf_age: float) -> list[int]:
+    """Dense conf-relative offsets: every DUMP_STEP_S from the probe through ~minute 6 after confirmation."""
+    pre = list(range(-int(round(conf_age - probe_age)), 0, DUMP_STEP_S))
+    post = list(range(0, DUMP_AFTER_CONF_S + 1, DUMP_STEP_S))
+    return sorted(set(pre + post))
+
+
+def dump_pool(journal, store, cfg, pool: str, helius=None, max_credits: int = 4_000,
+              paths: dict | None = None, now: float | None = None) -> dict:
+    """Reconstruct one pool's reserve path from the probe through ~minute 6 so the climb-peak timing and any stall
+    before a pull can be eyeballed (9KaQvM4Z: did it climb in the first minute, then stall, then rug?). With `helius`
+    (research key) it fetches a fine `last_before` series every DUMP_STEP_S; else it uses the cached `watch_probe_exit`
+    rows and the dashboard pts. Prices are shown relative to the confirmation entry price; read only."""
+    from tradingbot import pool_tracker as pt
+    now = now if now is not None else time.time()
+    look = now - 30 * 24 * 3600
+    f = pt.feint_pools(journal.query, look).get(pool)
+    s = pt.scorer_rows(store.query, look).get(pool) or {}
+    if not f:
+        return {"pool": pool, "error": "no probe/feint event found for this pool in the last 30 days"}
+    created = s.get("create_ts")
+    feint_ts = f["feint_ts"]
+    conf_ts = feint_ts + CONF_AFTER_S
+    probe_age = (feint_ts - created) if created else 0.0
+    conf_age = (conf_ts - created) if created else CONF_AFTER_S
+    mint = s.get("token_mint") or f.get("mint")
+    sol_usd = pt._sol_usd(store.query)
+    pulled_ts = s.get("pulled_ts")
+
+    samples: list[tuple[float, float, float | None]] = []  # (pool_age_s, price_raw, liq_usd|None)
+    if helius is not None:
+        grid = _dump_grid(probe_age, conf_age)
+        fetched = fetch_series(store, helius, [{"pool": pool, "conf_ts": conf_ts, "token_mint": mint}],
+                               max_credits, grid=[g for g in grid if g > 0], conf_offsets=[g for g in grid if g <= 0])
+        for sec, sol, tok in fetched.get(pool, []):
+            if sol and tok:
+                samples.append((conf_age + sec, sol / tok, (2 * sol / 1e9 * sol_usd) if sol_usd else None))
+        source = "helius fine series"
+    else:
+        p = (paths if paths is not None else _load_paths(cfg)).get(pool) or {}
+        for a, lq, pr in p.get("pts", []):
+            if pr:
+                samples.append((a, pr, lq))
+        store.execute(SCHEMA)
+        for r in store.query("SELECT sec, sol, tok FROM watch_probe_exit WHERE pool=?", (pool,)):
+            if r["sol"] and r["tok"]:
+                samples.append((conf_age + int(r["sec"]), r["sol"] / r["tok"],
+                                (2 * r["sol"] / 1e9 * sol_usd) if sol_usd else None))
+        source = "dashboard path + cache (no --fetch)"
+    samples = sorted(set(samples))
+    if not samples:
+        return {"pool": pool, "mint": mint, "error": "no reserve samples (run with --fetch)"}
+    entry = next((pr for a, pr, _ in samples if a >= conf_age), samples[0][1])
+    peak = max(pr for _, pr, _ in samples)
+    return {"pool": pool, "mint": mint, "source": source, "created_ts": created,
+            "probe_age_s": round(probe_age, 1), "conf_age_s": round(conf_age, 1),
+            "pull_pool_age_s": round(pulled_ts - created, 1) if (pulled_ts and created) else None,
+            "entry_px": entry, "peak_px": peak,
+            "peak_from_entry": (peak / entry - 1) if entry else None,
+            "samples": [{"pool_age_s": round(a, 1), "after_conf_s": round(a - conf_age, 1),
+                         "px_rel_conf": (pr / entry) if entry else None, "liq_usd": lq} for a, pr, lq in samples]}
+
+
+def render_dump(d: dict) -> str:
+    if d.get("error"):
+        return f"PATH DUMP — {d['pool']}: {d['error']}"
+    pull = d.get("pull_pool_age_s")
+    o = [f"PATH DUMP — {d['pool']} ({d.get('mint')})  [{d['source']}]",
+         f"probe at pool age {d['probe_age_s']}s, confirmation (entry) at {d['conf_age_s']}s, "
+         + (f"scorer LP pull at {pull}s" if pull is not None else "no scorer pull on record"),
+         f"entry price {d['entry_px']:.3g}, peak {d['peak_px']:.3g} ({_pct(d['peak_from_entry'])} from entry)",
+         "",
+         f"  {'pool_age':>8} {'after_conf':>10} {'px xEntry':>9} {'liq':>9}  mark"]
+    rels = [sm["px_rel_conf"] for sm in d["samples"] if sm["px_rel_conf"] is not None]
+    peak_rel = max(rels) if rels else None
+    pull_marked = False
+    for sm in d["samples"]:
+        marks = []
+        if abs(sm["after_conf_s"]) < DUMP_STEP_S:
+            marks.append("<- entry")
+        if peak_rel is not None and sm["px_rel_conf"] == peak_rel:
+            marks.append("<- peak")
+        if pull is not None and not pull_marked and sm["pool_age_s"] >= pull - DUMP_STEP_S:
+            marks.append("<- scorer pull")  # the first sample at/around the scorer's LP-pull time
+            pull_marked = True
+        px = f"{sm['px_rel_conf']:.3f}" if sm["px_rel_conf"] is not None else "—"
+        liq = f"${sm['liq_usd'] / 1000:.1f}k" if sm.get("liq_usd") else "—"
+        o.append(f"  {sm['pool_age_s']:>7.0f}s {sm['after_conf_s']:>9.0f}s {px:>9} {liq:>9}  {' '.join(marks)}")
+    return "\n".join(o)
 
 
 # --- render --------------------------------------------------------------------------------------

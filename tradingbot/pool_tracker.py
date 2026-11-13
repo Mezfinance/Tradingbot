@@ -131,7 +131,8 @@ def read_vaults(rpc, pools: list[dict]) -> dict:
 
 
 def update_path(path: dict | None, now: float, created: float | None, feint_ts: float, sol: float,
-                tok: float, sol_usd: float | None, exit_px: float | None) -> dict:
+                tok: float, sol_usd: float | None, exit_px: float | None,
+                scorer_pulled_ts: float | None = None) -> dict:
     """Append one live reserve sample to a pool's path and recompute the live/peak/pull/optimal figures.
 
     `path` carries `pts` = [(pool_age_s, liq_usd, price)], `peak_liq`, `live_liq`, `pulled_ts`,
@@ -148,6 +149,16 @@ def update_path(path: dict | None, now: float, created: float | None, feint_ts: 
         if path["pulled_ts"] is None and path["peak_liq"] > 0 and liq < PULLED_SHARE * path["peak_liq"]:
             path["pulled_ts"] = now
     path["last_ts"] = now
+    # effective pull time: the dashboard's own reserve-detected pull (`path["pulled_ts"]`) OR the scorer's
+    # authoritative LP-pull flag (`scorer_pulled_ts`), whichever is earlier. The dashboard stops sampling a pool once
+    # its live read fails or it ages out, so a pool can fully rug AFTER our last reserve sample -- the scorer catches
+    # that, and without folding it in here a full rug (9KaQvM4Z, pulled at minute 2) scores as a small loss, which
+    # inflates the survivor returns. opt_ret / conf_ret are hold-to-minute-6, so a pull at or before minute 6 = -100%.
+    eff_pulled = path["pulled_ts"]
+    if scorer_pulled_ts and (eff_pulled is None or scorer_pulled_ts < eff_pulled):
+        eff_pulled = scorer_pulled_ts
+    pulled_age = (eff_pulled - created) if (eff_pulled and created) else None
+    rugged_by_m6 = pulled_age is not None and pulled_age <= MINUTE6_S
     # optimal entry: the lowest price at or after the probe and before minute 6 while the pool is still alive
     # (liquidity at least PULLED_SHARE of its peak), exited near minute 6.
     probe_age = (feint_ts - created) if created else 0.0
@@ -158,7 +169,7 @@ def update_path(path: dict | None, now: float, created: float | None, feint_ts: 
         exit_px = exit_px or next((pr for a, pr in reversed(window) if a >= MINUTE6_S - 60), window[-1][1])
         opt_age, opt_px = min(window, key=lambda ap: ap[1])
         path["opt_age"] = opt_age
-        path["opt_ret"] = (-1.0 if path["pulled_ts"] else min(exit_px / opt_px - 1 - COST, 3.0)) if opt_px else None
+        path["opt_ret"] = (-1.0 if rugged_by_m6 else min(exit_px / opt_px - 1 - COST, 3.0)) if opt_px else None
         # realistic two-stage entry: the first price at or after the survival confirmation (~probe age + the watch
         # window), held to minute 6 -- what entering a SURVIVOR for real would actually have made, vs opt (the
         # hindsight-best entry). -100% if the pool was pulled (a survivor that later rugged).
@@ -166,11 +177,9 @@ def update_path(path: dict | None, now: float, created: float | None, feint_ts: 
                      if pr and a >= probe_age + CONF_AFTER_S and lq >= floor), None)
         if conf and exit_px:
             path["conf_age"] = conf[0]
-            path["conf_ret"] = -1.0 if path["pulled_ts"] else min(exit_px / conf[1] - 1 - COST, 3.0)
+            path["conf_ret"] = -1.0 if rugged_by_m6 else min(exit_px / conf[1] - 1 - COST, 3.0)
             # hold curve: enter at confirmation, sell at each horizon (last live price at/before it while alive);
-            # -100% if pulled by then. Tells us whether holding a survivor past minute 6 pays (ripsnorters) or just
-            # adds rug risk. Capped +1000% (not +300%) so the big winners show.
-            pulled_age = (path["pulled_ts"] - created) if (path["pulled_ts"] and created) else None
+            # -100% if pulled by then (eff_pulled, so a scorer-known rug past our last reserve sample counts).
             curve = {}
             for H in HOLD_MINS:
                 h = H * 60
@@ -204,6 +213,18 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
             peak_liq = max(peak_liq or 0.0, p["peak_liq"])
         pulled_ts = p.get("pulled_ts") or s.get("pulled_ts")
         ret_m6 = s.get("ret")
+        # A pool the dashboard stopped sampling (live read failed, or it aged out, or the young-read filter dropped it
+        # once the scorer flagged a pull) can fully rug after our last reserve sample. The scorer's `pulled_ts` is the
+        # authoritative LP-pull time, so fold it into the hold-to-m6 entry returns here: a confirmation entry held to
+        # minute 6 through a pull at or before minute 6 is -100%, not the small loss the stale reserves imply
+        # (9KaQvM4Z fully rugged at minute 2 but the path, frozen at a pre-rug $34.8k sample, scored enter@conf -8%).
+        pull_age = (pulled_ts - created) if (pulled_ts and created) else None
+        rugged_by_m6 = pull_age is not None and pull_age <= MINUTE6_S
+        opt_ret = -1.0 if rugged_by_m6 else p.get("opt_ret")
+        conf_ret = -1.0 if rugged_by_m6 else p.get("conf_ret")
+        conf_by = p.get("conf_by")
+        if conf_by and pull_age is not None:  # clamp each hold horizon the pull reaches to -100%
+            conf_by = {H: (-1.0 if pull_age <= H * 60 else v) for H, v in conf_by.items()}
         # for a 1-slot probe the meaningful verdict is the survival read (rugger/survivor); fall back to the probe's
         # own result (ok/trapped/...) until the watch fires. Feints keep alive/pulled/inconclusive.
         disp = f.get("watch_verdict") or f.get("verdict") if f.get("kind") == "probe" else f.get("verdict")
@@ -230,8 +251,8 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
             "pull_pool_age_s": (pulled_ts - created) if (pulled_ts and created) else None,
             "pull_after_probe_s": (pulled_ts - f["feint_ts"]) if pulled_ts else None,
             "ret_m6": ret_m6, "pnl25": (STAKE_USD * ret_m6) if ret_m6 is not None else None,
-            "opt_age_s": p.get("opt_age"), "opt_ret": p.get("opt_ret"),
-            "conf_age_s": p.get("conf_age"), "conf_ret": p.get("conf_ret"), "conf_by": p.get("conf_by"),
+            "opt_age_s": p.get("opt_age"), "opt_ret": opt_ret,
+            "conf_age_s": p.get("conf_age"), "conf_ret": conf_ret, "conf_by": conf_by,
             "status": s.get("status") or "pending",
         })
     out.sort(key=lambda r: (r["created_ts"] or r["feint_ts"] or 0), reverse=True)
