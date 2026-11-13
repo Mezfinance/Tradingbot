@@ -296,6 +296,14 @@ class RotatingExecutor:
         sub = self.subs[idx]
         return sub.pool_sol(token) if hasattr(sub, "pool_sol") else None
 
+    def pool_price(self, token: str) -> float | None:
+        """Read the pool's current price through a wallet (read-only), for the canary's two-stage climb check."""
+        with self._lock:
+            idx = self._holder(token)
+            self._apply_pool(idx, token)
+        sub = self.subs[idx]
+        return sub.pool_price(token) if hasattr(sub, "pool_price") else None
+
     def sell(self, token: str, qty: float, ref_price: float) -> Fill | None:
         idx = self._holder(token)
         self._apply_pool(idx, token)

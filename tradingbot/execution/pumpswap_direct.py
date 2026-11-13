@@ -583,6 +583,18 @@ class DirectPumpswapExecutor(JupiterExecutor):
         base_amt, quote_amt = st["reserves"]
         return (quote_amt if st["token_is_base"] else base_amt) / 1e9
 
+    def pool_price(self, mint: str) -> float | None:
+        """The pool's current price (SOL per token, raw reserve ratio), or None if unreadable. The canary's
+        two-stage climb check compares this over time, because Jupiter can't quote a ~2-minute-old pool; a raw ratio
+        is enough since the check only compares price-to-price (entry vs the check)."""
+        st = self._state(mint)
+        if st is None:
+            return None
+        base_amt, quote_amt = st["reserves"]
+        sol_res = quote_amt if st["token_is_base"] else base_amt
+        tok_res = base_amt if st["token_is_base"] else quote_amt
+        return (sol_res / tok_res) if (sol_res and tok_res) else None
+
     def _wait_visible(self, sig: str, timeout_s: float) -> tuple[bool, int | None]:
         """Poll until the transaction is seen on-chain. (ok, slot): ok False = reverted or never appeared.
         A dependent sell can't be built until the buy's tokens exist, so we fire the sell the moment the buy is

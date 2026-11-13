@@ -644,6 +644,7 @@ class ProbeExec(PaperExecutor):
         self.probed = []
         self.verdict = "ok"
         self.sol_now = {}   # mint -> current pool SOL at the watch read (None = unreadable)
+        self.price_now = {}  # mint -> current pool price (reserve ratio), for the entry fill and the climb check
 
     def probe_1slot(self, token, usd):
         self.probed.append((token, usd))
@@ -652,6 +653,15 @@ class ProbeExec(PaperExecutor):
 
     def pool_sol(self, token):
         return self.sol_now.get(token, 10.0)
+
+    def pool_price(self, token):
+        return self.price_now.get(token, 1.0)
+
+    def buy(self, token, usd, ref_price):  # the direct route fills from the pool, ignoring ref_price (0 for an entry)
+        from tradingbot.execution.base import Fill
+        price = self.price_now.get(token, 1.0)
+        fee = usd * self.fee
+        return Fill(qty=(usd - fee) / price, price=price, usd=usd, fee_usd=fee, tx="paper")
 
     def remember_pool(self, mint, pool):
         pass
@@ -715,6 +725,70 @@ def test_probe_watch_records_survivor_and_rugger(cfg, good_pair):
                 for r in j.query("SELECT detail FROM events WHERE kind='canary_probe_verdict'")}
     assert verdicts == {"PA": "survivor", "PB": "rugger"}
     assert not eng._probe_watches            # both resolved and cleared
+
+
+class _FlatHelius:  # every confirmation-window read is the same price -> range 0 -> the vol gate fails
+    def last_before(self, addr, ts, limit=10):
+        return _vault_tx("PA", "A", 60.0, 1_000_000_000)
+
+
+def _survivor_w(book_name, mint="A"):
+    return {"mint": mint, "pool": "P" + mint, "probe_ts": time.time(), "liq": 12_000.0,
+            "created_ts": time.time() - 6, "book": book_name, "sol_before": 10.0}
+
+
+def test_two_stage_entry_enters_a_double_survivor_and_arms_the_climb_check(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False  # gate tested separately (avoids a live Helius call)
+    book = eng.books[mb.CANARY4]
+    live.verdict = "ok"                                   # the SECOND probe survives too
+    eng._canary_enter(_survivor_w(book.name))
+    assert live.probed[-1] == ("A", cfg.launch_canary_probe2_usd)   # "one more hit" fired at the second-probe size
+    pos = j.open_positions(mb.CANARY4)
+    assert pos and pos[0].token_address == "A"                      # entered for real
+    assert pos[0].id in eng._canary_climbs                          # a reserve-priced climb check was armed
+
+
+def test_two_stage_entry_skips_when_the_second_probe_insta_rugs(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    live.verdict = "trapped"                              # the second hit got pulled -> do not enter
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert live.probed[-1] == ("A", cfg.launch_canary_probe2_usd)   # the second probe ran
+    assert not j.open_positions(mb.CANARY4)                         # but we did NOT commit
+
+
+def test_two_stage_entry_volatility_gate_blocks_a_flat_pool(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate, cfg.launch_canary_vol_min_pct = True, True, 2.0
+    eng._canary_helius = _FlatHelius()                    # a dead-flat confirmation window
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert live.probed == []                              # gate failed before the second probe
+    assert not j.open_positions(mb.CANARY4)
+    gate = json.loads(j.query("SELECT detail FROM events WHERE kind='canary_entry_gate'")[0]["detail"])
+    assert gate["ok"] is False and gate["range"] == 0.0
+
+
+def test_two_stage_climb_check_rides_a_climber_and_bails_a_flat_entry(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    cfg.launch_canary_climb_min_gain_pct = 0.0
+    book = eng.books[mb.CANARY4]
+    eng._canary_enter(_survivor_w(book.name))            # entry_px = pool_price("A") = 1.0
+    pos = j.open_positions(mb.CANARY4)[0]
+    rec = eng._canary_climbs[pos.id]
+    rec["at"] = time.time() - 1                          # make the check due
+    live.price_now["A"] = 1.10                           # up 10% -> keep (ride to the pool-minute exit)
+    assert eng._canary_climb_failed(book, pos, time.time()) is False
+    eng._canary_climbs[pos.id] = {**rec}                 # re-arm for the other branch
+    live.price_now["A"] = 0.90                           # down -> bail
+    assert eng._canary_climb_failed(book, pos, time.time()) is True
+
+
+def test_canary_exit_deadline_uses_the_configured_minute(cfg):
+    cfg.launch_canary_exit_min = 6.0
+    assert mb.exit_deadline(cfg, mb.CANARY4, {"created_ts": 1000.0}) == 1000.0 + 360
 
 
 def test_probe_watches_rearm_after_a_restart(cfg, good_pair):

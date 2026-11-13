@@ -125,6 +125,8 @@ class Engine:
         self._climbs = self._load_climbs()  # position id -> [check time, price to reach, best price seen]
         self._holds = self._load_holds()  # position id -> {"at": [check times left], "last": return at the last check}
         self._probe_watches = self._load_probe_watches()  # pool -> a 1-slot probe awaiting its survival read
+        self._canary_climbs = self._load_canary_climbs()  # position id -> the two-stage entry's reserve-priced climb check
+        self._canary_helius = None  # lazy live Helius client for the entry volatility gate (main key)
         self._model_pool = None  # threads that let every book buy a signal at the same time
         self._sell_pool = None  # threads that sell every due exit of a monitor pass at once
         self._last_snapshot = 0.0
@@ -396,6 +398,8 @@ class Engine:
                 exits = [(pos.qty, "pool_age_exit")]  # hand-made pool: out before its creator usually pulls it
             if not exits and self._climb_failed(pos.id, price, now):
                 exits = [(pos.qty, "no_climb")]  # flat after the first minutes: pulled pools mostly look like this
+            if not exits and self._canary_climb_failed(book, pos, now):
+                exits = [(pos.qty, "no_climb")]  # two-stage entry: not up by the check (reserve-priced), bail
             if not exits and self._hold_failed(pos, now):
                 exits = [(pos.qty, "hold_check")]  # not up (or falling) at a pool-minute check: out now
             if any(r.startswith("take_profit") for _, r in exits):
@@ -803,7 +807,7 @@ class Engine:
         started = time.time()
         from tradingbot import model_book as mb
         canary = book.name in mb.CANARY_BOOKS
-        if canary and c.launch_canary_probe and hasattr(book.executor, "probe_1slot"):
+        if canary and c.launch_canary_probe and not sig.get("entry") and hasattr(book.executor, "probe_1slot"):
             # 1-slot probe measurement (11-12): land committed money (slot N) then pull it out next slot, so a
             # size-reacting rugger is tripped while our sell escapes, and we NEVER commit. Runs before the Jupiter
             # price/route block, as a seconds-old pool has no Jupiter price. The survival watch scheduled here reads the
@@ -832,7 +836,9 @@ class Engine:
                 {"verdict": verdict, "note": getattr(book.executor, "last_note", "") or "",
                  **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
             return f"feint only: pool {verdict}"
-        if canary and c.launch_canary_flat_usd > 0:
+        if canary and sig.get("entry"):
+            base = c.launch_canary_entry_usd  # two-stage entry: the real commit on a confirmed double-survivor
+        elif canary and c.launch_canary_flat_usd > 0:
             base = c.launch_canary_flat_usd  # one tiny size for every pick: does any real buy set the operators off?
         elif canary and c.launch_canary_band_scale > 0 and sig.get("liq") is not None:
             # the twin's own sizes scaled down (11-07: 1/25 = $10 thin / $1 at $15-25k / $4 above), same ratios
@@ -904,6 +910,17 @@ class Engine:
             self.journal.log_event("model_climb_check", sig["mint"],
                                    json.dumps({"position_id": pos.id, "at": check[0], "price": check[1]}),
                                    strategy=book.name)
+        if canary and sig.get("entry") and c.launch_canary_climb_check_s > 0:
+            # Two-stage entry climb check (11-13): at entry + climb_check_s, bail unless the pool price (read from the
+            # pool's own reserves, via the paid Helius RPC -- Jupiter can't quote a ~2-min-old pool) is up by
+            # climb_min_gain_pct over the entry price, else ride to the pool-minute exit. Priced reserve-to-reserve, so
+            # the raw entry price from the fill is the baseline.
+            entry_px = book.executor.pool_price(sig["mint"]) if hasattr(book.executor, "pool_price") else None
+            if entry_px:
+                rec = {"position_id": pos.id, "at": pos.opened_at + c.launch_canary_climb_check_s,
+                       "entry_px": entry_px, "min_gain": c.launch_canary_climb_min_gain_pct / 100.0}
+                self._canary_climbs[pos.id] = rec
+                self.journal.log_event("canary_climb_check", sig["mint"], json.dumps(rec), strategy=book.name)
         checks = mb.hold_checks(book.name, sig)
         if checks:
             self._holds[pos.id] = {"at": list(checks), "last": None}
@@ -965,7 +982,18 @@ class Engine:
             pool = d.get("pool")
             if pool and r["token"] not in done:
                 out[pool] = {"mint": r["token"], "pool": pool, "due": d["due"], "probe_ts": d["probe_ts"],
-                             "sol_before": d.get("sol_before"), "liq": d.get("liq"), "book": d.get("book")}
+                             "sol_before": d.get("sol_before"), "liq": d.get("liq"), "book": d.get("book"),
+                             "created_ts": d.get("created_ts")}
+        return out
+
+    def _load_canary_climbs(self) -> dict[int, dict]:
+        """Pending two-stage-entry climb checks of open positions, re-armed after a restart."""
+        open_ids = {p.id for p in self.journal.open_positions(strategy=None)}
+        out: dict[int, dict] = {}
+        for r in self.journal.query("SELECT detail FROM events WHERE kind='canary_climb_check'"):
+            d = json.loads(r["detail"])
+            if d.get("position_id") in open_ids and d.get("entry_px"):
+                out[d["position_id"]] = d
         return out
 
     def _schedule_probe_watch(self, book: Book, sig: dict, res: dict) -> None:
@@ -975,7 +1003,7 @@ class Engine:
             return
         now = time.time()
         rec = {"mint": sig["mint"], "pool": pool, "probe_ts": now, "sol_before": res.get("sol_before"),
-               "liq": sig.get("liq"), "book": book.name,
+               "liq": sig.get("liq"), "book": book.name, "created_ts": sig.get("created_ts"),
                "due": now + self.cfg.launch_canary_probe_watch_s + self.cfg.launch_canary_probe_margin_s}
         self._probe_watches[pool] = rec
         self.journal.log_event("canary_probe_watch", sig["mint"], json.dumps(rec), strategy=book.name)
@@ -1007,6 +1035,62 @@ class Engine:
             self.journal.log_event("canary_probe_verdict", w["mint"], json.dumps(
                 {"pool": pool, "verdict": verdict, "sol_before": w.get("sol_before"), "sol_after": sol_after,
                  "liq": w.get("liq"), "watched_s": round(now - w["probe_ts"], 1)}), strategy=w.get("book"))
+            if verdict == "survivor" and self.cfg.launch_canary_enter:
+                try:
+                    self._canary_enter(w)
+                except Exception:  # noqa: BLE001 (an entry failure must never stop the monitor loop)
+                    log.exception("canary two-stage entry failed")
+
+    def _canary_helius_client(self):
+        """Lazy live (main-key) Helius client for the two-stage entry's volatility gate — the paid tool, since the
+        gate is part of committing real money."""
+        if self._canary_helius is None:
+            import httpx
+            from tradingbot.data.helius import Helius
+            self._canary_helius = Helius(client=httpx.Client(timeout=10), role="live")
+        return self._canary_helius
+
+    def _canary_enter(self, w: dict) -> None:
+        """A probe survivor (passed the ~48 s watch): run the confirmation-window volatility gate (live Helius), then a
+        SECOND 1-slot probe ("one more hit" — some ruggers fire only on the second visible commit); if it survives too,
+        enter for real at the entry size. Logs each stage; opens nothing unless both gates pass."""
+        from tradingbot import launch_canary as lc
+        from tradingbot import model_book as mb
+        c = self.cfg
+        cbook = next((b for b in self.books.values() if b.name in mb.CANARY_BOOKS), None)
+        if cbook is None or self.journal.get_state(CANARY_HALT):
+            return
+        mint, pool = w["mint"], w.get("pool")
+        open_ = self.journal.open_positions(cbook.name)
+        if len(open_) >= c.launch_canary_max_open or any(p.token_address == mint for p in open_):
+            return
+        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        if c.launch_canary_daily_loss_usd > 0 \
+                and -self.journal.realized_since(day_start, cbook.name) >= c.launch_canary_daily_loss_usd:
+            return
+        if c.launch_canary_vol_gate:  # enter only if the pool moved during the confirmation window (not dead-flat)
+            conf_ts = w["probe_ts"] + lc.CONF_AFTER_S
+            ok, rng, n = lc.volatility_ok(self._canary_helius_client(), pool, mint, conf_ts, c.launch_canary_vol_min_pct)
+            self.journal.log_event("canary_entry_gate", mint, json.dumps(
+                {"pool": pool, "stage": "volatility", "ok": ok, "range": rng, "samples": n,
+                 "min_pct": c.launch_canary_vol_min_pct}), strategy=cbook.name)
+            if not ok:
+                return
+        ex = cbook.executor
+        if not hasattr(ex, "probe_1slot"):
+            return
+        if pool and hasattr(ex, "remember_pool"):
+            ex.remember_pool(mint, pool)
+        res2 = ex.probe_1slot(mint, c.launch_canary_probe2_usd)
+        self.journal.log_event("canary_probe2", mint, json.dumps({**res2, "pool": pool}), strategy=cbook.name)
+        if res2.get("verdict") != "ok":  # trapped / honeypot / buy_failed: it insta-rugged on the second hit, skip
+            return
+        entry_sig = {"mint": mint, "pool": pool, "name": (mint or "")[:10], "score": 0.0,
+                     "liq": w.get("liq") or 0.0, "price": 0.0, "created_ts": w.get("created_ts"),
+                     "kind": "canary_entry", "entry": True, "rw50": True}
+        note = self._buy_model(cbook, entry_sig)
+        self.journal.log_event("canary_entry", mint, json.dumps(
+            {"pool": pool, "result": note or "bought"}), strategy=cbook.name)
 
     def _hold_failed(self, pos: Position, now: float) -> bool:
         """At each due check (model_book.HOLD_CHECK_MIN) quote a sale of the position: True (sell) when it would
@@ -1046,6 +1130,25 @@ class Engine:
             del self._climbs[pos_id]
             return False
         return True
+
+    def _canary_climb_failed(self, book: Book, pos: Position, now: float) -> bool:
+        """Two-stage entry climb check: at entry + climb_check_s, read the pool's current price from its reserves
+        (the paid Helius RPC, since Jupiter can't quote a ~2-min-old pool) and compare to the entry price. Up by
+        min_gain -> keep (ride to the pool-minute exit); not up -> bail (no_climb). Runs once; an unreadable price
+        retries next pass (the pool-minute deadline still exits it)."""
+        rec = self._canary_climbs.get(pos.id)
+        if rec is None or now < rec["at"]:
+            return False
+        px = book.executor.pool_price(pos.token_address) if hasattr(book.executor, "pool_price") else None
+        if not px:
+            return False  # can't read the pool now; try again next pass
+        self._canary_climbs.pop(pos.id, None)  # the check runs once
+        gain = (px / rec["entry_px"] - 1.0) if rec.get("entry_px") else None
+        kept = gain is not None and gain >= rec.get("min_gain", 0.0)
+        self.journal.log_event("canary_climb_result", pos.token_address, json.dumps(
+            {"position_id": pos.id, "entry_px": rec.get("entry_px"), "price": px, "gain": gain, "kept": kept}),
+            strategy=book.name)
+        return not kept
 
     def _jup_failure(self, default: str) -> str:
         """Skip reason for a failed Jupiter lookup: a refused request is not a missing route."""
@@ -1118,6 +1221,7 @@ class Engine:
                 pos.qty = 0.0
                 pos.closed_at = time.time()
                 pos.exit_reason = reason
+                self._canary_climbs.pop(pos.id, None)  # drop the two-stage climb record on close
         log.info("[%s] SELL %s %s qty=%.6g @ %.10g -> $%.2f",
                  book.name, pos.symbol, reason, fill.qty, fill.price, fill.usd)
         if pos.closed_at is not None and pos.realized_usd < pos.cost_usd:
