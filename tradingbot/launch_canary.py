@@ -17,6 +17,44 @@ from tradingbot.data.jupiter import USDC_MINT
 SIM_TWIN = mb.CANARY_TWIN
 SMOKE_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"  # BONK: deep pools, for a tiny buy/sell test
 
+# --- two-stage entry: confirmation-window volatility gate (11-13) ---------------------------------
+# At a probe SURVIVOR, read the pool's reserves across the confirmation window via LIVE Helius (the paid key) and
+# require the peak-to-trough price range to clear a floor. A dead-flat pool is a dud (it won't run); a pool that
+# dipped and recovered is fine (a down-move before entry is to our benefit) -- so this is a RANGE, not a net up-move.
+CONF_AFTER_S = 60.0                        # confirmation ≈ probe age + the ~48s watch + margin (probe_exits.CONF_AFTER_S)
+CONF_OFFSETS = (-58, -44, -30, -16, 0)     # relative to conf_ts (mirrors probe_exits.CONF_FETCH_OFFSETS)
+
+
+def confirmation_range(helius, pool: str, token_mint: str | None, conf_ts: float,
+                       offsets=CONF_OFFSETS) -> tuple[float | None, int]:
+    """Peak-to-trough price range over the confirmation window via live Helius (one `last_before` per offset, ~10
+    credits each). Returns (conf_range, readable_samples); conf_range is None when fewer than 2 samples read."""
+    from tradingbot import launch_live as ll
+    from tradingbot.data import pumpswap as ps
+    prices = []
+    for off in offsets:
+        tx = helius.last_before(pool, conf_ts + off)
+        if not isinstance(tx, dict):
+            continue
+        sol = ll._raw_vault(tx, pool, ps.WSOL)
+        tok = ll._raw_vault(tx, pool, token_mint) if token_mint else None
+        if sol and tok:
+            prices.append(sol / tok)
+    if len(prices) < 2:
+        return None, len(prices)
+    lo, hi = min(prices), max(prices)
+    return (((hi - lo) / lo) if lo else None), len(prices)
+
+
+def volatility_ok(helius, pool: str, token_mint: str | None, conf_ts: float, min_pct: float,
+                  offsets=CONF_OFFSETS) -> tuple[bool, float | None, int]:
+    """True if the confirmation-window range >= `min_pct`. Fails CLOSED (False) when it can't be measured (no
+    helius / fewer than 2 readable samples), so a pool we can't confirm is skipped rather than entered blind."""
+    rng, n = confirmation_range(helius, pool, token_mint, conf_ts, offsets) if helius is not None else (None, 0)
+    if rng is None:
+        return False, rng, n
+    return rng >= (min_pct / 100.0), rng, n
+
 
 def _trades(journal, book: str, since: float) -> dict[str, dict]:
     """Closed or open positions of `book` since `since`, keyed by token (first position per token)."""

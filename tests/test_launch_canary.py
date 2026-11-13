@@ -283,6 +283,48 @@ def test_two_stage_entry_needs_the_probe_on():
                live_confirm=LIVE_CONFIRM_PHRASE).validate()
 
 
+def _vault_tx(pool, token, sol, tok):
+    from tradingbot.data import pumpswap as ps
+    return {"meta": {"postTokenBalances": [
+        {"owner": pool, "mint": ps.WSOL, "uiTokenAmount": {"uiAmount": sol}},
+        {"owner": pool, "mint": token, "uiTokenAmount": {"amount": str(tok)}}]}}
+
+
+class _VolHelius:
+    """Fake live Helius: last_before(ts) -> the tx mapped from int(ts). With conf_ts=0, ts == the offset."""
+    def __init__(self, by_off):
+        self.by_off, self.calls = by_off, 0
+    def last_before(self, address, ts, limit=10):
+        self.calls += 1
+        return self.by_off.get(int(round(ts)))
+
+
+def test_confirmation_range_measures_peak_to_trough():
+    from tradingbot import launch_canary as lc
+    POOL, TOK = "PoolV", "MintV"
+    by_off = {-58: _vault_tx(POOL, TOK, 60.0, 1_000_000_000), -44: _vault_tx(POOL, TOK, 61.0, 1_000_000_000),
+              -30: _vault_tx(POOL, TOK, 62.0, 1_000_000_000), -16: _vault_tx(POOL, TOK, 61.5, 1_000_000_000),
+              0: _vault_tx(POOL, TOK, 63.0, 1_000_000_000)}  # sol 60..63 on a flat token supply -> range 5%
+    rng, n = lc.confirmation_range(_VolHelius(by_off), POOL, TOK, conf_ts=0.0)
+    assert n == 5 and abs(rng - 0.05) < 1e-9
+
+
+def test_volatility_ok_passes_a_mover_and_fails_flat_and_unmeasurable():
+    from tradingbot import launch_canary as lc
+    POOL, TOK = "PoolV", "MintV"
+    mover = {o: _vault_tx(POOL, TOK, 60.0 + (i * 1.0), 1_000_000_000) for i, o in enumerate((-58, -44, -30, -16, 0))}
+    ok, rng, n = lc.volatility_ok(_VolHelius(mover), POOL, TOK, 0.0, min_pct=2.0)
+    assert ok and rng and rng > 0.02 and n == 5
+    flat = {o: _vault_tx(POOL, TOK, 60.0, 1_000_000_000) for o in (-58, -44, -30, -16, 0)}
+    ok, rng, _ = lc.volatility_ok(_VolHelius(flat), POOL, TOK, 0.0, min_pct=2.0)
+    assert not ok and rng == 0.0                                   # measurable but flat -> skip
+    ok, rng, n = lc.volatility_ok(None, POOL, TOK, 0.0, min_pct=2.0)
+    assert not ok and rng is None and n == 0                       # no helius -> fail closed
+    one = {0: _vault_tx(POOL, TOK, 60.0, 1_000_000_000)}           # only one readable sample
+    ok, rng, n = lc.volatility_ok(_VolHelius(one), POOL, TOK, 0.0, min_pct=2.0)
+    assert not ok and rng is None and n == 1                       # < 2 samples -> fail closed
+
+
 def test_feint_smoke_runs_one_feint_and_reports_the_verdict():
     class FakeEx:
         last_feint = {"pool": "P", "sol_before": 1.0, "sol_after": 1.0}
