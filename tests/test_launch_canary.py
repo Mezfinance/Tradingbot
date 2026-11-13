@@ -275,6 +275,14 @@ def test_feint_all_needs_the_feint_on():
         Config(launch_canary=True, launch_canary_feint_all=True, live_confirm=LIVE_CONFIRM_PHRASE).validate()
 
 
+def test_two_stage_entry_needs_the_probe_on():
+    Config(launch_canary=True, launch_canary_probe=True, launch_canary_route="direct",
+           launch_canary_enter=True, live_confirm=LIVE_CONFIRM_PHRASE).validate()  # probe on: fine
+    with pytest.raises(ValueError):  # enter without the probe
+        Config(launch_canary=True, launch_canary_enter=True, launch_canary_route="direct",
+               live_confirm=LIVE_CONFIRM_PHRASE).validate()
+
+
 def test_feint_smoke_runs_one_feint_and_reports_the_verdict():
     class FakeEx:
         last_feint = {"pool": "P", "sol_before": 1.0, "sol_after": 1.0}

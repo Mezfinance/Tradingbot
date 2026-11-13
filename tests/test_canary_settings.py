@@ -54,6 +54,22 @@ def test_preset_applies_a_coherent_set(tmp_path):
     assert cfg.launch_canary_max_liq_usd == 0.0
 
 
+def test_two_stage_preset_turns_on_the_entry_with_the_probe(tmp_path):
+    cfg = _cfg(tmp_path)
+    cs.apply(cfg, None, cs.PRESETS["two_stage"]["values"])
+    assert cfg.launch_canary_probe and cfg.launch_canary_enter and cfg.launch_canary_route == "direct"
+    assert cfg.launch_canary_entry_usd == 25.0 and cfg.launch_canary_vol_gate and cfg.launch_canary_vol_min_pct == 2.0
+    assert cfg.launch_canary_exit_min == 6.0
+
+
+def test_coherent_rejects_entering_without_the_probe(tmp_path):
+    cfg = _cfg(tmp_path)
+    cs.apply(cfg, None, {"launch_canary_route": "direct", "launch_canary_probe": True})
+    with pytest.raises(ValueError):  # enter needs the probe on; it is off in this change set
+        cs.apply(cfg, None, {"launch_canary_enter": True, "launch_canary_probe": False})
+    assert cfg.launch_canary_enter is False
+
+
 def test_apply_overlay_is_defensive_at_boot(tmp_path):
     cfg = _cfg(tmp_path)
     with open(cs.settings_path(cfg), "w") as fh:

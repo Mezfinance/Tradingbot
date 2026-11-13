@@ -49,6 +49,24 @@ FIELDS: list[dict] = [
     {"key": "launch_canary_probe_delay_s", "label": "Blind sell pause (s)", "type": "float", "group": "Probe",
      "live": True, "lo": 0, "hi": 1, "help": "Blind only: wait this long after the buy before the sell, so it lands "
      "in the next slot (gap 1) not the same block (gap 0). ~half a Solana slot (0.2)."},
+    # --- entry (two-stage) ---
+    {"key": "launch_canary_enter", "label": "Enter double-survivors (REAL commit)", "type": "bool", "group": "Entry",
+     "live": True, "help": "On a probe survivor: volatility gate, then a SECOND probe; if it survives too, enter for "
+                           "real at the entry size. Needs the 1-slot probe on. Off = probe stays measure-only."},
+    {"key": "launch_canary_entry_usd", "label": "Entry size ($)", "type": "float", "group": "Entry", "live": True,
+     "lo": 1, "hi": 500, "help": "The real commit after both probes pass."},
+    {"key": "launch_canary_probe2_usd", "label": "Second probe size ($)", "type": "float", "group": "Entry",
+     "live": True, "lo": 1, "hi": 100, "help": "The 'one more hit' probe: some ruggers fire only on the second commit."},
+    {"key": "launch_canary_vol_gate", "label": "Volatility gate", "type": "bool", "group": "Entry", "live": True,
+     "help": "Enter only if the confirmation-window price range clears the minimum below (via live Helius)."},
+    {"key": "launch_canary_vol_min_pct", "label": "Min confirmation range (%)", "type": "float", "group": "Entry",
+     "live": True, "lo": 0, "hi": 50, "help": "Peak-to-trough range over [probe, confirmation]; skips dead-flat duds."},
+    {"key": "launch_canary_climb_check_s", "label": "Climb check (s after entry)", "type": "float", "group": "Entry",
+     "live": True, "lo": 5, "hi": 300, "help": "At this point: if not up by the gain below, bail; else ride to m6."},
+    {"key": "launch_canary_climb_min_gain_pct", "label": "Climb min gain (%)", "type": "float", "group": "Entry",
+     "live": True, "lo": 0, "hi": 100, "help": "Keep the position at the check only if up at least this much."},
+    {"key": "launch_canary_exit_min", "label": "Exit pool minute", "type": "float", "group": "Entry", "live": True,
+     "lo": 1, "hi": 60, "help": "Sell the held position at this pool minute (the hold-to-m6 exit)."},
     # --- sizing ---
     {"key": "launch_canary_flat_usd", "label": "Flat buy size ($)", "type": "float", "group": "Sizing", "live": True,
      "lo": 0, "hi": 500, "help": "> 0: every commit at this size (0 = use the band scale)."},
@@ -80,7 +98,7 @@ FIELDS: list[dict] = [
      "live": False, "lo": 100, "hi": 5000, "help": "Sells must go through on a fast pool."},
 ]
 FIELD_BY_KEY = {f["key"]: f for f in FIELDS}
-GROUPS = ["Probe", "Sizing", "Limits", "Execution"]
+GROUPS = ["Probe", "Entry", "Sizing", "Limits", "Execution"]
 
 PRESETS: dict[str, dict] = {
     "feint_measure": {
@@ -110,6 +128,18 @@ PRESETS: dict[str, dict] = {
                    "launch_canary_feint": False, "launch_canary_feint_only": False, "launch_canary_feint_all": False,
                    "launch_canary_max_liq_usd": 0.0, "launch_canary_every_n": 1, "launch_canary_max_trades": 0,
                    "launch_canary_follow_dd": False}},
+    "two_stage": {
+        "label": "Two-stage entry (probe → enter)",
+        "about": "Probe every liquid pool; on a survivor, check the confirmation-window volatility (Helius), fire a "
+                 "second probe, and if it survives too, enter $25 for real and ride to pool minute 6 with a climb check.",
+        "values": {"launch_canary_route": "direct", "launch_canary_probe": True, "launch_canary_probe_usd": 25.0,
+                   "launch_canary_probe_watch_s": 48.0, "launch_canary_probe_margin_s": 12.0,
+                   "launch_canary_enter": True, "launch_canary_entry_usd": 25.0, "launch_canary_probe2_usd": 25.0,
+                   "launch_canary_vol_gate": True, "launch_canary_vol_min_pct": 2.0,
+                   "launch_canary_climb_check_s": 60.0, "launch_canary_climb_min_gain_pct": 0.0,
+                   "launch_canary_exit_min": 6.0, "launch_canary_feint": False, "launch_canary_feint_only": False,
+                   "launch_canary_feint_all": False, "launch_canary_max_liq_usd": 0.0, "launch_canary_every_n": 1,
+                   "launch_canary_max_trades": 0, "launch_canary_follow_dd": False}},
     "sz_replica": {
         "label": "Exact sz replica (1/10)",
         "about": "Trade sz's rule in every band at a tenth of its band sizes, no feint, no daily stop.",
@@ -169,6 +199,8 @@ def _coherent(state: dict) -> None:
         raise ValueError("Clip buys need the direct route.")
     if state.get("launch_canary_probe") and state.get("launch_canary_route") != "direct":
         raise ValueError("The 1-slot probe needs the direct route — set Route to direct first (takes effect after restart).")
+    if state.get("launch_canary_enter") and not state.get("launch_canary_probe"):
+        raise ValueError("Enter double-survivors needs the 1-slot probe on (it runs after the probe).")
 
 
 def apply(cfg, journal, changes: dict) -> dict:

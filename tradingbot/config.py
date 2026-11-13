@@ -149,6 +149,18 @@ class Config:
     launch_canary_probe_buy_slippage_bps: int = 0  # 0 = use slippage_bps (300). Widening this lands runners in fewer
     # attempts, but buy_min_out doubles as the pre-signed sell amount, so a wider floor leaves more unsold dust -- and on
     # a rugger that dust is lost, so a wide value inflates the real probe cost. Prefer the retry; keep this tight.
+    # Two-stage entry (11-13): the probe is measurement; this is the live commit. On a probe SURVIVOR (passed the ~48s
+    # watch), check the confirmation-window volatility (Helius), then fire a SECOND 1-slot probe ("one more hit" -- some
+    # ruggers fire only on the second visible commit); if it survives too, ENTER for real at the entry size and manage
+    # to the climb-check / pool-minute-6 exit. REAL MONEY, direct route, needs the probe on. OFF by default.
+    launch_canary_enter: bool = False  # REAL MONEY: enter confirmed double-survivors (else the probe is measure-only)
+    launch_canary_entry_usd: float = 25.0  # the real commit size after both probes pass
+    launch_canary_probe2_usd: float = 25.0  # the second ("one more hit") probe size
+    launch_canary_vol_min_pct: float = 2.0  # enter only if the confirmation-window peak-to-trough range >= this %
+    launch_canary_vol_gate: bool = True  # gate entry on the volatility range (via live Helius); off = enter every survivor
+    launch_canary_climb_check_s: float = 60.0  # run the climb check this many seconds after entry
+    launch_canary_climb_min_gain_pct: float = 0.0  # at the check, keep only if up at least this % (else bail), then ride
+    launch_canary_exit_min: float = 6.0  # sell the held position at this pool minute (the hold-to-m6 exit)
     # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
     launch_fast_canary: bool = False  # REAL MONEY: buy on detection, before the scorer's second-4 decide
@@ -422,6 +434,8 @@ class Config:
                 raise ValueError(f"The 1-slot probe spends real money; set TB_LIVE_CONFIRM={LIVE_CONFIRM_PHRASE}")
             if self.launch_canary_route != "direct":
                 raise ValueError("The 1-slot probe is built for the direct route; set TB_LAUNCH_CANARY_ROUTE=direct")
+        if self.launch_canary_enter and not self.launch_canary_probe:
+            raise ValueError("The two-stage entry runs after the 1-slot probe; set TB_LAUNCH_CANARY_PROBE=1")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):
