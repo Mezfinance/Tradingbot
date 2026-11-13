@@ -436,10 +436,22 @@ def dump_pool(journal, store, cfg, pool: str, helius=None, max_credits: int = 4_
     from tradingbot import pool_tracker as pt
     now = now if now is not None else time.time()
     look = now - 30 * 24 * 3600
-    f = pt.feint_pools(journal.query, look).get(pool)
-    s = pt.scorer_rows(store.query, look).get(pool) or {}
+    feints = pt.feint_pools(journal.query, look)
+    scorer = pt.scorer_rows(store.query, look)
+    f = feints.get(pool)
     if not f:
-        return {"pool": pool, "error": "no probe/feint event found for this pool in the last 30 days"}
+        # resolve a truncated id (the dashboard shows a shortened pool/mint): prefix-match on the pool address or its
+        # token mint, over probed pools only. One hit wins; several -> list them; none -> no event.
+        pfx = pool.strip().rstrip(".")
+        hits = [p for p, fe in feints.items()
+                if p.startswith(pfx) or str(fe.get("mint") or (scorer.get(p) or {}).get("token_mint") or "").startswith(pfx)]
+        if len(hits) == 1:
+            pool, f = hits[0], feints[hits[0]]
+        elif len(hits) > 1:
+            return {"pool": pool, "error": f"'{pool}' matches {len(hits)} probed pools: " + ", ".join(sorted(hits)[:8])}
+        else:
+            return {"pool": pool, "error": "no probe/feint event found for this pool in the last 30 days"}
+    s = scorer.get(pool) or {}
     created = s.get("create_ts")
     feint_ts = f["feint_ts"]
     conf_ts = feint_ts + CONF_AFTER_S

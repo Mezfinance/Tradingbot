@@ -180,6 +180,10 @@ def test_dump_pool_reconstructs_the_path_and_marks_the_pull():
     assert round(by[41]["px_rel_conf"], 3) == round(0.95 / 1.15, 3)    # the 41s dip is below the conf entry
     assert by[20]["liq_usd"] == 32600                                  # liq from the pts
     assert pe.render_dump(out).startswith("PATH DUMP") and "scorer LP pull at 120" in pe.render_dump(out)
+    # a truncated id resolves: a shortened pool address (with the dashboard's ellipsis) or the token mint
+    for q in ("P9...", "M9"):
+        r = pe.dump_pool(J(), S(), cfg=None, pool=q, helius=None, paths=paths, now=now)
+        assert r["pool"] == "P9" and r.get("error") is None
 
 
 def test_dump_pool_reports_when_the_pool_is_unknown():
