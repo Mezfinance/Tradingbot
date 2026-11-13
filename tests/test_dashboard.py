@@ -687,7 +687,7 @@ def test_probe_summary_counts_trips_and_survivors():
     j = Journal(":memory:")
     for mint, pv, slot in (("A", "ok", 1), ("B", "ok", 2), ("C", "trapped", None)):
         j.log_event("canary_probe", mint, _j.dumps({"verdict": pv, "pool": "P" + mint, "slot_gap": slot,
-                                                    "recovered_sol": 0.12}), strategy="canary_rw50_sz")
+                                                    "blind": True, "recovered_sol": 0.12}), strategy="canary_rw50_sz")
     j.log_event("canary_probe_verdict", "A", '{"pool": "PA", "verdict": "survivor"}', strategy="canary_rw50_sz")
     j.log_event("canary_probe_verdict", "B", '{"pool": "PB", "verdict": "rugger"}', strategy="canary_rw50_sz")
     s = dash.probe_summary(j)
@@ -695,6 +695,8 @@ def test_probe_summary_counts_trips_and_survivors():
     assert s["trip_rate"] == 0.5 and s["pending"] == 1  # C probed, no verdict yet
     rec = {r["token"]: r for r in s["recent"]}
     assert rec["A"]["watch"] == "survivor" and rec["C"]["watch"] is None and rec["A"]["slot_gap"] == 1
+    # gap distribution for tuning the probe delay: A=gap1, B=gap2 (C has no gap); gap2_rate = trap-risk share
+    assert s["gap_dist"] == {"0": 0, "1": 1, "2": 1, "3+": 0} and s["gap2_rate"] == 0.5 and s["gaps_n"] == 2
 
 
 def test_canary_one_arms_exactly_one_probe():

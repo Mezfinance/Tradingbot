@@ -167,6 +167,13 @@ def probe_summary(journal, n: int = 500) -> dict:
     blind = [_probe_detail(r) for r in probes if _probe_detail(r).get("blind")]
     blind_reverted = sum(1 for d in blind if d.get("blind_reverted"))
     gaps = [d["slot_gap"] for d in blind if d.get("slot_gap") is not None and not d.get("used_fallback")]
+    # gap distribution for tuning launch_canary_probe_delay_s: gap 1 is the sweet spot (lands before the earliest
+    # ~slot-2 pull), gap 0 is a free/safe same-block round trip, gap >= 2 risks the sell colliding with a pull and
+    # trapping the stake -- so aim for gap 1, tolerate 0, and drive gap2_rate to ~0 (bias the delay LOW).
+    gap_dist = {"0": 0, "1": 0, "2": 0, "3+": 0}
+    for g in gaps:
+        gap_dist["3+" if g >= 3 else str(g)] += 1
+    gap2_rate = round(sum(1 for g in gaps if g >= 2) / len(gaps), 3) if gaps else None
     recent = []
     for r in probes[:60]:
         d, v = _probe_detail(r), vd.get(r["token"], {})
@@ -182,7 +189,8 @@ def probe_summary(journal, n: int = 500) -> dict:
             "trip_rate": round(counts["rugger"] / decided, 3) if decided else None,
             "blind": len(blind), "blind_reverted": blind_reverted,
             "blind_revert_rate": round(blind_reverted / len(blind), 3) if blind else None,
-            "blind_median_gap": (sorted(gaps)[len(gaps) // 2] if gaps else None), "recent": recent}
+            "blind_median_gap": (sorted(gaps)[len(gaps) // 2] if gaps else None),
+            "gap_dist": gap_dist, "gap2_rate": gap2_rate, "gaps_n": len(gaps), "recent": recent}
 
 
 def canary_one(journal) -> dict:
@@ -1797,7 +1805,7 @@ function b64urlToBuf(s){s=s.replace(/-/g,"+").replace(/_/g,"/");const pad=s.leng
 function bufToB64url(b){const bytes=new Uint8Array(b);let bin="";for(const x of bytes)bin+=String.fromCharCode(x);return btoa(bin).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}
 function probePoll(){if(R.v!=="settings"){window._pbStarted=false;return}renderProbe();clearTimeout(window._pbT);window._pbT=setTimeout(probePoll,5000)}
 function renderProbe(){const t=$("pb-tiles");if(!t)return;fetch("api/canary/probes").then(r=>r.json()).then(d=>{
-t.innerHTML=[["Probed",d.probes],["Rugger",d.rugger],["Survivor",d.survivor],["Trip rate",d.trip_rate==null?"—":(d.trip_rate*100).toFixed(0)+"%"],["Blind revert",d.blind_revert_rate==null?"—":(d.blind_revert_rate*100).toFixed(0)+"%"],["Blind gap",d.blind_median_gap==null?"—":d.blind_median_gap],["Pending",d.pending]].map(([k,v])=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+t.innerHTML=[["Probed",d.probes],["Rugger",d.rugger],["Survivor",d.survivor],["Trip rate",d.trip_rate==null?"—":(d.trip_rate*100).toFixed(0)+"%"],["Blind revert",d.blind_revert_rate==null?"—":(d.blind_revert_rate*100).toFixed(0)+"%"],["Blind gap",d.blind_median_gap==null?"—":d.blind_median_gap],["Gaps 0/1/2+",d.gap_dist?(d.gap_dist["0"]+"/"+d.gap_dist["1"]+"/"+(d.gap_dist["2"]+d.gap_dist["3+"])):"—"],["Gap ≥2 (trap risk)",d.gap2_rate==null?"—":(d.gap2_rate*100).toFixed(0)+"%"],["Pending",d.pending]].map(([k,v])=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
 const rows=d.recent||[];$("pb-recent").innerHTML="<tr><th>Token</th><th>Wallet</th><th>Probe</th><th>Gap</th><th>Recovered SOL</th><th>Watch</th></tr>"+(rows.length?rows.map(r=>r.sent===false?`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${walletCell(r.wallet)}</td><td>${esc(r.probe||"")}</td><td colspan="3" class="sub" title="Caught by the free pre-buy simulation — no buy was broadcast, so $0 was at risk.">no money sent ($0 at risk)</td></tr>`:`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${walletCell(r.wallet)}</td><td>${esc(r.probe||"")}</td><td>${r.slot_gap==null?"—":r.slot_gap}</td><td>${r.recovered_sol==null?"—":r.recovered_sol}</td><td class="${r.watch==='rugger'?'neg':r.watch==='survivor'?'pos':''}">${esc(r.watch||"…")}</td></tr>`).join(""):'<tr><td colspan="6" class="sub">No probes yet. Enable the 1-slot probe preset and start the canary.</td></tr>')}).catch(()=>{})}
 function probeOne(){const b=$("pb-one");b.disabled=true;$("pb-one-note").textContent="arming…";
 fetch("api/canary/probe-one",{method:"POST"}).then(r=>r.json()).then(d=>{b.disabled=false;$("pb-one-note").textContent=d.msg||"armed."}).catch(e=>{b.disabled=false;$("pb-one-note").textContent="error: "+e})}
