@@ -30,6 +30,47 @@ def _diverse_stream(seed):
     return {"recs": recs, "creator": "DEV2", "complete": True}
 
 
+def _rug_stream():
+    # the creator trading its own pool, few wallets, few trades, no fixed-size bot: the rug fingerprint
+    recs = [[1.0, "DEV", 1, 100.0], [3.0, "DEV", 1, 55.0], [8.0, "DEV", -1, 30.0], [12.0, "DEV", 1, 70.0],
+            [5.0, "x", 1, 41.0], [6.0, "y", 1, 22.0], [9.0, "x", -1, 13.0], [14.0, "z", 1, 33.0], [18.0, "y", -1, 7.0]]
+    return {"recs": recs, "creator": "DEV", "complete": True}
+
+
+class _MemStore:
+    def __init__(self):
+        import sqlite3
+        self.c = sqlite3.connect(":memory:")
+        self.c.row_factory = sqlite3.Row
+
+    def execute(self, sql, p=()):
+        self.c.execute(sql, p)
+        self.c.commit()
+
+    def query(self, sql, p=()):
+        return [dict(r) for r in self.c.execute(sql, p).fetchall()]
+
+
+def test_gate_score_ranks_the_rug_higher_and_fails_open():
+    ref = [f for f in (pw.wallet_features(_diverse_stream(i), 66) for i in range(25)) if f]
+    s_r, rank_r, why_r = pw.gate_score(pw.wallet_features(_rug_stream(), 66), ref)
+    s_c, rank_c, why_c = pw.gate_score(pw.wallet_features(_diverse_stream(99), 66), ref)
+    assert why_r == "ok" and why_c == "ok"
+    assert rank_r > rank_c and rank_r >= 0.5          # the rug pattern ranks in the riskiest half
+    assert pw.gate_score(pw.wallet_features(_rug_stream(), 66), ref[:5])[2] == "insufficient_history"
+    assert pw.gate_score(None, ref)[2] == "too_sparse"  # no usable stream -> caller fails open
+
+
+def test_reference_features_reads_the_cache():
+    store = _MemStore()
+    store.execute(pw.SCHEMA)
+    for i in range(3):
+        store.execute("INSERT OR REPLACE INTO watch_pool_wallets(pool, data, ts) VALUES(?,?,?)",
+                      (f"P{i}", json.dumps(_diverse_stream(i)), 1000.0 + i))
+    ref = pw.reference_features(store, 66)
+    assert len(ref) == 3 and all("n_wallets" in f for f in ref)
+
+
 def test_wallet_features_flag_the_bot_pattern():
     rug = pw.wallet_features(_bot_stream(), 66)
     surv = pw.wallet_features(_diverse_stream(1), 66)

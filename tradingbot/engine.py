@@ -1100,6 +1100,8 @@ class Engine:
                  "min_pct": c.launch_canary_vol_min_pct}), strategy=cbook.name)
             if not ok:
                 return
+        if c.launch_canary_wallet_gate and not self._canary_wallet_ok(cbook, pool, mint, w.get("created_ts")):
+            return  # the wallet fingerprint ranks in the riskiest k% of recent probed pools
         ex = cbook.executor
         if not hasattr(ex, "probe_1slot"):
             return
@@ -1115,6 +1117,38 @@ class Engine:
         note = self._buy_model(cbook, entry_sig)
         self.journal.log_event("canary_entry", mint, json.dumps(
             {"pool": pool, "result": note or "bought"}), strategy=cbook.name)
+
+    def _canary_wallet_ok(self, cbook, pool, mint, created_ts) -> bool:
+        """Wallet-pattern selection gate (11-13): read the pool's first-~66s trade stream (live Helius) and skip a
+        survivor whose wallet fingerprint ranks in the riskiest k% of recent probed pools (the creator trading its own
+        pool, few distinct wallets / trades = rug; a deep organic crowd + a fixed-size bot = survivor). Caches the
+        stream in `watch_pool_wallets` for the offline study. Fails OPEN (enters) when the stream is too sparse, there
+        is too little history to rank, or the read errors. True = enter, False = skip."""
+        from tradingbot import pool_wallets as pw
+        c = self.cfg
+        store = getattr(self.model_book, "store", None)
+        if store is None or not pool:
+            return True  # no watch store (e.g. tests): can't rank -> fail open
+        score, rank, reason = None, None, "no_stream"
+        try:
+            data = pw.fetch_live(self._canary_helius_client(), pool, mint, created_ts,
+                                 window_s=c.launch_canary_wallet_entry_s + 15.0)
+            store.execute(pw.SCHEMA)
+            store.execute("INSERT OR REPLACE INTO watch_pool_wallets(pool, data, ts) VALUES(?,?,?)",
+                          (pool, json.dumps(data), time.time()))
+            fe = pw.wallet_features(data, c.launch_canary_wallet_entry_s)
+            ref = pw.reference_features(store, c.launch_canary_wallet_entry_s)
+            score, rank, reason = pw.gate_score(fe, ref)
+        except Exception:  # noqa: BLE001 (a read failure must never block the monitor loop; fail open)
+            log.exception("canary wallet gate read failed")
+            return True
+        skip = reason == "ok" and rank is not None and rank >= 1.0 - c.launch_canary_wallet_skip_pct / 100.0
+        self.journal.log_event("canary_entry_gate", mint, json.dumps(
+            {"pool": pool, "stage": "wallet", "ok": not skip, "reason": reason,
+             "score": round(score, 3) if score is not None else None,
+             "rank_pct": round(rank, 3) if rank is not None else None,
+             "skip_pct": c.launch_canary_wallet_skip_pct}), strategy=cbook.name)
+        return not skip
 
     def _hold_failed(self, pos: Position, now: float) -> bool:
         """At each due check (model_book.HOLD_CHECK_MIN) quote a sale of the position: True (sell) when it would

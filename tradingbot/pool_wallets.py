@@ -61,12 +61,28 @@ FEATURE_HELP = {
 
 # --- fetch -----------------------------------------------------------------------------------------
 
+def _parse_stream(txs, done, ok, pool, token_mint, create_ts) -> dict:
+    """Parse a from-creation tx list into per-wallet trade records (shared by the batch study and the live gate).
+    Each record is [sec_after_creation, wallet, +1 buy / -1 sell, abs token size]; the pool's own vault leg is dropped."""
+    from tradingbot.data import helius as H
+    recs: list = []
+    creator = None
+    if txs:
+        creator = (H.pool_creation(txs[0], pool) or {}).get("creator")
+        ct = create_ts or txs[0].get("blockTime") or 0
+        for t in H.trades(txs, token_mint):
+            bt, _slot, owner, delta = t[0], t[1], t[2], t[3]
+            if owner == pool or not bt or not delta:   # skip the pool's own vault leg
+                continue
+            recs.append([round(bt - ct, 1), owner, 1 if delta > 0 else -1, abs(float(delta))])
+    return {"recs": recs, "creator": creator, "complete": bool(done and ok)}
+
+
 def fetch_streams(store, helius, metas: list[dict], window_s: float, max_credits: int,
                   progress=None) -> tuple[dict, int]:
     """Per pool, the first `window_s` of trading from creation -> per-wallet records, cached in
     `watch_pool_wallets`. With `helius` it fetches pools not yet cached complete, in a stable hash order so a
     credit cap leaves an even sample; without it, reads only the cache. Returns ({pool: data}, credits spent)."""
-    from tradingbot.data import helius as H
     store.execute(SCHEMA)
     have: dict = {}
     for r in store.query("SELECT pool, data FROM watch_pool_wallets", ()):
@@ -85,17 +101,7 @@ def fetch_streams(store, helius, metas: list[dict], window_s: float, max_credits
             continue
         txs, done, ok = helius.history_from_start(pool, window_s, max_pages=MAX_PAGES)
         credits += max(1, math.ceil(len(txs) / 100)) * HIST_CREDITS_PER_PAGE
-        recs: list = []
-        creator = None
-        if txs:
-            creator = (H.pool_creation(txs[0], pool) or {}).get("creator")
-            create_ts = m.get("create_ts") or txs[0].get("blockTime") or 0
-            for t in H.trades(txs, m["token_mint"]):
-                bt, _slot, owner, delta = t[0], t[1], t[2], t[3]
-                if owner == pool or not bt or not delta:   # skip the pool's own vault leg
-                    continue
-                recs.append([round(bt - create_ts, 1), owner, 1 if delta > 0 else -1, abs(float(delta))])
-        data = {"recs": recs, "creator": creator, "complete": bool(done and ok)}
+        data = _parse_stream(txs, done, ok, pool, m["token_mint"], m.get("create_ts"))
         store.execute("INSERT OR REPLACE INTO watch_pool_wallets(pool, data, ts) VALUES(?,?,?)",
                       (pool, json.dumps(data), time.time()))
         have[pool] = data
@@ -143,6 +149,61 @@ def wallet_features(data: dict, upto: float) -> dict | None:
         "repeat_frac": repeat_trades / n, "buy_frac": buys / n, "size_repeat_frac": size_repeat,
         "cadence_cv": cadence_cv, "creator_frac": creator_frac,
     }
+
+
+# --- live selection gate (wired into the two-stage entry) ------------------------------------------
+
+# The tells `pool-wallets` found clearly away from AUC 0.50 and mechanistic: the creator trading its own pool (rug), and
+# a thin, shallow book -- few wallets / trades, low churn, no fixed-size bot -- vs a deep organic crowd (survivor).
+# sign = +1 when a HIGHER value is more rug, -1 when a LOWER value is more rug.
+GATE_FEATURES = {"creator_frac": 1.0, "n_wallets": -1.0, "n_trades": -1.0,
+                 "trades_per_wallet": -1.0, "size_repeat_frac": -1.0}
+GATE_MIN_REF = 20   # fewer recent probed pools than this: too little to rank -> the gate fails open
+
+
+def fetch_live(helius, pool, token_mint, create_ts, window_s: float = DEFAULT_ENTRY_S + 15.0) -> dict:
+    """One `history_from_start` read of a pool's first `window_s` of trading -> per-wallet records (the live gate's
+    input). Same parse as the batch study."""
+    txs, done, ok = helius.history_from_start(pool, window_s, max_pages=MAX_PAGES)
+    return _parse_stream(txs, done, ok, pool, token_mint, create_ts)
+
+
+def reference_features(store, entry_s: float = DEFAULT_ENTRY_S, limit: int = 400) -> list[dict]:
+    """Entry-cut wallet features of the most recent cached probed pools -- the rolling reference the live gate ranks
+    against (self-calibrating, no retrain)."""
+    store.execute(SCHEMA)
+    out = []
+    for r in store.query("SELECT data FROM watch_pool_wallets ORDER BY ts DESC LIMIT ?", (limit,)):
+        try:
+            fe = wallet_features(json.loads(r["data"]), entry_s)
+        except Exception:  # noqa: BLE001 (a malformed cache row)
+            fe = None
+        if fe:
+            out.append(fe)
+    return out
+
+
+def _gate_combined(fe: dict, stats: dict) -> float:
+    return sum(sign * ((fe[name] - mu) / sd) for name, (mu, sd, sign) in stats.items())
+
+
+def gate_score(fe: dict | None, reference: list[dict], features: dict = GATE_FEATURES) -> tuple:
+    """(score, rank_pct, reason). rank_pct = fraction of recent probed pools this pool scores riskier than (high =
+    riskier, toward rug). reason 'too_sparse' (no usable stream yet) or 'insufficient_history' (< GATE_MIN_REF reference
+    pools) -> the caller fails open. The score z-scores each gate feature against the reference and signs it toward rug."""
+    if not fe:
+        return (None, None, "too_sparse")
+    ref = [r for r in reference if all(r.get(n) is not None for n in features)]
+    if len(ref) < GATE_MIN_REF:
+        return (None, None, "insufficient_history")
+    stats = {}
+    for name, sign in features.items():
+        vals = [r[name] for r in ref]
+        stats[name] = (statistics.mean(vals), statistics.pstdev(vals) or 1.0, sign)
+    score = _gate_combined(fe, stats)
+    ref_scores = [_gate_combined(r, stats) for r in ref]
+    rank = sum(1 for s in ref_scores if s < score) / len(ref_scores)
+    return (score, rank, "ok")
 
 
 # --- separation ------------------------------------------------------------------------------------

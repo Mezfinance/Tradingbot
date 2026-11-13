@@ -770,6 +770,62 @@ def test_two_stage_entry_volatility_gate_blocks_a_flat_pool(cfg, good_pair):
     assert gate["ok"] is False and gate["range"] == 0.0
 
 
+class _MemStore:
+    def __init__(self):
+        import sqlite3
+        self.c = sqlite3.connect(":memory:")
+        self.c.row_factory = sqlite3.Row
+
+    def execute(self, sql, p=()):
+        self.c.execute(sql, p)
+        self.c.commit()
+
+    def query(self, sql, p=()):
+        return [dict(r) for r in self.c.execute(sql, p).fetchall()]
+
+
+def test_two_stage_entry_wallet_gate_skips_a_rug_pattern(cfg, good_pair, monkeypatch):
+    import json
+    from tradingbot import pool_wallets as pw
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    cfg.launch_canary_wallet_gate, cfg.launch_canary_wallet_skip_pct = True, 50.0
+    eng.model_book.store = _MemStore()
+    eng._canary_helius = object()                      # not None, so no live client is built; fetch_live is stubbed
+    monkeypatch.setattr(pw, "fetch_live", lambda *a, **k: {"recs": [[1.0, "DEV", 1, 1.0]], "creator": "DEV", "complete": True})
+    monkeypatch.setattr(pw, "reference_features", lambda *a, **k: [])
+    monkeypatch.setattr(pw, "gate_score", lambda *a, **k: (2.5, 0.95, "ok"))  # riskiest 5% -> skip
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert live.probed == []                            # skipped before the second probe
+    assert not j.open_positions(mb.CANARY4)
+    gate = json.loads(j.query("SELECT detail FROM events WHERE kind='canary_entry_gate'")[-1]["detail"])
+    assert gate["stage"] == "wallet" and gate["ok"] is False and gate["rank_pct"] == 0.95
+
+
+def test_two_stage_entry_wallet_gate_enters_a_clean_pattern(cfg, good_pair, monkeypatch):
+    from tradingbot import pool_wallets as pw
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate, cfg.launch_canary_wallet_gate = True, False, True
+    eng.model_book.store = _MemStore()
+    eng._canary_helius = object()
+    live.verdict = "ok"
+    monkeypatch.setattr(pw, "fetch_live", lambda *a, **k: {"recs": [], "creator": None, "complete": True})
+    monkeypatch.setattr(pw, "reference_features", lambda *a, **k: [])
+    monkeypatch.setattr(pw, "gate_score", lambda *a, **k: (-1.0, 0.1, "ok"))  # clean -> pass
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert live.probed[-1] == ("A", cfg.launch_canary_probe2_usd)   # passed the gate -> second probe fired
+    assert j.open_positions(mb.CANARY4)                             # entered for real
+
+
+def test_two_stage_entry_wallet_gate_fails_open_without_a_store(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate, cfg.launch_canary_wallet_gate = True, False, True
+    eng.model_book.store = None                        # no watch store: can't rank -> enter (never silently block)
+    live.verdict = "ok"
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert j.open_positions(mb.CANARY4)
+
+
 def test_two_stage_climb_check_rides_a_climber_and_bails_a_flat_entry(cfg, good_pair):
     eng, j, live = _probe_engine(cfg, good_pair)
     cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False

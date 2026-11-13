@@ -164,6 +164,14 @@ class Config:
     launch_canary_stall_window_s: float = 0.0  # stall exit: sell when the rolling peak-to-trough range over this trailing
     # window falls below launch_canary_vol_min_pct (the wash bot stalling flat before a pull); 0 = off. Re-uses the vol gate
     launch_canary_exit_min: float = 6.0  # sell the held position at this pool minute (the hold-to-m6 exit)
+    # Wallet-pattern selection gate (11-13): on a probe SURVIVOR, before the second probe, read the pool's first-~66s
+    # trade stream (live Helius) and skip it when its wallet fingerprint ranks in the riskiest k% of recent probed pools
+    # -- the creator trading its own pool, few distinct wallets / trades = rug; a deep organic crowd + a fixed-size bot =
+    # survivor. The `pool-wallets` study found this ~halves the rug rate at entry out-of-sample. Needs enter on; fails
+    # OPEN (too sparse, or too little history to rank -> enters). Caches each stream for the offline study. REAL MONEY.
+    launch_canary_wallet_gate: bool = False  # OFF by default
+    launch_canary_wallet_skip_pct: float = 50.0  # skip the riskiest k% by wallet-pattern score
+    launch_canary_wallet_entry_s: float = 66.0  # read the stream up to this pool age (the selection-usable cut)
     # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
     launch_fast_canary: bool = False  # REAL MONEY: buy on detection, before the scorer's second-4 decide
