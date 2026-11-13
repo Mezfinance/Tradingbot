@@ -1700,7 +1700,7 @@ const WRL={trading:"Trading",treasury:"Treasury",reserve:"Reserve"};
 function walletLink(a){return a?`<a class="lk mono" href="https://solscan.io/account/${encodeURIComponent(a)}" target="_blank" rel="noopener">${esc(a.slice(0,4)+"…"+a.slice(-4))}</a>`:"–"}
 // Which rotation wallet executed a probe/trade: show W{n} from the Wallets directory when known, else the short address. Links to solscan.
 function walletNum(a){const live=(S.wallets&&S.wallets.live)||[];for(const w of live){if(w.address===a&&w.n!=null)return w.n}return null}
-function walletCell(a){if(!a)return'<span class="muted">—</span>';const n=walletNum(a);return`<a class="lk mono" href="https://solscan.io/account/${encodeURIComponent(a)}" target="_blank" rel="noopener" title="${esc(a)}">${n!=null?("W"+n):esc(a.slice(0,4))}</a>`}
+function walletCell(a){if(a==null||a==="")return'<span class="muted">—</span>';if(typeof a!=="string")return'<span class="mono" title="rotation wallet index">W'+a+'</span>';const n=walletNum(a);return`<a class="lk mono" href="https://solscan.io/account/${encodeURIComponent(a)}" target="_blank" rel="noopener" title="${esc(a)}">${n!=null?("W"+n):esc(a.slice(0,4))}</a>`}
 function walletRow(w){return`<tr><td>${w.n!=null?w.n:'<span class="muted">—</span>'}</td><td>${esc(WRL[w.role]||w.role||"")}</td><td>${walletLink(w.address)}</td><td class="num">${w.sol!=null?fmt(w.sol,4):"–"}</td><td class="num">${w.txs!=null?w.txs:"–"}</td><td class="l">${esc(w.label||"")}</td></tr>`}
 function renderWallets(){const W=S.wallets,note=$("w-note");
 if(!W){note.innerHTML='<p class="note">Loading wallet balances…</p>';["w-tiles","w-live","w-arch"].forEach(i=>$(i).innerHTML="");return}
