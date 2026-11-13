@@ -143,6 +143,12 @@ class Config:
     # the capped estimate) to try to land in the next slot. OFF by default (0 = normal priority): a live test (11-12)
     # showed the gap stays 2-3 whether or not it is paid -- the gap is set by the observe-lag (we wait for the buy to be
     # visible before firing the sell), not by fee priority on a lone dependent sell, so the extra fee buys no speed.
+    launch_canary_probe_buy_retries: int = 2  # a probe's BUY reverts when a runner moves past the slippage floor between
+    # the state read and the land (BSqTc1zD, a +59% winner, was missed this way 11-13). Retry the buy this many extra
+    # times, re-reading the pool each attempt so buy_min_out re-centres on the new price and lands. 0 = no retry.
+    launch_canary_probe_buy_slippage_bps: int = 0  # 0 = use slippage_bps (300). Widening this lands runners in fewer
+    # attempts, but buy_min_out doubles as the pre-signed sell amount, so a wider floor leaves more unsold dust -- and on
+    # a rugger that dust is lost, so a wide value inflates the real probe cost. Prefer the retry; keep this tight.
     # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
     launch_fast_canary: bool = False  # REAL MONEY: buy on detection, before the scorer's second-4 decide

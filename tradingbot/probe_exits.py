@@ -17,6 +17,18 @@ exit rules the owner asked to compare, over the survivor population:
    pull-time distribution: the longest window after confirmation in which *no* survivor has rugged
    is a hold we can take with ~zero rug exposure.
 
+Before any exit rule, the owner settled an **entry filter** (2026-11-13): among survivors, enter only
+those whose confirmation-window peak-to-trough price range is >= V (``VOL_GRID``, swept) — i.e. the
+pool *moved* during the ~60 s we waited, up or down, a dip-and-recover counting (it is measured as a
+range, not a net change).  Dead-flat pools (e.g. BykXeroQ, +2% and no run) are skipped; a down-move
+before entry is to our benefit (cheaper basis), so the filter must be volatility, not an up-only
+climb gate (a pool that dipped and then ran would be thrown away by "must be up to enter").  The
+deployed *exit* is the **climb gate** (``climb_gate``: keep only if up by the check, else bail) riding
+winners to minute 6 — the one lever that both banks the climbers (CF2LVJVy +30% at m6) and bails the
+flat-then-rugs (CUFUqgSE, flat past the 60 s watch then pulled at 2m).  Take-profit and trailing are
+kept only as comparisons; on the evidence so far hold-to-minute-6 captures the wins (the givebacks
+happen at or after minute 6), so a TP is on probation, not required.
+
 Price paths come from the dashboard's persisted reserve samples (``pool_paths.json``: ``pts`` =
 [(pool_age_s, liq_usd, price)], ~20 s apart, young pools only) joined to the scorer's
 ``watch_launch_live`` row (creation, pull time, minute-6 return).  ``--fetch`` refines each survivor
@@ -44,6 +56,11 @@ TRAIL_GRID = (0.15, 0.20, 0.30, 0.40)
 HOLD_GRID_S = (30, 60, 120, 180, 240, 300, 360, 600)
 # finer grid for the pull-time distribution / the "safe window" question
 PULL_GRID_S = (15, 30, 45, 60, 90, 120, 180, 240, 300, 360, 420, 480, 600, 900, 1800)
+# confirmation-window fetch offsets (relative to conf_ts; the probe is at conf - CONF_AFTER_S, so -58
+# ≈ 2 s after the probe), for the entry volatility measure
+CONF_FETCH_OFFSETS = (-58, -44, -30, -16, 0)
+VOL_GRID = (0.015, 0.02, 0.03, 0.05)   # confirmation-window peak-to-trough thresholds to sweep
+DEFAULT_VOL = 0.02                      # the entry filter we run the deployed climb gate on top of
 
 SCHEMA = "CREATE TABLE IF NOT EXISTS watch_probe_exit(pool TEXT, sec INTEGER, sol REAL, tok REAL, ts REAL, " \
          "PRIMARY KEY(pool, sec))"
@@ -68,10 +85,14 @@ def _committed(f: dict) -> bool:
 
 
 def _entry_series(f: dict, s: dict, path: dict | None, fetched: list | None) -> dict | None:
-    """Per-survivor entry price and the post-confirmation price series, relative to entry.
+    """Per-survivor entry price, confirmation-window volatility, and the post-confirmation series.
 
-    Returns {conf_ts, pull_after_conf (s or None), series=[(t_after_conf, mult)], peak_mult, m6_ret}.
-    ``mult`` = price / entry price.  Prefers the fine fetched series; else the dashboard pts path.
+    Returns {conf_ts, pull_after_conf (s or None), series=[(t_after_conf, mult)], peak_mult, m6_ret,
+    conf_range}.  ``mult`` = price / entry price (entry = price at confirmation).  ``conf_range`` =
+    peak-to-trough fractional range over the confirmation window [probe, confirmation] (the entry
+    filter's measure; None when fewer than two samples land in the window).  Prefers the fine fetched
+    series (``sec`` <= 0 = confirmation-window samples relative to conf_ts, ``sec`` > 0 = after conf);
+    else the dashboard pts path.
     """
     created = s.get("create_ts")
     feint_ts = f.get("feint_ts")
@@ -79,39 +100,58 @@ def _entry_series(f: dict, s: dict, path: dict | None, fetched: list | None) -> 
         return None
     conf_ts = feint_ts + CONF_AFTER_S
     conf_age = conf_ts - created
+    probe_age = feint_ts - created
     pulled_ts = (path or {}).get("pulled_ts") or s.get("pulled_ts")
     pull_after_conf = (pulled_ts - conf_ts) if pulled_ts else None
 
-    pts: list[tuple[float, float]] = []  # (t_after_conf, raw price)
-    if fetched:  # fine Helius series: (sec_after_conf, sol, tok)
-        peak_sol = max((sol for _, sol, _ in fetched if sol), default=0.0)
+    conf_prices: list[float] = []        # prices within the confirmation window [probe, conf]
+    post_pts: list[tuple[float, float]] = []  # (t_after_conf, raw price), t >= 0
+    entry_px: float | None = None
+    if fetched:  # (sec, sol, tok); sec <= 0 = conf window (relative to conf_ts), sec > 0 = after conf
+        peak_sol = max((sol for sec, sol, _ in fetched if sec > 0 and sol), default=0.0)
         for sec, sol, tok in fetched:
             if not tok or not sol:
                 continue
-            if peak_sol and sol < PULLED_SHARE * peak_sol:  # pulled from here on
-                break
-            pts.append((float(sec), sol / tok))
+            px = sol / tok
+            if sec <= 0:
+                conf_prices.append(px)
+                if sec == 0:
+                    entry_px = px
+            else:
+                if peak_sol and sol < PULLED_SHARE * peak_sol:  # pulled from here on
+                    break
+                post_pts.append((float(sec), px))
     elif path and path.get("pts"):
         peak_liq = path.get("peak_liq") or 0.0
         floor = PULLED_SHARE * peak_liq
         for age, liq, pr in path["pts"]:
-            if pr is None or age < conf_age:
+            if pr is None:
+                continue
+            if probe_age <= age <= conf_age:
+                conf_prices.append(float(pr))
+            if age < conf_age:
                 continue
             if floor and liq is not None and liq < floor:
                 break
-            pts.append((age - conf_age, float(pr)))
-    if not pts:
+            post_pts.append((age - conf_age, float(pr)))
+    if not post_pts:
         return None
-    entry_px = pts[0][1]
+    if entry_px is None:
+        entry_px = post_pts[0][1]
     if entry_px <= 0:
         return None
-    series = [(t, px / entry_px) for t, px in pts if pull_after_conf is None or t <= pull_after_conf]
+    series = [(t, px / entry_px) for t, px in post_pts if pull_after_conf is None or t <= pull_after_conf]
     if not series:
         return None
     peak_mult = max(m for _, m in series)
+    conf_range = None
+    if len(conf_prices) >= 2:
+        lo, hi = min(conf_prices), max(conf_prices)
+        if lo > 0:
+            conf_range = (hi - lo) / lo  # peak-to-trough; a dip-and-recover counts as alive
     m6 = s.get("ret")
     return {"conf_ts": conf_ts, "pull_after_conf": pull_after_conf, "series": series,
-            "peak_mult": peak_mult, "m6_ret": m6}
+            "peak_mult": peak_mult, "m6_ret": m6, "conf_range": conf_range}
 
 
 # --- scenario maths --------------------------------------------------------------------------------
@@ -217,6 +257,29 @@ def climb_gate(survs: list[dict], checks=CLIMB_CHECKS_S, gains=CLIMB_GAINS, hold
     return out
 
 
+def volatility_filter(entered: list[dict], committed: int, vol_grid=VOL_GRID,
+                      probe_cost: float = PROBE_COST, entry_usd: float = ENTRY_USD,
+                      hold: float = CLIMB_HOLD_S) -> dict:
+    """Entry filter: among survivors, enter only those whose confirmation-window peak-to-trough range
+    (``conf_range``) is >= V, skipping the dead-flat ones.  Per threshold, compare kept vs skipped on
+    the hold-to-minute-`hold` exit (``win`` is the share that profits = the climber rate) and the net
+    $ per committed probe.  The filter changes which survivors we *enter*, not how many we probe, so
+    every committed probe is still paid; only kept survivors earn.  Survivors with no conf-window path
+    are excluded from the split (counted as ``no_range``)."""
+    have_range = [e for e in entered if e.get("conf_range") is not None]
+    out = []
+    for v in vol_grid:
+        kept = [e for e in have_range if e["conf_range"] >= v]
+        skipped = [e for e in have_range if e["conf_range"] < v]
+        kr = [_hold_ret(e, hold) for e in kept]
+        sr = [_hold_ret(e, hold) for e in skipped]
+        net = sum(r * entry_usd for r in kr) - committed * probe_cost
+        out.append({"vol_pct": v, "kept": _dist(kr), "skipped": _dist(sr),
+                    "net_per_probe": (net / committed) if committed else None, "net_total": net})
+    return {"with_range": len(have_range), "no_range": len(entered) - len(have_range),
+            "by_threshold": out}
+
+
 def pull_distribution(survs: list[dict], grid=PULL_GRID_S) -> dict:
     """Over survivors (pools we would have entered): the share pulled within T seconds of confirmation,
     for each T in the grid.  The largest T with 0 pulls is a hold window with ~no rug exposure."""
@@ -238,10 +301,15 @@ def pull_distribution(survs: list[dict], grid=PULL_GRID_S) -> dict:
 
 # --- fetch (optional, research key) ----------------------------------------------------------------
 
-def fetch_series(store, helius, survivors_meta: list[dict], max_credits: int, grid=PULL_GRID_S) -> dict:
-    """One `last_before` call per (pool, offset) from confirmation, cached in `watch_probe_exit`.
-    Returns {pool: [(sec, sol, tok), ...]} (SOL lamports, raw token units).  Research (backup) key only.
-    Reads reserves from the tx with the same `_raw_vault` helper the other trajectory studies use."""
+def fetch_series(store, helius, survivors_meta: list[dict], max_credits: int, grid=PULL_GRID_S,
+                 conf_offsets=CONF_FETCH_OFFSETS) -> dict:
+    """One `last_before` call per (pool, offset), cached in `watch_probe_exit`.  Fetches the
+    confirmation-window offsets (``conf_offsets``, stored as sec <= 0, for the entry volatility) and
+    the post-confirmation offsets (``grid``, sec > 0, for the exit maths).  Returns
+    {pool: [(sec, sol, tok), ...]} (SOL lamports, raw token units).  Research (backup) key only.
+    Reads reserves from the tx with the same `_raw_vault` helper the other trajectory studies use.
+    Roughly len(conf_offsets)+len(grid) calls per survivor (~210 credits), so a full run wants
+    --max-credits in the tens of thousands."""
     store.execute(SCHEMA)
     have: dict = {}
     for r in store.query("SELECT pool, sec, sol, tok FROM watch_probe_exit"):
@@ -251,17 +319,33 @@ def fetch_series(store, helius, survivors_meta: list[dict], max_credits: int, gr
     from tradingbot import launch_live as ll
     from tradingbot.data import pumpswap as ps
     start = helius.credits_used
+
+    def _read(pool, mint, at_ts):
+        tx = helius.last_before(pool, at_ts)
+        sol = ll._raw_vault(tx, pool, ps.WSOL) if isinstance(tx, dict) else None
+        tok = ll._raw_vault(tx, pool, mint) if (isinstance(tx, dict) and mint) else None
+        return sol, tok
+
     for m in survivors_meta:
         pool, conf_ts, mint = m["pool"], m["conf_ts"], m.get("token_mint")
         cur = have.setdefault(pool, {})
+        # confirmation-window samples (pre-entry, the pool is alive): read each, no early break
+        for off in conf_offsets:
+            if off in cur:
+                continue
+            if helius.credits_used - start + 10 > max_credits:
+                break
+            sol, tok = _read(pool, mint, conf_ts + off)
+            cur[off] = (sol, tok)
+            store.execute("INSERT OR REPLACE INTO watch_probe_exit(pool, sec, sol, tok, ts) VALUES(?,?,?,?,?)",
+                          (pool, off, sol, tok, time.time()))
+        # post-confirmation series (for the exit maths): break when emptied
         for t in grid:
             if t in cur:
                 continue
             if helius.credits_used - start + 10 > max_credits:
                 break
-            tx = helius.last_before(pool, conf_ts + t)
-            sol = ll._raw_vault(tx, pool, ps.WSOL) if isinstance(tx, dict) else None
-            tok = ll._raw_vault(tx, pool, mint) if (isinstance(tx, dict) and mint) else None
+            sol, tok = _read(pool, mint, conf_ts + t)
             cur[t] = (sol, tok)
             store.execute("INSERT OR REPLACE INTO watch_probe_exit(pool, sec, sol, tok, ts) VALUES(?,?,?,?,?)",
                           (pool, t, sol, tok, time.time()))
@@ -309,7 +393,7 @@ def study(journal, store, cfg=None, hours: float = 24.0, helius=None, max_credit
                "pull_after_conf": None if e is None else e["pull_after_conf"],
                "m6_ret": scorer[f["pool"]].get("ret")}
         if e is not None:
-            rec.update(peak_mult=e["peak_mult"], series_n=len(e["series"]))
+            rec.update(peak_mult=e["peak_mult"], series_n=len(e["series"]), conf_range=e.get("conf_range"))
             with_path.append(e)
             rec["pull_after_conf"] = e["pull_after_conf"]
         # for the pull distribution, fall back to the scorer's pull time when there is no path
@@ -317,10 +401,14 @@ def study(journal, store, cfg=None, hours: float = 24.0, helius=None, max_credit
             rec["pull_after_conf"] = scorer[f["pool"]]["pulled_ts"] - rec["conf_ts"]
         survs.append(rec)
 
+    kept = [e for e in with_path if e.get("conf_range") is not None and e["conf_range"] >= DEFAULT_VOL]
     return {"hours": hours, "probes_total": len(all_probed), "probes_committed": committed,
             "survivors": len(surv_pools), "survivors_with_path": len(with_path),
             "pull_distribution": pull_distribution(
                 [{"pull_after_conf": r["pull_after_conf"]} for r in survs]),
+            "volatility": volatility_filter(with_path, committed),
+            "kept_vol_pct": DEFAULT_VOL, "kept_n": len(kept),
+            "kept_climb": climb_gate(kept),
             "take_profit": take_profit(with_path, committed),
             "trailing": trailing(with_path),
             "fixed_hold": fixed_hold(with_path),
@@ -348,6 +436,28 @@ def render(r: dict) -> str:
         o.append("\n(no survivor has a reserve path yet — run with --fetch, or let the dashboard watch more pools)")
         return "\n".join(o)
 
+    v = r["volatility"]
+    o.append(f"\nVOLATILITY ENTRY FILTER (enter a survivor only if its confirmation-window peak-to-trough "
+             f"range >= V; up OR down, a dip-and-recover counts)")
+    o.append(f"  {v['with_range']} survivors have a conf-window path, {v['no_range']} do not "
+             f"(the latter are left out of the split)")
+    o.append(f"  {'V':>5} | {'kept n':>6} {'mean':>8} {'climb%':>7} | {'skip n':>6} {'mean':>8} {'climb%':>7} | {'net/probe':>10}")
+    for b in v["by_threshold"]:
+        k, sk = b["kept"], b["skipped"]
+        o.append(f"  {b['vol_pct'] * 100:>4.1f}% | {k['n']:>6} {_pct(k.get('mean')):>8} {_pct(k.get('win'), 0):>7} | "
+                 f"{sk['n']:>6} {_pct(sk.get('mean')):>8} {_pct(sk.get('win'), 0):>7} | "
+                 f"{(f'${b['net_per_probe']:+.2f}' if b['net_per_probe'] is not None else '—'):>10}")
+
+    o.append(f"\nDEPLOYED COMBO — climb gate on the {r['kept_vol_pct'] * 100:.0f}% volatility-kept set "
+             f"({r['kept_n']} survivors): enter movers, bail at the check if not up, else ride to "
+             f"{CLIMB_HOLD_S // 60}m")
+    o.append(f"  {'check':>6} {'gain':>5} {'mean':>8} {'median':>8} {'win':>6} {'n':>4}")
+    for t in r["kept_climb"]:
+        s = t["ret"]
+        o.append(f"  {t['check_s']:>5}s {t['gain_pct'] * 100:>4.0f}% {_pct(s.get('mean')):>8} "
+                 f"{_pct(s.get('median')):>8} {_pct(s.get('win'), 0):>6} {s['n']:>4}")
+
+    o.append("\n--- exit-lever comparison on all survivors with a path (unfiltered) ---")
     o.append("\nTAKE PROFIT (enter every survivor at confirmation; -100% if pulled before the TP)")
     o.append(f"  {'TP':>5} {'climbers':>8} {'probes/climber':>14} {'mean ret':>9} {'win':>6} {'net/probe':>10}")
     for t in r["take_profit"]:

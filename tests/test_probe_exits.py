@@ -109,4 +109,44 @@ def test_study_end_to_end_without_helius():
     # the +30% survivor is a climber for a +25% TP; the flat-rug is not
     tp25 = next(t for t in out["take_profit"] if t["tp_pct"] == 0.25)
     assert tp25["climbers"] == 1
+    # the paths here have <2 samples inside the confirmation window, so no conf_range
+    assert "volatility" in out and out["volatility"]["with_range"] == 0
+    assert "kept_climb" in out and out["kept_vol_pct"] == pe.DEFAULT_VOL
     assert pe.render(out).startswith("PROBE EXITS")
+
+
+def test_conf_range_measures_the_window_and_the_filter_splits_movers_from_the_flat():
+    created = 1000.0
+    feint_ts = 1007.0                                   # probe at pool age 7
+    conf_age = feint_ts + pe.CONF_AFTER_S - created     # 67
+    f = {"pool": "P", "feint_ts": feint_ts, "kind": "probe", "verdict": "ok", "watch_verdict": "survivor"}
+    s = {"create_ts": created, "pulled_ts": None, "ret": 0.1}
+    # mover: dips to 0.95 and recovers inside the conf window, then runs to 1.2 after
+    mover = pe._entry_series(f, s, {"peak_liq": 20000, "pts": [
+        (12, 20000, 1.0), (30, 19000, 0.95), (50, 20000, 1.0),
+        (conf_age, 20000, 1.0), (conf_age + 60, 20000, 1.2)]}, None)
+    assert mover is not None
+    assert abs(mover["conf_range"] - (1.0 - 0.95) / 0.95) < 1e-9   # peak-to-trough; dip-and-recover counts
+    # dead-flat: no movement in the window
+    flat = pe._entry_series(f, s, {"peak_liq": 20000, "pts": [
+        (12, 20000, 1.0), (30, 20000, 1.0), (conf_age, 20000, 1.0), (conf_age + 60, 20000, 1.0)]}, None)
+    assert flat["conf_range"] < 0.01
+    vf = pe.volatility_filter([mover, flat], committed=10)
+    assert vf["with_range"] == 2 and vf["no_range"] == 0
+    b2 = next(b for b in vf["by_threshold"] if b["vol_pct"] == 0.02)
+    assert b2["kept"]["n"] == 1 and b2["skipped"]["n"] == 1        # mover kept at 2%, flat skipped
+    assert b2["kept"]["win"] == 1.0 and b2["skipped"]["win"] == 0.0  # mover profits, flat bleeds -cost
+    b5 = next(b for b in vf["by_threshold"] if b["vol_pct"] == 0.05)
+    assert b5["kept"]["n"] == 1                                    # the ~5.3% range still clears 5%
+
+
+def test_conf_range_from_a_fetched_series_splits_the_window_at_sec_zero():
+    created = 1000.0
+    feint_ts = 1007.0
+    f = {"pool": "P", "feint_ts": feint_ts, "kind": "probe", "verdict": "ok", "watch_verdict": "survivor"}
+    s = {"create_ts": created, "pulled_ts": None, "ret": 0.5}
+    # (sec, sol, tok): sec <= 0 = conf window, sec > 0 = after conf; price = sol / tok
+    fetched = [(-58, 1.0, 1.0), (-30, 1.1, 1.0), (0, 1.0, 1.0), (60, 1.5, 1.0)]
+    e = pe._entry_series(f, s, None, fetched)
+    assert abs(e["conf_range"] - 0.10) < 1e-9     # 1.0 -> 1.1 across the conf-window samples
+    assert e["series"][0] == (60.0, 1.5)          # entry = price at sec 0 (1.0); post sample 60 -> 1.5x

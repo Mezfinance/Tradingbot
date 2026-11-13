@@ -44,6 +44,7 @@ CU_LIMIT = 300_000  # real direct swaps use ~80-115k compute units; a first buy 
 FEINT_CU_LIMIT = 500_000  # the feint is two swaps (buy + sell) plus the fee-account creation in one transaction
 PROBE_SLOT_WAIT_S = 2.5   # how long to wait for the probe's buy to be visible on-chain before firing the sell
 PROBE_POLL_S = 0.05       # poll the buy's status this often (tight: fire the pre-signed sell the instant it is seen)
+PROBE_RETRY_S = 0.4       # short pause before re-reading the pool and retrying a buy that reverted on a moving pool
 GLOBAL_TTL_S = 600
 ROUTE = "direct"
 POOL_FILE = "canary_pools.json"  # next to the journal: mint -> pool of the canary's buys
@@ -628,75 +629,105 @@ class DirectPumpswapExecutor(JupiterExecutor):
             self.last_note = out["note"]
             return out
         sol_usd = self.jup.sol_price()
-        st = self._state(token)
-        if not sol_usd or st is None:
+        if not sol_usd:
             out["note"] = self.last_note = "probe: state unreadable"
             return out
-        out["pool"] = st["addr"]
-        base_amt, quote_amt = st["reserves"]
-        sol_res, tok_res = (quote_amt, base_amt) if st["token_is_base"] else (base_amt, quote_amt)
-        out["sol_before"] = round(sol_res / 1e9, 6)  # the pool's SOL at the probe, so the survival watch can see a pull
         lamports = int(usd / sol_usd * 1e9)
         bal = self.sol_balance()
         if bal is None or bal < lamports / 1e9 + MIN_SOL:
             out["note"] = self.last_note = "probe: wallet SOL low"
             return out
-        if not sol_res or lamports / (sol_res + lamports) * 100 > self.cfg.max_price_impact_pct:
-            out["note"] = self.last_note = "probe: impact too high"
-            return out
-        # The pre-signed sell sells exactly buy_min_out — the floor we're certain the buy delivers — so it needs no
-        # read of the real balance and can go the instant the buy is visible; the sliver above the floor is dust.
-        buy_min_out = int(amount_out(lamports, sol_res, tok_res, st["fee_bps"]) * (10_000 - self.cfg.slippage_bps) / 10_000)
-        if buy_min_out <= 0:
-            out["note"] = self.last_note = "probe: pool has no tokens"
-            return out
-        # Pre-build and sign the sell NOW, before the buy, so firing it after the buy is a bare sendTransaction (no
-        # blockhash fetch, compile, sign or preflight on the critical path). It sells exactly buy_min_out (the floor),
-        # at max priority so it lands in the next slot (N+1), not N+2 -- the race to escape the rug.
-        sell_built = self._build_tx(self._instructions(
-            st, "sell", buy_min_out, 1, max_priority_sol=getattr(self.cfg, "launch_canary_probe_priority_sol", 0.0) or None))
+        slip = int(getattr(self.cfg, "launch_canary_probe_buy_slippage_bps", 0) or self.cfg.slippage_bps)
+        retries = max(0, int(getattr(self.cfg, "launch_canary_probe_buy_retries", 2) or 0))
         blind = bool(getattr(self.cfg, "launch_canary_probe_blind", True))
         out["blind"] = blind
-        buy_sig = self._send_ixs(self._instructions(st, "buy", lamports, buy_min_out))
-        if buy_sig.startswith(NOT_SENT):
-            out["note"] = self.last_note = f"probe: buy not sent ({buy_sig})"
-            return out
-        out["buy_tx"] = buy_sig
         empty = {"ok": False, "swap_lamports": 0, "fee_lamports": 0, "note": "no sell"}
-        settle_buy = None
-        if blind:
-            # Blind fire: submit the pre-signed sell without waiting for the buy to be visible, after a short pause so
-            # it lands ONE slot after the buy (gap 1) instead of the same block (gap 0, which is net-zero at the slot
-            # boundary and so invisible to a reserve-polling rugger). The pause also lets the buy land first, cutting
-            # reverts; if the sell still reaches the leader before the buy, it reverts on-chain (final, dead) and the
-            # confirmed fallback below recovers the stake. We record `blind_reverted` so the revert rate can be measured.
-            self.sleep(max(0.0, getattr(self.cfg, "launch_canary_probe_delay_s", 0.2)))
-            sell_sig = self._submit(sell_built, skip_preflight=True)
-            out["sell_tx"] = None if sell_sig.startswith(NOT_SENT) else sell_sig
-            settle_sell = self._settle_direct(sell_sig, token) if out["sell_tx"] else {**empty, "note": sell_sig}
-            settle_buy = self._settle_direct(buy_sig, token)
-            out["blind_reverted"] = not settle_sell["ok"]
-            if not settle_sell["ok"] and settle_buy["ok"] and settle_buy["token"] > 0:
-                # the blind sell did not recover but the buy's money is in the pool: a confirmed sell (preflight on,
-                # the tokens now exist) gets the stake out. This is the backup for a blind revert.
-                out["used_fallback"] = True
-                sell_sig, settle_sell = self._confirmed_sell(st, token, settle_buy["token"])
-            else:
-                out["used_fallback"] = False
-        else:
-            # Observe-lag path: wait for the buy to be visible, then fire the pre-signed sell (lands N+1 at best).
-            buy_ok, _ = self._wait_visible(buy_sig, PROBE_SLOT_WAIT_S)
-            if not buy_ok:
+        settle_buy = settle_sell = None
+        sell_sig = buy_sig = ""
+        attempt = 0
+        # A probe buy reverts when a runner moves past the slippage floor between the state read and the land (BSqTc1zD,
+        # a +59% winner, was missed this way 11-13). Retry with a FRESH read each attempt so buy_min_out re-centres on the
+        # current price and lands; this keeps the slippage (and so the sell's dust) tight instead of widening it, which on
+        # a rugger would be lost dust. Only transient failures (a reverted/dropped buy, a moving-pool preflight miss) are
+        # retried — a honeypot is caught by the sim above, and impact / no-tokens do not improve on retry.
+        while True:
+            attempt += 1
+            out["attempts"] = attempt
+            for k in ("buy_tx", "sell_tx", "blind_reverted", "used_fallback"):
+                out.pop(k, None)  # drop any stale per-attempt fields before this try
+            st = self._state(token)
+            if st is None:
+                if attempt <= retries:
+                    self.sleep(PROBE_RETRY_S)
+                    continue
+                out["note"] = self.last_note = "probe: state unreadable"
+                return out
+            out["pool"] = st["addr"]
+            base_amt, quote_amt = st["reserves"]
+            sol_res, tok_res = (quote_amt, base_amt) if st["token_is_base"] else (base_amt, quote_amt)
+            out["sol_before"] = round(sol_res / 1e9, 6)  # the landed attempt's pool SOL, so the watch's pull baseline is right
+            if not sol_res or lamports / (sol_res + lamports) * 100 > self.cfg.max_price_impact_pct:
+                out["note"] = self.last_note = "probe: impact too high"
+                return out  # impact does not improve on retry
+            # The pre-signed sell sells exactly buy_min_out — the floor we're certain the buy delivers — so it needs no
+            # read of the real balance and can go the instant the buy is visible; the sliver above the floor is dust.
+            buy_min_out = int(amount_out(lamports, sol_res, tok_res, st["fee_bps"]) * (10_000 - slip) / 10_000)
+            if buy_min_out <= 0:
+                out["note"] = self.last_note = "probe: pool has no tokens"
+                return out
+            # Pre-build and sign the sell NOW, before the buy, so firing it after the buy is a bare sendTransaction (no
+            # blockhash fetch, compile, sign or preflight on the critical path). It sells exactly buy_min_out (the floor),
+            # at max priority so it lands in the next slot (N+1), not N+2 -- the race to escape the rug.
+            # bump = attempt makes each retry a distinct transaction (a different compute-unit price), so a re-sent buy
+            # on a static blockhash is never deduped to the first attempt's reverted signature.
+            sell_built = self._build_tx(self._instructions(
+                st, "sell", buy_min_out, 1, attempt,
+                max_priority_sol=getattr(self.cfg, "launch_canary_probe_priority_sol", 0.0) or None))
+            buy_sig = self._send_ixs(self._instructions(st, "buy", lamports, buy_min_out, attempt))
+            if buy_sig.startswith(NOT_SENT):
+                # a preflight/send miss on a moving pool (the min-out would revert at the current price) is transient
+                if attempt <= retries:
+                    self.sleep(PROBE_RETRY_S)
+                    continue
+                out["verdict"], out["note"] = "buy_failed", f"probe: buy not sent ({buy_sig})"
+                self.last_note = out["note"]
+                return out
+            out["buy_tx"] = buy_sig
+            settle_sell = None
+            if blind:
+                # Blind fire: submit the pre-signed sell without waiting for the buy to be visible, after a short pause so
+                # it lands ONE slot after the buy (gap 1) instead of the same block (gap 0, which is net-zero at the slot
+                # boundary and so invisible to a reserve-polling rugger). The pause also lets the buy land first, cutting
+                # reverts; if the sell still reaches the leader before the buy, it reverts on-chain (final, dead) and the
+                # confirmed fallback below recovers the stake. We record `blind_reverted` so the revert rate can be measured.
+                self.sleep(max(0.0, getattr(self.cfg, "launch_canary_probe_delay_s", 0.2)))
+                sell_sig = self._submit(sell_built, skip_preflight=True)
+                out["sell_tx"] = None if sell_sig.startswith(NOT_SENT) else sell_sig
+                settle_sell = self._settle_direct(sell_sig, token) if out["sell_tx"] else {**empty, "note": sell_sig}
                 settle_buy = self._settle_direct(buy_sig, token)
-                if not (settle_buy["ok"] and settle_buy["token"] > 0):
-                    out["verdict"], out["note"] = "buy_failed", "probe: buy reverted / not visible"
-                    self.last_note = out["note"]
-                    return out
-            sell_sig = self._submit(sell_built, skip_preflight=True)
-            out["sell_tx"] = None if sell_sig.startswith(NOT_SENT) else sell_sig
-            settle_buy = settle_buy or self._settle_direct(buy_sig, token)
-            settle_sell = self._settle_direct(sell_sig, token) if out["sell_tx"] else {**empty, "note": sell_sig}
-        if not (settle_buy["ok"] and settle_buy["token"] > 0):  # the buy never landed: nothing was committed
+                if settle_buy["ok"] and settle_buy["token"] > 0:
+                    out["blind_reverted"] = not settle_sell["ok"]
+                    if not settle_sell["ok"]:
+                        # the blind sell did not recover but the buy's money is in the pool: a confirmed sell (preflight
+                        # on, the tokens now exist) gets the stake out. This is the backup for a blind revert.
+                        out["used_fallback"] = True
+                        sell_sig, settle_sell = self._confirmed_sell(st, token, settle_buy["token"])
+                    else:
+                        out["used_fallback"] = False
+            else:
+                # Observe-lag path: wait for the buy to be visible, then fire the pre-signed sell (lands N+1 at best).
+                buy_ok, _ = self._wait_visible(buy_sig, PROBE_SLOT_WAIT_S)
+                settle_buy = self._settle_direct(buy_sig, token)
+                if buy_ok or (settle_buy["ok"] and settle_buy["token"] > 0):
+                    sell_sig = self._submit(sell_built, skip_preflight=True)
+                    out["sell_tx"] = None if sell_sig.startswith(NOT_SENT) else sell_sig
+                    settle_sell = self._settle_direct(sell_sig, token) if out["sell_tx"] else {**empty, "note": sell_sig}
+            if settle_buy and settle_buy["ok"] and settle_buy["token"] > 0:
+                break  # the buy landed; proceed to recovery / verdict
+            # the buy did not land (reverted on a moving pool, or dropped): retry with a fresh read
+            if attempt <= retries:
+                self.sleep(PROBE_RETRY_S)
+                continue
             out["verdict"], out["note"] = "buy_failed", "probe: buy reverted / not visible"
             self.last_note = out["note"]
             return out

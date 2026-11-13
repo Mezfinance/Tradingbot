@@ -391,6 +391,35 @@ def test_probe_1slot_observe_lag_path_waits_then_sells():
     assert len(rpc.raw) == 2 and out["slot_gap"] == 1
 
 
+def test_probe_1slot_retries_a_reverted_buy_then_lands_on_a_runner():
+    ex, rpc = probe_direct()
+    ex.cfg.launch_canary_probe_blind = False  # observe-lag: a reverted buy fires no sell, so the retry is clean to assert
+    assert ex.cfg.launch_canary_probe_buy_retries == 2  # the default
+    # attempt 1 buy reverts (a runner moved past the slippage floor between the read and the land, as BSqTc1zD did);
+    # attempt 2 re-reads the pool and the buy lands, then the sell lands -- the fix for the missed-runner case.
+    rev = sol_meta(ex.owner, (0, 0), -5_000, err={"InstructionError": [6, {"Custom": 6004}]})
+    rpc.next_meta = [rev,
+                     sol_meta(ex.owner, (0, 12_000_000), -(125_000_000 + 5_000 + 2_000_000), new_rent=2_000_000),
+                     sol_meta(ex.owner, (12_000_000, 0), 119_995_000)]
+    out = ex.probe_1slot(MINT, 25.0)
+    assert out["verdict"] == "ok" and out["escaped"] is True
+    assert out["attempts"] == 2                 # it took a second try
+    assert len(rpc.raw) == 3                     # the reverted buy, then the landed buy + sell
+    assert 0.4 in ex._sleeps                     # PROBE_RETRY_S between attempts (re-read, re-centre, retry)
+
+
+def test_probe_1slot_gives_up_after_the_retry_budget():
+    ex, rpc = probe_direct()
+    ex.cfg.launch_canary_probe_blind = False
+    ex.cfg.launch_canary_probe_buy_retries = 1   # 2 attempts total
+    rev = lambda: sol_meta(ex.owner, (0, 0), -5_000, err={"InstructionError": [6, {"Custom": 6004}]})
+    rpc.next_meta = [rev(), rev()]               # every buy reverts
+    out = ex.probe_1slot(MINT, 25.0)
+    assert out["verdict"] == "buy_failed" and "reverted" in out["note"]
+    assert out["attempts"] == 2 and len(rpc.raw) == 2  # exactly 2 buys, no infinite retry
+    assert out.get("escaped") is None            # never reached the recovery block
+
+
 def test_direct_buy_declines_without_enough_sol_or_on_a_thin_pool():
     ex, rpc = direct(sol=40_000_000)  # 0.04 SOL: short of the 0.05 SOL buy plus the 0.01 SOL reserve
     assert ex.buy(MINT, 10.0, 0.0) is None and "wallet SOL low" in ex.last_note and not rpc.sent
