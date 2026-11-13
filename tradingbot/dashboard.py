@@ -521,6 +521,7 @@ class Dashboard:
         # (~60 s) reserve samples: without them a now-old pool's conf_ret / best entry / live peak can never be
         # rebuilt (the confirmation-window price is long gone), so those columns would blank out after every deploy.
         self._pool_paths: dict = self._load_pool_paths()
+        self._paths_logged = False  # log the resolved save path once, so /data placement is verifiable in the logs
         self._mdb = None
 
     def _pool_paths_file(self) -> str | None:
@@ -531,6 +532,8 @@ class Dashboard:
     def _load_pool_paths(self) -> dict:
         path = self._pool_paths_file()
         if not path or not os.path.exists(path):
+            if path:
+                log.info("dashboard: no pool paths to restore at %s (fresh)", path)
             return {}
         try:
             with open(path) as fh:
@@ -543,9 +546,10 @@ class Dashboard:
                 if isinstance(cb, dict):  # JSON stringifies int keys; hold_curve looks them up as ints
                     p["conf_by"] = {int(k): v for k, v in cb.items()}
                 out[pool] = p
+            log.info("dashboard: restored %d pool paths from %s", len(out), path)
             return out
         except Exception as exc:  # noqa: BLE001 (a corrupt file must never stop the dashboard)
-            log.warning("dashboard: could not load pool paths: %s", exc)
+            log.warning("dashboard: could not load pool paths from %s: %s", path, exc)
             return {}
 
     def _save_pool_paths(self) -> None:
@@ -553,12 +557,16 @@ class Dashboard:
         if not path:
             return
         try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)  # /data exists on Fly; belt-and-suspenders
             tmp = path + ".tmp"
             with open(tmp, "w") as fh:
                 json.dump(self._pool_paths, fh)
             os.replace(tmp, path)  # atomic: a deploy mid-write never leaves a half file
+            if not self._paths_logged:  # confirm /data placement in the logs the first time it lands
+                log.info("dashboard: persisting %d pool paths to %s", len(self._pool_paths), path)
+                self._paths_logged = True
         except Exception as exc:  # noqa: BLE001
-            log.warning("dashboard: could not save pool paths: %s", exc)
+            log.warning("dashboard: could not save pool paths to %s: %s", path, exc)
 
     def _build_in_child(self) -> dict:
         path = os.path.join(os.path.dirname(os.path.abspath(self.cfg.db_path)), SUMMARY_FILE)
@@ -732,13 +740,16 @@ class Dashboard:
                        or (scorer.get(pl) and (scorer[pl].get("create_ts") or 0) < cut)]:
                 self._pool_paths.pop(pl, None)
             rows = pt.assemble(feints, scorer, su, self._pool_paths, now)
-            self._save_pool_paths()  # persist so a fly deploy keeps the early samples (conf/best entry survive)
             data = {"rows": rows[:200], "summary": pt.summary(rows), "sol_usd": su,
                     "fetched_ts": now, "stale": False}
         except Exception as exc:  # noqa: BLE001 (keep the last good data; the public RPC can be slow)
             log.warning("dashboard: pool tracker failed: %s", exc)
             data = {**(self.pools or {"rows": [], "summary": {}}), "stale": True,
                     "error": f"{type(exc).__name__}: {str(exc)[:120]}"}
+        finally:
+            # persist to /data on EVERY poll, even when the live read / assemble above threw: a slow or rate-limited
+            # public RPC must never stop the reserve samples reaching disk, or a fly deploy wipes them.
+            self._save_pool_paths()
         with self._lock:
             self.pools, self.pools_ver = data, self.pools_ver + 1
 

@@ -148,6 +148,26 @@ def test_pool_paths_survive_a_restart(cfg, tmp_path):
     assert dash.Dashboard(Journal(":memory:"), cfg.with_overrides({"db_path": ":memory:"}))._pool_paths == {}
 
 
+def test_fetch_pools_persists_to_data_even_when_the_live_read_fails(cfg, tmp_path, monkeypatch):
+    """A slow / rate-limited public RPC must never stop the reserve samples reaching /data (or a fly deploy
+    wipes them): fetch_pools persists _pool_paths in a finally, even when the live read / assemble raises."""
+    from tradingbot import pool_tracker as pt
+    db = str(tmp_path / "bot.db")
+    cfg.db_path = db
+    board = dash.Dashboard(Journal(db), cfg)
+    board._pool_paths = {"P1": {"pts": [[66.0, 14000.0, 1e-7]], "peak_liq": 14000.0, "pulled_ts": None}}
+
+    def boom(*a, **k):
+        raise RuntimeError("rpc down")
+    monkeypatch.setattr(pt, "feint_pools", boom)  # force the try body to raise before the old save point
+    board.fetch_pools(rpc=lambda m, p: {})
+    assert board.pools["stale"] is True  # the poll reported stale ...
+    assert (tmp_path / "pool_paths.json").exists()  # ... but the file still landed in the db dir (/data on Fly)
+    import json as _json
+    with open(tmp_path / "pool_paths.json") as fh:
+        assert "P1" in _json.load(fh)
+
+
 def test_summary_is_built_in_a_child_process_for_a_file_journal(cfg, tmp_path, monkeypatch):
     """11-05: building the summary inside the bot delayed the scorer by ~40 s; a file journal uses a child."""
     db = str(tmp_path / "bot.db")
