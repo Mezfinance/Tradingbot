@@ -124,7 +124,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -186,6 +186,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-credits", type=int, default=None,
                         help="Helius credit cap (defaults: backfills 60000, launch-exit-study 10000, "
                              "launch-late-entry 12000)")
+    parser.add_argument("--window-s", type=float, default=120.0, help="pool-wallets: fetch + full-window features over the first N s of trading")
+    parser.add_argument("--entry-s", type=float, default=66.0, help="pool-wallets: the selection cut (~confirmation); features here are what a live filter would see")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
     parser.add_argument("--apply", action="store_true", help="canary-sweep: close the empty accounts (default: list)")
@@ -724,6 +726,23 @@ def main(argv: list[str] | None = None) -> None:
         out = _pe.study(_PeJournal(cfg.db_path), _PeWS(_pe_wdp(cfg)), cfg=cfg, hours=args.hours or 24.0,
                         helius=pe_helius, max_credits=int(args.max_credits or 8_000))
         print(json.dumps(out, indent=2, default=str) if args.json else _pe.render(out))
+        return
+
+    if args.command == "pool-wallets":  # wallet-pattern fingerprint of ruggers vs survivors (11-13)
+        from tradingbot import pool_wallets as _pw
+        from tradingbot.journal import Journal as _PwJournal
+        from tradingbot.watcher import WatchStore as _PwWS, watch_db_path as _pw_wdp
+        pw_helius = None
+        if args.fetch:
+            import httpx as _pw_httpx
+            from tradingbot.data.helius import Helius as _PwHelius
+            pw_helius = _PwHelius(client=_pw_httpx.Client(timeout=60))  # research (backup) key, never the live key
+            pw_helius.min_interval_s = 1 / max(args.rps, 0.1)
+        out = _pw.study(_PwJournal(cfg.db_path), _PwWS(_pw_wdp(cfg)), cfg=cfg, hours=args.hours or 720.0,
+                        window_s=args.window_s, entry_s=args.entry_s, helius=pw_helius,
+                        max_credits=int(args.max_credits or 20_000),
+                        progress=lambda i, n, c: print(f"streams {i}/{n}, {c} credits", flush=True))
+        print(json.dumps(out, indent=2, default=str) if args.json else _pw.render(out))
         return
 
     if args.command == "canary-trades":  # every real canary trade + the pool path after our buy (11-10)
