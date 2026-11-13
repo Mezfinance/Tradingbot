@@ -114,6 +114,22 @@ def test_vol_stall_exit_sweep_reports_rug_dodge_and_clip():
     assert c["winners"] >= 1 and c["clip"] == 0.0               # did not clip the still-pumping climber
 
 
+def test_stall_scan_catches_a_flat_then_pull_and_misses_a_one_slot_rug():
+    # ran up to +12%, then went flat for ~100s before the pull at 180s: a gate that reads the flat catches it
+    flat_then_pull = _e([(0, 1.0), (20, 1.05), (40, 1.10), (60, 1.12), (80, 1.12),
+                         (100, 1.121), (120, 1.12), (140, 1.122), (160, 1.12)], pull=180)
+    scan = {(c["window_s"], c["thr_pct"]): c for c in pe._stall_scan(flat_then_pull)}
+    dep = scan[(20, 0.05)]                                          # the deployed two-stage gate
+    assert dep["caught"] is True
+    assert dep["fire_after_conf_s"] < 180                           # fires before the pull
+    assert dep["lead_before_pull_s"] == 180 - dep["fire_after_conf_s"]
+    assert dep["ret"] > -1.0                                        # banks the flat, not a -100% rug
+    # one-slot rug: pulled before any full window registers -> nothing to catch (the honest limit)
+    one_slot = _e([(0, 1.0)], pull=10)
+    miss = {(c["window_s"], c["thr_pct"]): c for c in pe._stall_scan(one_slot)}[(20, 0.05)]
+    assert miss["caught"] is False and miss["fires"] is False
+
+
 def test_pull_distribution_finds_the_safe_window():
     survs = [{"pull_after_conf": None}, {"pull_after_conf": 200.0}, {"pull_after_conf": 400.0}]
     d = pe.pull_distribution(survs)
@@ -239,7 +255,11 @@ def test_dump_pool_reconstructs_the_path_and_marks_the_pull():
     by = {round(sm["pool_age_s"]): sm for sm in out["samples"]}
     assert round(by[41]["px_rel_conf"], 3) == round(0.95 / 1.15, 3)    # the 41s dip is below the conf entry
     assert by[20]["liq_usd"] == 32600                                  # liq from the pts
-    assert pe.render_dump(out).startswith("PATH DUMP") and "scorer LP pull at 120" in pe.render_dump(out)
+    txt = pe.render_dump(out)
+    assert txt.startswith("PATH DUMP") and "scorer LP pull at 120" in txt
+    # the per-pool stall-gate scan: pull 54s after entry (120s pool age - 66s conf age), table + verdict render
+    assert out["pull_after_conf_s"] == 54 and out["stall_scan"]
+    assert "VOLATILITY STALL GATE" in txt and "deployed gate (20s / 5%)" in txt
     # a truncated id resolves: a shortened pool address (with the dashboard's ellipsis) or the token mint
     for q in ("P9...", "M9"):
         r = pe.dump_pool(J(), S(), cfg=None, pool=q, helius=None, paths=paths, now=now)

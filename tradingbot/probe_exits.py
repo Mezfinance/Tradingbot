@@ -326,18 +326,20 @@ def decline_exit(survs: list[dict], steps=POLL_STEP_S, ns=DECLINE_N, drops=DECLI
     return out
 
 
-def _vol_stall_ret(e: dict, step: float, win: float, thr: float, hold: float = CLIMB_HOLD_S) -> float:
-    """Poll every `step` s from entry; sell when the rolling peak-to-trough range over the last `win` s
-    falls below `thr` -- the wash bot going flat before the pull. This is the entry volatility filter
-    (``conf_range``) applied rolling during the hold: it fires on a *flat* stretch, the shape the 30%
-    trailing stop misses (no down-tick). -100% if the pool pulls before it fires; ride to `hold` else."""
+def _stall_fire(e: dict, step: float, win: float, thr: float,
+                hold: float = CLIMB_HOLD_S) -> tuple[float | None, float | None]:
+    """When the rolling-range stall gate (window `win`, threshold `thr`) first fires, polling every
+    `step` s from entry: the wash bot going flat (peak-to-trough range over the last `win` s < `thr`)
+    before the pull. Returns (fire_t_after_conf, mult_at_fire), or (None, None) if the pull lands first
+    or the gate never fires within `hold`. The single source of the stall trigger: `_vol_stall_ret` and
+    the single-pool `_stall_scan` both read it, so the sweep and the per-pool diagnostic always agree."""
     pull = e["pull_after_conf"]
     series = e["series"]
     window: list[tuple[float, float]] = []
     t = step
     while t <= hold:
         if pull is not None and pull <= t:
-            return -1.0  # the pull already landed by this poll
+            return (None, None)  # the pull already landed by this poll -- the gate did not catch it
         m = _poll_price(series, t)
         window.append((t, m))
         while len(window) > 1 and window[0][0] < t - win:
@@ -346,9 +348,22 @@ def _vol_stall_ret(e: dict, step: float, win: float, thr: float, hold: float = C
             lo = min(x for _, x in window)
             hi = max(x for _, x in window)
             if lo > 0 and (hi - lo) / lo < thr:
-                return _clamp(m - 1.0 - COST)  # stalled flat: sell here, before any pull
+                return (t, m)  # stalled flat: fires here, before any pull
         t += step
-    return _hold_ret(e, hold)              # never fired: hold to the end
+    return (None, None)         # never fired within the hold
+
+
+def _vol_stall_ret(e: dict, step: float, win: float, thr: float, hold: float = CLIMB_HOLD_S) -> float:
+    """The stall exit's return: sell at the stall fire; -100% if the pool pulls before it fires; ride to
+    `hold` otherwise. Trigger is `_stall_fire` (the entry volatility filter applied rolling, the flat
+    stretch the 30% trailing stop misses for lack of a down-tick)."""
+    fire_t, m = _stall_fire(e, step, win, thr, hold)
+    if fire_t is not None:
+        return _clamp(m - 1.0 - COST)
+    pull = e["pull_after_conf"]
+    if pull is not None and pull <= hold:
+        return -1.0            # pulled before any flat window registered
+    return _hold_ret(e, hold)  # never fired, never pulled: hold to the end
 
 
 def vol_stall_exit(survs: list[dict], steps=POLL_STEP_S, windows=STALL_WINDOW_S, thrs=VOL_GRID,
@@ -541,6 +556,33 @@ def study(journal, store, cfg=None, hours: float = 24.0, helius=None, max_credit
 
 # --- single-pool path dump -------------------------------------------------------------------------
 
+STALL_SCAN_WINDOWS = (10, 15, 20, 30, 45, 60)  # trailing windows to try against one pull (diagnostic)
+
+
+def _stall_scan(e: dict, windows=STALL_SCAN_WINDOWS, thrs=VOL_GRID, step=DUMP_STEP_S,
+                hold: float = CLIMB_HOLD_S) -> list[dict]:
+    """For one pool's path and pull time, which rolling-volatility stall gate (window x threshold) would
+    have fired before the LP pull, when, and with how much lead. Answers "what vol gate, over how long a
+    window, would have caught this rug." A cell is ``caught`` iff the gate fires at all with a pull on
+    record (``_stall_fire`` only returns a fire that precedes the pull), and ``lead_before_pull_s`` is how
+    early. Re-uses `_stall_fire`, so the single-pool answer matches the population sweep's trigger."""
+    pull = e["pull_after_conf"]
+    out = []
+    for win in windows:
+        for thr in thrs:
+            fire_t, m = _stall_fire(e, step, win, thr, hold)
+            fires = fire_t is not None
+            out.append({
+                "window_s": win, "thr_pct": thr, "fires": fires,
+                "fire_after_conf_s": round(fire_t, 0) if fires else None,
+                "fire_px": round(m, 4) if fires else None,
+                "lead_before_pull_s": round(pull - fire_t, 0) if (fires and pull is not None) else None,
+                "ret": (_clamp(m - 1.0 - COST) if fires
+                        else (-1.0 if (pull is not None and pull <= hold) else _hold_ret(e, hold))),
+                "caught": bool(fires and pull is not None)})
+    return out
+
+
 def _dump_grid(probe_age: float, conf_age: float) -> list[int]:
     """Dense conf-relative offsets: every DUMP_STEP_S from the probe through ~minute 6 after confirmation."""
     pre = list(range(-int(round(conf_age - probe_age)), 0, DUMP_STEP_S))
@@ -607,11 +649,16 @@ def dump_pool(journal, store, cfg, pool: str, helius=None, max_credits: int = 4_
         return {"pool": pool, "mint": mint, "error": "no reserve samples (run with --fetch)"}
     entry = next((pr for a, pr, _ in samples if a >= conf_age), samples[0][1])
     peak = max(pr for _, pr, _ in samples)
+    pull_after_conf = (pulled_ts - conf_ts) if pulled_ts else None
+    series = [(a - conf_age, pr / entry) for a, pr, _ in samples if a >= conf_age and entry]
+    stall_scan = _stall_scan({"series": series, "pull_after_conf": pull_after_conf}) if series else None
     return {"pool": pool, "mint": mint, "source": source, "created_ts": created,
             "probe_age_s": round(probe_age, 1), "conf_age_s": round(conf_age, 1),
             "pull_pool_age_s": round(pulled_ts - created, 1) if (pulled_ts and created) else None,
+            "pull_after_conf_s": round(pull_after_conf, 0) if pull_after_conf is not None else None,
             "entry_px": entry, "peak_px": peak,
             "peak_from_entry": (peak / entry - 1) if entry else None,
+            "stall_scan": stall_scan,
             "samples": [{"pool_age_s": round(a, 1), "after_conf_s": round(a - conf_age, 1),
                          "px_rel_conf": (pr / entry) if entry else None, "liq_usd": lq} for a, pr, lq in samples]}
 
@@ -641,6 +688,41 @@ def render_dump(d: dict) -> str:
         px = f"{sm['px_rel_conf']:.3f}" if sm["px_rel_conf"] is not None else "—"
         liq = f"${sm['liq_usd'] / 1000:.1f}k" if sm.get("liq_usd") else "—"
         o.append(f"  {sm['pool_age_s']:>7.0f}s {sm['after_conf_s']:>9.0f}s {px:>9} {liq:>9}  {' '.join(marks)}")
+
+    scan = d.get("stall_scan")
+    if scan:
+        pac = d.get("pull_after_conf_s")
+        thrs = sorted({c["thr_pct"] for c in scan})
+        wins = sorted({c["window_s"] for c in scan})
+        cell = {(c["window_s"], c["thr_pct"]): c for c in scan}
+        o.append("")
+        o.append("VOLATILITY STALL GATE — which rolling-range gate would have caught this pull")
+        o.append(f"  (pull {pac:.0f}s after entry; a gate catches it if it goes flat before then. "
+                 "cell = fire_s / lead_s before the pull, or 'miss')" if pac is not None else
+                 "  (no pull on record for this pool; cells show where a gate would have exited a live pool)")
+        o.append("  " + f"{'window':>8}  " + "  ".join(f"{_pct(t, 1):>11}" for t in thrs))
+        for w in wins:
+            row = []
+            for t in thrs:
+                c = cell[(w, t)]
+                if c["caught"]:
+                    row.append(f"{c['fire_after_conf_s']:.0f}/{c['lead_before_pull_s']:.0f}".rjust(11))
+                elif c["fires"]:  # no pull on record; it still fired (clip on a live pool)
+                    row.append(f"exit@{c['fire_after_conf_s']:.0f}".rjust(11))
+                else:
+                    row.append("miss".rjust(11))
+            o.append("  " + f"{w:>7}s  " + "  ".join(row))
+        caught = [c for c in scan if c["caught"]]
+        if caught:
+            best = max(caught, key=lambda c: c["lead_before_pull_s"])  # earliest catch = most protective
+            o.append(f"  earliest catch: window {best['window_s']}s, thr {_pct(best['thr_pct'], 1)} "
+                     f"-> fires {best['fire_after_conf_s']:.0f}s after entry, "
+                     f"{best['lead_before_pull_s']:.0f}s before the pull ({_pct(best['ret'])})")
+        dep = cell.get((20, 0.05))  # the deployed two-stage preset: 20 s window, 5% gate
+        if dep is not None:
+            v = (f"catches it ({dep['lead_before_pull_s']:.0f}s before the pull, {_pct(dep['ret'])})"
+                 if dep["caught"] else "MISSES it (pulled flat under the gate)")
+            o.append(f"  deployed gate (20s / 5%): {v}")
     return "\n".join(o)
 
 
