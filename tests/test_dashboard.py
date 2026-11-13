@@ -732,6 +732,21 @@ def test_probe_summary_counts_trips_and_survivors():
     assert s["gap_dist"] == {"0": 0, "1": 1, "2": 1, "3+": 0} and s["gap2_rate"] == 0.5 and s["gaps_n"] == 2
 
 
+def test_wallet_gate_summary_counts_ranked_skipped_and_fail_open():
+    import json as _j
+    j = Journal(":memory:")
+    for tok, ok, reason, rank in (("A", False, "ok", 0.95), ("B", True, "ok", 0.1),
+                                  ("C", True, "insufficient_history", None), ("D", True, "too_sparse", None)):
+        j.log_event("canary_entry_gate", tok, _j.dumps({"stage": "wallet", "pool": "P" + tok, "ok": ok,
+                    "reason": reason, "rank_pct": rank}), strategy="canary_rw50_sz")
+    j.log_event("canary_entry_gate", "V", '{"stage": "volatility", "ok": true}', strategy="canary_rw50_sz")
+    wg = dash.wallet_gate_summary(j)
+    assert wg["decisions"] == 4            # only the wallet-stage gates, not the volatility one
+    assert wg["ranked"] == 2 and wg["skipped"] == 1 and wg["entered"] == 1 and wg["fail_open"] == 2
+    assert wg["skip_rate"] == 0.5          # 1 of 2 ranked
+    assert dash.probe_summary(j)["wallet_gate"]["decisions"] == 4  # folded into the probe payload
+
+
 def test_canary_one_arms_exactly_one_probe():
     from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
     j = Journal(":memory:")

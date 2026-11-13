@@ -190,7 +190,33 @@ def probe_summary(journal, n: int = 500) -> dict:
             "blind": len(blind), "blind_reverted": blind_reverted,
             "blind_revert_rate": round(blind_reverted / len(blind), 3) if blind else None,
             "blind_median_gap": (sorted(gaps)[len(gaps) // 2] if gaps else None),
-            "gap_dist": gap_dist, "gap2_rate": gap2_rate, "gaps_n": len(gaps), "recent": recent}
+            "gap_dist": gap_dist, "gap2_rate": gap2_rate, "gaps_n": len(gaps), "recent": recent,
+            "wallet_gate": wallet_gate_summary(journal, n)}
+
+
+def wallet_gate_summary(journal, n: int = 500) -> dict:
+    """Readout of the wallet-pattern entry gate (`canary_entry_gate`, stage 'wallet'): of the survivors it scored,
+    how many it RANKED (reason 'ok') vs let through because there was too little history / too sparse a stream
+    (fail-open), and of the ranked ones how many it SKIPPED as riskiest-k%. Plus the skip rate and the recent
+    decisions with their rank percentile -- the live check that the gate is ranking and not stuck failing open."""
+    rows = journal.query("SELECT ts, token, detail FROM events WHERE kind='canary_entry_gate' ORDER BY id DESC LIMIT ?",
+                         (n,))
+    gates = [(r, _probe_detail(r)) for r in rows]
+    gates = [(r, d) for r, d in gates if d.get("stage") == "wallet"]
+    ranked = skipped = fail_open = 0
+    recent = []
+    for r, d in gates:
+        if d.get("reason") == "ok":
+            ranked += 1
+            if not d.get("ok"):
+                skipped += 1
+        else:
+            fail_open += 1
+        if len(recent) < 60:
+            recent.append({"ts": r["ts"], "token": r["token"], "pool": d.get("pool"), "ok": d.get("ok"),
+                           "reason": d.get("reason"), "rank_pct": d.get("rank_pct"), "score": d.get("score")})
+    return {"decisions": len(gates), "ranked": ranked, "skipped": skipped, "entered": ranked - skipped,
+            "fail_open": fail_open, "skip_rate": round(skipped / ranked, 3) if ranked else None, "recent": recent}
 
 
 def canary_one(journal) -> dict:
@@ -1352,7 +1378,9 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:8px 0 6px"><button id="pb-one" onclick="probeOne()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Execute one probe</button><button id="pb-all" onclick="probeAll()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Probe every liquid pool</button><span class="sub" id="pb-one-note">Execute one probe arms a single probe, then waits. Probe every liquid pool runs continuously.</span></div>
 <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin:6px 0"><input id="pb-mint" placeholder="token mint (deep pool)" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:220px"><input id="pb-pool" placeholder="pool (optional)" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:170px"><input id="pb-usd" type="number" value="1" min="0.1" max="25" step="any" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:80px"><button id="pb-smoke" onclick="probeSmoke()" style="padding:9px 20px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);cursor:pointer;font:inherit;font-weight:700">Smoke test</button><span class="sub" id="pb-smoke-note"></span></div>
 <pre id="pb-smoke-out" hidden style="white-space:pre-wrap;word-break:break-word;background:var(--sunken);border:2px solid var(--rule-soft);padding:10px;max-height:240px;overflow:auto;font:500 12px/1.5 var(--mono)"></pre>
-<div class="scroll"><table id="pb-recent"></table></div></section>
+<div class="scroll"><table id="pb-recent"></table></div>
+<p class="sub" style="margin-top:12px"><b>Wallet-pattern gate</b> — on the two-stage entry, before the second probe, it reads the pool's first-~66s trades and skips a survivor whose wallet fingerprint ranks in the riskiest k% of recent probed pools. <b>WG skipped</b> = ranked survivors it blocked; <b>fail-open</b> = let through for too little history to rank. Arm it on the Canary settings above.</p>
+<div class="scroll"><table id="pb-wg"></table></div></section>
 <section class="card"><p class="label eyebrow">Access</p><h2>Passkeys</h2>
 <p class="sub">Sign in with FaceID, TouchID, Windows Hello or a security key instead of the shared link. Add a passkey on each device you use; the private key never leaves that device. The <code>?key=</code> link stays as a break-glass bootstrap and for recovery. Removing every passkey falls back to the link.</p>
 <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:4px 0 10px"><input id="pk-label" placeholder="e.g. iPhone, MacBook" maxlength="40" style="padding:7px 9px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);font:inherit;width:190px"><button id="pk-add" onclick="addPasskey()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Add this device</button><span class="sub" id="pk-note"></span></div>
@@ -1816,7 +1844,9 @@ function b64urlToBuf(s){s=s.replace(/-/g,"+").replace(/_/g,"/");const pad=s.leng
 function bufToB64url(b){const bytes=new Uint8Array(b);let bin="";for(const x of bytes)bin+=String.fromCharCode(x);return btoa(bin).replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"")}
 function probePoll(){if(R.v!=="settings"){window._pbStarted=false;return}renderProbe();clearTimeout(window._pbT);window._pbT=setTimeout(probePoll,5000)}
 function renderProbe(){const t=$("pb-tiles");if(!t)return;fetch("api/canary/probes").then(r=>r.json()).then(d=>{
-t.innerHTML=[["Probed",d.probes],["Rugger",d.rugger],["Survivor",d.survivor],["Trip rate",d.trip_rate==null?"—":(d.trip_rate*100).toFixed(0)+"%"],["Blind revert",d.blind_revert_rate==null?"—":(d.blind_revert_rate*100).toFixed(0)+"%"],["Blind gap",d.blind_median_gap==null?"—":d.blind_median_gap],["Gaps 0/1/2+",d.gap_dist?(d.gap_dist["0"]+"/"+d.gap_dist["1"]+"/"+(d.gap_dist["2"]+d.gap_dist["3+"])):"—"],["Gap ≥2 (trap risk)",d.gap2_rate==null?"—":(d.gap2_rate*100).toFixed(0)+"%"],["Pending",d.pending]].map(([k,v])=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+const wg=d.wallet_gate||{};const wtiles=wg.decisions?[["WG skipped",wg.skipped+" / "+wg.ranked],["WG skip rate",wg.skip_rate==null?"—":(wg.skip_rate*100).toFixed(0)+"%"],["WG fail-open",wg.fail_open]]:[];
+t.innerHTML=[["Probed",d.probes],["Rugger",d.rugger],["Survivor",d.survivor],["Trip rate",d.trip_rate==null?"—":(d.trip_rate*100).toFixed(0)+"%"],["Blind revert",d.blind_revert_rate==null?"—":(d.blind_revert_rate*100).toFixed(0)+"%"],["Blind gap",d.blind_median_gap==null?"—":d.blind_median_gap],["Gaps 0/1/2+",d.gap_dist?(d.gap_dist["0"]+"/"+d.gap_dist["1"]+"/"+(d.gap_dist["2"]+d.gap_dist["3+"])):"—"],["Gap ≥2 (trap risk)",d.gap2_rate==null?"—":(d.gap2_rate*100).toFixed(0)+"%"],["Pending",d.pending]].concat(wtiles).map(([k,v])=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`).join("");
+const wr=wg.recent||[];$("pb-wg").innerHTML=wg.decisions?('<tr><th>Token</th><th>Decision</th><th>Reason</th><th>Rank %</th></tr>'+(wr.length?wr.map(r=>`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td class="${r.ok?'pos':'neg'}">${r.ok?'entered':'skipped'}</td><td class="sub">${esc(r.reason||"")}</td><td>${r.rank_pct==null?"—":(r.rank_pct*100).toFixed(0)+"%"}</td></tr>`).join(""):'')):'';
 const rows=d.recent||[];$("pb-recent").innerHTML="<tr><th>Token</th><th>Wallet</th><th>Probe</th><th>Gap</th><th>Recovered SOL</th><th>Watch</th></tr>"+(rows.length?rows.map(r=>r.sent===false?`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${walletCell(r.wallet)}</td><td>${esc(r.probe||"")}</td><td colspan="3" class="sub" title="Caught by the free pre-buy simulation — no buy was broadcast, so $0 was at risk.">no money sent ($0 at risk)</td></tr>`:`<tr><td><a href="https://dexscreener.com/solana/${esc(r.token||"")}" target="_blank" rel="noopener" class="mono">${esc((r.token||"").slice(0,8))}</a></td><td>${walletCell(r.wallet)}</td><td>${esc(r.probe||"")}</td><td>${r.slot_gap==null?"—":r.slot_gap}</td><td>${r.recovered_sol==null?"—":r.recovered_sol}</td><td class="${r.watch==='rugger'?'neg':r.watch==='survivor'?'pos':''}">${esc(r.watch||"…")}</td></tr>`).join(""):'<tr><td colspan="6" class="sub">No probes yet. Enable the 1-slot probe preset and start the canary.</td></tr>')}).catch(()=>{})}
 function probeOne(){const b=$("pb-one");b.disabled=true;$("pb-one-note").textContent="arming…";
 fetch("api/canary/probe-one",{method:"POST"}).then(r=>r.json()).then(d=>{b.disabled=false;$("pb-one-note").textContent=d.msg||"armed."}).catch(e=>{b.disabled=false;$("pb-one-note").textContent="error: "+e})}
