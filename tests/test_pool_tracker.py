@@ -252,3 +252,65 @@ def test_summary_counts_verdicts_and_pnl():
     s = pt.summary(rows)
     assert s["pools"] == 3 and s["alive"] == 1 and s["pulled_at_probe"] == 1 and s["inconclusive"] == 1
     assert s["pulled_since"] == 1 and s["with_outcome"] == 2 and s["would_pnl25"] == -20.0
+
+
+def test_lifecycle_collects_gates_probe2_entries_and_reentry():
+    import json
+    ev = [
+        {"id": 1, "ts": 10.0, "token": "M", "kind": "canary_entry_gate",
+         "detail": json.dumps({"pool": "P", "stage": "volatility", "ok": True, "range": 0.4})},
+        {"id": 2, "ts": 11.0, "token": "M", "kind": "canary_entry_gate",
+         "detail": json.dumps({"pool": "P", "stage": "wallet", "ok": True, "reason": "ok", "rank_pct": 0.4})},
+        {"id": 3, "ts": 12.0, "token": "M", "kind": "canary_probe2", "detail": json.dumps({"pool": "P", "verdict": "ok"})},
+        {"id": 4, "ts": 13.0, "token": "M", "kind": "canary_entry",
+         "detail": json.dumps({"pool": "P", "stage": "hold_probe", "result": "bought"})},
+        {"id": 5, "ts": 200.0, "token": "M", "kind": "canary_reentry_verdict",
+         "detail": json.dumps({"pool": "P", "verdict": "clean", "sol_after": 70})},
+        {"id": 6, "ts": 14.0, "token": "N", "kind": "canary_probe2", "detail": "{}"},  # no pool: dropped
+    ]
+    q = lambda sql, p: [r for r in ev if r["ts"] >= p[0]]
+    st = pt.lifecycle(q, 0.0)
+    assert set(st) == {"P"}
+    assert st["P"]["gates"]["vol"] == {"ok": True, "range": 0.4, "min_pct": None}
+    assert st["P"]["gates"]["wallet"]["rank_pct"] == 0.4 and st["P"]["probe2"] == "ok"
+    assert st["P"]["entries"] == [{"stage": "hold_probe", "result": "bought"}]
+    assert st["P"]["reentry"] == {"verdict": "clean", "sol_after": 70}
+
+
+def test_real_trades_returns_canary_positions_per_mint_oldest_first():
+    # two canary positions on one mint: the hold-probe (closed, small gain) then the minute-6 re-entry (open)
+    rows = [
+        {"token": "M", "entry_price": 1.0, "cost_usd": 25.0, "opened_at": 100.0, "realized_usd": 25.75,
+         "closed_at": 190.0, "exit_reason": "safe_zone", "strategy": "canary_rw50_sz"},
+        {"token": "M", "entry_price": 1.1, "cost_usd": 25.0, "opened_at": 300.0, "realized_usd": 0.0,
+         "closed_at": None, "exit_reason": None, "strategy": "canary_rw50_sz"},
+    ]
+    q = lambda sql, p: rows if "FROM positions" in sql else []
+    out = pt.real_trades(q, ["M"])
+    assert len(out["M"]) == 2
+    hp, final = out["M"]
+    assert hp["exit_reason"] == "safe_zone" and round(hp["ret"], 4) == 0.03 and round(hp["pnl"], 2) == 0.75
+    assert final["open"] is True and final["ret"] is None and final["pnl"] is None
+    assert pt.real_trades(q, []) == {}
+
+
+def test_assemble_and_summary_fold_in_the_journey_and_real_trade():
+    import json
+    frows = [{"ts": 100.0, "token": "M", "kind": "canary_probe",
+              "detail": json.dumps({"pool": "P", "verdict": "ok", "slot_gap": 1})}]
+    verds = [{"detail": json.dumps({"pool": "P", "verdict": "survivor", "sol_after": 70})}]
+    fq = lambda sql, p: (verds if "canary_probe_verdict" in sql else [r for r in frows if r["ts"] >= p[0]])
+    feints = pt.feint_pools(fq, 0.0)
+    stages = {"P": {"mint": "M", "gates": {"vol": {"ok": True}, "wallet": {"ok": True, "rank_pct": 0.3}},
+                    "probe2": "ok", "entries": [{"stage": "hold_probe"}], "reentry": {"verdict": "clean"}}}
+    real = {"M": [{"book": "canary_rw50_sz", "entry_px": 1.0, "cost_usd": 25.0, "opened_at": 150.0,
+                   "closed_at": 240.0, "exit_reason": "safe_zone", "open": False, "ret": 0.03, "pnl": 0.75}]}
+    rows = pt.assemble(feints, {"P": {"create_ts": 100.0}}, 100.0, {}, 500.0, stages=stages, real=real)
+    r = rows[0]
+    assert r["journey"]["vol_gate"]["ok"] and r["journey"]["wallet_gate"]["rank_pct"] == 0.3
+    assert r["journey"]["entry_stages"] == ["hold_probe"] and r["reentry"] == "clean"
+    assert r["real"]["stage"] == "hold_probe" and round(r["real"]["ret"], 2) == 0.03
+    assert r["real"]["entry_pool_age_s"] == 50.0 and r["final"] is None
+    s = pt.summary(rows)
+    assert s["real_entries"] == 1 and s["real_closed"] == 1 and s["real_pnl"] == 0.75
+    assert s["clean_after"] == 1 and s["holding_rug_after"] == 0

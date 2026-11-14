@@ -470,6 +470,48 @@ def test_fetch_pools_joins_feints_to_the_scorer_and_reads_young_reserves(cfg):
     assert board.pools["rows"] and board.pools["rows"][0]["pool"] == "PoolY"
 
 
+def test_fetch_pools_folds_in_the_lifecycle_journey_and_the_real_trade(cfg):
+    from tradingbot import launch_live
+    from tradingbot.watcher import WatchStore
+    cfg.launch_live = cfg.launch_canary = True
+    now = time.time()
+    j = Journal(":memory:")
+    # a 1-slot probe that survived the ~48s watch, then the two-stage entry's gates + a safe-zone hold-probe
+    j.log_event("canary_probe", "MintZ", json.dumps({"pool": "PoolZ", "verdict": "ok", "slot_gap": 1,
+                "sol_before": 60.0, "wallet_addr": "Wa11etZZZZ"}), strategy="canary_rw50_sz")
+    j.log_event("canary_probe_verdict", "MintZ", json.dumps({"pool": "PoolZ", "verdict": "survivor", "sol_after": 62}),
+                strategy="canary_rw50_sz")
+    j.log_event("canary_entry_gate", "MintZ", json.dumps({"pool": "PoolZ", "stage": "volatility", "ok": True,
+                "range": 0.4}), strategy="canary_rw50_sz")
+    j.log_event("canary_entry_gate", "MintZ", json.dumps({"pool": "PoolZ", "stage": "wallet", "ok": True,
+                "reason": "ok", "rank_pct": 0.3}), strategy="canary_rw50_sz")
+    j.log_event("canary_probe2", "MintZ", json.dumps({"pool": "PoolZ", "verdict": "ok"}), strategy="canary_rw50_sz")
+    j.log_event("canary_entry", "MintZ", json.dumps({"pool": "PoolZ", "stage": "hold_probe", "result": "bought"}),
+                strategy="canary_rw50_sz")
+    j.log_event("canary_reentry_verdict", "MintZ", json.dumps({"pool": "PoolZ", "verdict": "clean", "sol_after": 61}),
+                strategy="canary_rw50_sz")
+    # the REAL canary trade: entered at pool age 60s, sold at the safe zone for +3% (proceeds 25.75 on a 25 cost)
+    j.execute("INSERT INTO positions(token, entry_price, qty, cost_usd, opened_at, realized_usd, closed_at, "
+              "exit_reason, strategy) VALUES(?,?,?,?,?,?,?,?,?)",
+              ("MintZ", 1.0, 1.0, 25.0, now - 240, 25.75, now - 150, "safe_zone", "canary_rw50_sz"))
+    store = WatchStore(":memory:")
+    launch_live.ensure_schema(store)
+    store.execute("INSERT INTO watch_launch_live(pool, token_mint, create_ts, decided_ts, liquid, liq_usd, "
+                  "sol_at_decide, peak_sol, ret, status) VALUES(?,?,?,?,1,?,?,?,?,?)",
+                  ("PoolZ", "MintZ", now - 300, now - 296, 12000.0, 60.0, 65.0, 0.1, "done"))
+    board = dash.Dashboard(j, cfg, store)
+    board.fetch_pools(rpc=lambda m, p: {})  # no live read needed; the journey/real come from the journal
+
+    r = board.pools["rows"][0]
+    assert r["journey"]["vol_gate"]["ok"] and r["journey"]["wallet_gate"]["rank_pct"] == 0.3
+    assert r["journey"]["probe2"] == "ok" and r["journey"]["entry_stages"] == ["hold_probe"]
+    assert r["reentry"] == "clean"
+    assert r["real"]["exit_reason"] == "safe_zone" and round(r["real"]["ret"], 2) == 0.03
+    assert r["real"]["entry_pool_age_s"] == 60 and r["real"]["open"] is False and r["final"] is None
+    s = board.pools["summary"]
+    assert s["real_entries"] == 1 and s["real_closed"] == 1 and s["real_pnl"] == 0.75 and s["clean_after"] == 1
+
+
 def test_canary_rotate_validates_halts_and_launches_provision(cfg, tmp_path, monkeypatch):
     import pytest
     from tradingbot.engine import CANARY_HALT

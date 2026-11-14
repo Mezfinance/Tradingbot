@@ -106,6 +106,83 @@ def scorer_rows(wquery, since: float, pools: list | None = None) -> dict:
     return {r["pool"]: {c: r[c] for c in SCORER_COLS} for r in rows}
 
 
+def _loads(detail) -> dict:
+    try:
+        return json.loads(detail or "{}")
+    except Exception:  # noqa: BLE001 (a malformed detail: skip)
+        return {}
+
+
+LIFECYCLE_KINDS = ("canary_entry_gate", "canary_probe2", "canary_entry", "canary_reentry_verdict")
+
+
+def lifecycle(jquery, since: float = 0.0) -> dict:
+    """The two-stage entry's per-pool lifecycle stages between the first probe and the exit, keyed by pool:
+    the volatility gate and the wallet-pattern gate (`canary_entry_gate`), the second 1-slot probe (`canary_probe2`),
+    the real entries (`canary_entry`: hold_probe then, on a clean survivor, final) and the re-entry watch verdict
+    (`canary_reentry_verdict`: holding_rug / clean -- did the pool rug AFTER our safe-zone exit). Events are keyed by
+    token but carry `pool` in the detail; low-volume, so one scan by kind."""
+    out: dict = {}
+    try:
+        rows = jquery("SELECT id, ts, token, detail, kind FROM events WHERE kind IN "
+                      "('canary_entry_gate','canary_probe2','canary_entry','canary_reentry_verdict') AND ts >= ? "
+                      "ORDER BY id", (since,))
+    except Exception:  # noqa: BLE001 (no events table / old db)
+        return {}
+    for r in rows:
+        d = _loads(r["detail"])
+        pool = d.get("pool")
+        if not pool:
+            continue
+        st = out.setdefault(pool, {"mint": r["token"], "entries": [], "gates": {}})
+        k = r["kind"]
+        if k == "canary_entry_gate":
+            if d.get("stage") == "volatility":
+                st["gates"]["vol"] = {"ok": d.get("ok"), "range": d.get("range"), "min_pct": d.get("min_pct")}
+            elif d.get("stage") == "wallet":
+                st["gates"]["wallet"] = {"ok": d.get("ok"), "reason": d.get("reason"), "rank_pct": d.get("rank_pct")}
+        elif k == "canary_probe2":
+            st["probe2"] = d.get("verdict")
+        elif k == "canary_entry":
+            st["entries"].append({"stage": d.get("stage"), "result": d.get("result")})
+        elif k == "canary_reentry_verdict":
+            st["reentry"] = {"verdict": d.get("verdict"), "sol_after": d.get("sol_after")}
+    return out
+
+
+def real_trades(jquery, mints: list) -> dict:
+    """The REAL canary trades per token mint (the actual money, not the ideal reserve-path return): each canary-book
+    position with its entry fill, cost, exit reason and realised result. A safe-zone mint can have two -- the
+    hold-probe (sold at the safe zone) then, if the pool stayed clean, the minute-6 re-entry -- so the value is a list,
+    oldest first. `ret` = realised proceeds / cost - 1; `pnl` = proceeds - cost; open positions carry neither."""
+    if not mints:
+        return {}
+    from tradingbot import model_book as mb
+    books = tuple(mb.CANARY_BOOKS)
+    out: dict = {}
+    bmarks = ",".join("?" * len(books))
+    try:
+        for i in range(0, len(mints), 300):
+            chunk = mints[i:i + 300]
+            marks = ",".join("?" * len(chunk))
+            rows = jquery(
+                "SELECT token, entry_price, cost_usd, opened_at, realized_usd, closed_at, exit_reason, strategy "
+                f"FROM positions WHERE strategy IN ({bmarks}) AND token IN ({marks}) ORDER BY opened_at",
+                tuple(books) + tuple(chunk))
+            for r in rows:
+                cost = r["cost_usd"] or 0.0
+                closed = r["closed_at"] is not None
+                out.setdefault(r["token"], []).append({
+                    "book": r["strategy"], "entry_px": r["entry_price"], "cost_usd": r["cost_usd"],
+                    "opened_at": r["opened_at"], "closed_at": r["closed_at"], "exit_reason": r["exit_reason"],
+                    "open": not closed,
+                    "ret": ((r["realized_usd"] / cost - 1) if cost else None) if closed else None,
+                    "pnl": ((r["realized_usd"] or 0.0) - cost) if closed else None})
+    except Exception:  # noqa: BLE001 (no positions table / old db)
+        return {}
+    return out
+
+
 # --- live reserve reads ----------------------------------------------------------------------------
 
 def _amount(data) -> int | None:
@@ -208,9 +285,13 @@ def update_path(path: dict | None, now: float, created: float | None, feint_ts: 
 
 # --- assembly --------------------------------------------------------------------------------------
 
-def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | None, now: float) -> list[dict]:
-    """Join each feint to its scorer row and live path into one tracker row. Pure; newest pool first."""
+def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | None, now: float,
+             stages: dict | None = None, real: dict | None = None) -> list[dict]:
+    """Join each feint to its scorer row, live path, two-stage lifecycle (`stages`) and real canary trades (`real`)
+    into one tracker row. Pure; newest pool first."""
     paths = paths or {}
+    stages = stages or {}
+    real = real or {}
     out = []
     for pool, f in feints.items():
         s = scorer.get(pool) or {}
@@ -251,6 +332,20 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
         else:
             sent = pv not in ("inconclusive", None)
             committed = sent
+        # the two-stage lifecycle between the first probe and the exit, and the REAL canary trade(s) on this mint
+        st = stages.get(pool) or {}
+        trades = real.get(f.get("mint")) or []
+        primary = trades[0] if trades else None       # the first real entry (the hold-probe, or the final commit)
+        last = trades[-1] if trades else None          # the last (the minute-6 re-entry, if a clean survivor got one)
+        entry_stages = [e.get("stage") for e in st.get("entries", [])]
+        reentry = st.get("reentry")
+        journey = {
+            "probe2": st.get("probe2"),
+            "vol_gate": (st.get("gates") or {}).get("vol"),
+            "wallet_gate": (st.get("gates") or {}).get("wallet"),
+            "entry_stages": entry_stages,
+            "reentry": reentry.get("verdict") if reentry else None,
+        }
         out.append({
             "pool": pool, "mint": f.get("mint"), "verdict": disp, "kind": f.get("kind"),
             "watch_verdict": f.get("watch_verdict"), "probe_verdict": f.get("verdict") if f.get("kind") == "probe" else None,
@@ -269,6 +364,18 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
             "opt_age_s": p.get("opt_age"), "opt_ret": opt_ret,
             "conf_age_s": p.get("conf_age"), "conf_ret": conf_ret, "conf_by": conf_by,
             "status": s.get("status") or "pending",
+            # --- the combined journey: lifecycle stages + the REAL trade (actual entry, exit, % gained in the hold) ---
+            "journey": journey, "reentry": journey["reentry"], "trades": trades,
+            "real": ({
+                "entry_px": primary["entry_px"], "cost_usd": primary["cost_usd"], "open": primary["open"],
+                "exit_reason": primary["exit_reason"], "ret": primary["ret"], "pnl": primary["pnl"],
+                "stage": entry_stages[0] if entry_stages else None,
+                "entry_pool_age_s": (primary["opened_at"] - created) if (primary["opened_at"] and created) else None,
+                "held_s": ((primary["closed_at"] or now) - primary["opened_at"]) if primary["opened_at"] else None,
+            } if primary else None),
+            # the final minute-6 re-entry hold (a second trade on a clean survivor), when there is one
+            "final": ({"ret": last["ret"], "pnl": last["pnl"], "open": last["open"],
+                       "exit_reason": last["exit_reason"]} if (last and last is not primary) else None),
         })
     out.sort(key=lambda r: (r["created_ts"] or r["feint_ts"] or 0), reverse=True)
     return out
@@ -280,6 +387,11 @@ def summary(rows: list[dict]) -> dict:
     surv = [r for r in rows if r.get("watch_verdict") == "survivor"]
     entry = [r["conf_ret"] for r in surv if r.get("conf_ret") is not None]  # enter at confirmation, hold to m6
     best = [r["opt_ret"] for r in surv if r.get("opt_ret") is not None]     # hindsight-best entry
+    # REAL trades (actual money): the primary canary trade on each pool, and how those we exited turned out
+    real = [r["real"] for r in rows if r.get("real")]
+    rclosed = [t for t in real if not t["open"] and t.get("ret") is not None]
+    # after-exit: on the safe-zone hold-probe, did the pool rug once we were out (holding_rug) or stay clean?
+    reentry = [r["reentry"] for r in rows if r.get("reentry")]
     return {
         "pools": len(rows),
         "alive": sum(1 for r in rows if r["verdict"] == "alive"),
@@ -298,6 +410,15 @@ def summary(rows: list[dict]) -> dict:
         "survivor_best_mean": round(sum(best) / len(best), 4) if best else None,
         # hold curve: entering a survivor and holding to each horizon -- does a long hold pay (ripsnorters)?
         "survivor_hold_curve": hold_curve(surv),
+        # REAL trades: how many pools we actually entered, how many we have exited, and the real result
+        "real_entries": len(real),
+        "real_open": sum(1 for t in real if t["open"]),
+        "real_closed": len(rclosed),
+        "real_mean": round(sum(t["ret"] for t in rclosed) / len(rclosed), 4) if rclosed else None,
+        "real_pnl": round(sum(t["pnl"] for t in rclosed), 2) if rclosed else 0.0,
+        # after-exit watch: clean (stayed liquid once we were out) vs holding_rug (pulled after our safe-zone sell)
+        "clean_after": sum(1 for v in reentry if v == "clean"),
+        "holding_rug_after": sum(1 for v in reentry if v == "holding_rug"),
     }
 
 
@@ -350,6 +471,8 @@ def rows_for(jquery, wquery, hours: float = TRACK_WINDOW_S / 3600, now: float | 
     since = now - hours * 3600
     feints = feint_pools(jquery, since)
     scorer = scorer_rows(wquery, since, pools=list(feints))  # by pool: cheap however large --hours
+    stages = lifecycle(jquery, since)
+    real = real_trades(jquery, [f.get("mint") for f in feints.values() if f.get("mint")])
     su = _sol_usd(wquery)
     paths = dict(paths or {})
     if rpc is not None:
@@ -364,7 +487,7 @@ def rows_for(jquery, wquery, hours: float = TRACK_WINDOW_S / 3600, now: float | 
                                         sol, tok, su, s.get("exit_px"))
         except Exception:  # noqa: BLE001 (the public RPC can be slow / rate-limited)
             pass
-    return assemble(feints, scorer, su, paths, now), su
+    return assemble(feints, scorer, su, paths, now, stages=stages, real=real), su
 
 
 def _age(s) -> str:
@@ -380,6 +503,27 @@ def _usd(v) -> str:
     if abs(v) >= 1000:
         return f"${v / 1000:.1f}k"
     return f"${v:.0f}"
+
+
+def _journey(r: dict) -> str:
+    """Compact probe->entry journey: probe(gap) watch vol wallet probe2 entry-stage."""
+    j = r.get("journey") or {}
+    bits = []
+    if r.get("probe_verdict") or r.get("kind") == "feint":
+        bits.append((r.get("probe_verdict") or r.get("verdict") or "?"))
+    if r.get("watch_verdict"):
+        bits.append("surv" if r["watch_verdict"] == "survivor" else "rug")
+    vg = j.get("vol_gate")
+    if vg is not None:
+        bits.append("vol" + ("+" if vg.get("ok") else "x"))
+    wg = j.get("wallet_gate")
+    if wg is not None:
+        bits.append("wg" + ("+" if wg.get("ok") else "x"))
+    if j.get("probe2"):
+        bits.append("p2" + ("+" if j["probe2"] == "ok" else "x"))
+    for stg in (j.get("entry_stages") or []):
+        bits.append("HP" if stg == "hold_probe" else "F" if stg == "final" else (stg or "?"))
+    return " ".join(bits) or "—"
 
 
 def render(rows: list[dict], su: float | None) -> str:
@@ -400,21 +544,30 @@ def render(rows: list[dict], su: float | None) -> str:
             out.append("  hold curve (enter at confirmation, sell at minute): " + "  ".join(
                 f"{H}m {c['mean'] * 100:+.0f}% (win {c['win'] * 100:.0f}%, +100% {c['big'] * 100:.0f}%, n{c['n']})"
                 for H, c in curve.items()))
+    if s.get("real_entries"):
+        rm = f"{s['real_mean'] * 100:+.1f}%" if s.get("real_mean") is not None else "—"
+        out.append(f"real trades: {s['real_entries']} entered ({s['real_open']} open), {s['real_closed']} exited "
+                   f"-> {rm} mean, ${s['real_pnl']:+.2f}; after exit clean {s['clean_after']} / "
+                   f"holding-rug {s['holding_rug_after']}")
     if su:
         out.append(f"SOL ${su:.2f}")
     out.append("")
-    hdr = f"{'mint':<10} {'verdict':<8} {'age':>7} {'probe@':>6} {'liq':>7} {'live':>7} {'peak':>7} " \
-          f"{'pulled@':>7} {'+probe':>7} {'m6%':>7} {'$25':>7} {'enter%':>7} {'best%':>7}"
+    hdr = f"{'mint':<9} {'journey':<24} {'age':>6} {'liq':>6} {'peak':>6} {'pulled@':>7} " \
+          f"{'entry@':>6} {'hold%':>7} {'after':>6} {'$25':>6} {'best%':>7}"
     out.append(hdr)
     out.append("-" * len(hdr))
     for r in rows[:60]:
-        m = (r["mint"] or "")[:10]
-        m6 = f"{r['ret_m6'] * 100:+.0f}%" if r["ret_m6"] is not None else "—"
+        m = (r["mint"] or "")[:9]
         pnl = f"${r['pnl25']:+.1f}" if r["pnl25"] is not None else "—"
         opt = f"{r['opt_ret'] * 100:+.0f}%" if r["opt_ret"] is not None else "—"
-        enter = f"{r['conf_ret'] * 100:+.0f}%" if r.get("conf_ret") is not None else "—"
-        out.append(f"{m:<10} {(r['verdict'] or '')[:8]:<8} {_age(r['pool_age_s']):>7} "
-                   f"{_age(r['probe_pool_age_s']):>6} {_usd(r['liq_probe']):>7} {_usd(r['live_liq']):>7} "
-                   f"{_usd(r['peak_liq']):>7} {_age(r['pull_pool_age_s']):>7} {_age(r['pull_after_probe_s']):>7} "
-                   f"{m6:>7} {pnl:>7} {enter:>7} {opt:>7}")
+        real, fin = r.get("real"), r.get("final")
+        hold = "—"
+        if real:
+            hold = "open" if real["open"] else (f"{real['ret'] * 100:+.0f}%" if real.get("ret") is not None else "sold")
+        if fin and fin.get("ret") is not None:  # the minute-6 re-entry result, when a clean survivor got one
+            hold += f"/{fin['ret'] * 100:+.0f}%"
+        after = {"clean": "clean", "holding_rug": "rug"}.get(r.get("reentry") or "", "—")
+        out.append(f"{m:<9} {_journey(r)[:24]:<24} {_age(r['pool_age_s']):>6} {_usd(r['liq_probe']):>6} "
+                   f"{_usd(r['peak_liq']):>6} {_age(r['pull_pool_age_s']):>7} {_age(r.get('real') and r['real']['entry_pool_age_s']):>6} "
+                   f"{hold:>7} {after:>6} {pnl:>6} {opt:>7}")
     return "\n".join(out)

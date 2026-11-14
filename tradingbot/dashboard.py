@@ -762,6 +762,10 @@ class Dashboard:
             wq = (lambda sql, p: self.live.wdb.execute(sql, p).fetchall()) if self.live.wdb is not None \
                 else (lambda sql, p: [])
             scorer = pt.scorer_rows(wq, 0.0, pools=list(feints))
+            # the two-stage lifecycle (gates, probe2, entries, re-entry verdict) and the REAL canary trades, so the
+            # pool tracker shows the whole journey -- the probe entries, the actual entry/exit and the % we banked.
+            stages = pt.lifecycle(self.live._q, 0.0)
+            real = pt.real_trades(self.live._q, [f.get("mint") for f in feints.values() if f.get("mint")])
             su = pt._sol_usd(wq)
             # The live reserve read is BEST-EFFORT: a slow / rate-limited public RPC must never hide the pools
             # themselves (feints + probes come from the journal + watch.db, no RPC) -- it only fills the live liq /
@@ -793,7 +797,7 @@ class Dashboard:
                     self._pool_paths.pop(pl, None)  # orphan: a path with no probe event
                 elif scorer.get(pl) and (scorer[pl].get("create_ts") or 0) < aged and self._pool_paths[pl].get("pts"):
                     self._pool_paths[pl]["pts"] = []  # past live sampling: finalized scalars stay, drop the samples
-            rows = pt.assemble(feints, scorer, su, self._pool_paths, now)
+            rows = pt.assemble(feints, scorer, su, self._pool_paths, now, stages=stages, real=real)
             data = {"rows": rows[:200], "summary": pt.summary(rows), "sol_usd": su,
                     "fetched_ts": now, "stale": False, "live_read_ok": live_ok}
         except Exception as exc:  # noqa: BLE001 (keep the last good data; the public RPC can be slow)
@@ -1358,7 +1362,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <section class="card" id="p-hold-card" style="display:none"><p class="label eyebrow">Survivor hold curve</p><h2>Does holding a survivor past minute 6 pay?</h2><p class="sub">Enter a survivor at the ~48s confirmation, then sell at each horizon (last live price at or before it, −100% if it rugged first). <b>big</b> = share that hit +100% or more. If the mean and the big-win share keep rising out to 30–60 min, a long hold beats the minute-6 exit.</p>
 <div class="scroll"><table id="p-hold"></table></div></section>
 <section class="card"><p class="label eyebrow">Feinted pools</p><h2>Live pool state</h2><p class="sub">Newest pool first. <b>Probe@</b> = pool age when we feinted. <b>Liq</b> = liquidity at second 4; <b>Live</b> = latest reserve read; <b>Peak</b> = most liquidity seen after the probe. <b>Pulled@</b> = pool age when the LP was pulled, <b>+probe</b> = how long after our feint. <b>$25 @ m6</b> = the dollar result of a $25 <b>confirmation entry</b> (price ~60s after creation, when the ~48s watch clears a survivor) held to minute 6, net of 6% cost, −100% if it later rugged — the realistic two-stage trade. <b>Enter @conf</b> = that same trade as a percent. <b>Best entry</b> = the hindsight-cheapest price before minute 6 (the ceiling, not attainable live).</p>
-<div class="filters"><select id="p-filter" aria-label="Filter"><option value="all">All pools</option><option value="survivor">Survivor</option><option value="rugger">Rugger</option><option value="alive">Alive at feint</option><option value="pulled">Pulled</option><option value="live">Still live (&lt;25m)</option><option value="win">$25 in profit</option></select></div>
+<div class="filters"><select id="p-filter" aria-label="Filter"><option value="all">All pools</option><option value="entered">Entered (real)</option><option value="survivor">Survivor</option><option value="rugger">Rugger</option><option value="alive">Alive at feint</option><option value="pulled">Pulled</option><option value="live">Still live (&lt;25m)</option><option value="win">Real win</option></select></div>
 <div class="scroll"><table id="p-tbl"></table></div></section>
 </main>
 <main id="v-settings" hidden>
@@ -1753,13 +1757,34 @@ $("w-arch").innerHTML=`<tr><th>Address</th><th class="l">Label</th><th>SOL</th><
 const PLIQ=v=>v==null?"–":(Math.abs(v)>=1000?"$"+(v/1000).toFixed(1)+"k":"$"+v.toFixed(0));
 const PAGE2=s=>s==null?"–":agoStr(Math.round(s));
 const PPCT=r=>r==null?"–":(r>=0?"+":"")+(r*100).toFixed(0)+"%";
-function poolRow(r){const neg=r.pnl25!=null&&r.pnl25<0,win=r.pnl25!=null&&r.pnl25>0;
-const vt=(r.verdict==="alive"||r.verdict==="survivor")?'<span class="tag lime">'+esc(r.verdict)+'</span>':(r.verdict==="pulled"||r.verdict==="rugger"||r.verdict==="trapped")?'<span class="tag neg">'+esc(r.verdict)+'</span>':r.verdict?'<span class="tag">'+esc(r.verdict)+'</span>':"–";
-// A honeypot/skipped probe broadcast nothing (no buy tx), so GAP and recovered SOL are blank BECAUSE $0 was ever sent — say so, or the dashes read as "lost / unknown".
-const ns=r.sent===false?' <span class="tag" style="opacity:.75" title="Nothing was broadcast — the honeypot was caught by the free pre-buy simulation, so $0 was committed.">no money sent</span>':'';
+// one small badge in the Journey cell
+function jtag(txt,cls,title){return '<span class="tag'+(cls?' '+cls:'')+'" style="font-size:10px" title="'+esc(title||'')+'">'+esc(txt)+'</span>'}
+// the whole probe->entry journey as inline badges: probe verdict, ~48s watch, volatility gate, wallet gate, second
+// probe, then the entry stage(s). Only stages the pool reached are shown; hover a badge for detail.
+function journeyCell(r){const j=r.journey||{},b=[];
+const pv=r.kind==="probe"?r.probe_verdict:r.verdict;
+if(pv)b.push(jtag(pv,(pv==="ok"||pv==="alive")?"lime":(pv==="honeypot"||pv==="trapped"||pv==="pulled"||pv==="buy_failed")?"neg":"",(r.kind==="probe"?"1-slot probe":"feint")+" verdict"));
+if(r.sent===false)b.push(jtag("no $ sent","","Caught by the free pre-buy simulation — nothing was broadcast, $0 committed."));
+if(r.watch_verdict)b.push(jtag(r.watch_verdict==="survivor"?"surv":"rug",r.watch_verdict==="survivor"?"lime":"neg","~48s survival watch: "+r.watch_verdict));
+const vg=j.vol_gate;if(vg)b.push(jtag("vol"+(vg.ok?"✓":"✗"),vg.ok?"lime":"neg","volatility gate"+(vg.range!=null?" — confirmation range "+(vg.range*100).toFixed(0)+"%":"")+(vg.ok?"":" (too flat, skipped)")));
+const wg=j.wallet_gate;if(wg)b.push(jtag("wg"+(wg.ok?"✓":"✗"),wg.ok?"lime":"neg","wallet-pattern gate"+(wg.rank_pct!=null?" — rank "+(wg.rank_pct*100).toFixed(0)+"%":"")+(wg.reason&&wg.reason!=="ok"?" ("+wg.reason+")":"")+(wg.ok?"":" (riskiest k%, skipped)")));
+if(j.probe2)b.push(jtag("p2"+(j.probe2==="ok"?"✓":"✗"),j.probe2==="ok"?"lime":"neg","second 1-slot probe: "+j.probe2));
+(j.entry_stages||[]).forEach(s=>b.push(jtag(s==="hold_probe"?"HP":s==="final"?"F":s,"lime",s==="hold_probe"?"safe-zone hold-probe entry":s==="final"?"minute-6 commit":s)));
+return b.length?b.join(" "):'<span class="muted">—</span>'}
+// the REAL hold result: the % we actually banked (realised proceeds / cost - 1), plus the minute-6 re-entry if a clean survivor got one; hover for the exit reason.
+function holdCell(r){const t=r.real;if(!t)return '<span class="muted">—</span>';
+let s=t.open?'<span class="muted">open</span>':t.ret==null?'<span class="muted">sold</span>':'<span class="'+(t.ret>0?"pos":t.ret<0?"neg":"muted")+'">'+PPCT(t.ret)+'</span>';
+if(r.final&&r.final.ret!=null)s+=' <span class="sub">/ '+(r.final.ret>=0?"+":"")+(r.final.ret*100).toFixed(0)+'%</span>';
+return '<span title="exit: '+esc(t.exit_reason||(t.open?"open":"?"))+'">'+s+'</span>'}
+// after our safe-zone exit: did the pool stay liquid (clean) or rug (holding rug — we induced and dodged it)?
+function afterCell(r){const v=r.reentry;
+if(v==="clean")return jtag("clean","lime","pool stayed liquid after our safe-zone exit");
+if(v==="holding_rug")return jtag("holding rug","neg","pool rugged after our safe-zone exit — we induced and dodged it");
+if((r.journey&&(r.journey.entry_stages||[]).includes("hold_probe")))return '<span class="muted" title="watching the pool after our safe-zone exit">…</span>';
+return '<span class="muted">—</span>'}
+function poolRow(r){const t=r.real,win=t&&t.ret!=null&&t.ret>0,neg=t&&t.ret!=null&&t.ret<0;
 const lk=r.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(r.pool)}" target="_blank" rel="noopener">${esc((r.mint||r.pool).slice(0,8))}</a>`:esc((r.mint||"").slice(0,8));
-const wal=walletCell(r.wallet);
-return`<tr><td>${lk}</td><td>${wal}</td><td>${vt}${ns}</td><td class="num">${PAGE2(r.pool_age_s)}</td><td class="num">${PAGE2(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PAGE2(r.pull_pool_age_s):"–"}</td><td class="num">${r.pulled?PAGE2(r.pull_after_probe_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–"}</td><td class="num"><span class="${r.conf_ret>0?'pos':r.conf_ret<0?'neg':'muted'}">${PPCT(r.conf_ret)}</span></td><td class="num">${r.opt_age_s!=null?PAGE2(r.opt_age_s)+" ":""}<span class="${r.opt_ret>0?'pos':r.opt_ret<0?'neg':'muted'}">${PPCT(r.opt_ret)}</span></td></tr>`}
+return`<tr><td>${lk}</td><td>${walletCell(r.wallet)}</td><td>${journeyCell(r)}</td><td class="num">${PAGE2(r.pool_age_s)}</td><td class="num">${PAGE2(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PAGE2(r.pull_pool_age_s):"–"}</td><td class="num">${t?PAGE2(t.entry_pool_age_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${holdCell(r)}</td><td>${afterCell(r)}</td><td class="num${r.pnl25!=null&&r.pnl25<0?' neg':r.pnl25>0?' pos':''}">${r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–"}</td><td class="num"><span class="${r.conf_ret>0?'pos':r.conf_ret<0?'neg':'muted'}">${PPCT(r.conf_ret)}</span></td><td class="num">${r.opt_age_s!=null?PAGE2(r.opt_age_s)+" ":""}<span class="${r.opt_ret>0?'pos':r.opt_ret<0?'neg':'muted'}">${PPCT(r.opt_ret)}</span></td></tr>`}
 function canaryRotate(){const n=+($("rot-n").value||0),s=+($("rot-sol").value||0);
 if(!(n>=1&&n<=10)){alert("Wallets must be between 1 and 10.");return}
 if(!(s>=0.01&&s<=5)){alert("SOL per wallet must be between 0.01 and 5.");return}
@@ -1870,12 +1895,12 @@ function renderPools(){const P=S.pools,note=$("p-note");
 if(!P){note.innerHTML='<p class="note">Loading pool reserves…</p>';["p-tiles","p-tbl"].forEach(i=>$(i).innerHTML="");return}
 const s=P.summary||{},rows=P.rows||[];const when=P.fetched_ts?agoStr(Math.max(0,Math.round(Date.now()/1000-P.fetched_ts)))+" ago":"–";
 note.innerHTML=P.stale?`<p class="note neg">Live reserves stale${P.error?": "+esc(P.error):""}. Showing the last read.</p>`:"";
-tiles("p-tiles",[["Pools",String(s.pools||0),(P.sol_usd?"SOL $"+P.sol_usd.toFixed(0)+" · ":"")+"updated "+when],["Survivors",String(s.survivor||0),"alive at the ~48s watch — pools to enter"],["Ruggers",String(s.rugger||0),"pulled — we tripped and dodged"],["Survivor entry",s.survivor_entry_mean!=null?(s.survivor_entry_mean>=0?"+":"")+(s.survivor_entry_mean*100).toFixed(0)+"%":"–","enter at confirmation → m6, "+(s.survivor_entry_n||0)+" with a path (hindsight best "+(s.survivor_best_mean!=null?(s.survivor_best_mean>=0?"+":"")+(s.survivor_best_mean*100).toFixed(0)+"%":"–")+")"],["$25 would make",s.would_pnl25!=null?(s.would_pnl25>=0?"+":"")+"$"+s.would_pnl25.toFixed(0):"–","entering at confirmation, held to m6, across "+(s.would_pnl25_n||0)+" with a path"]]);
+tiles("p-tiles",[["Pools",String(s.pools||0),(P.sol_usd?"SOL $"+P.sol_usd.toFixed(0)+" · ":"")+"updated "+when],["Survivors",String(s.survivor||0),(s.rugger||0)+" ruggers · alive at the ~48s watch"],["Real entries",String(s.real_entries||0),(s.real_open||0)+" open · "+(s.real_closed||0)+" exited (actual money)"],["Real result",s.real_mean!=null?(s.real_mean>=0?"+":"")+(s.real_mean*100).toFixed(0)+"%":"–",(s.real_pnl!=null?(s.real_pnl>=0?"+":"")+"$"+s.real_pnl.toFixed(1):"$0")+" over "+(s.real_closed||0)+" exited"],["After exit",(s.clean_after||0)+" / "+(s.holding_rug_after||0),"clean / holding-rug — did it rug once we were out"],["$25 ideal",s.would_pnl25!=null?(s.would_pnl25>=0?"+":"")+"$"+s.would_pnl25.toFixed(0):"–","enter at confirmation → m6 (survivor entry "+(s.survivor_entry_mean!=null?(s.survivor_entry_mean>=0?"+":"")+(s.survivor_entry_mean*100).toFixed(0)+"%":"–")+", "+(s.would_pnl25_n||0)+" with a path)"]]);
 const hc=s.survivor_hold_curve||{},hk=Object.keys(hc);
 if(hk.length){$("p-hold-card").style.display="";$("p-hold").innerHTML='<tr><th class="l">Hold to</th><th>n</th><th>Mean</th><th>Median</th><th>Win</th><th>+100%</th></tr>'+hk.map(k=>{const c=hc[k];return `<tr><td class="l">minute ${k}</td><td class="num">${c.n}</td><td class="num ${c.mean>0?"pos":c.mean<0?"neg":"muted"}">${(c.mean>=0?"+":"")+(c.mean*100).toFixed(0)}%</td><td class="num">${(c.median>=0?"+":"")+(c.median*100).toFixed(0)}%</td><td class="num">${(c.win*100).toFixed(0)}%</td><td class="num">${(c.big*100).toFixed(0)}%</td></tr>`}).join("")}else{$("p-hold-card").style.display="none"}
 const f=($("p-filter")||{}).value||"all";$("p-filter").onchange=render;
-const show=rows.filter(r=>f==="survivor"?r.watch_verdict==="survivor":f==="rugger"?r.watch_verdict==="rugger":f==="alive"?r.verdict==="alive":f==="pulled"?r.pulled:f==="live"?(r.pool_age_s!=null&&r.pool_age_s<1500&&!r.pulled):f==="win"?(r.pnl25!=null&&r.pnl25>0):true);
-$("p-tbl").innerHTML=`<tr><th class="l">Pool</th><th>Wallet</th><th>Verdict</th><th>Age</th><th>Probe@</th><th>Liq</th><th>Live</th><th>Peak</th><th>Pulled@</th><th>+probe</th><th>$25 @ m6</th><th>Enter @conf</th><th>Best entry</th></tr>`+(show.length?show.map(poolRow).join(""):`<tr><td class="muted">No feinted pools in the window yet.</td></tr>`)}
+const show=rows.filter(r=>f==="entered"?!!r.real:f==="survivor"?r.watch_verdict==="survivor":f==="rugger"?r.watch_verdict==="rugger":f==="alive"?r.verdict==="alive":f==="pulled"?r.pulled:f==="live"?(r.pool_age_s!=null&&r.pool_age_s<1500&&!r.pulled):f==="win"?(r.real&&r.real.ret!=null&&r.real.ret>0):true);
+$("p-tbl").innerHTML=`<tr><th class="l">Pool</th><th>Wallet</th><th class="l">Journey</th><th>Age</th><th>Probe@</th><th>Liq@4s</th><th>Live</th><th>Peak</th><th>Pulled@</th><th>Entry@</th><th title="the % we actually banked in the hold">Hold %</th><th title="did the pool rug after our safe-zone exit?">After</th><th>$25 ideal</th><th>Enter @conf</th><th>Best entry</th></tr>`+(show.length?show.map(poolRow).join(""):`<tr><td class="muted">No feinted pools in the window yet.</td></tr>`)}
 function render(){renderHealth();renderFeints();
 // The pool tracker / wallets / market / shorts / canary settings views do NOT depend on the books list, so they
 // must render even before (or without) books -- gating them on S.books left the Pools tab blank when books were
