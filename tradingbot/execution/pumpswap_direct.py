@@ -410,6 +410,10 @@ class DirectPumpswapExecutor(JupiterExecutor):
         lamports = int(usd / sol_usd * 1e9)
         if not sol0 or lamports <= 0:
             return None
+        bal = self.sol_balance()
+        if bal is None or bal < lamports / 1e9 + MIN_SOL:
+            return None  # can't fund the wrap, so the sim's transfer leg reverts ([4, Custom 1] =
+            #              ResultWithNegativeLamports) — that is a dry wallet, not a honeypot, so skip rather than cry one
         tokens = amount_out(lamports, sol0, tok_res, st["fee_bps"])
         fslip = getattr(self.cfg, "launch_canary_feint_slippage_bps", 0) or self.cfg.slippage_bps
         buy_min_out = int(tokens * (10_000 - fslip) / 10_000)
@@ -631,6 +635,18 @@ class DirectPumpswapExecutor(JupiterExecutor):
         survival = a legitimate pool to enter for real."""
         out = {"token": token, "usd": usd, "verdict": "skipped", "note": "", "pool": self.pools.get(token),
                "wallet_addr": self.owner}  # which wallet executed this probe (for the dashboard "buying wallet" view)
+        # Check the wallet can fund the probe BEFORE the honeypot sim: a drained wallet can't fund the wrap, so the
+        # sim's transfer leg reverts ([InstructionError 4, Custom 1] = ResultWithNegativeLamports) and round_trip would
+        # mislabel the pool a honeypot. That is a dry wallet, not a trap — report it as such and don't poison the stat.
+        sol_usd = self.jup.sol_price()
+        if not sol_usd:
+            out["note"] = self.last_note = "probe: SOL price unknown"
+            return out
+        lamports = int(usd / sol_usd * 1e9)
+        bal = self.sol_balance()
+        if bal is None or bal < lamports / 1e9 + MIN_SOL:
+            out["note"] = self.last_note = "probe: wallet SOL low"
+            return out
         rt = self.round_trip(token, usd)  # free sim: nothing is sent
         if rt is None:
             out["note"] = self.last_note = "probe: pool unreadable / not simulable"
@@ -639,15 +655,6 @@ class DirectPumpswapExecutor(JupiterExecutor):
         if loss >= 100.0:
             out["verdict"], out["note"] = "honeypot", f"probe: {note}"
             self.last_note = out["note"]
-            return out
-        sol_usd = self.jup.sol_price()
-        if not sol_usd:
-            out["note"] = self.last_note = "probe: state unreadable"
-            return out
-        lamports = int(usd / sol_usd * 1e9)
-        bal = self.sol_balance()
-        if bal is None or bal < lamports / 1e9 + MIN_SOL:
-            out["note"] = self.last_note = "probe: wallet SOL low"
             return out
         slip = int(getattr(self.cfg, "launch_canary_probe_buy_slippage_bps", 0) or self.cfg.slippage_bps)
         retries = max(0, int(getattr(self.cfg, "launch_canary_probe_buy_retries", 2) or 0))

@@ -272,6 +272,23 @@ def test_direct_round_trip_flags_a_honeypot_when_the_sell_leg_reverts():
     assert not rpc.sent  # a honeypot is caught for free, before any real buy or feint
 
 
+def test_direct_round_trip_skips_a_dry_wallet_instead_of_calling_it_a_honeypot():
+    # 0.05 SOL can't fund a $25 (~0.125 SOL) wrap, so the sim's transfer leg would revert ([4, Custom 1]); round_trip
+    # must return None (skip, can't judge), NOT (100, honeypot) — a dry wallet is not a trap.
+    ex, rpc = direct(sol=50_000_000)
+    rpc.sim_err = {"InstructionError": [4, {"Custom": 1}]}  # what a drained wallet's wrap leg reverts with
+    assert ex.round_trip(MINT, 25.0) is None
+
+
+def test_probe_1slot_reports_a_dry_wallet_as_sol_low_not_a_honeypot():
+    ex, rpc = probe_direct(sol=50_000_000)
+    rpc.sim_err = {"InstructionError": [4, {"Custom": 1}]}  # the wrap-leg revert a dry wallet produces
+    out = ex.probe_1slot(MINT, 25.0)
+    assert out["verdict"] == "skipped" and out["note"] == "probe: wallet SOL low"
+    assert "honeypot" not in out["note"]
+    assert not rpc.sent and not rpc.raw  # nothing simulated-into-a-verdict or committed on a dry wallet
+
+
 class SlotRpc(PoolRpc):
     """PoolRpc that stamps each sent transaction with a slot (sig0 -> 100, sig1 -> 101, ...), so the probe's
     buy->sell slot gap can be asserted. The real RPC carries the slot on getSignatureStatuses and getTransaction."""
