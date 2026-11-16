@@ -314,3 +314,62 @@ def test_assemble_and_summary_fold_in_the_journey_and_real_trade():
     s = pt.summary(rows)
     assert s["real_entries"] == 1 and s["real_closed"] == 1 and s["real_pnl"] == 0.75
     assert s["clean_after"] == 1 and s["holding_rug_after"] == 0
+
+
+def test_probe_costs_sum_the_probe_fees_and_dust_per_pool():
+    import json
+    ev = [
+        {"detail": json.dumps({"pool": "P", "net_usd": -0.30})},   # first 1-slot probe
+        {"detail": json.dumps({"pool": "P", "net_usd": -0.25})},   # the second probe on the same pool
+        {"detail": json.dumps({"pool": "Q", "net_usd": 0.05})},    # a probe that happened to recover a touch more
+        {"detail": "{}"},                                          # no pool: ignored
+    ]
+    q = lambda sql, p: ev
+    out = pt.probe_costs(q, 0.0)
+    assert round(out["P"]["probe_cost_usd"], 2) == -0.55 and out["P"]["probes"] == 2
+    assert out["Q"]["probe_cost_usd"] == 0.05 and out["Q"]["probes"] == 1
+    assert "none" not in out
+
+
+def test_lifecycle_status_reads_the_pool_s_stage_in_the_journey():
+    L = pt._lifecycle
+    assert L("feint", "alive", None, True, None, None, None, None) == "feint: alive"
+    assert L("probe", "honeypot", None, False, None, None, None, None) == "probe: no money sent"
+    assert L("probe", "ok", "survivor", True, None, None, None, None) == "1st probe safe (survivor)"
+    assert L("probe", "ok", "rugger", True, None, None, None, None) == "1st probe lost (pool rugged)"
+    assert L("probe", "trapped", None, True, None, None, None, None) == "probe trapped (stake stuck)"
+    assert L("probe", "ok", None, True, None, None, None, None) == "probe landed; watching"
+    assert L("probe", "ok", "survivor", True, {"open": True}, None, None, "hold_probe") == "holding (hold-probe)"
+    assert L("probe", "ok", "survivor", True, {"open": False, "pnl": 0.75}, None, None, "final") == "exited: win"
+    assert L("probe", "ok", "survivor", True, {"open": False, "pnl": -5.0}, None, None, "final") == "exited: loss"
+    # safe-zone hold-probe sold, then the pool rugged while we were out = we dodged it
+    assert L("probe", "ok", "survivor", True, {"open": False, "pnl": 0.2}, None, "holding_rug",
+             "hold_probe") == "exited: dodged the rug"
+    # safe-zone hold-probe sold, re-entry read not in yet
+    assert L("probe", "ok", "survivor", True, {"open": False, "pnl": 0.2}, None, None,
+             "hold_probe") == "exited: watching for re-entry"
+
+
+def test_assemble_computes_realtime_entry_pnl_and_the_running_pool_result():
+    # an OPEN hold-probe: its P&L is the live reserve-price move since entry (not the Jupiter fill price), and the
+    # pool's running result is the probe fees plus that live entry P&L.
+    now = 1000.0
+    created = now - 300
+    feints = {"P": {"pool": "P", "mint": "M", "kind": "probe", "verdict": "ok", "watch_verdict": "survivor",
+                    "note": "", "feint_ts": created + 6, "sol_before": 65}}
+    scorer = {"P": {"pool": "P", "token_mint": "M", "create_ts": created, "status": "scored"}}  # no pull
+    paths = {"P": {"pts": [(66, 10000, 1.0), (70, 10000, 1.0), (120, 12000, 1.2)],  # price 1.0 at entry -> 1.2 now
+                   "peak_liq": 12000, "live_liq": 12000, "pulled_ts": None}}
+    stages = {"P": {"entries": [{"stage": "hold_probe"}]}}
+    real = {"M": [{"book": "canary_rw50_sz", "entry_px": 1.0, "cost_usd": 25.0, "opened_at": created + 70,
+                   "closed_at": None, "exit_reason": None, "open": True, "ret": None, "pnl": None}]}
+    costs = {"P": {"probe_cost_usd": -0.30, "probes": 2}}
+    row = pt.assemble(feints, scorer, 100.0, paths, now, stages=stages, real=real, costs=costs)[0]
+    assert row["lifecycle"] == "holding (hold-probe)"
+    assert row["probe_cost_usd"] == -0.30 and row["probes"] == 2
+    assert round(row["real"]["live_ret"], 2) == 0.14           # 1.2 / 1.0 - 1 - 6% cost
+    assert round(row["real"]["live_pnl"], 2) == 3.50           # 25 * 0.14
+    assert round(row["entry_pnl"], 2) == 3.50                  # open -> the live unrealized P&L
+    assert round(row["pnl_so_far"], 2) == 3.20                 # -0.30 probe fees + 3.50 entry
+    s = pt.summary([row])
+    assert s["probe_cost_total"] == -0.30 and s["pnl_so_far_total"] == 3.2

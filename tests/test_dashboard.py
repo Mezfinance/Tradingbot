@@ -478,7 +478,7 @@ def test_fetch_pools_folds_in_the_lifecycle_journey_and_the_real_trade(cfg):
     j = Journal(":memory:")
     # a 1-slot probe that survived the ~48s watch, then the two-stage entry's gates + a safe-zone hold-probe
     j.log_event("canary_probe", "MintZ", json.dumps({"pool": "PoolZ", "verdict": "ok", "slot_gap": 1,
-                "sol_before": 60.0, "wallet_addr": "Wa11etZZZZ"}), strategy="canary_rw50_sz")
+                "sol_before": 60.0, "wallet_addr": "Wa11etZZZZ", "net_usd": -0.30}), strategy="canary_rw50_sz")
     j.log_event("canary_probe_verdict", "MintZ", json.dumps({"pool": "PoolZ", "verdict": "survivor", "sol_after": 62}),
                 strategy="canary_rw50_sz")
     j.log_event("canary_entry_gate", "MintZ", json.dumps({"pool": "PoolZ", "stage": "volatility", "ok": True,
@@ -508,8 +508,13 @@ def test_fetch_pools_folds_in_the_lifecycle_journey_and_the_real_trade(cfg):
     assert r["reentry"] == "clean"
     assert r["real"]["exit_reason"] == "safe_zone" and round(r["real"]["ret"], 2) == 0.03
     assert r["real"]["entry_pool_age_s"] == 60 and r["real"]["open"] is False and r["final"] is None
+    # the new journey fields: a single Status, the probe fees/dust, and the pool's running result
+    assert r["lifecycle"] == "exited: clean (re-entry off/ pending)"
+    assert r["probe_cost_usd"] == -0.30 and r["probes"] == 2  # both probes counted; the second had no net_usd
+    assert r["entry_pnl"] == 0.75 and round(r["pnl_so_far"], 2) == 0.45  # -0.30 fees + 0.75 entry
     s = board.pools["summary"]
     assert s["real_entries"] == 1 and s["real_closed"] == 1 and s["real_pnl"] == 0.75 and s["clean_after"] == 1
+    assert round(s["probe_cost_total"], 2) == -0.30 and round(s["pnl_so_far_total"], 2) == 0.45
 
 
 def test_canary_rotate_validates_halts_and_launches_provision(cfg, tmp_path, monkeypatch):

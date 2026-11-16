@@ -183,6 +183,64 @@ def real_trades(jquery, mints: list) -> dict:
     return out
 
 
+def probe_costs(jquery, since: float) -> dict:
+    """Per pool, the real wallet friction of the 1-slot probes (first + second): the sum of each probe's `net_usd`
+    (recovered - spent - fees, in USD; negative = cost) and how many probes ran. This is the fees/dust a pool's
+    probing has cost us, kept separate from any entry's trade result."""
+    out: dict = {}
+    try:
+        rows = jquery("SELECT detail FROM events WHERE kind IN ('canary_probe','canary_probe2') AND ts >= ?", (since,))
+    except Exception:  # noqa: BLE001 (no events table / old db)
+        return {}
+    for r in rows:
+        d = _loads(r["detail"])
+        pool = d.get("pool")
+        if not pool:
+            continue
+        o = out.setdefault(pool, {"probe_cost_usd": 0.0, "probes": 0})
+        o["probes"] += 1
+        nu = d.get("net_usd")
+        if isinstance(nu, (int, float)):
+            o["probe_cost_usd"] += nu
+    for o in out.values():
+        o["probe_cost_usd"] = round(o["probe_cost_usd"], 4)
+    return out
+
+
+def _lifecycle(kind, pv, watch_verdict, committed, primary, final, reentry, entry_stage) -> str:
+    """A single plain-language status for where a pool is in the probe -> entry -> exit journey, for the dashboard's
+    Status column. Derived only from recorded events/trades (no engine state)."""
+    if kind == "feint":
+        return {"alive": "feint: alive", "pulled": "feint: pulled",
+                "inconclusive": "feint: no-op"}.get(pv, "feint")
+    if primary is not None:  # a real two-stage entry exists on this pool
+        if primary["open"]:
+            return "holding (" + {"hold_probe": "hold-probe", "final": "re-entry"}.get(entry_stage, "entry") + ")"
+        if final is not None:  # a minute-6 re-entry on a clean survivor
+            if final["open"]:
+                return "holding (re-entry)"
+            return "exited: win" if (final.get("pnl") or 0) >= 0 else "exited: loss"
+        if reentry == "holding_rug":
+            return "exited: dodged the rug"        # we sold at the safe zone, the pool rugged after
+        if reentry == "clean":
+            return "exited: clean (re-entry off/ pending)"
+        if entry_stage == "hold_probe":
+            return "exited: watching for re-entry"  # safe-zone sold, awaiting the ~120s re-entry read
+        return "exited: win" if (primary.get("pnl") or 0) >= 0 else "exited: loss"
+    if kind == "probe":
+        if pv in ("honeypot", "skipped") or (pv is None and not committed):
+            return "probe: no money sent"
+        if watch_verdict == "survivor":
+            return "1st probe safe (survivor)"
+        if watch_verdict == "rugger":
+            return "1st probe lost (pool rugged)"
+        if pv == "trapped":
+            return "probe trapped (stake stuck)"
+        if committed:
+            return "probe landed; watching"
+    return "probed"
+
+
 # --- live reserve reads ----------------------------------------------------------------------------
 
 def _amount(data) -> int | None:
@@ -285,13 +343,27 @@ def update_path(path: dict | None, now: float, created: float | None, feint_ts: 
 
 # --- assembly --------------------------------------------------------------------------------------
 
+def _price_at(pts: list, target_age: float, tol: float = 90.0) -> float | None:
+    """The reserve price (sol/tok) sampled nearest `target_age` pool seconds, within `tol`s. Both this and the live
+    price come from the same path, so their ratio is a valid return (no Jupiter-fill-price unit mismatch)."""
+    best = None
+    for a, _lq, pr in pts:
+        if pr is None:
+            continue
+        gap = abs(a - target_age)
+        if gap <= tol and (best is None or gap < best[0]):
+            best = (gap, pr)
+    return best[1] if best else None
+
+
 def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | None, now: float,
-             stages: dict | None = None, real: dict | None = None) -> list[dict]:
+             stages: dict | None = None, real: dict | None = None, costs: dict | None = None) -> list[dict]:
     """Join each feint to its scorer row, live path, two-stage lifecycle (`stages`) and real canary trades (`real`)
     into one tracker row. Pure; newest pool first."""
     paths = paths or {}
     stages = stages or {}
     real = real or {}
+    costs = costs or {}
     out = []
     for pool, f in feints.items():
         s = scorer.get(pool) or {}
@@ -346,6 +418,26 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
             "entry_stages": entry_stages,
             "reentry": reentry.get("verdict") if reentry else None,
         }
+        entry_stage0 = entry_stages[0] if entry_stages else None
+        # fees/dust: the real wallet friction of this pool's 1-slot probes (first + second), summed in USD.
+        pc = costs.get(pool) or {}
+        probe_cost = pc.get("probe_cost_usd")
+        # realtime entry P&L: a closed entry uses its realised pnl; an OPEN entry uses the live reserve-price move
+        # since entry (price ratio from the same path, unit-consistent -- NOT the Jupiter fill price, different units).
+        live_ret = live_pnl = None
+        if primary and primary["open"] and p.get("pts") and primary["opened_at"] and created:
+            px0 = _price_at(p["pts"], primary["opened_at"] - created)
+            px_now = next((pr for a, _lq, pr in reversed(p["pts"]) if pr), None)
+            if px0 and px_now:
+                live_ret = min(px_now / px0 - 1 - COST, 3.0)
+                if primary.get("cost_usd"):
+                    live_pnl = round(primary["cost_usd"] * live_ret, 4)
+        entry_pnl = (primary["pnl"] if (primary and not primary["open"]) else live_pnl) if primary else None
+        final_pnl = last["pnl"] if (last and last is not primary and not last["open"]) else None
+        pnl_so_far = (round((probe_cost or 0.0) + (entry_pnl or 0.0) + (final_pnl or 0.0), 4)
+                      if (probe_cost is not None or entry_pnl is not None or final_pnl is not None) else None)
+        lifecycle = _lifecycle(f.get("kind"), pv, f.get("watch_verdict"), committed, primary,
+                               (last if (last and last is not primary) else None), journey["reentry"], entry_stage0)
         out.append({
             "pool": pool, "mint": f.get("mint"), "verdict": disp, "kind": f.get("kind"),
             "watch_verdict": f.get("watch_verdict"), "probe_verdict": f.get("verdict") if f.get("kind") == "probe" else None,
@@ -365,10 +457,15 @@ def assemble(feints: dict, scorer: dict, sol_usd: float | None, paths: dict | No
             "conf_age_s": p.get("conf_age"), "conf_ret": conf_ret, "conf_by": conf_by,
             "status": s.get("status") or "pending",
             # --- the combined journey: lifecycle stages + the REAL trade (actual entry, exit, % gained in the hold) ---
+            "lifecycle": lifecycle,  # one plain-language Status for the journey (probe -> holding -> exited -> ...)
+            "probe_cost_usd": probe_cost, "probes": pc.get("probes"),  # fees/dust spent probing this pool
+            "entry_pnl": entry_pnl,       # realised pnl if exited, else the live unrealized pnl while holding
+            "pnl_so_far": pnl_so_far,     # running cost/result of the pool: probe fees + entry (+ re-entry) P&L
             "journey": journey, "reentry": journey["reentry"], "trades": trades,
             "real": ({
                 "entry_px": primary["entry_px"], "cost_usd": primary["cost_usd"], "open": primary["open"],
                 "exit_reason": primary["exit_reason"], "ret": primary["ret"], "pnl": primary["pnl"],
+                "live_ret": live_ret, "live_pnl": live_pnl,  # realtime unrealized while the entry is open
                 "stage": entry_stages[0] if entry_stages else None,
                 "entry_pool_age_s": (primary["opened_at"] - created) if (primary["opened_at"] and created) else None,
                 "held_s": ((primary["closed_at"] or now) - primary["opened_at"]) if primary["opened_at"] else None,
@@ -419,6 +516,9 @@ def summary(rows: list[dict]) -> dict:
         # after-exit watch: clean (stayed liquid once we were out) vs holding_rug (pulled after our safe-zone sell)
         "clean_after": sum(1 for v in reentry if v == "clean"),
         "holding_rug_after": sum(1 for v in reentry if v == "holding_rug"),
+        # fees/dust and running result across every probed pool
+        "probe_cost_total": round(sum(r["probe_cost_usd"] for r in rows if r.get("probe_cost_usd") is not None), 2),
+        "pnl_so_far_total": round(sum(r["pnl_so_far"] for r in rows if r.get("pnl_so_far") is not None), 2),
     }
 
 
@@ -473,6 +573,7 @@ def rows_for(jquery, wquery, hours: float = TRACK_WINDOW_S / 3600, now: float | 
     scorer = scorer_rows(wquery, since, pools=list(feints))  # by pool: cheap however large --hours
     stages = lifecycle(jquery, since)
     real = real_trades(jquery, [f.get("mint") for f in feints.values() if f.get("mint")])
+    costs = probe_costs(jquery, since)
     su = _sol_usd(wquery)
     paths = dict(paths or {})
     if rpc is not None:
@@ -487,7 +588,7 @@ def rows_for(jquery, wquery, hours: float = TRACK_WINDOW_S / 3600, now: float | 
                                         sol, tok, su, s.get("exit_px"))
         except Exception:  # noqa: BLE001 (the public RPC can be slow / rate-limited)
             pass
-    return assemble(feints, scorer, su, paths, now, stages=stages, real=real), su
+    return assemble(feints, scorer, su, paths, now, stages=stages, real=real, costs=costs), su
 
 
 def _age(s) -> str:
@@ -549,25 +650,33 @@ def render(rows: list[dict], su: float | None) -> str:
         out.append(f"real trades: {s['real_entries']} entered ({s['real_open']} open), {s['real_closed']} exited "
                    f"-> {rm} mean, ${s['real_pnl']:+.2f}; after exit clean {s['clean_after']} / "
                    f"holding-rug {s['holding_rug_after']}")
+    out.append(f"probe fees/dust: ${s.get('probe_cost_total', 0.0):+.2f} spent probing; "
+               f"running result (fees + entries): ${s.get('pnl_so_far_total', 0.0):+.2f}")
     if su:
         out.append(f"SOL ${su:.2f}")
     out.append("")
-    hdr = f"{'mint':<9} {'journey':<24} {'age':>6} {'liq':>6} {'peak':>6} {'pulled@':>7} " \
-          f"{'entry@':>6} {'hold%':>7} {'after':>6} {'$25':>6} {'best%':>7}"
+    hdr = f"{'mint':<9} {'status':<26} {'age':>6} {'liq':>6} {'pulled@':>7} {'entry@':>6} " \
+          f"{'pnl':>8} {'cost':>7} {'run':>8} {'$25':>6}"
     out.append(hdr)
     out.append("-" * len(hdr))
     for r in rows[:60]:
         m = (r["mint"] or "")[:9]
-        pnl = f"${r['pnl25']:+.1f}" if r["pnl25"] is not None else "—"
-        opt = f"{r['opt_ret'] * 100:+.0f}%" if r["opt_ret"] is not None else "—"
+        pnl25 = f"${r['pnl25']:+.1f}" if r["pnl25"] is not None else "—"
+        cost = f"${r['probe_cost_usd']:+.2f}" if r.get("probe_cost_usd") is not None else "—"
+        run = f"${r['pnl_so_far']:+.2f}" if r.get("pnl_so_far") is not None else "—"
         real, fin = r.get("real"), r.get("final")
-        hold = "—"
+        pnl = "—"  # the entry's P&L: realised if exited, else live unrealized while holding (marked ~)
         if real:
-            hold = "open" if real["open"] else (f"{real['ret'] * 100:+.0f}%" if real.get("ret") is not None else "sold")
+            if real["open"]:
+                pnl = (f"~{real['live_ret'] * 100:+.0f}%" if real.get("live_ret") is not None else "open")
+            elif real.get("ret") is not None:
+                pnl = f"{real['ret'] * 100:+.0f}%"
+            else:
+                pnl = "sold"
         if fin and fin.get("ret") is not None:  # the minute-6 re-entry result, when a clean survivor got one
-            hold += f"/{fin['ret'] * 100:+.0f}%"
-        after = {"clean": "clean", "holding_rug": "rug"}.get(r.get("reentry") or "", "—")
-        out.append(f"{m:<9} {_journey(r)[:24]:<24} {_age(r['pool_age_s']):>6} {_usd(r['liq_probe']):>6} "
-                   f"{_usd(r['peak_liq']):>6} {_age(r['pull_pool_age_s']):>7} {_age(r.get('real') and r['real']['entry_pool_age_s']):>6} "
-                   f"{hold:>7} {after:>6} {pnl:>6} {opt:>7}")
+            pnl += f"/{fin['ret'] * 100:+.0f}%"
+        out.append(f"{m:<9} {(r.get('lifecycle') or '—')[:26]:<26} {_age(r['pool_age_s']):>6} "
+                   f"{_usd(r['liq_probe']):>6} {_age(r['pull_pool_age_s']):>7} "
+                   f"{_age(r.get('real') and r['real']['entry_pool_age_s']):>6} "
+                   f"{pnl:>8} {cost:>7} {run:>8} {pnl25:>6}")
     return "\n".join(out)
