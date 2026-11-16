@@ -1418,7 +1418,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div id="cs-note"></div>
 <section class="card"><p class="label eyebrow">Presets</p><h2>Modes</h2><p class="sub">Each applies a coherent set of settings. You are asked to confirm before anything changes.</p><div id="cs-presets" class="stats"></div></section>
 <div id="cs-groups"></div>
-<section class="card"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center"><button id="cs-save" onclick="canarySave()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Save changes</button><button onclick="canaryReset()" style="padding:9px 20px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);cursor:pointer;font:inherit;font-weight:700">Reset to deploy settings</button><span class="sub" id="cs-dirty"></span></div></section>
+<section class="card"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center"><button id="cs-save" onclick="canarySave()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Save changes</button><button onclick="canaryReset()" style="padding:9px 20px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);cursor:pointer;font:inherit;font-weight:700">Reset to deploy settings</button><span class="sub" id="cs-dirty"></span></div><div id="cs-save-note" class="sub" style="margin-top:8px"></div></section>
 <section class="card"><p class="label eyebrow">Deploy</p><h2>Deploy the bot</h2>
 <p class="sub">Runs the deploy command on this machine (if one is configured) and restarts it — <b>this page will disconnect</b>; reload in a minute. Normally you deploy from your Mac with <code>git pull &amp;&amp; fly deploy</code>. Restart-only settings above (route, budget, fees) take effect on the next deploy.</p>
 <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin:4px 0 10px"><button id="dep-go" onclick="flyDeploy()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">fly deploy</button><span class="sub mono" id="dep-cmd"></span></div>
@@ -1923,21 +1923,31 @@ $("dep-go").disabled=!C.deploy_cmd;csBuilt=true;csDirty();renderPasskeys()}
 function csDiff(){const out={};for(const f of S.cset.fields){const v=csVal(f),c=S.cset.current[f.key];if(f.type==="bool"?(!!v!==!!c):(""+v!==""+c))out[f.key]={f,to:v,from:c}}return out}
 function csDirty(){const d=csDiff(),n=Object.keys(d).length;$("cs-dirty").textContent=n?n+" unsaved change"+(n>1?"s":""):"No unsaved changes"}
 function csFmt(f,v){return f.type==="bool"?(v?"on":"off"):""+v}
+function csSaveNote(cls,html){// show the save result BOTH beside the button (where the click happened) and at the top
+const i=$("cs-save-note");if(i){i.className="sub "+(cls||"");i.innerHTML=html}
+const n=$("cs-note");if(n){n.dataset.kept=1;n.innerHTML='<p class="note '+(cls||"")+'">'+html+'</p>'}}
+function csSend(changes){
+fetch("api/canary/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({changes})}).then(r=>r.json().then(j=>({ok:r.ok,j}))).then(({ok,j})=>{
+if(!ok){
+// coherence rejection: offer to turn on the prerequisites and save in one go (but never re-flip a field the user just changed)
+const needs=(j&&j.needs)||null;const offer=needs?Object.keys(needs).filter(k=>!(k in changes)):[];
+if(offer.length){const labels=(j.need_labels&&j.need_labels.length?j.need_labels:offer).join(", ");
+if(confirm((j.error||"This change needs other settings on.")+"\n\nTurn these on and save too?\n\n• "+labels)){
+offer.forEach(k=>changes[k]=needs[k]);csSend(changes);return}}
+csSaveNote("neg",esc(j.error||"Rejected — nothing saved."));return}
+const cur={};S.cset.fields.forEach(f=>cur[f.key]=j.values[f.key]);S.cset.current=cur;S.cset.overlay=true;
+const rb=(j.restart_needed||[]);csSaveNote("","Saved "+Object.keys(j.changed||{}).length+" change(s)."+(rb.length?" Restart the bot (fly deploy) for: "+rb.map(esc).join(", ")+".":" Live now."));csBuilt=false;render()})
+.catch(e=>{csSaveNote("neg","Could not save: "+esc(""+e))})}
 function canarySave(){const d=csDiff(),keys=Object.keys(d);if(!keys.length){alert("No changes to save.");return}
 const lines=keys.map(k=>`• ${d[k].f.label}: ${csFmt(d[k].f,d[k].from)} → ${csFmt(d[k].f,d[k].to)}${d[k].f.live?"":"  (after restart)"}`).join("\n");
 if(!confirm("Apply these canary changes?\n\n"+lines+"\n\nLive changes take effect immediately on the real-money canary; restart ones apply after fly deploy."))return;
-const changes={};keys.forEach(k=>changes[k]=d[k].to);
-fetch("api/canary/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({changes})}).then(r=>r.json().then(j=>({ok:r.ok,j}))).then(({ok,j})=>{
-if(!ok){$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">'+esc(j.error||"Rejected.")+'</p>';return}
-const cur={};S.cset.fields.forEach(f=>cur[f.key]=j.values[f.key]);S.cset.current=cur;S.cset.overlay=true;
-const rb=(j.restart_needed||[]);$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note">Saved '+Object.keys(j.changed||{}).length+' change(s).'+(rb.length?" Restart the bot (fly deploy) for: "+rb.map(esc).join(", ")+".":" Live now.")+'</p>';csBuilt=false;render()})
-.catch(e=>{$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">Could not save: '+esc(""+e)+'</p>'})}
+const changes={};keys.forEach(k=>changes[k]=d[k].to);csSaveNote("","Saving…");csSend(changes)}
 function csPreset(name){const p=S.cset.presets[name];if(!confirm('Apply preset "'+p.label+'"?\n\n'+p.about+'\n\nThis sets several canary settings at once on the real-money canary. You can review and adjust the fields after.'))return;
 fetch("api/canary/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({preset:name})}).then(r=>r.json().then(j=>({ok:r.ok,j}))).then(({ok,j})=>{
-if(!ok){$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">'+esc(j.error||"Rejected.")+'</p>';return}
+if(!ok){csSaveNote("neg",esc(j.error||"Rejected."));return}
 const cur={};S.cset.fields.forEach(f=>cur[f.key]=j.values[f.key]);S.cset.current=cur;S.cset.overlay=true;
-const rb=(j.restart_needed||[]);$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note">Preset applied ('+Object.keys(j.changed||{}).length+' change(s)).'+(rb.length?" Restart for: "+rb.map(esc).join(", ")+".":"")+'</p>';csBuilt=false;render()})
-.catch(e=>{$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">Could not apply: '+esc(""+e)+'</p>'})}
+const rb=(j.restart_needed||[]);csSaveNote("","Preset applied ("+Object.keys(j.changed||{}).length+" change(s))."+(rb.length?" Restart for: "+rb.map(esc).join(", ")+".":""));csBuilt=false;render()})
+.catch(e=>{csSaveNote("neg","Could not apply: "+esc(""+e))})}
 function canaryReset(){if(!confirm("Reset every canary setting to the deploy (fly.toml) values and clear the dashboard override?"))return;
 fetch("api/canary/settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({reset:true})}).then(r=>r.json()).then(j=>{const cur={};S.cset.fields.forEach(f=>cur[f.key]=j.values[f.key]);S.cset.current=cur;S.cset.overlay=false;$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note">'+esc(j.msg||"Reset.")+'</p>';csBuilt=false;render()}).catch(e=>{$("cs-note").dataset.kept=1;$("cs-note").innerHTML='<p class="note neg">Could not reset: '+esc(""+e)+'</p>'})}
 function flyDeploy(){const cmd=(S.cset&&S.cset.deploy_cmd)||null;

@@ -122,6 +122,28 @@ def test_multi_hold_preset_and_coherence(tmp_path):
         cs.apply(_cfg(tmp_path), None, {"launch_canary_hold_for_s": 10.0, "launch_canary_safe_zone": False})
 
 
+def test_coherence_error_carries_the_full_prerequisite_chain(tmp_path):
+    # Editing ONLY the hold schedule is rejected, but the error names every prerequisite the dashboard can turn on
+    # in one click: safe-zone hold-probe -> Enter -> probe -> direct route.
+    cfg = _cfg(tmp_path)
+    with pytest.raises(cs.CoherenceError) as exc:
+        cs.apply(cfg, None, {"launch_canary_hold_schedule": "6:4,6"})
+    err = exc.value
+    assert err.needs == {"launch_canary_safe_zone": True, "launch_canary_enter": True,
+                         "launch_canary_probe": True, "launch_canary_route": "direct"}
+    assert "Safe-zone hold-probe" in err.need_labels and "Route = direct" in err.need_labels
+    # Applying the change together with the prerequisites it named succeeds and nothing is lost.
+    r = cs.apply(cfg, None, {"launch_canary_hold_schedule": "6:4,6", **err.needs})
+    assert cfg.launch_canary_hold_schedule == "6:4,6" and cfg.launch_canary_safe_zone and cfg.launch_canary_route == "direct"
+    assert "launch_canary_hold_schedule" in r["changed"]
+
+
+def test_coherence_error_is_a_value_error_with_an_empty_needs_when_none(tmp_path):
+    # A plain coherent apply raises nothing; the resolver returns no prerequisites for an already-coherent state.
+    assert cs._resolve_coherence({"launch_canary_probe": True, "launch_canary_route": "direct"}) == ({}, [])
+    assert issubclass(cs.CoherenceError, ValueError)
+
+
 def test_safe_zone_validation_needs_enter_and_reentry_needs_safe_zone():
     from tradingbot.config import LIVE_CONFIRM_PHRASE, Config
     with pytest.raises(ValueError, match="safe-zone hold-probe"):  # safe_zone on, enter off

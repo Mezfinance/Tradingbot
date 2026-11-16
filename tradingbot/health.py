@@ -333,7 +333,12 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                     log.info("dashboard canary switch: %s", res.get("msg"))
                 self._send(200, json.dumps(res).encode(), "application/json")
             except ValueError as e:
-                self._send(400, json.dumps({"error": str(e)}).encode(), "application/json")
+                payload = {"error": str(e)}
+                needs = getattr(e, "needs", None)  # a CoherenceError carries the prerequisites that would fix the combo
+                if needs:
+                    payload["needs"] = needs
+                    payload["need_labels"] = getattr(e, "need_labels", [])
+                self._send(400, json.dumps(payload).encode(), "application/json")
             except Exception as e:  # noqa: BLE001 (report the failure, never crash the server)
                 self._send(500, json.dumps({"error": str(e)}).encode(), "application/json")
 

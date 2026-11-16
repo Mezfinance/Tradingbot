@@ -253,34 +253,81 @@ def validate(changes: dict) -> dict:
     return out
 
 
+# Dependency rules: when ``active(state)`` holds, ``req_key`` must equal ``req_val``, else the combo is incoherent.
+# ``label`` names the prerequisite the dashboard offers to turn on in one click. Resolution iterates to a fixed
+# point, since enabling one prerequisite (e.g. the safe-zone hold-probe) can activate another rule (it needs Enter,
+# which needs the probe, which needs the direct route).
+_DEPS: list = [
+    (lambda s: s.get("launch_canary_feint"), "launch_canary_route", "direct",
+     "Feint needs the direct route — set Route to direct first (takes effect after restart).", "Route = direct"),
+    (lambda s: s.get("launch_canary_feint_all"), "launch_canary_feint", True,
+     "Feint every pool needs Feint before buying on.", "Feint before buying"),
+    (lambda s: s.get("launch_canary_feint_only"), "launch_canary_feint", True,
+     "Feint only needs Feint before buying on.", "Feint before buying"),
+    (lambda s: s.get("launch_canary_clips", 1) > 1, "launch_canary_route", "direct",
+     "Clip buys need the direct route.", "Route = direct"),
+    (lambda s: s.get("launch_canary_probe"), "launch_canary_route", "direct",
+     "The 1-slot probe needs the direct route — set Route to direct first (takes effect after restart).",
+     "Route = direct"),
+    (lambda s: s.get("launch_canary_enter"), "launch_canary_probe", True,
+     "Enter double-survivors needs the 1-slot probe on (it runs after the probe).", "1-slot probe"),
+    (lambda s: s.get("launch_canary_wallet_gate"), "launch_canary_enter", True,
+     "The wallet-pattern gate only runs on the two-stage entry — turn Enter double-survivors on.",
+     "Enter double-survivors"),
+    (lambda s: s.get("launch_canary_lp_entry"), "launch_canary_enter", True,
+     "The LP deposit entry is the two-stage entry's commit — turn Enter double-survivors on.", "Enter double-survivors"),
+    (lambda s: s.get("launch_canary_lp_entry"), "launch_canary_route", "direct",
+     "The LP deposit entry keeps direct probes; set Route to direct (the entry itself is LP).", "Route = direct"),
+    (lambda s: s.get("launch_canary_safe_zone"), "launch_canary_enter", True,
+     "The safe-zone hold-probe is part of the two-stage entry — turn Enter double-survivors on.",
+     "Enter double-survivors"),
+    (lambda s: s.get("launch_canary_reentry"), "launch_canary_safe_zone", True,
+     "Re-entry runs after the safe-zone hold-probe — turn Safe-zone hold-probe on.", "Safe-zone hold-probe"),
+    (lambda s: s.get("launch_canary_hold_for_s", 0) > 0 or s.get("launch_canary_hold_schedule"),
+     "launch_canary_safe_zone", True,
+     "The hold-for duration / hold schedule drive the safe-zone hold-probe — turn Safe-zone hold-probe on.",
+     "Safe-zone hold-probe"),
+]
+
+
+class CoherenceError(ValueError):
+    """A settings combination the canary can't run. Carries the prerequisite changes (``needs``: key -> value)
+    and their human ``need_labels`` so the dashboard can offer to turn them on and save in one step."""
+
+    def __init__(self, message: str, needs: dict, labels: list):
+        super().__init__(message)
+        self.needs = needs
+        self.need_labels = labels
+
+
+def _resolve_coherence(state: dict) -> tuple[dict, list]:
+    """The prerequisite changes (key -> value) and their labels that would make ``state`` coherent. Iterates to a
+    fixed point so a prerequisite that itself has a prerequisite is pulled in too."""
+    work = dict(state)
+    needs: dict = {}
+    labels: list = []
+    for _ in range(len(_DEPS) + 1):
+        changed = False
+        for active, key, val, _msg, label in _DEPS:
+            if active(work) and work.get(key) != val:
+                work[key] = val
+                needs[key] = val
+                if label not in labels:
+                    labels.append(label)
+                changed = True
+        if not changed:
+            break
+    return needs, labels
+
+
 def _coherent(state: dict) -> None:
-    """Reject combinations the canary can't run (checked against the resulting state)."""
-    if state.get("launch_canary_feint") and state.get("launch_canary_route") != "direct":
-        raise ValueError("Feint needs the direct route — set Route to direct first (takes effect after restart).")
-    if state.get("launch_canary_feint_all") and not state.get("launch_canary_feint"):
-        raise ValueError("Feint every pool needs Feint before buying on.")
-    if state.get("launch_canary_feint_only") and not state.get("launch_canary_feint"):
-        raise ValueError("Feint only needs Feint before buying on.")
-    if state.get("launch_canary_clips", 1) > 1 and state.get("launch_canary_route") != "direct":
-        raise ValueError("Clip buys need the direct route.")
-    if state.get("launch_canary_probe") and state.get("launch_canary_route") != "direct":
-        raise ValueError("The 1-slot probe needs the direct route — set Route to direct first (takes effect after restart).")
-    if state.get("launch_canary_enter") and not state.get("launch_canary_probe"):
-        raise ValueError("Enter double-survivors needs the 1-slot probe on (it runs after the probe).")
-    if state.get("launch_canary_wallet_gate") and not state.get("launch_canary_enter"):
-        raise ValueError("The wallet-pattern gate only runs on the two-stage entry — turn Enter double-survivors on.")
-    if state.get("launch_canary_lp_entry") and not state.get("launch_canary_enter"):
-        raise ValueError("The LP deposit entry is the two-stage entry's commit — turn Enter double-survivors on.")
-    if state.get("launch_canary_lp_entry") and state.get("launch_canary_route") != "direct":
-        raise ValueError("The LP deposit entry keeps direct probes; set Route to direct (the entry itself is LP).")
-    if state.get("launch_canary_safe_zone") and not state.get("launch_canary_enter"):
-        raise ValueError("The safe-zone hold-probe is part of the two-stage entry — turn Enter double-survivors on.")
-    if state.get("launch_canary_reentry") and not state.get("launch_canary_safe_zone"):
-        raise ValueError("Re-entry runs after the safe-zone hold-probe — turn Safe-zone hold-probe on.")
-    if (state.get("launch_canary_hold_for_s", 0) > 0 or state.get("launch_canary_hold_schedule")) \
-            and not state.get("launch_canary_safe_zone"):
-        raise ValueError("The hold-for duration / hold schedule drive the safe-zone hold-probe — turn Safe-zone "
-                         "hold-probe on.")
+    """Reject combinations the canary can't run (checked against the resulting state). On a conflict, raise a
+    CoherenceError naming the first unmet prerequisite and carrying every prerequisite that would fix it, so the
+    dashboard can offer to enable them and save in one step instead of rejecting a lone dependent edit."""
+    for active, key, val, msg, _label in _DEPS:
+        if active(state) and state.get(key) != val:
+            needs, labels = _resolve_coherence(state)
+            raise CoherenceError(msg, needs, labels)
 
 
 def apply(cfg, journal, changes: dict) -> dict:
