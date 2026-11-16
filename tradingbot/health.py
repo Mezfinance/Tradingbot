@@ -277,7 +277,8 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                                            self._cookie(dash.COOKIE, "", 0)]})
                 return
             if path not in ("/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/topup",
-                            "/api/canary/settings", "/api/canary/probe-smoke", "/api/canary/probe-one",
+                            "/api/canary/settings", "/api/canary/journey", "/api/canary/probe-smoke",
+                            "/api/canary/probe-one",
                             "/api/canary/probe-all", "/api/canary/abort", "/api/deploy",
                             "/api/auth/register/verify", "/api/auth/passkeys/remove"):
                 self.send_error(404)
@@ -306,6 +307,8 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 elif path == "/api/canary/settings":
                     res = dash.canary_settings_update(cfg, journal, json.loads(body or b"{}"))
                     log.info("dashboard canary settings: %s", {k: v["to"] for k, v in res.get("changed", {}).items()})
+                elif path == "/api/canary/journey":  # read-only: the step-by-step trade journey for the pending settings
+                    res = dash.canary_journey(cfg, json.loads(body or b"{}"))
                 elif path == "/api/canary/rotate":
                     data = json.loads(body or b"{}")
                     res = dash.canary_rotate(journal, cfg, data.get("wallets"), data.get("sol"))

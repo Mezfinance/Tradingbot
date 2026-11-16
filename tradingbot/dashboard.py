@@ -400,6 +400,14 @@ def canary_settings_menu(cfg) -> dict:
             "deploy_cmd": " ".join(cmd) if cmd else None}
 
 
+def canary_journey(cfg, body: dict) -> dict:
+    """The step-by-step 'trade journey' for the given pending settings (current cfg overlaid with the dashboard's
+    live edits), so the operator can confirm the canary is set up the way they want. Read only, never mutates."""
+    from tradingbot import canary_settings
+    state = {**canary_settings.current(cfg), **(body.get("state") or {})}
+    return canary_settings.trade_journey(state)
+
+
 def canary_settings_update(cfg, journal, body: dict) -> dict:
     """Apply a settings change from the dashboard: a preset, a reset, or a {changes} map. Live fields take effect at
     once (the engine shares this cfg); restart-bound ones are persisted and reported as needing a restart."""
@@ -1416,6 +1424,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div><p class="label eyebrow"><a class="lk" href="#/supermeme">Supermeme</a> · launch canary · real money</p><h1>Canary settings</h1>
 <p class="lead">Preset modes set every setting at once; edit any field below. <b>Probe, sizing and limit</b> changes take effect immediately (the engine shares this config). <b>Route, budget and fees</b> apply after a restart (fly deploy). Every change is confirmed and saved so it survives a redeploy.</p></div>
 <div id="cs-note"></div>
+<section class="card"><p class="label eyebrow">Trade journey</p><h2 id="cs-journey-mode">What each canary trade will do</h2><p class="sub">The exact steps a trade takes with your current settings (including unsaved edits). Check it reads the way you want before you save.</p><div id="cs-journey"></div></section>
 <section class="card"><p class="label eyebrow">Presets</p><h2>Modes</h2><p class="sub">Each applies a coherent set of settings. You are asked to confirm before anything changes.</p><div id="cs-presets" class="stats"></div></section>
 <div id="cs-groups"></div>
 <section class="card"><div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center"><button id="cs-save" onclick="canarySave()" style="padding:9px 20px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Save changes</button><button onclick="canaryReset()" style="padding:9px 20px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);cursor:pointer;font:inherit;font-weight:700">Reset to deploy settings</button><span class="sub" id="cs-dirty"></span></div><div id="cs-save-note" class="sub" style="margin-top:8px"></div></section>
@@ -1921,7 +1930,18 @@ $("cs-groups").oninput=csDirty;$("cs-groups").onchange=csDirty;
 $("dep-cmd").textContent=C.deploy_cmd?("will run: "+C.deploy_cmd):"no deploy command on this machine — deploy from your Mac";
 $("dep-go").disabled=!C.deploy_cmd;csBuilt=true;csDirty();renderPasskeys()}
 function csDiff(){const out={};for(const f of S.cset.fields){const v=csVal(f),c=S.cset.current[f.key];if(f.type==="bool"?(!!v!==!!c):(""+v!==""+c))out[f.key]={f,to:v,from:c}}return out}
-function csDirty(){const d=csDiff(),n=Object.keys(d).length;$("cs-dirty").textContent=n?n+" unsaved change"+(n>1?"s":""):"No unsaved changes"}
+function csDirty(){const d=csDiff(),n=Object.keys(d).length;$("cs-dirty").textContent=n?n+" unsaved change"+(n>1?"s":""):"No unsaved changes";csJourneyLater()}
+let csJourneyT=null;
+function csJourneyLater(){clearTimeout(csJourneyT);csJourneyT=setTimeout(csJourney,220)}
+let csJourneyLast=null;
+function csJourney(){if(!S.cset||!S.cset.fields)return;const state={};S.cset.fields.forEach(f=>{state[f.key]=csVal(f)});
+const key=JSON.stringify(state);if(key===csJourneyLast)return;csJourneyLast=key;  // only re-fetch when a setting actually changed (background polls don't spam)
+fetch("api/canary/journey",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({state})}).then(r=>r.json()).then(j=>{
+const m=$("cs-journey-mode");if(m)m.textContent=(j.mode?("Mode: "+j.mode):"What each canary trade will do");
+const el=$("cs-journey");if(!el)return;let idx=0;
+el.innerHTML=(j.steps||[]).map(s=>{const on=!!s.on;if(on)idx++;
+const chip=on?'display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex:none;border:2px solid #000;background:#c9f24d;color:#000;font-weight:800;font-size:12px':'display:inline-flex;align-items:center;justify-content:center;width:22px;height:22px;flex:none;border:2px solid var(--rule);color:var(--ink);font-weight:800;font-size:12px;opacity:.6';
+return '<div style="display:flex;gap:10px;padding:7px 0;border-bottom:1px solid var(--rule-soft)'+(on?'':';opacity:.55')+'"><span style="'+chip+'">'+(on?idx:'–')+'</span><div style="min-width:0"><div style="font-weight:700">'+esc(s.title)+'</div><div class="sub" style="margin:0">'+esc(s.detail||"")+'</div></div></div>'}).join("")}).catch(()=>{})}
 function csFmt(f,v){return f.type==="bool"?(v?"on":"off"):""+v}
 function csSaveNote(cls,html){// show the save result BOTH beside the button (where the click happened) and at the top
 const i=$("cs-save-note");if(i){i.className="sub "+(cls||"");i.innerHTML=html}

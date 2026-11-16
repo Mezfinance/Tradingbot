@@ -413,3 +413,166 @@ def menu(cfg) -> dict:
     """The payload the dashboard needs to render the settings menu."""
     return {"fields": FIELDS, "groups": GROUPS, "current": current(cfg),
             "presets": {k: {"label": v["label"], "about": v["about"]} for k, v in PRESETS.items()}}
+
+
+def _num(v) -> str:
+    """Tidy a number for display: 25.0 -> '25', 0.215 -> '0.215'."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return str(int(f)) if f == int(f) else f"{f:g}"
+
+
+def _commit_size(s: dict) -> str:
+    if float(s.get("launch_canary_flat_usd", 0) or 0) > 0:
+        base = f"${_num(s['launch_canary_flat_usd'])} per buy"
+    elif float(s.get("launch_canary_band_scale", 0) or 0) > 0:
+        base = f"the twin's band size x {_num(s['launch_canary_band_scale'])}"
+    else:
+        base = "the book's default band size"
+    clips = int(s.get("launch_canary_clips", 1) or 1)
+    return base + (f", split into {clips} back-to-back swaps" if clips > 1 else "")
+
+
+def _exit_steps(s: dict, two_stage: bool) -> list:
+    """The hold/exit steps after a real commit."""
+    g = s.get
+    out = []
+    emin = _num(g("launch_canary_exit_min", 6))
+    if two_stage and g("launch_canary_safe_zone"):
+        sched = (g("launch_canary_hold_schedule") or "").strip()
+        hold_for = float(g("launch_canary_hold_for_s", 0) or 0)
+        if sched:
+            how = f"Multi-round hold: {sched}  (seconds hold[:wait] per round, measured from each fill)."
+        elif hold_for > 0:
+            how = f"Hold {_num(hold_for)}s from the fill, then sell."
+        else:
+            how = f"Sell at pool age {_num(g('launch_canary_safe_zone_s', 90))}s (dodging the ~1m40 holding rug)."
+        out.append({"on": True, "title": "Safe-zone hold-probe", "detail": how})
+        out.append({"on": True, "title": "Watch for the holding rug",
+                    "detail": f"Re-read the pool at pool age {_num(g('launch_canary_reentry_watch_s', 120))}s: "
+                              "rugged = we dodged it; still liquid = clean."})
+        if g("launch_canary_reentry"):
+            out.append({"on": True, "title": "Re-enter clean survivors (REAL)",
+                        "detail": f"A clean pool gets the real entry and rides to pool minute {emin}."})
+        else:
+            out.append({"on": False, "title": "Re-entry — off",
+                        "detail": "Measures the holding-rug rate; clean survivors are not re-entered."})
+        return out
+    # Final entry (no safe-zone) or a plain/feint commit: hold to the pool-minute exit, with the price exits if armed.
+    out.append({"on": True, "title": f"Hold to pool minute {emin}", "detail": f"Sell the held position at pool minute {emin}."})
+    if two_stage:
+        if float(g("launch_canary_trail_pct", 0) or 0) > 0:
+            out.append({"on": True, "title": "Trailing stop",
+                        "detail": f"Sell if the price falls {_num(g('launch_canary_trail_pct'))}% off its running peak."})
+        if float(g("launch_canary_stall_window_s", 0) or 0) > 0:
+            out.append({"on": True, "title": "Stall exit",
+                        "detail": f"Sell if the rolling range over {_num(g('launch_canary_stall_window_s'))}s drops below "
+                                  f"{_num(g('launch_canary_vol_min_pct', 2))}% (the wash bot going flat before a pull)."})
+        if float(g("launch_canary_climb_check_s", 0) or 0) > 0:
+            out.append({"on": True, "title": "Climb check",
+                        "detail": f"At entry + {_num(g('launch_canary_climb_check_s'))}s: bail unless up "
+                                  f"{_num(g('launch_canary_climb_min_gain_pct', 0))}%, else ride to the exit."})
+    return out
+
+
+def trade_journey(state: dict) -> dict:
+    """The ordered steps a single canary trade will take under `state` (the current/pending settings), so the operator
+    can confirm at a glance that it is set up the way they want. Read only; mirrors the engine's canary pipeline."""
+    s = dict(state)
+    g = s.get
+    probe = bool(g("launch_canary_probe"))
+    feint = bool(g("launch_canary_feint"))
+    enter = bool(g("launch_canary_enter"))
+    route = g("launch_canary_route", "jupiter")
+    steps: list = []
+
+    # 1. Which pools are offered to the canary.
+    broad = probe or enter or bool(g("launch_canary_feint_all"))
+    pools = "Every liquid pool (>= $5k at second 4)" if broad \
+        else "The scorer's thin rug-vs-win picks (the sz twin's signals)"
+    maxliq = float(g("launch_canary_max_liq_usd", 0) or 0)
+    liq_txt = f"only pools under ${_num(maxliq)} liquidity" if maxliq > 0 else "any pool size"
+    nth = int(g("launch_canary_every_n", 1) or 1)
+    samp = f"; sampling 1 in {nth} signals" if nth > 1 else ""
+    steps.append({"on": True, "title": "Candidate pool", "detail": f"{pools} - {liq_txt}{samp}. Route: {route}."})
+
+    if probe:  # 1-slot probe pipeline (the two-stage entry)
+        mode = "Two-stage entry (probe -> enter)" if enter else "1-slot probe (measure only)"
+        blind = "fire the sell blind to land one slot after the buy (gap 1)" if g("launch_canary_probe_blind") \
+            else "sell on the observe-lag path (gap 2)"
+        steps.append({"on": True, "title": "1-slot probe",
+                      "detail": f"Buy ${_num(g('launch_canary_probe_usd', 25))}, land it, {blind}; the sell escapes the "
+                                "reactive pull. Never holds."})
+        watch = float(g("launch_canary_probe_watch_s", 48) or 0) + float(g("launch_canary_probe_margin_s", 12) or 0)
+        steps.append({"on": True, "title": f"Watch ~{_num(watch)}s",
+                      "detail": "Re-read the pool: pulled -> rugger (tripped and dodged); still liquid -> survivor."})
+        if not enter:
+            steps.append({"on": False, "title": "Stops here - measure only",
+                          "detail": "Never commits real money. Turn on “Enter double-survivors” to trade survivors."})
+            return _finish(mode, steps, s)
+        if g("launch_canary_vol_gate"):
+            steps.append({"on": True, "title": "Volatility gate",
+                          "detail": f"On a survivor, the confirmation-window price range must be >= "
+                                    f"{_num(g('launch_canary_vol_min_pct', 2))}% (live Helius), else skip."})
+        else:
+            steps.append({"on": False, "title": "Volatility gate - off",
+                          "detail": "Survivors are entered whatever the confirmation-window move."})
+        if g("launch_canary_wallet_gate"):
+            steps.append({"on": True, "title": "Wallet-pattern gate",
+                          "detail": f"Read the first ~{_num(g('launch_canary_wallet_entry_s', 66))}s of trades; skip a "
+                                    f"survivor in the riskiest {_num(g('launch_canary_wallet_skip_pct', 50))}% pattern."})
+        if float(g("launch_canary_probe2_usd", 25) or 0) > 0:
+            steps.append({"on": True, "title": "Second 1-slot probe",
+                          "detail": f"“One more hit” at ${_num(g('launch_canary_probe2_usd'))} - enter only if it "
+                                    "survives too (some ruggers fire on the second commit)."})
+        else:
+            steps.append({"on": False, "title": "Second probe - off", "detail": "No second probe (size 0)."})
+        if g("launch_canary_lp_entry"):
+            commit = (f"Enter as a liquidity provider (atomic buy + deposit), ${_num(g('launch_canary_entry_usd', 25))} - "
+                      "a proportional rug leaves our SOL half (~50% recovered). Probes stay direct.")
+        else:
+            commit = f"Buy ${_num(g('launch_canary_entry_usd', 25))} for real on the pool (direct)."
+        steps.append({"on": True, "title": "Enter (REAL money)", "detail": commit})
+        steps.extend(_exit_steps(s, two_stage=True))
+        return _finish(mode, steps, s)
+
+    if feint:  # feint pipeline (no 1-slot probe)
+        if g("launch_canary_feint_only"):
+            steps.append({"on": True, "title": "Feint every routed pool",
+                          "detail": f"Poke with ${_num(g('launch_canary_feint_usd', 25))}, re-read after "
+                                    f"{_num(g('launch_canary_feint_wait_s', 4))}s - never commits."})
+            steps.append({"on": False, "title": "Stops here - measure only",
+                          "detail": "Measures the pull-trigger rate for ~$0.30 a pool."})
+            return _finish("Feint (measure only)", steps, s)
+        steps.append({"on": True, "title": "Feint the pool",
+                      "detail": f"Poke with ${_num(g('launch_canary_feint_usd', 25))}; re-read after "
+                                f"{_num(g('launch_canary_feint_wait_s', 4))}s. Commit only if it wasn't pulled."})
+        steps.append({"on": True, "title": "Liquidity recheck",
+                      "detail": "Read the SOL vault just before the buy; abort if the pool has been pulled since."})
+        steps.append({"on": True, "title": "Buy (REAL money)", "detail": f"Buy {_commit_size(s)}."})
+        steps.extend(_exit_steps(s, two_stage=False))
+        return _finish("Feint, then commit", steps, s)
+
+    # Plain direct/jupiter buy.
+    steps.append({"on": True, "title": "Honeypot / route check",
+                  "detail": "Simulate a buy + sell on the pool (free); skip a blocked sell or a high round-trip loss."})
+    steps.append({"on": True, "title": "Buy (REAL money)", "detail": f"Buy {_commit_size(s)}."})
+    steps.extend(_exit_steps(s, two_stage=False))
+    return _finish("Direct buy", steps, s)
+
+
+def _finish(mode: str, steps: list, s: dict) -> dict:
+    """Append the limits that apply to every trade and return the journey."""
+    bits = [f"at most {int(s.get('launch_canary_max_open', 5) or 5)} open"]
+    cap = int(s.get("launch_canary_max_trades", 0) or 0)
+    if cap > 0:
+        bits.append(f"stop after {cap} trades")
+    dl = float(s.get("launch_canary_daily_loss_usd", 0) or 0)
+    if dl > 0:
+        bits.append(f"no new buys once today's loss hits ${_num(dl)}")
+    if s.get("launch_canary_follow_dd"):
+        bits.append("pause with the twin's drawdown limit")
+    steps.append({"on": True, "title": "Limits (every trade)", "detail": "; ".join(bits) + "."})
+    return {"mode": mode, "steps": steps}

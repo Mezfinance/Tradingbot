@@ -144,6 +144,46 @@ def test_coherence_error_is_a_value_error_with_an_empty_needs_when_none(tmp_path
     assert issubclass(cs.CoherenceError, ValueError)
 
 
+def _titles(j):
+    return [s["title"] for s in j["steps"]]
+
+
+def test_trade_journey_two_stage_entry_lists_the_full_pipeline(tmp_path):
+    cfg = _cfg(tmp_path)
+    cs.apply(cfg, None, cs.PRESETS["two_stage"]["values"])
+    j = cs.trade_journey(cs.current(cfg))
+    assert j["mode"] == "Two-stage entry (probe -> enter)"
+    t = _titles(j)
+    assert t[0] == "Candidate pool" and "1-slot probe" in t and "Volatility gate" in t
+    assert "Wallet-pattern gate" in t and "Second 1-slot probe" in t
+    assert "Enter (REAL money)" in t and t[-1] == "Limits (every trade)"
+    # the two-stage preset holds to pool minute 6 with the trailing stop + stall exit armed
+    assert any("Hold to pool minute 6" in x for x in t) and "Trailing stop" in t and "Stall exit" in t
+    enter = next(s for s in j["steps"] if s["title"] == "Enter (REAL money)")
+    assert "$25" in enter["detail"]
+
+
+def test_trade_journey_measure_only_modes_stop_before_committing(tmp_path):
+    probe = cs.trade_journey({"launch_canary_probe": True, "launch_canary_enter": False,
+                              "launch_canary_route": "direct", "launch_canary_probe_usd": 25.0})
+    assert probe["mode"] == "1-slot probe (measure only)"
+    assert "Stops here - measure only" in _titles(probe)
+    assert not any("REAL money" in s["title"] for s in probe["steps"])
+    feint = cs.trade_journey({"launch_canary_feint": True, "launch_canary_feint_only": True,
+                              "launch_canary_route": "direct"})
+    assert feint["mode"] == "Feint (measure only)" and "Stops here - measure only" in _titles(feint)
+
+
+def test_trade_journey_safe_zone_schedule_and_reentry(tmp_path):
+    j = cs.trade_journey({"launch_canary_probe": True, "launch_canary_enter": True, "launch_canary_route": "direct",
+                          "launch_canary_safe_zone": True, "launch_canary_hold_schedule": "6:4,6:4,6",
+                          "launch_canary_reentry": False})
+    sz = next(s for s in j["steps"] if s["title"] == "Safe-zone hold-probe")
+    assert "6:4,6:4,6" in sz["detail"]
+    reentry = next(s for s in j["steps"] if "Re-entry" in s["title"] or "Re-enter" in s["title"])
+    assert reentry["on"] is False  # measure-only until re-entry is on
+
+
 def test_safe_zone_validation_needs_enter_and_reentry_needs_safe_zone():
     from tradingbot.config import LIVE_CONFIRM_PHRASE, Config
     with pytest.raises(ValueError, match="safe-zone hold-probe"):  # safe_zone on, enter off
