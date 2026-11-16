@@ -24,6 +24,19 @@ def test_validate_coerces_types_and_checks_bounds():
         cs.validate({"not_a_setting": 1})                 # unknown key
 
 
+def test_second_probe_can_be_turned_off_from_the_dashboard(tmp_path):
+    # 0 turns the second probe off (the engine skips it); the field must accept 0, not reject it as below bounds.
+    assert cs.validate({"launch_canary_probe2_usd": 0}) == {"launch_canary_probe2_usd": 0.0}
+    cfg = _cfg(tmp_path)
+    r = cs.apply(cfg, None, {"launch_canary_probe2_usd": 0})
+    assert cfg.launch_canary_probe2_usd == 0.0 and "launch_canary_probe2_usd" in r["changed"]
+    with pytest.raises(ValueError):  # negative is still rejected
+        cs.validate({"launch_canary_probe2_usd": -1})
+    j = cs.trade_journey({"launch_canary_probe": True, "launch_canary_enter": True,
+                          "launch_canary_route": "direct", "launch_canary_probe2_usd": 0})
+    assert any(s["title"] == "Second probe - off" for s in j["steps"])
+
+
 def test_apply_sets_live_fields_now_persists_and_flags_restart(tmp_path):
     cfg = _cfg(tmp_path)
     res = cs.apply(cfg, None, {"launch_canary_max_open": 8, "launch_canary_route": "direct",

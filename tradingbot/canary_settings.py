@@ -56,7 +56,8 @@ FIELDS: list[dict] = [
     {"key": "launch_canary_entry_usd", "label": "Entry size ($)", "type": "float", "group": "Entry", "live": True,
      "lo": 1, "hi": 500, "help": "The real commit after both probes pass."},
     {"key": "launch_canary_probe2_usd", "label": "Second probe size ($)", "type": "float", "group": "Entry",
-     "live": True, "lo": 1, "hi": 100, "help": "The 'one more hit' probe: some ruggers fire only on the second commit."},
+     "live": True, "lo": 0, "hi": 100, "help": "The 'one more hit' probe: some ruggers fire only on the second commit. "
+     "0 = turn the second probe off (enter straight after the gates)."},
     {"key": "launch_canary_vol_gate", "label": "Volatility gate", "type": "bool", "group": "Entry", "live": True,
      "help": "Enter only if the confirmation-window price range clears the minimum below (via live Helius)."},
     {"key": "launch_canary_vol_min_pct", "label": "Min confirmation range (%)", "type": "float", "group": "Entry",
