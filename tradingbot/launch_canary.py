@@ -25,6 +25,30 @@ CONF_AFTER_S = 60.0                        # confirmation ≈ probe age + the ~4
 CONF_OFFSETS = (-58, -44, -30, -16, 0)     # relative to conf_ts (mirrors probe_exits.CONF_FETCH_OFFSETS)
 
 
+def hold_schedule(cfg) -> list[tuple[float, float]]:
+    """The safe-zone hold-probe's rounds as (hold_s, wait_s) pairs (seconds from the FILL, and the wait before the next
+    round), from `launch_canary_hold_schedule` (per-round "hold[:wait],...") or `launch_canary_hold_for_s` (one
+    duration round). Empty = fall back to the pool-age `safe_zone_s`. The last round's wait is forced to 0 -- nothing
+    follows it."""
+    rounds: list[tuple[float, float]] = []
+    sched = (getattr(cfg, "launch_canary_hold_schedule", "") or "").strip()
+    if sched:
+        for item in sched.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            parts = item.split(":")
+            hold = float(parts[0])
+            wait = float(parts[1]) if len(parts) > 1 and parts[1].strip() else 0.0
+            if hold > 0:
+                rounds.append((hold, max(0.0, wait)))
+    elif getattr(cfg, "launch_canary_hold_for_s", 0.0) > 0:
+        rounds.append((cfg.launch_canary_hold_for_s, 0.0))
+    if rounds:
+        rounds[-1] = (rounds[-1][0], 0.0)  # the last round's wait is ignored
+    return rounds
+
+
 def confirmation_range(helius, pool: str, token_mint: str | None, conf_ts: float,
                        offsets=CONF_OFFSETS) -> tuple[float | None, int]:
     """Peak-to-trough price range over the confirmation window via live Helius (one `last_before` per offset, ~10

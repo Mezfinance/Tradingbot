@@ -189,6 +189,15 @@ class Config:
     launch_canary_safe_zone_s: float = 90.0  # sell the hold-probe at this pool age (before the ~1m40 holding-rug cluster)
     launch_canary_reentry_watch_s: float = 120.0  # read the pool at this pool age: holding rugger vs clean survivor
     launch_canary_reentry: bool = False  # REAL MONEY: re-enter a clean survivor and hold to minute 6 (else measure only)
+    # Multi-round hold probe (11-16): "hold for" a DURATION from the fill instead of a fixed pool age (fill latency ate
+    # the pool-age budget -- fills landed ~76s for a 66s target, 11-14), and optionally a SEQUENCE of holds with a wait
+    # between each. Each round: buy, hold `hold` s from the fill, sell, wait `wait` s, re-enter the SAME pool. The
+    # sequence stops the moment the pool rugs during a hold or a wait. Tests whether re-entering after a wait gets
+    # rugged again (reactive-to-capital, fires regardless) or survives (the pull aborts when we leave), round by round.
+    launch_canary_hold_for_s: float = 0.0  # > 0: the safe-zone hold-probe sells this many seconds after the FILL (a
+    # duration), not at pool age safe_zone_s. A single round unless a schedule is set.
+    launch_canary_hold_schedule: str = ""  # "hold[:wait],hold[:wait],..." seconds: one round per item, per-round hold
+    # and wait between rounds. Overrides hold_for_s and safe_zone_s. The last round's wait is ignored. e.g. "8:5,8:5,12".
     # Fast canary (11-11): buy every new hand-made pool at the earliest instant (on the LP-mint websocket + 1 pool read,
     # ~pool second 2-3), no filter, direct route, to test whether an invisible-early entry dodges the operators' reaction.
     launch_fast_canary: bool = False  # REAL MONEY: buy on detection, before the scorer's second-4 decide
@@ -477,6 +486,24 @@ class Config:
                 raise ValueError("The safe-zone hold-probe is part of the two-stage entry; set TB_LAUNCH_CANARY_ENTER=1")
         if self.launch_canary_reentry and not self.launch_canary_safe_zone:
             raise ValueError("Re-entry runs after the safe-zone hold-probe; set TB_LAUNCH_CANARY_SAFE_ZONE=1")
+        if (self.launch_canary_hold_for_s > 0 or self.launch_canary_hold_schedule) \
+                and not self.launch_canary_safe_zone:
+            raise ValueError("The hold-for duration / hold schedule drive the safe-zone hold-probe; "
+                             "set TB_LAUNCH_CANARY_SAFE_ZONE=1")
+        if self.launch_canary_hold_schedule:  # "hold[:wait],hold[:wait],..." -- each round a float, optional :float wait
+            for item in self.launch_canary_hold_schedule.split(","):
+                item = item.strip()
+                if not item:
+                    continue
+                parts = item.split(":")
+                if len(parts) > 2:
+                    raise ValueError(f"launch_canary_hold_schedule: bad round {item!r} (want 'hold[:wait]')")
+                try:
+                    float(parts[0])
+                    if len(parts) > 1 and parts[1].strip():
+                        float(parts[1])
+                except ValueError:
+                    raise ValueError(f"launch_canary_hold_schedule: bad round {item!r} (want 'hold[:wait]')")
         if self.canary_every_n > 0 and self.mode == "live":
             raise ValueError("Canary trades are for paper mode; live mode already trades for real")
         if self.sim_fill_mode not in ("expected", "midpoint", "pessimistic"):

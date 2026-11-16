@@ -126,6 +126,7 @@ class Engine:
         self._holds = self._load_holds()  # position id -> {"at": [check times left], "last": return at the last check}
         self._probe_watches = self._load_probe_watches()  # pool -> a 1-slot probe awaiting its survival read
         self._reentry_watches = self._load_reentry_watches()  # pool -> a safe-zone hold-probe awaiting its re-entry read
+        self._hold_rounds = self._load_hold_rounds()  # pool -> the next multi-round hold due after its wait
         self._canary_climbs = self._load_canary_climbs()  # position id -> the two-stage entry's reserve-priced climb check
         self._canary_trails = self._load_canary_trails()  # position id -> the two-stage entry's reserve-priced trailing stop
         self._canary_helius = None  # lazy live Helius client for the entry volatility gate (main key)
@@ -368,6 +369,7 @@ class Engine:
         self.journal.set_state("heartbeat", repr(now))
         self._run_probe_watches()  # record rugger/survivor for probes whose watch window is up (read only)
         self._run_reentry_watches()  # safe-zone hold-probes whose watch is up: holding-rug (dodged) vs clean -> re-enter
+        self._run_hold_rounds()  # multi-round holds whose wait is up: read the pool, then re-enter for the next round
         from tradingbot import model_book as mb
         jobs: list[tuple] = []
         for pos in positions:
@@ -907,6 +909,8 @@ class Engine:
         if canary and self.journal.get_state(CANARY_ALLOW) is not None:  # used up the trade canary-one allowed
             self.journal.set_state(CANARY_ALLOW, str(max(0, int(self.journal.get_state(CANARY_ALLOW)) - 1)))
         deadline = mb.exit_deadline(self.cfg, book.name, sig)
+        if sig.get("hold_for_s") is not None:  # "hold for" a duration measured from the fill, not a pool age
+            deadline = pos.opened_at + sig["hold_for_s"]
         if deadline is not None:
             self._deadlines[pos.id] = deadline
             self.journal.log_event("model_exit_deadline", sig["mint"],
@@ -1185,12 +1189,13 @@ class Engine:
         else:
             self._canary_final_entry(cbook, w)  # commit straight to the minute-6 hold
 
-    def _canary_entry_sig(self, w: dict, exit_age_s: float | None = None, safe_zone: bool = False) -> dict:
+    def _canary_entry_sig(self, w: dict, exit_age_s: float | None = None, safe_zone: bool = False,
+                          hold_for_s: float | None = None) -> dict:
         mint = w["mint"]
         return {"mint": mint, "pool": w.get("pool"), "name": (mint or "")[:10], "score": 0.0,
                 "liq": w.get("liq") or 0.0, "price": 0.0, "created_ts": w.get("created_ts"),
                 "kind": "canary_entry", "entry": True, "rw50": True,
-                "exit_age_s": exit_age_s, "safe_zone": safe_zone}
+                "exit_age_s": exit_age_s, "safe_zone": safe_zone, "hold_for_s": hold_for_s}
 
     def _canary_final_entry(self, cbook, w: dict) -> None:
         """The real commit: buy and hold to the pool-minute-6 exit with the trailing/stall exits armed."""
@@ -1200,13 +1205,89 @@ class Engine:
 
     def _canary_hold_probe(self, cbook, w: dict) -> None:
         """Buy and sell at the safe-zone age (before the ~1m40 holding-rug cluster) -- a held third probe that induces
-        and dodges the holding rug while banking the pre-cluster peak. Schedules a watch to read the pool afterwards."""
+        and dodges the holding rug while banking the pre-cluster peak. With a hold-for duration or a hold schedule set,
+        the sell is a DURATION from the fill (fill latency ate the pool-age budget, 11-14) and may repeat over several
+        rounds with a wait between each. Schedules a watch to read the pool afterwards."""
+        from tradingbot import launch_canary as lc
+        sched = lc.hold_schedule(self.cfg)
+        if sched:  # duration-based: one or more rounds of buy / hold-for / sell / wait
+            self._canary_hold_round(cbook, w, sched, 0)
+            return
         sig = self._canary_entry_sig(w, exit_age_s=self.cfg.launch_canary_safe_zone_s, safe_zone=True)
         note = self._buy_model(cbook, sig)  # time-based exit at the safe zone; no trail/stall (skipped for safe_zone)
         self.journal.log_event("canary_entry", w["mint"], json.dumps(
             {"pool": w.get("pool"), "result": note or "bought", "stage": "hold_probe"}), strategy=cbook.name)
         if note is None:  # the hold-probe opened: watch the pool for the holding rug after our safe-zone sell
             self._schedule_reentry_watch(cbook, w)
+
+    def _canary_hold_round(self, cbook, w: dict, sched: list, i: int) -> None:
+        """One round of a multi-round hold: buy, hold `hold_s` from the fill, sell. If more rounds remain, schedule the
+        next at fill + hold_s + wait_s (the wait-watch reads the pool first: a rug during the wait stops the sequence).
+        After the last round, watch for a holding rug once we are fully out, as the single hold-probe does."""
+        hold_s, wait_s = sched[i]
+        sig = self._canary_entry_sig(w, safe_zone=True, hold_for_s=hold_s)  # safe_zone -> no trail/stall, pure time exit
+        note = self._buy_model(cbook, sig)
+        self.journal.log_event("canary_hold_round", w["mint"], json.dumps(
+            {"pool": w.get("pool"), "round": i, "of": len(sched), "hold_s": hold_s, "wait_s": wait_s,
+             "result": note or "bought"}), strategy=cbook.name)
+        if note is not None:  # the round's buy did not open -> stop the sequence
+            return
+        if i + 1 < len(sched):
+            rec = {"mint": w["mint"], "pool": w.get("pool"), "created_ts": w.get("created_ts"), "liq": w.get("liq"),
+                   "sol_before": w.get("sol_before"), "book": cbook.name, "sched": sched, "next_round": i + 1,
+                   "due": time.time() + hold_s + wait_s}
+            self._hold_rounds[w.get("pool")] = rec
+            self.journal.log_event("canary_hold_next", w["mint"], json.dumps(rec), strategy=cbook.name)
+        else:  # fully out after the last round: watch for a holding rug like the single hold-probe
+            self._schedule_reentry_watch(cbook, w)
+
+    def _run_hold_rounds(self) -> None:
+        """At each due next-round time read the pool once (did it rug during the wait?) and, if it is still alive, run
+        the next hold round on the same pool. A rug during the wait, a halt, or a full book stops the sequence. Read
+        only apart from the re-entry buy."""
+        if not self._hold_rounds:
+            return
+        from tradingbot import model_book as mb
+        now = time.time()
+        cbook = next((b for b in self.books.values() if b.name in mb.CANARY_BOOKS), None)
+        ex = cbook.executor if cbook else None
+        for pool in [p for p, w in self._hold_rounds.items() if now >= w["due"]]:
+            w = self._hold_rounds.pop(pool)
+            sol_after = None
+            if ex is not None and hasattr(ex, "pool_sol"):
+                try:
+                    sol_after = ex.pool_sol(w["mint"])
+                except Exception:  # noqa: BLE001 (a read failure must never stop the monitor loop)
+                    sol_after = None
+            before = w.get("sol_before") or 0.0
+            alive = sol_after is not None and not (before and sol_after < PROBE_PULLED_SHARE * before)
+            self.journal.log_event("canary_hold_gap", w["mint"], json.dumps(
+                {"pool": pool, "before_round": w["next_round"], "alive": alive, "sol_before": before,
+                 "sol_after": sol_after}), strategy=w.get("book"))
+            if not alive or cbook is None or self.journal.get_state(CANARY_HALT):
+                continue  # rugged during the wait, or halted -> stop the sequence
+            open_ = self.journal.open_positions(cbook.name)
+            if len(open_) >= self.cfg.launch_canary_max_open or any(p.token_address == w["mint"] for p in open_):
+                continue
+            try:
+                self._canary_hold_round(cbook, w, w["sched"], w["next_round"])
+            except Exception:  # noqa: BLE001 (a round failure must never stop the monitor loop)
+                log.exception("canary hold round failed")
+
+    def _load_hold_rounds(self) -> dict:
+        """Pending next rounds, re-armed after a restart: canary_hold_next events whose round has no canary_hold_round
+        yet (an overdue one runs on the next monitor pass after reading the pool)."""
+        run = set()
+        for r in self.journal.query("SELECT token, detail FROM events WHERE kind='canary_hold_round'"):
+            d = json.loads(r["detail"] or "{}")
+            run.add((r["token"], d.get("round")))
+        out: dict = {}
+        for r in self.journal.query("SELECT token, detail FROM events WHERE kind='canary_hold_next'"):
+            d = json.loads(r["detail"] or "{}")
+            pool = d.get("pool")
+            if pool and (r["token"], d.get("next_round")) not in run:
+                out[pool] = d
+        return out
 
     def _canary_wallet_ok(self, cbook, pool, mint, created_ts) -> bool:
         """Wallet-pattern selection gate (11-13): read the pool's first-~66s trade stream (live Helius) and skip a

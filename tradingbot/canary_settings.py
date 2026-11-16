@@ -94,6 +94,13 @@ FIELDS: list[dict] = [
      "live": True, "lo": 60, "hi": 360, "help": "Read the pool at this pool age: rugged = holding rugger dodged; survived = clean."},
     {"key": "launch_canary_reentry", "label": "Re-enter clean survivors (REAL)", "type": "bool", "group": "Entry",
      "live": True, "help": "A pool clean through the watch gets the real minute-6 entry. Needs the safe-zone hold-probe on."},
+    {"key": "launch_canary_hold_for_s", "label": "Hold for (s from fill)", "type": "float", "group": "Entry",
+     "live": True, "lo": 0, "hi": 600, "help": "> 0: the safe-zone hold-probe sells this many seconds after the FILL "
+     "(a duration), not at the pool age above. Fixes the fill-latency gap (fills land ~76s for a 66s target). 0 = off."},
+    {"key": "launch_canary_hold_schedule", "label": "Hold schedule (hold[:wait],...)", "type": "str", "group": "Entry",
+     "live": True, "help": "Multi-round holds: 'hold[:wait],...' seconds, one round per item. Each round buys, holds "
+     "`hold` s from the fill, sells, waits `wait` s, then re-enters the same pool; a rug during a hold or wait stops it. "
+     "Overrides Hold-for and the pool-age sell. e.g. 8:5,8:5,12"},
     # --- sizing ---
     {"key": "launch_canary_flat_usd", "label": "Flat buy size ($)", "type": "float", "group": "Sizing", "live": True,
      "lo": 0, "hi": 500, "help": "> 0: every commit at this size (0 = use the band scale)."},
@@ -195,6 +202,17 @@ PRESETS["safe_zone"] = {
              "survivor. Re-entry is off, so it measures the holding-rug rate before any re-entry money is committed.",
     "values": {**PRESETS["two_stage"]["values"], "launch_canary_safe_zone": True, "launch_canary_safe_zone_s": 90.0,
                "launch_canary_reentry_watch_s": 120.0, "launch_canary_reentry": False}}
+# The safe-zone hold-probe, but each hold is a DURATION from the fill and repeats over several rounds with a wait
+# between: enter, hold a few seconds, sell, wait, re-enter the same pool. Measures whether re-entering after a wait
+# gets rugged again (reactive, fires regardless) or survives (the pull aborts when we leave), and the per-round latency.
+PRESETS["multi_hold"] = {
+    "label": "Multi-round hold probe (measure)",
+    "about": "The safe-zone hold-probe, but each hold is a duration from the fill and repeats: enter a probe survivor, "
+             "hold a few seconds, sell, wait, re-enter the same pool, over several rounds. Tests whether re-entering "
+             "after a wait rugs again (reactive) or survives (the pull aborts when we leave), round by round. Minute-6 "
+             "re-entry stays off.",
+    "values": {**PRESETS["safe_zone"]["values"], "launch_canary_hold_schedule": "8:5,8:5,8",
+               "launch_canary_hold_for_s": 0.0}}
 
 
 def settings_path(cfg) -> str:
@@ -259,6 +277,10 @@ def _coherent(state: dict) -> None:
         raise ValueError("The safe-zone hold-probe is part of the two-stage entry — turn Enter double-survivors on.")
     if state.get("launch_canary_reentry") and not state.get("launch_canary_safe_zone"):
         raise ValueError("Re-entry runs after the safe-zone hold-probe — turn Safe-zone hold-probe on.")
+    if (state.get("launch_canary_hold_for_s", 0) > 0 or state.get("launch_canary_hold_schedule")) \
+            and not state.get("launch_canary_safe_zone"):
+        raise ValueError("The hold-for duration / hold schedule drive the safe-zone hold-probe — turn Safe-zone "
+                         "hold-probe on.")
 
 
 def apply(cfg, journal, changes: dict) -> dict:

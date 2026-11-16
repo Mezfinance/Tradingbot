@@ -1007,3 +1007,92 @@ def test_safe_zone_reentry_watch_rearms_after_restart_until_resolved(cfg, good_p
     assert eng._load_reentry_watches()["PA"]["mint"] == "A"          # reloaded from the event
     j.log_event("canary_reentry_verdict", "A", json.dumps({"pool": "PA", "verdict": "clean"}), strategy=mb.CANARY4)
     assert "PA" not in eng._load_reentry_watches()                   # resolved -> not re-armed
+
+
+def test_hold_schedule_parses_durations_and_rounds(cfg):
+    from tradingbot import launch_canary as lc
+    cfg.launch_canary_hold_for_s, cfg.launch_canary_hold_schedule = 0.0, ""
+    assert lc.hold_schedule(cfg) == []                               # neither set -> pool-age fallback
+    cfg.launch_canary_hold_for_s = 10.0
+    assert lc.hold_schedule(cfg) == [(10.0, 0.0)]                    # a single duration round
+    cfg.launch_canary_hold_schedule = "8:5, 8:5 ,12"                 # overrides hold_for_s; last wait zeroed
+    assert lc.hold_schedule(cfg) == [(8.0, 5.0), (8.0, 5.0), (12.0, 0.0)]
+    cfg.launch_canary_hold_schedule = "7"                            # a bare hold -> wait 0
+    assert lc.hold_schedule(cfg) == [(7.0, 0.0)]
+
+
+def test_hold_for_duration_sells_a_set_time_after_the_fill(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_safe_zone, cfg.launch_canary_vol_gate = True, True, False
+    cfg.launch_canary_hold_for_s = 10.0                              # hold a DURATION from the fill, not a pool age
+    book = eng.books[mb.CANARY4]
+    w = _survivor_w(book.name)
+    eng._canary_enter(w)
+    pos = j.open_positions(mb.CANARY4)
+    assert pos and pos[0].token_address == "A"
+    assert abs(eng._deadlines[pos[0].id] - (pos[0].opened_at + 10.0)) < 1  # fill + 10s
+    assert abs(eng._deadlines[pos[0].id] - (w["created_ts"] + 90.0)) > 5   # NOT the pool-age (90s) sell
+    assert pos[0].id not in eng._canary_trails                        # a hold round arms no price exits
+    rnd = json.loads(j.query("SELECT detail FROM events WHERE kind='canary_hold_round'")[-1]["detail"])
+    assert rnd["round"] == 0 and rnd["of"] == 1 and rnd["hold_s"] == 10.0
+    assert "PA" in eng._reentry_watches                              # one round -> straight to the holding-rug watch
+
+
+def test_multi_round_hold_re_enters_the_same_pool_after_the_wait(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    book = eng.books[mb.CANARY4]
+    eng._hold_rounds["PA"] = {"mint": "A", "pool": "PA", "created_ts": time.time() - 6, "liq": 12_000.0,
+                              "sol_before": 10.0, "book": book.name, "sched": [[8, 5], [6, 0]], "next_round": 1,
+                              "due": time.time() - 1}
+    live.sol_now = {"A": 10.0}                                       # still liquid through the wait
+    eng._run_hold_rounds()
+    gap = json.loads(j.query("SELECT detail FROM events WHERE kind='canary_hold_gap'")[0]["detail"])
+    assert gap["alive"] is True and gap["before_round"] == 1
+    pos = j.open_positions(mb.CANARY4)
+    assert pos and pos[0].token_address == "A"                       # re-entered for round 1
+    assert abs(eng._deadlines[pos[0].id] - (pos[0].opened_at + 6.0)) < 1  # round 1 holds 6s
+    rnd = json.loads(j.query("SELECT detail FROM events WHERE kind='canary_hold_round'")[-1]["detail"])
+    assert rnd["round"] == 1
+    assert not eng._hold_rounds                                      # last round -> nothing pending
+    assert "PA" in eng._reentry_watches                             # watch for a holding rug after the final round
+
+
+def test_a_rug_during_the_wait_stops_the_multi_round_hold(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    book = eng.books[mb.CANARY4]
+    eng._hold_rounds["PA"] = {"mint": "A", "pool": "PA", "created_ts": time.time() - 6, "liq": 12_000.0,
+                              "sol_before": 10.0, "book": book.name, "sched": [[8, 5], [6, 0]], "next_round": 1,
+                              "due": time.time() - 1}
+    live.sol_now = {"A": 0.2}                                        # drained during the wait
+    eng._run_hold_rounds()
+    gap = json.loads(j.query("SELECT detail FROM events WHERE kind='canary_hold_gap'")[0]["detail"])
+    assert gap["alive"] is False
+    assert not j.open_positions(mb.CANARY4)                          # did NOT re-enter into the rug
+    assert not eng._hold_rounds
+
+
+def test_hold_rounds_rearm_after_a_restart(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    j.log_event("canary_hold_next", "A", json.dumps(
+        {"mint": "A", "pool": "PA", "next_round": 1, "sched": [[8, 5], [6, 0]], "due": time.time(),
+         "sol_before": 10.0, "book": mb.CANARY4}), strategy=mb.CANARY4)
+    assert eng._load_hold_rounds()["PA"]["next_round"] == 1          # reloaded from the event
+    j.log_event("canary_hold_round", "A", json.dumps({"round": 1}), strategy=mb.CANARY4)
+    assert "PA" not in eng._load_hold_rounds()                       # round 1 ran -> not re-armed
+
+
+def test_hold_for_needs_the_safe_zone_on():
+    Config(launch_canary=True, launch_canary_probe=True, launch_canary_route="direct", launch_canary_enter=True,
+           launch_canary_safe_zone=True, launch_canary_hold_for_s=10.0,
+           live_confirm=LIVE_CONFIRM_PHRASE).validate()              # safe-zone on: fine
+    with pytest.raises(ValueError):                                  # hold-for without the safe-zone hold-probe
+        Config(launch_canary=True, launch_canary_probe=True, launch_canary_route="direct", launch_canary_enter=True,
+               launch_canary_hold_for_s=10.0, live_confirm=LIVE_CONFIRM_PHRASE).validate()
+    with pytest.raises(ValueError):                                  # a malformed schedule string
+        Config(launch_canary=True, launch_canary_probe=True, launch_canary_route="direct", launch_canary_enter=True,
+               launch_canary_safe_zone=True, launch_canary_hold_schedule="8:oops",
+               live_confirm=LIVE_CONFIRM_PHRASE).validate()
