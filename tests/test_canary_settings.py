@@ -115,7 +115,7 @@ def test_multi_hold_preset_and_coherence(tmp_path):
     cfg = _cfg(tmp_path)
     cs.apply(cfg, None, cs.PRESETS["multi_hold"]["values"])
     assert cfg.launch_canary_safe_zone and cfg.launch_canary_enter and cfg.launch_canary_probe
-    assert cfg.launch_canary_hold_schedule == "8:5,8:5,8" and cfg.launch_canary_reentry is False
+    assert cfg.launch_canary_hold_schedule == "6:4,6:4,6" and cfg.launch_canary_reentry is False
     with pytest.raises(ValueError):  # a hold schedule drives the safe-zone hold-probe
         cs.apply(_cfg(tmp_path), None, {"launch_canary_hold_schedule": "8:5,8", "launch_canary_safe_zone": False})
     with pytest.raises(ValueError):  # a hold-for duration too

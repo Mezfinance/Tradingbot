@@ -211,7 +211,7 @@ PRESETS["multi_hold"] = {
              "hold a few seconds, sell, wait, re-enter the same pool, over several rounds. Tests whether re-entering "
              "after a wait rugs again (reactive) or survives (the pull aborts when we leave), round by round. Minute-6 "
              "re-entry stays off.",
-    "values": {**PRESETS["safe_zone"]["values"], "launch_canary_hold_schedule": "8:5,8:5,8",
+    "values": {**PRESETS["safe_zone"]["values"], "launch_canary_hold_schedule": "6:4,6:4,6",
                "launch_canary_hold_for_s": 0.0}}
 
 
