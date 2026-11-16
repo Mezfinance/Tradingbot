@@ -697,6 +697,16 @@ def test_probe_mode_measures_every_candidate_and_never_commits(cfg, good_pair):
     assert w["mint"] == "A" and w["sol_before"] == 10.0 and w["due"] > time.time()  # a survival watch is scheduled
 
 
+def test_a_pool_is_probed_once_not_re_probed_on_the_next_wallet(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    book = eng.books[mb.CANARY4]
+    eng._try_model(book, _probe_sig("A"))                        # first offer: probes A, marks it
+    eng._try_model(book, _probe_sig("A"))                        # same pool offered again -> must NOT probe/enter again
+    assert live.probed == [("A", cfg.launch_canary_probe_usd)]   # exactly one two-stage treatment for the pool
+    eng._try_model(book, _probe_sig("B"))                        # a different pool still probes
+    assert ("B", cfg.launch_canary_probe_usd) in live.probed
+
+
 def test_a_honeypot_probe_commits_nothing_and_is_not_watched_for_survival(cfg, good_pair):
     # The pre-buy sim caught a honeypot, so no money was sent; a survival watch would wrongly mark a pool we never
     # touched "survivor". It must not be scheduled, and the event records committed=False.
@@ -767,6 +777,27 @@ def test_second_probe_off_skips_p2_and_enters_after_the_gates(cfg, good_pair):
     assert live.probed == []                              # no second probe fired
     pos = j.open_positions(mb.CANARY4)
     assert pos and pos[0].token_address == "A"            # entered for real after the gates
+
+
+def test_entry_aborts_when_the_pool_was_pulled_since_the_verdict(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    live.verdict = "ok"                                  # the probes survive
+    live.sol_now["A"] = 0.5                              # but the pool was pulled: SOL < 10% of the probe level (10.0)
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert not j.open_positions(mb.CANARY4)              # the pre-buy liquidity check aborted the commit
+    skip = j.query("SELECT detail FROM events WHERE kind='canary_entry_skip'")
+    assert skip and json.loads(skip[0]["detail"])["reason"] == "pulled"
+
+
+def test_entry_aborts_when_the_pool_is_unreadable_before_the_buy(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    live.verdict = "ok"
+    live.sol_now["A"] = None                             # unreadable -> fail closed, never commit on faith
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert not j.open_positions(mb.CANARY4)
 
 
 def test_two_stage_entry_volatility_gate_blocks_a_flat_pool(cfg, good_pair):

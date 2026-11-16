@@ -40,6 +40,7 @@ CANARY = "canary"
 CANARY_HALT = "launch_canary:halted"  # state key: set = the real-money launch canary buys nothing (kill switch)
 CANARY_ALLOW = "launch_canary:allow"  # state key: buys left before the canary waits (canary-one sets 1); absent = no limit
 PROBE_PULLED_SHARE = 0.10  # the probe survival watch calls a pool rugged when its SOL falls below this share of probe-time
+CANARY_PROBED_CAP = 10_000  # bound on the per-session "already probed" mint set (cleared past this; old pools are dead)
 BOOK_PRIORITY = {MAIN: 0, CANARY: 1, "canary_rw50_sz": 1}  # real-money books are exited before simulated baselines
 REANALYSE_AFTER_S = 6 * 3600
 RECHECK_REJECTED_S = 30 * 60
@@ -130,6 +131,8 @@ class Engine:
         self._canary_climbs = self._load_canary_climbs()  # position id -> the two-stage entry's reserve-priced climb check
         self._canary_trails = self._load_canary_trails()  # position id -> the two-stage entry's reserve-priced trailing stop
         self._canary_helius = None  # lazy live Helius client for the entry volatility gate (main key)
+        self._canary_probed: set[str] = set()  # mints already probed this session: one two-stage treatment per pool
+        self._canary_probed_lock = threading.Lock()  # atomic check-and-mark (BUY_WORKERS probe signals in parallel)
         self._model_pool = None  # threads that let every book buy a signal at the same time
         self._sell_pool = None  # threads that sell every due exit of a monitor pass at once
         self._last_snapshot = 0.0
@@ -821,6 +824,12 @@ class Engine:
             # size-reacting rugger is tripped while our sell escapes, and we NEVER commit. Runs before the Jupiter
             # price/route block, as a seconds-old pool has no Jupiter price. The survival watch scheduled here reads the
             # pool at probe_ts + the watch window and records rugger (pulled, we dodged) / survivor (a pool to enter).
+            with self._canary_probed_lock:  # one two-stage treatment per pool: a pool probed on one rotation wallet
+                if sig["mint"] in self._canary_probed:  # must not be re-probed + re-entered on the next free wallet
+                    return "canary already probed this pool"  # (re-entries come from the hold path, which never probes)
+                if len(self._canary_probed) > CANARY_PROBED_CAP:
+                    self._canary_probed.clear()
+                self._canary_probed.add(sig["mint"])
             if sig.get("pool") and hasattr(book.executor, "remember_pool"):
                 book.executor.remember_pool(sig["mint"], sig["pool"])
             res = book.executor.probe_1slot(sig["mint"], c.launch_canary_probe_usd)
@@ -898,6 +907,22 @@ class Engine:
                  **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
             if verdict != "alive":
                 return f"feint: pool {verdict}"
+        if canary and sig.get("entry") and sig.get("sol_before") and hasattr(book.executor, "pool_sol"):
+            # Liquidity check before EVERY commit: a rugged pumpswap pool keeps residual reserves at the same price
+            # ratio, so the honeypot round_trip sim round-trips and PASSES -- it does not detect a pull. Read the SOL
+            # vault here and abort if it has collapsed below PROBE_PULLED_SHARE of the probe-time level (the operator
+            # withdrew the LP since the survivor verdict), so a stale verdict can never buy a pool that has rugged.
+            # Fails CLOSED (real money): an unreadable pool is skipped rather than entered on faith.
+            try:
+                sol_now = book.executor.pool_sol(sig["mint"])
+            except Exception:  # noqa: BLE001 (a read failure must never land us in a pulled pool)
+                sol_now = None
+            pulled = sol_now is None or sol_now < PROBE_PULLED_SHARE * sig["sol_before"]
+            if pulled:
+                self.journal.log_event("canary_entry_skip", sig["mint"], json.dumps(
+                    {"pool": sig.get("pool"), "reason": "pulled" if sol_now is not None else "unreadable",
+                     "sol_now": sol_now, "sol_before": sig["sol_before"]}), strategy=book.name)
+                return "pool pulled before entry" if sol_now is not None else "pool unreadable before entry"
         fill = book.executor.buy(sig["mint"], usd, trigger)
         if fill is None:
             return f"executor declined: {getattr(book.executor, 'last_note', '') or 'no reason given'}"
@@ -1195,7 +1220,7 @@ class Engine:
         mint = w["mint"]
         return {"mint": mint, "pool": w.get("pool"), "name": (mint or "")[:10], "score": 0.0,
                 "liq": w.get("liq") or 0.0, "price": 0.0, "created_ts": w.get("created_ts"),
-                "kind": "canary_entry", "entry": True, "rw50": True,
+                "kind": "canary_entry", "entry": True, "rw50": True, "sol_before": w.get("sol_before"),
                 "exit_age_s": exit_age_s, "safe_zone": safe_zone, "hold_for_s": hold_for_s}
 
     def _canary_final_entry(self, cbook, w: dict) -> None:
