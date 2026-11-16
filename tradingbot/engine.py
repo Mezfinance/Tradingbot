@@ -1176,14 +1176,15 @@ class Engine:
         if c.launch_canary_wallet_gate and not self._canary_wallet_ok(cbook, pool, mint, w.get("created_ts")):
             return  # the wallet fingerprint ranks in the riskiest k% of recent probed pools
         ex = cbook.executor
-        if not hasattr(ex, "probe_1slot"):
-            return
         if pool and hasattr(ex, "remember_pool"):
             ex.remember_pool(mint, pool)
-        res2 = ex.probe_1slot(mint, c.launch_canary_probe2_usd)
-        self.journal.log_event("canary_probe2", mint, json.dumps({**res2, "pool": pool}), strategy=cbook.name)
-        if res2.get("verdict") != "ok":  # trapped / honeypot / buy_failed: it insta-rugged on the second hit, skip
-            return
+        if c.launch_canary_probe2_usd > 0:  # a SECOND 1-slot probe ("one more hit"); set the size to 0 to skip it
+            if not hasattr(ex, "probe_1slot"):
+                return
+            res2 = ex.probe_1slot(mint, c.launch_canary_probe2_usd)
+            self.journal.log_event("canary_probe2", mint, json.dumps({**res2, "pool": pool}), strategy=cbook.name)
+            if res2.get("verdict") != "ok":  # trapped / honeypot / buy_failed: it insta-rugged on the second hit, skip
+                return
         if c.launch_canary_safe_zone:  # a third, held probe: ride to the safe-zone age, dodge the holding rug, then watch
             self._canary_hold_probe(cbook, w)
         else:

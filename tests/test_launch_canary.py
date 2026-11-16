@@ -758,6 +758,17 @@ def test_two_stage_entry_skips_when_the_second_probe_insta_rugs(cfg, good_pair):
     assert not j.open_positions(mb.CANARY4)                         # but we did NOT commit
 
 
+def test_second_probe_off_skips_p2_and_enters_after_the_gates(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    cfg.launch_canary_probe2_usd = 0.0                    # second probe turned off -> go straight to entry
+    live.verdict = "trapped"                              # a verdict that WOULD block entry -- but P2 must not run at all
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert live.probed == []                              # no second probe fired
+    pos = j.open_positions(mb.CANARY4)
+    assert pos and pos[0].token_address == "A"            # entered for real after the gates
+
+
 def test_two_stage_entry_volatility_gate_blocks_a_flat_pool(cfg, good_pair):
     import json
     eng, j, live = _probe_engine(cfg, good_pair)
