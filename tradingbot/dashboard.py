@@ -1761,6 +1761,8 @@ tuBuild(trading);checkRotate();checkTopup();
 $("w-arch").innerHTML=`<tr><th>Address</th><th class="l">Label</th><th>SOL</th><th>First recorded</th></tr>`+(arch.length?arch.map(w=>`<tr><td>${walletLink(w.address)}</td><td class="l">${esc(w.label||"")}</td><td class="num">${w.sol!=null?fmt(w.sol,4):"–"}</td><td class="mono">${w.created?esc(String(w.created).slice(0,10)):"–"}</td></tr>`).join(""):`<tr><td class="muted">No archived wallets.</td></tr>`)}
 const PLIQ=v=>v==null?"–":(Math.abs(v)>=1000?"$"+(v/1000).toFixed(1)+"k":"$"+v.toFixed(0));
 const PAGE2=s=>s==null?"–":agoStr(Math.round(s));
+// up to 6 minutes show the exact pool-age second (a seconds counter); coarser above
+const PSEC=s=>s==null?"–":(s<=360?Math.round(s)+"s":agoStr(Math.round(s)));
 const PPCT=r=>r==null?"–":(r>=0?"+":"")+(r*100).toFixed(0)+"%";
 // one small badge in the Journey cell
 function jtag(txt,cls,title){return '<span class="tag'+(cls?' '+cls:'')+'" style="font-size:10px" title="'+esc(title||'')+'">'+esc(txt)+'</span>'}
@@ -1802,11 +1804,11 @@ function poolRow(r){const t=r.real,win=t&&t.ret!=null&&t.ret>0,neg=t&&t.ret!=nul
 const open=r.pool&&poolExpanded.has(r.pool);
 const car=r.pool?`<button class="exp" title="ideal / hindsight numbers" onclick="togglePool('${r.pool}')">${open?"▾":"▸"}</button> `:"";
 const lk=r.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(r.pool)}" target="_blank" rel="noopener">${esc((r.mint||r.pool).slice(0,8))}</a>`:esc((r.mint||"").slice(0,8));
-const row=`<tr><td>${car}${lk}</td><td>${walletCell(r.wallet)}</td><td>${statusCell(r)}</td><td>${journeyCell(r)}</td><td class="num">${PAGE2(r.pool_age_s)}</td><td class="num">${PAGE2(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PAGE2(r.pull_pool_age_s):"–"}</td><td class="num">${t?PAGE2(t.entry_pool_age_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${holdCell(r)}</td><td>${afterCell(r)}</td><td class="num" title="fees + dust spent probing this pool (both 1-slot probes)">${USD2(r.probe_cost_usd)}</td><td class="num" title="running result: probe fees + entry P&L (live while holding)">${USD2(r.pnl_so_far)}</td></tr>`;
+const row=`<tr><td>${car}${lk}</td><td>${walletCell(r.wallet)}</td><td>${statusCell(r)}</td><td>${journeyCell(r)}</td><td class="num agelive" data-age="${r.pool_age_s!=null?r.pool_age_s:''}">${PSEC(r.pool_age_s)}</td><td class="num">${PSEC(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PSEC(r.pull_pool_age_s):"–"}</td><td class="num">${t?PSEC(t.entry_pool_age_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${holdCell(r)}</td><td>${afterCell(r)}</td><td class="num" title="fees + dust spent probing this pool (both 1-slot probes)">${USD2(r.probe_cost_usd)}</td><td class="num" title="running result: probe fees + entry P&L (live while holding)">${USD2(r.pnl_so_far)}</td></tr>`;
 if(!open)return row;
 const pnl25=r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–";
 const conf='<span class="'+(r.conf_ret>0?'pos':r.conf_ret<0?'neg':'muted')+'">'+PPCT(r.conf_ret)+'</span>';
-const best=(r.opt_age_s!=null?PAGE2(r.opt_age_s)+" ":"")+'<span class="'+(r.opt_ret>0?'pos':r.opt_ret<0?'neg':'muted')+'">'+PPCT(r.opt_ret)+'</span>';
+const best=(r.opt_age_s!=null?PSEC(r.opt_age_s)+" ":"")+'<span class="'+(r.opt_ret>0?'pos':r.opt_ret<0?'neg':'muted')+'">'+PPCT(r.opt_ret)+'</span>';
 return row+`<tr class="pdetail"><td colspan="15"><span class="sub">ideal / hindsight — untouched-pool numbers that overstate the live edge: </span><b>$25 @ m6</b> ${pnl25} · <b>Enter @conf</b> ${conf} · <b>Best entry</b> ${best}</td></tr>`}
 function canaryRotate(){const n=+($("rot-n").value||0),s=+($("rot-sol").value||0);
 if(!(n>=1&&n<=10)){alert("Wallets must be between 1 and 10.");return}
@@ -1966,13 +1968,18 @@ S.shortsEnabled=!!d.shorts_enabled;S.marketEnabled=!!d.market_enabled;S.canary=!
 es.addEventListener("shorts",e=>{S.shorts=JSON.parse(e.data);schedule()});
 es.addEventListener("market",e=>{S.market=JSON.parse(e.data);schedule()});
 es.addEventListener("wallets",e=>{S.wallets=JSON.parse(e.data);schedule()});
-es.addEventListener("pools",e=>{S.pools=JSON.parse(e.data);schedule()});
+es.addEventListener("pools",e=>{S.pools=JSON.parse(e.data);S.poolsAt=Date.now()/1000;schedule()});
 es.addEventListener("delta",e=>{merge(JSON.parse(e.data));schedule()});
 es.addEventListener("summary",e=>{S.extra=JSON.parse(e.data);const d=S.extra.downtime;$("foot").textContent=d?`${d.outages} outages, ${fmt(d.hours_offline,1)} h offline since start`:"";schedule()});
 es.addEventListener("backlog",e=>{$("feed").innerHTML="";JSON.parse(e.data).forEach(f=>fill(f,false))});
 es.addEventListener("fill",e=>fill(JSON.parse(e.data),true));
 es.addEventListener("feintlog",e=>{S.feints=JSON.parse(e.data);schedule()});
 es.addEventListener("feint",e=>{S.feints.push(JSON.parse(e.data));if(S.feints.length>500)S.feints.shift();schedule()})}
+// tick the current pool AGE every second for young pools so you can watch the exact pool-age second.
+// Anchored to the server's pool_age_s + browser-clock elapsed since the data arrived (a duration, so no clock skew).
+function tickAges(){if(R.v!=="pools"||!S.pools)return;const el=Date.now()/1000-(S.poolsAt||Date.now()/1000);
+document.querySelectorAll("#p-tbl td.agelive").forEach(td=>{const v=td.dataset.age;if(v==="")return;const a=+v+el;if(!isNaN(a))td.textContent=PSEC(a)})}
+setInterval(tickAges,1000);
 route();connect();
 </script></body></html>"""
 
