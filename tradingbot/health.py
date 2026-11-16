@@ -278,7 +278,7 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 return
             if path not in ("/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/topup",
                             "/api/canary/settings", "/api/canary/probe-smoke", "/api/canary/probe-one",
-                            "/api/canary/probe-all", "/api/deploy",
+                            "/api/canary/probe-all", "/api/canary/abort", "/api/deploy",
                             "/api/auth/register/verify", "/api/auth/passkeys/remove"):
                 self.send_error(404)
                 return
@@ -314,6 +314,9 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                     data = json.loads(body or b"{}")
                     res = dash.canary_topup(cfg, data.get("level"), data.get("wallets"))
                     log.info("dashboard wallet top-up: %s", res.get("msg"))
+                elif path == "/api/canary/abort":  # sell this open position now + stop all further rounds on its pool
+                    res = dash.canary_abort(journal, json.loads(body or b"{}").get("mint"))
+                    log.info("dashboard canary abort: %s", res.get("msg"))
                 elif path == "/api/canary/probe-one":  # arm exactly one probe (Execute one probe)
                     res = dash.canary_one(journal)
                     log.info("dashboard probe-one: %s", res.get("msg"))

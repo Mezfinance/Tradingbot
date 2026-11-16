@@ -464,10 +464,23 @@ def test_fetch_pools_joins_feints_to_the_scorer_and_reads_young_reserves(cfg):
     assert board.pools["summary"]["pools"] == 1 and board.pools["stale"] is False
 
     # a thrown live reserve read is best-effort now: the pools still render (not stale), only the live columns
-    # are skipped -- a flaky public RPC must never hide the probe/feint pools (which come from events + watch.db).
+    # are skipped -- a flaky RPC must never hide the probe/feint pools (which come from events + watch.db).
+    board._last_vaults = 0.0  # reopen the VAULT_READ_S gate so this poll actually attempts the (throwing) read
     board.fetch_pools(lambda m, p: (_ for _ in ()).throw(RuntimeError("rpc down")))
     assert board.pools["stale"] is False and board.pools["live_read_ok"] is False
     assert board.pools["rows"] and board.pools["rows"][0]["pool"] == "PoolY"
+
+
+def test_canary_abort_writes_the_mint_and_dedups():
+    from tradingbot.engine import CANARY_ABORT
+    j = Journal(":memory:")
+    assert dash.canary_abort(j, "")["ok"] is False                 # no mint -> no-op
+    assert dash.canary_abort(j, "MintX")["ok"] is True
+    assert json.loads(j.get_state(CANARY_ABORT)) == ["MintX"]
+    dash.canary_abort(j, "MintX")                                   # idempotent
+    assert json.loads(j.get_state(CANARY_ABORT)) == ["MintX"]
+    dash.canary_abort(j, "MintY")
+    assert json.loads(j.get_state(CANARY_ABORT)) == ["MintX", "MintY"]
 
 
 def test_fetch_pools_folds_in_the_lifecycle_journey_and_the_real_trade(cfg):

@@ -716,6 +716,29 @@ def test_probe_mode_measures_every_candidate_and_never_commits(cfg, good_pair):
     assert w["mint"] == "A" and w["sol_before"] == 10.0 and w["due"] > time.time()  # a survival watch is scheduled
 
 
+def test_abort_sells_the_position_now_clears_rounds_and_blocks_further_action(cfg, good_pair):
+    # the per-trade kill switch: an aborted mint is sold on the next monitor pass, its scheduled re-entry/hold is
+    # dropped, and no new probe/entry fires on it.
+    import json as _json
+    from tradingbot.engine import CANARY_ABORT
+    from tradingbot.models import Position
+    cfg.launch_live = cfg.launch_canary = True
+    cfg.launch_canary_route, cfg.live_confirm = "direct", LIVE_CONFIRM_PHRASE
+    j = Journal(":memory:")
+    eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                 model_executor=PaperExecutor(cfg), launch_canary_executor=PaperExecutor(cfg))
+    book = eng.books[mb.CANARY4]
+    pos = Position(None, "A", "A", 1.0, 1e-5, 1e-5, 1e-5, time.time(), 0.0, 1.0, strategy=book.name)
+    j.save_position(pos)
+    eng._hold_rounds["PA"] = {"mint": "A", "pool": "PA", "due": time.time() + 100, "book": book.name}
+    eng._deadlines[pos.id] = time.time() + 500
+    j.set_state(CANARY_ABORT, _json.dumps(["A"]))
+    eng.manage_positions()
+    assert "PA" not in eng._hold_rounds                     # the scheduled re-entry is cancelled
+    assert not j.open_positions(book.name)                  # sold now (aborted), not left to run its deadline
+    assert eng._try_model(book, _probe_sig("A")) is False   # a fresh signal on an aborted mint is refused
+
+
 def test_a_pool_is_probed_once_not_re_probed_on_the_next_wallet(cfg, good_pair):
     eng, j, live = _probe_engine(cfg, good_pair)
     book = eng.books[mb.CANARY4]

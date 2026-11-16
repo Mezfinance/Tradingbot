@@ -39,7 +39,8 @@ KEEPALIVE_S = 15
 SHORTS_POLL_S = 30  # MZF Short Only feed (another Fly app) is read this often
 SHORTS_TIMEOUT_S = 8
 MARKET_POLL_S = 60  # the market monitor's hourly rows (watch.db market_hours) are re-read this often
-POOLS_POLL_S = 20  # the pool tracker re-reads young feinted pools' reserves this often (public RPC)
+POOLS_POLL_S = 1   # the pool tracker re-assembles rows every second so status / entries / exits are real-time
+VAULT_READ_S = 10  # but the public-RPC reserve read (live liq / conf) is gated to this, so we don't hammer the RPC
 FEED_BACKLOG = 60  # fills sent when a page connects
 COOKIE = "tb_dash"
 
@@ -133,6 +134,25 @@ def canary_switch(journal, action: str) -> dict:
         journal.execute("DELETE FROM state WHERE key IN (?, ?)", (CANARY_HALT, CANARY_ALLOW))
         return {"halted": False, "msg": "Canary kill switch cleared: buys and feints resume."}
     raise ValueError(f"unknown canary action {action!r}")
+
+
+def canary_abort(journal, mint) -> dict:
+    """Abort one open canary position from the dashboard: the engine sells it on its next pass (1s monitor) and runs no
+    more rounds / re-entries on that pool. Writes the mint into the CANARY_ABORT state list the engine reads each pass.
+    Per-position, unlike the kill switch (which only stops new buys)."""
+    from tradingbot.engine import CANARY_ABORT
+    if not mint or not isinstance(mint, str):
+        return {"ok": False, "msg": "No token mint given."}
+    try:
+        cur = json.loads(journal.get_state(CANARY_ABORT) or "[]")
+        if not isinstance(cur, list):
+            cur = []
+    except Exception:  # noqa: BLE001
+        cur = []
+    if mint not in cur:
+        cur.append(mint)
+    journal.set_state(CANARY_ABORT, json.dumps(cur[-500:]))  # keep the list bounded (dead pools stay aborted)
+    return {"ok": True, "msg": f"Aborting {mint[:8]}: selling now and stopping all rounds."}
 
 
 def _probe_detail(r) -> dict:
@@ -490,6 +510,21 @@ def _solana_rpc(url: str, method: str, params: list, timeout: float = 12.0):
     return r.json().get("result")
 
 
+def _dash_rpc(method: str, params: list, timeout: float = 12.0):
+    """Dashboard chain reads over Helius on the MAIN (paid live) key -- live pool visibility matters as much as trade
+    latency, and the public RPC is what rate-limited and made the tracker lag. The reads are cheap (getMultipleAccounts
+    is 1 credit / 100 accounts), so they don't dent the live budget. Falls back to the research key, then the public
+    RPC, only when the main key is unset or Helius errors."""
+    from tradingbot.data import helius
+    key = helius.main_key() or helius.research_key()
+    if key:
+        try:
+            return _solana_rpc(f"{helius.RPC_URL}?api-key={key}", method, params, timeout)
+        except Exception:  # noqa: BLE001 (fall back to the public RPC)
+            pass
+    return _solana_rpc(WALLETS_RPC, method, params, timeout)
+
+
 def wallet_directory(cfg) -> dict:
     """Addresses only (never keys) of the canary's wallets, with roles and labels: the live trading set numbered
     1..n, the treasury, the reserve (the canary wallet that funds top-ups), and an archive of every other address
@@ -551,6 +586,7 @@ class Dashboard:
         self.wallets_ver = 0
         self.pools: dict | None = None  # the pool tracker (feinted pools + live reserves), every POOLS_POLL_S
         self.pools_ver = 0
+        self._last_vaults = 0.0  # last public-RPC reserve read (gated to VAULT_READ_S; rows still refresh every poll)
         # pool -> live reserve path kept between polls. Persisted to /data so a fly deploy does not wipe the early
         # (~60 s) reserve samples: without them a now-old pool's conf_ret / best entry / live peak can never be
         # rebuilt (the confirmation-window price is long gone), so those columns would blank out after every deploy.
@@ -717,7 +753,7 @@ class Dashboard:
         """Add SOL balances (one getMultipleAccounts for every address) and tx counts (getSignaturesForAddress for
         the live set only, to bound the calls) to the wallet directory, over the public RPC so no Helius credits are
         spent. A failure keeps the last good data and marks it stale."""
-        rpc = rpc or (lambda m, p: _solana_rpc(WALLETS_RPC, m, p))
+        rpc = rpc or (lambda m, p: _dash_rpc(m, p))
         try:
             d = wallet_directory(self.cfg)
             addrs = [w["address"] for w in d["live"] + d["archive"]]
@@ -751,7 +787,7 @@ class Dashboard:
         Live poller's read-only connections, and the reserves over the public RPC (no Helius credits). Keeps the
         last good data and marks it stale on a failure."""
         from tradingbot import pool_tracker as pt
-        rpc = rpc or (lambda m, p: _solana_rpc(WALLETS_RPC, m, p))
+        rpc = rpc or (lambda m, p: _dash_rpc(m, p))
         try:
             now = time.time()
             # The tracker keeps every probed pool forever (no data loss): feints come from the probe events only
@@ -773,16 +809,20 @@ class Dashboard:
             # conf / best-entry columns. Before this, a thrown read failed the whole poll, so the tab froze on stale
             # rows while new probes never appeared (the CLI --no-live and the probe card kept working).
             live_ok = True
+            # The rows re-assemble every poll (POOLS_POLL_S, cheap journal + watch.db reads) so status, entries, exits
+            # and scorer-flagged pulls appear in near-real-time. The reserve read (public RPC) is gated to VAULT_READ_S
+            # so a fast poll doesn't hammer the RPC; between reads the last reserve path (live liq / conf) is reused.
             try:
                 young = [scorer[pl] for pl in feints
                          if scorer.get(pl) and scorer[pl].get("create_ts")
                          and now - scorer[pl]["create_ts"] <= pt.YOUNG_MAX_AGE_S and not scorer[pl].get("pulled_ts")]
-                if young:
+                if young and now - self._last_vaults >= VAULT_READ_S:
                     v = pt.read_vaults(rpc, young)
                     for pl, (sol, tok) in v.items():
                         s = scorer[pl]
                         self._pool_paths[pl] = pt.update_path(self._pool_paths.get(pl), now, s["create_ts"],
                                                               feints[pl]["feint_ts"], sol, tok, su, s.get("exit_px"))
+                    self._last_vaults = now
             except Exception as exc:  # noqa: BLE001 (the public RPC can be slow / rate-limited)
                 live_ok = False
                 log.warning("dashboard: pool tracker live reserve read failed (pools still shown): %s", exc)
@@ -1198,6 +1238,8 @@ h1{margin:0;font-size:30px;line-height:1.05;font-weight:800;letter-spacing:-.02e
 .exp{border:0;background:none;cursor:pointer;font:inherit;color:var(--ink);opacity:.5;padding:0 5px 0 0}
 .exp:hover{opacity:1}
 .pdetail td{padding:4px 10px 10px;border-top:0}
+.abort{margin-left:8px;border:2px solid var(--neg);background:none;color:var(--neg);font:inherit;font-weight:800;font-size:11px;padding:2px 8px;cursor:pointer;vertical-align:middle}
+.abort:hover{background:var(--neg);color:var(--surface)}
 table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:tabular-nums}
 th{font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--ink-2);text-align:right;
 padding:8px 9px;border-bottom:2px solid var(--rule);white-space:nowrap;cursor:pointer;user-select:none}
@@ -1792,6 +1834,10 @@ const USD2=v=>v==null?'<span class="muted">–</span>':'<span class="'+(v>0?"pos
 function statusCell(r){const t=r.lifecycle||"–";let c="muted";
 if(/lost|loss|trapped|no money|feint: pulled/.test(t))c="neg";else if(/safe|clean|win|alive|dodged|holding/.test(t))c="pos";
 return '<b class="'+c+'">'+esc(t)+'</b>'}
+// a per-trade kill switch: on an OPEN real canary position, sell now and stop all further rounds/re-entries on its pool
+function abortBtn(r){return (r.real&&r.real.open&&r.mint)?'<button class="abort" title="sell this position now and stop all further rounds on this pool" onclick="abortTrade(\''+r.mint+'\')">Abort</button>':''}
+function abortTrade(mint){if(!confirm("Sell this position NOW and stop all further rounds / re-entries on this pool?\n\nReal money. The engine acts on its next 1-second pass."))return;
+fetch("api/canary/abort",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mint})}).then(r=>r.json()).then(d=>{if(!(d&&d.ok))alert((d&&d.msg)||"Abort failed.")}).catch(e=>alert("Could not reach the abort endpoint: "+e))}
 // after our safe-zone exit: did the pool stay liquid (clean) or rug (holding rug — we induced and dodged it)?
 function afterCell(r){const v=r.reentry;
 if(v==="clean")return jtag("clean","lime","pool stayed liquid after our safe-zone exit");
@@ -1804,7 +1850,7 @@ function poolRow(r){const t=r.real,win=t&&t.ret!=null&&t.ret>0,neg=t&&t.ret!=nul
 const open=r.pool&&poolExpanded.has(r.pool);
 const car=r.pool?`<button class="exp" title="ideal / hindsight numbers" onclick="togglePool('${r.pool}')">${open?"▾":"▸"}</button> `:"";
 const lk=r.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(r.pool)}" target="_blank" rel="noopener">${esc((r.mint||r.pool).slice(0,8))}</a>`:esc((r.mint||"").slice(0,8));
-const row=`<tr><td>${car}${lk}</td><td>${walletCell(r.wallet)}</td><td>${statusCell(r)}</td><td>${journeyCell(r)}</td><td class="num agelive" data-age="${r.pool_age_s!=null?r.pool_age_s:''}">${PSEC(r.pool_age_s)}</td><td class="num">${PSEC(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PSEC(r.pull_pool_age_s):"–"}</td><td class="num">${t?PSEC(t.entry_pool_age_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${holdCell(r)}</td><td>${afterCell(r)}</td><td class="num" title="fees + dust spent probing this pool (both 1-slot probes)">${USD2(r.probe_cost_usd)}</td><td class="num" title="running result: probe fees + entry P&L (live while holding)">${USD2(r.pnl_so_far)}</td></tr>`;
+const row=`<tr><td>${car}${lk}</td><td>${walletCell(r.wallet)}</td><td>${statusCell(r)}${abortBtn(r)}</td><td>${journeyCell(r)}</td><td class="num agelive" data-age="${r.pool_age_s!=null?r.pool_age_s:''}">${PSEC(r.pool_age_s)}</td><td class="num">${PSEC(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PSEC(r.pull_pool_age_s):"–"}</td><td class="num">${t?PSEC(t.entry_pool_age_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${holdCell(r)}</td><td>${afterCell(r)}</td><td class="num" title="fees + dust spent probing this pool (both 1-slot probes)">${USD2(r.probe_cost_usd)}</td><td class="num" title="running result: probe fees + entry P&L (live while holding)">${USD2(r.pnl_so_far)}</td></tr>`;
 if(!open)return row;
 const pnl25=r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–";
 const conf='<span class="'+(r.conf_ret>0?'pos':r.conf_ret<0?'neg':'muted')+'">'+PPCT(r.conf_ret)+'</span>';

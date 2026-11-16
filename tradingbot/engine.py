@@ -39,6 +39,7 @@ MAIN = "claude"
 CANARY = "canary"
 CANARY_HALT = "launch_canary:halted"  # state key: set = the real-money launch canary buys nothing (kill switch)
 CANARY_ALLOW = "launch_canary:allow"  # state key: buys left before the canary waits (canary-one sets 1); absent = no limit
+CANARY_ABORT = "launch_canary:abort"  # state key: JSON list of mints to abort now (sell the position + stop all rounds)
 PROBE_PULLED_SHARE = 0.10  # the probe survival watch calls a pool rugged when its SOL falls below this share of probe-time
 CANARY_PROBED_CAP = 10_000  # bound on the per-session "already probed" mint set (cleared past this; old pools are dead)
 BOOK_PRIORITY = {MAIN: 0, CANARY: 1, "canary_rw50_sz": 1}  # real-money books are exited before simulated baselines
@@ -382,6 +383,23 @@ class Engine:
         return prices
 
     # --- positions ----------------------------------------------------------
+    def _canary_abort(self) -> set:
+        """Mints the operator asked to abort (dashboard 'Abort' button / canary-abort): sell the position now and run
+        no more rounds. Read from journal state each pass, like the kill switch."""
+        raw = self.journal.get_state(CANARY_ABORT)
+        if not raw:
+            return set()
+        try:
+            return set(json.loads(raw))
+        except Exception:  # noqa: BLE001 (a malformed value must never break the monitor)
+            return set()
+
+    def _clear_canary_schedules(self, mint: str) -> None:
+        """Drop every pending re-entry / hold-round / probe watch for this mint so an abort stops all further buys."""
+        for d in (self._hold_rounds, self._reentry_watches, self._probe_watches):
+            for k in [k for k, w in list(d.items()) if (w or {}).get("mint") == mint]:
+                d.pop(k, None)
+
     def manage_positions(self) -> dict[str, float]:
         # The real book is handled first so simulated latency on baselines never delays it.
         # Only books that are running: a switched-off book's positions stay in the journal as they are.
@@ -393,6 +411,9 @@ class Engine:
         prices = self.current_prices(set(held), held)
         now = time.time()
         self.journal.set_state("heartbeat", repr(now))
+        abort = self._canary_abort()  # mints the operator aborted: drop their schedules first so no re-entry fires
+        for m in abort:
+            self._clear_canary_schedules(m)
         self._run_probe_watches()  # record rugger/survivor for probes whose watch window is up (read only)
         self._run_reentry_watches()  # safe-zone hold-probes whose watch is up: holding-rug (dodged) vs clean -> re-enter
         self._run_hold_rounds()  # multi-round holds whose wait is up: read the pool, then re-enter for the next round
@@ -416,6 +437,14 @@ class Engine:
                 # such trades for a day (11-06). Plan with the entry price for the time exits only; the sale itself
                 # quotes for real and either fills or marks the exit blocked.
                 price = pos.entry_price
+            if pos.strategy in mb.CANARY_BOOKS and pos.token_address in abort:
+                # Operator abort: sell this position NOW (bypass deadlines, holds and the exit-blocked wait) and run
+                # no more rounds -- the schedules were already cleared above. A pulled pool still marks exit-blocked.
+                self._deadlines.pop(pos.id, None)
+                self._canary_climbs.pop(pos.id, None)
+                self._canary_trails.pop(pos.id, None)
+                jobs.append((book, pos, [(pos.qty, "aborted")], price, (pos.tp_hits, pos.stop_price)))
+                continue
             blocked = self._blocked.get(pos.id)
             if blocked and now < blocked["next"]:
                 continue  # no route out last time: retry every EXIT_RETRY_S, not every pass
@@ -842,6 +871,8 @@ class Engine:
         started = time.time()
         from tradingbot import model_book as mb
         canary = book.name in mb.CANARY_BOOKS
+        if canary and sig.get("mint") in self._canary_abort():
+            return "canary aborted (manual): no further probe / entry on this pool"
         if canary and c.launch_canary_probe and not sig.get("entry") and hasattr(book.executor, "probe_1slot"):
             # 1-slot probe measurement (11-12): land committed money (slot N) then pull it out next slot, so a
             # size-reacting rugger is tripped while our sell escapes, and we NEVER commit. Runs before the Jupiter
