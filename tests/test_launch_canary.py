@@ -260,6 +260,25 @@ def test_sell_not_sent_is_retried_next_pass(cfg, good_pair):
     assert pos.id not in eng._blocked  # not treated as a pool with no route
 
 
+def test_monitor_wakes_at_the_soonest_canary_timer(cfg, good_pair):
+    from tradingbot.engine import MONITOR_MIN_SLEEP
+    j = Journal(":memory:")
+    cfg.monitor_interval_s = 10  # pin a coarse base so the early-wake logic is exercised regardless of the default
+    eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j)
+    base = float(cfg.monitor_interval_s)
+    assert eng._monitor_sleep() == pytest.approx(base)  # nothing pending: the full poll interval
+    now = time.time()
+    eng._deadlines[1] = now + 6.0  # a 6s hold: wake at it, not on the 10s poll (a 6s hold otherwise exited ~11s)
+    assert 5.0 < eng._monitor_sleep() < 7.0
+    eng._deadlines[1] = now - 30.0  # overdue: floored, not a busy loop or a negative wait
+    assert eng._monitor_sleep() == pytest.approx(MONITOR_MIN_SLEEP)
+    eng._deadlines.clear()
+    eng._deadlines[2] = now + 360.0  # a far pool-minute deadline alone keeps the full poll interval
+    assert eng._monitor_sleep() == pytest.approx(base)
+    eng._hold_rounds["POOL"] = {"due": now + 4.0}  # a short wait-then-reenter also wakes the loop early
+    assert 3.0 < eng._monitor_sleep() < 5.0
+
+
 def test_config_needs_the_confirmation_phrase():
     with pytest.raises(ValueError):
         Config(launch_canary=True).validate()

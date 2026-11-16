@@ -117,7 +117,7 @@ def test_tracker_samples_on_its_own_thread_not_after_claude(cfg, good_pair, safe
     eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: safe), None,
                  PaperExecutor(cfg), Journal(":memory:"))
     loops = []
-    monkeypatch.setattr(eng, "_loop", lambda interval, fn: loops.append((interval, fn.__name__)))
+    monkeypatch.setattr(eng, "_loop", lambda interval, fn, interval_fn=None: loops.append((interval, fn.__name__)))
     eng.run_forever()
     assert (cfg.track_interval_s, "update_outcomes") in loops
     polled = []

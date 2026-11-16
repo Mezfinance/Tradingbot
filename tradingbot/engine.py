@@ -58,6 +58,7 @@ CANARY_MIN_USD = 0.01  # the real-money canary may go down to a cent (Jupiter ro
 NO_LIQUIDITY_MULT = 10.0  # model entry: a live price this many times the snapshot means an empty pool
 DEAD_LIQ_USD = 100.0  # a DexScreener pool with less liquidity than this is treated as emptied (rugged)
 QUOTE_PRICE_MAX = 10  # positions per monitor pass priced from a swap quote when no feed lists the token
+MONITOR_MIN_SLEEP = 0.25  # floor on the monitor's adaptive wake, so an overdue timer fires next pass without a busy loop
 MODEL_POLL_S = 0.5  # how often queued model signals are picked up (early books lose ~6-8 pts per minute of delay)
 MODEL_SIGNAL_MAX_AGE_S = 180  # a signal older than this is stale (the edge is in the first minutes)
 
@@ -207,7 +208,8 @@ class Engine:
         from tradingbot import health
 
         monitor = threading.Thread(target=self._loop, name="monitor", daemon=True,
-                                   args=(self.cfg.monitor_interval_s, self.manage_positions))
+                                   args=(self.cfg.monitor_interval_s, self.manage_positions),
+                                   kwargs={"interval_fn": self._monitor_sleep})
         monitor.start()
         health.start_watchdog(self.journal, self.cfg, self._stop)
         if self.cfg.learning and self.analyst is not None:
@@ -302,7 +304,7 @@ class Engine:
         if wait:
             self._sweeper.join()
 
-    def _loop(self, interval: float, fn) -> None:
+    def _loop(self, interval: float, fn, interval_fn=None) -> None:
         while not self._stop.is_set():
             started = time.time()
             try:
@@ -314,7 +316,28 @@ class Engine:
                     self.journal.log_event("loop_error", None, f"{name}: {type(exc).__name__}: {exc}"[:500])
                 except Exception:  # noqa: BLE001 (never let error logging break the loop)
                     pass
-            self._stop.wait(max(0.0, interval - (time.time() - started)))
+            if interval_fn is not None:  # the monitor wakes at the soonest canary timer, not only on the fixed poll
+                self._stop.wait(interval_fn())
+            else:
+                self._stop.wait(max(0.0, interval - (time.time() - started)))
+
+    def _soonest_canary_timer(self) -> float:
+        """The earliest pending canary time exit / wait / watch, so the monitor loop can wake at it instead of only
+        on the fixed poll. A 6-second hold otherwise fired at the next 10s tick (observed ~11s exit on a 6s hold)."""
+        try:
+            times: list[float] = list(self._deadlines.values())  # sell-by times (hold duration, pool-age exit)
+            for d in (self._hold_rounds, self._reentry_watches, self._probe_watches):
+                times.extend(w["due"] for w in list(d.values()) if "due" in w)  # wait-then-reenter, survival reads
+            return min(times) if times else float("inf")
+        except Exception:  # noqa: BLE001 (a concurrent mutation just means "fall back to the fixed poll this pass")
+            return float("inf")
+
+    def _monitor_sleep(self) -> float:
+        base = float(self.cfg.monitor_interval_s)
+        soonest = self._soonest_canary_timer()
+        if soonest == float("inf"):
+            return base
+        return max(MONITOR_MIN_SLEEP, min(base, soonest - time.time()))
 
     def request_restart(self, reason: str) -> None:
         """Stop all loops so the process exits and the supervisor starts it again (new code)."""
