@@ -517,6 +517,15 @@ def test_canary_abort_writes_the_mint_and_dedups():
     assert json.loads(j.get_state(CANARY_ABORT)) == ["MintX", "MintY"]
 
 
+def test_canary_abort_all_sets_the_kill_switch_and_sweep_flag_and_start_clears_them():
+    from tradingbot.engine import CANARY_HALT, CANARY_ABORT_ALL
+    j = Journal(":memory:")
+    assert dash.canary_abort_all(j)["ok"] is True
+    assert j.get_state(CANARY_HALT) and j.get_state(CANARY_ABORT_ALL)   # kill switch + global sweep flag set
+    dash.canary_switch(j, "start")                                      # Start resumes -> both cleared
+    assert not j.get_state(CANARY_HALT) and not j.get_state(CANARY_ABORT_ALL)
+
+
 def test_fetch_pools_folds_in_the_lifecycle_journey_and_the_real_trade(cfg):
     from tradingbot import launch_live
     from tradingbot.watcher import WatchStore

@@ -284,7 +284,8 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                             "/api/canary/sweep",
                             "/api/canary/settings", "/api/canary/journey", "/api/canary/probe-smoke",
                             "/api/canary/probe-one",
-                            "/api/canary/probe-all", "/api/canary/abort", "/api/canary/enter", "/api/deploy",
+                            "/api/canary/probe-all", "/api/canary/abort", "/api/canary/abort-all",
+                            "/api/canary/enter", "/api/deploy",
                             "/api/auth/register/verify", "/api/auth/passkeys/remove"):
                 self.send_error(404)
                 return
@@ -328,6 +329,9 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 elif path == "/api/canary/abort":  # sell this open position now + stop all further rounds on its pool
                     res = dash.canary_abort(journal, json.loads(body or b"{}").get("mint"))
                     log.info("dashboard canary abort: %s", res.get("msg"))
+                elif path == "/api/canary/abort-all":  # kill switch + sell every open position + cancel every pending entry
+                    res = dash.canary_abort_all(journal)
+                    log.info("dashboard canary abort ALL: %s", res.get("msg"))
                 elif path == "/api/canary/enter":  # queue a real manual entry on a tracked pool (size + TP + hold)
                     d = json.loads(body or b"{}")
                     res = dash.canary_enter(journal, d.get("mint"), d.get("pool"), d.get("usd"), d.get("tp_pct"),

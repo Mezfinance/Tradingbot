@@ -126,12 +126,12 @@ def canary_switch(journal, action: str) -> dict:
     """Flip the real-money launch canary's kill switch from the dashboard. It writes the SAME state the canary-stop /
     canary-start CLI writes; the engine reads it on its next pass (no fly/SSH needed). 'stop' halts every canary buy
     and feint at once (open positions still sell at their pool minute); 'start' clears the halt."""
-    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
+    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT, CANARY_ABORT_ALL
     if action == "stop":
         journal.set_state(CANARY_HALT, repr(time.time()))
         return {"halted": True, "msg": "Canary halted: no new buys or feints."}
     if action == "start":
-        journal.execute("DELETE FROM state WHERE key IN (?, ?)", (CANARY_HALT, CANARY_ALLOW))
+        journal.execute("DELETE FROM state WHERE key IN (?, ?, ?)", (CANARY_HALT, CANARY_ALLOW, CANARY_ABORT_ALL))
         return {"halted": False, "msg": "Canary kill switch cleared: buys and feints resume."}
     raise ValueError(f"unknown canary action {action!r}")
 
@@ -154,6 +154,18 @@ def canary_abort(journal, mint) -> dict:
         cur.append(mint)
     journal.set_state(CANARY_ABORT, json.dumps(cur[-500:]))  # keep the list bounded (dead pools stay aborted)
     return {"ok": True, "msg": f"Aborting {mint[:8]}: selling any open position now and cancelling any pending entry."}
+
+
+def canary_abort_all(journal) -> dict:
+    """Abort EVERYTHING now (Pools-tab header button): set the kill switch so no new probe / buy fires, AND on the
+    engine's next pass sell every open canary position and cancel every pending probe / survivor-wait / gate / survival
+    gap / hold-round / re-entry on every pool, plus any queued manual Enter. The global equivalent of per-pool Abort;
+    cleared when the canary is started again."""
+    from tradingbot.engine import CANARY_HALT, CANARY_ABORT_ALL
+    journal.set_state(CANARY_HALT, repr(time.time()))
+    journal.set_state(CANARY_ABORT_ALL, repr(time.time()))
+    return {"ok": True, "msg": "Aborting everything: kill switch on; selling all open positions and cancelling all "
+                               "pending probes / entries on the next pass."}
 
 
 def canary_enter(journal, mint, pool=None, usd=None, tp_pct=None, hold_s=None, name=None, sol_before=None) -> dict:
@@ -277,9 +289,9 @@ def wallet_gate_summary(journal, n: int = 500) -> dict:
 def canary_one(journal) -> dict:
     """Arm exactly one more canary action (the 'Execute one probe' button): the next liquid candidate is probed (or
     bought, if committing), then it waits. Writes the same state as the canary-one CLI; the engine reads it next pass."""
-    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
+    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT, CANARY_ABORT_ALL
     journal.set_state(CANARY_ALLOW, "1")
-    journal.execute("DELETE FROM state WHERE key=?", (CANARY_HALT,))
+    journal.execute("DELETE FROM state WHERE key IN (?, ?)", (CANARY_HALT, CANARY_ABORT_ALL))
     return {"armed": True, "msg": "One probe armed: the next liquid candidate is probed, then it waits."}
 
 
@@ -288,8 +300,8 @@ def canary_probe_all(journal, cfg=None) -> dict:
     one-at-a-time allowance and the kill switch, so the engine probes each liquid candidate with no gate.
     This is the same state canary-start writes. Probing every pool also needs `launch_canary_probe` set on
     in the config (that is what routes every liquid pool to the canary); the UI warns when it is off."""
-    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT
-    journal.execute("DELETE FROM state WHERE key IN (?, ?)", (CANARY_HALT, CANARY_ALLOW))
+    from tradingbot.engine import CANARY_ALLOW, CANARY_HALT, CANARY_ABORT_ALL
+    journal.execute("DELETE FROM state WHERE key IN (?, ?, ?)", (CANARY_HALT, CANARY_ALLOW, CANARY_ABORT_ALL))
     on = bool(getattr(cfg, "launch_canary_probe", False)) if cfg is not None else None
     msg = "Probing every liquid pool: the kill switch and one-at-a-time gate are cleared."
     if on is False:
@@ -1513,7 +1525,7 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <main id="v-pools" hidden>
 <div><p class="label eyebrow"><a class="lk" href="#/supermeme">Supermeme</a> · launch canary · real money</p><h1>Pool tracker</h1>
 <p class="lead">Every pool the canary has probed (feint or 1-slot), with its live state and the ~48s survival verdict. Liquidity, age and the LP-pull time come from the second-4 scorer; live liquidity and the best entry come from a public-RPC read of the pool's reserves (no Helius credits), refreshed every 20 seconds while a pool is under 25 minutes old.</p></div>
-<div style="margin:2px 0 14px"><a href="#/settings" style="display:inline-block;padding:9px 20px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);text-decoration:none;font:inherit;font-weight:700">Probe measurement →</a></div>
+<div style="margin:2px 0 14px;display:flex;gap:12px;flex-wrap:wrap;align-items:center"><a href="#/settings" style="display:inline-block;padding:9px 20px;border:2px solid var(--rule);background:var(--surface);color:var(--ink);text-decoration:none;font:inherit;font-weight:700">Probe measurement →</a><button id="pb-abort-all" onclick="abortAll()" style="padding:9px 20px;border:2px solid var(--neg);background:var(--neg);color:var(--surface);cursor:pointer;font:inherit;font-weight:800">ABORT EVERYTHING</button><span class="sub">Sell every open position &amp; cancel every pending probe/entry, kill switch on.</span></div>
 <div id="p-note"></div>
 <div class="stats" id="p-tiles"></div>
 <section class="card" id="p-hold-card" style="display:none"><p class="label eyebrow">Survivor hold curve</p><h2>Does holding a survivor past minute 6 pay?</h2><p class="sub">Enter a survivor at the ~48s confirmation, then sell at each horizon (last live price at or before it, −100% if it rugged first). <b>big</b> = share that hit +100% or more. If the mean and the big-win share keep rising out to 30–60 min, a long hold beats the minute-6 exit.</p>
@@ -1957,6 +1969,8 @@ var t=open?"sell this position now and stop all further rounds on this pool":"ca
 return '<button class="abort" title="'+t+'" onclick="abortTrade(\''+r.mint+'\')">Abort</button>'}
 function abortTrade(mint){if(!confirm("Abort this pool NOW:\n• sell any open position\n• cancel any pending probe / survivor-wait / gate / entry on it\n\nReal money. The engine acts on its next 1-second pass."))return;
 fetch("api/canary/abort",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mint})}).then(r=>r.json()).then(d=>{if(!(d&&d.ok))alert((d&&d.msg)||"Abort failed.")}).catch(e=>alert("Could not reach the abort endpoint: "+e))}
+function abortAll(){if(!confirm("ABORT EVERYTHING NOW:\n• kill switch on (no new probe / buy)\n• sell EVERY open canary position\n• cancel EVERY pending probe / survivor-wait / gate / entry on every pool\n\nReal money. The engine acts on its next 1-second pass. Press Start to resume later."))return;
+fetch("api/canary/abort-all",{method:"POST",headers:{"Content-Type":"application/json"},body:"{}"}).then(r=>r.json()).then(d=>{alert((d&&d.msg)||(d&&d.ok?"Aborting everything.":"Abort-all failed."))}).catch(e=>alert("Could not reach the abort-all endpoint: "+e))}
 // manual real-money entry on a tracked, still-alive pool (clean survivor OR a skipped pool with legs): typed size, TP, optional hold
 function enterBtn(r){return (r.mint&&!r.pulled&&!(r.real&&r.real.open))?'<button class="abort" style="border-color:#000;background:#c9f24d;color:#000" title="enter this pool with real money: typed size, take-profit, optional hold time" onclick="enterTrade(\''+r.mint+'\',\''+(r.pool||'')+'\')">Enter</button>':''}
 function enterTrade(mint,pool){const usd=prompt("REAL MONEY — enter "+mint.slice(0,8)+"\n\nSize in USD:","25");if(usd===null)return;

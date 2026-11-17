@@ -41,6 +41,7 @@ CANARY_HALT = "launch_canary:halted"  # state key: set = the real-money launch c
 CANARY_ALLOW = "launch_canary:allow"  # state key: buys left before the canary waits (canary-one sets 1); absent = no limit
 CANARY_ABORT = "launch_canary:abort"  # state key: JSON list of mints to abort now (sell the position + stop all rounds)
 CANARY_ENTER = "launch_canary:enter"  # state key: JSON list of manual Enter requests {mint,pool,usd,tp_pct,hold_s} (dashboard)
+CANARY_ABORT_ALL = "launch_canary:abort_all"  # state key: set = sell every open canary position + cancel every pending probe/entry
 PROBE_PULLED_SHARE = 0.10  # the probe survival watch calls a pool rugged when its SOL falls below this share of probe-time
 CANARY_PROBED_CAP = 10_000  # bound on the per-session "already probed" mint set (cleared past this; old pools are dead)
 BOOK_PRIORITY = {MAIN: 0, CANARY: 1, "canary_rw50_sz": 1}  # real-money books are exited before simulated baselines
@@ -414,6 +415,15 @@ class Engine:
         now = time.time()
         self.journal.set_state("heartbeat", repr(now))
         abort = self._canary_abort()  # mints the operator aborted: drop their schedules first so no re-entry fires
+        if self.journal.get_state(CANARY_ABORT_ALL):
+            # "Abort everything" (dashboard): the kill switch is already set, so nothing new fires; here we drop EVERY
+            # pending probe / survivor-wait / hold-round / re-entry / survival-gap on every pool and any queued manual
+            # Enter, and mark every open canary position for an immediate sell below.
+            from tradingbot import model_book as mb
+            for d in (self._hold_rounds, self._reentry_watches, self._probe_watches, self._entry_gaps):
+                d.clear()
+            self.journal.set_state(CANARY_ENTER, "[]")
+            abort = abort | {p.token_address for p in positions if p.strategy in mb.CANARY_BOOKS}
         for m in abort:
             self._clear_canary_schedules(m)
         self._run_probe_watches()  # record rugger/survivor for probes whose watch window is up (read only)

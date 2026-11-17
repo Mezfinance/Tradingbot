@@ -740,6 +740,29 @@ def test_abort_sells_the_position_now_clears_rounds_and_blocks_further_action(cf
     assert eng._try_model(book, _probe_sig("A")) is False   # a fresh signal on an aborted mint is refused
 
 
+def test_abort_all_sells_every_open_canary_position_and_clears_every_schedule(cfg, good_pair):
+    # the global "Abort everything" kill switch: every open canary position is sold now and every pending probe /
+    # entry-gap / hold-round is dropped on one pass (the kill switch blocks anything new).
+    import json as _json
+    from tradingbot.engine import CANARY_ABORT_ALL
+    from tradingbot.models import Position
+    cfg.launch_live = cfg.launch_canary = True
+    cfg.launch_canary_route, cfg.live_confirm = "direct", LIVE_CONFIRM_PHRASE
+    j = Journal(":memory:")
+    eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                 model_executor=PaperExecutor(cfg), launch_canary_executor=PaperExecutor(cfg))
+    book = eng.books[mb.CANARY4]
+    for m in ("A", "B"):
+        j.save_position(Position(None, m, m, 1.0, 1e-5, 1e-5, 1e-5, time.time(), 0.0, 1.0, strategy=book.name))
+    eng._probe_watches["PX"] = {"mint": "X", "pool": "PX", "due": time.time() + 100, "sol_before": 10.0}
+    eng._entry_gaps["Y"] = {"mint": "Y", "pool": "PY", "due": time.time() + 100, "book": book.name, "w": {}}
+    eng._hold_rounds["PZ"] = {"mint": "Z", "pool": "PZ", "due": time.time() + 100, "book": book.name}
+    j.set_state(CANARY_ABORT_ALL, _json.dumps(True))
+    eng.manage_positions()
+    assert not j.open_positions(book.name)                               # every open position sold
+    assert not eng._probe_watches and not eng._entry_gaps and not eng._hold_rounds  # every schedule cleared
+
+
 def test_a_pool_is_probed_once_not_re_probed_on_the_next_wallet(cfg, good_pair):
     eng, j, live = _probe_engine(cfg, good_pair)
     book = eng.books[mb.CANARY4]
