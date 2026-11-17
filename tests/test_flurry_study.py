@@ -1,0 +1,111 @@
+import json
+
+from tradingbot import flurry_study as fl
+
+
+def _buy(res, dsol):
+    """One constant-product buy of dsol SOL: SOL enters, tokens leave. Returns (tokΔ<0, solΔ>0)."""
+    tok, sol = res
+    k = tok * sol
+    new_sol = sol + dsol
+    new_tok = k / new_sol
+    res[0], res[1] = new_tok, new_sol
+    return new_tok - tok, dsol
+
+
+def _rec(continuation=True, pull=False):
+    """A synthetic launch_record: a quiet warm-up, a 5-buy flurry at slot 100, then either a 5-buy continuation
+    at slot 101 (edge) or flat (no edge); optionally an LP pull at slot 101."""
+    res = [1e9, 100.0]
+    rows, sec = [], 0.0
+
+    def add(slot, n, dsol):
+        nonlocal sec
+        for _ in range(n):
+            dtok, dsolv = _buy(res, dsol)
+            rows.append([sec, slot, "w", round(dtok, 6), round(dsolv, 9), round(res[0], 6), round(res[1], 9)])
+            sec += 0.05
+
+    add(90, 1, 0.1); add(91, 1, 0.1); add(92, 1, 0.1)   # quiet
+    add(100, 5, 2.0)                                     # the flurry slot
+    if pull:
+        tok, sol = res
+        res[0], res[1] = tok * 0.05, sol * 0.05          # both vaults collapse = withdrawal
+        rows.append([sec, 101, "op", round(res[0] - tok, 6), round(res[1] - sol, 9),
+                     round(res[0], 6), round(res[1], 9)])
+    elif continuation:
+        add(101, 5, 2.0)                                 # the wash bot keeps buying -> price up next slot
+    else:
+        add(101, 1, 0.1)                                 # flurry burst-and-stops -> flat
+    add(102, 1, 0.1); add(103, 1, 0.1); add(104, 1, 0.1); add(105, 1, 0.1)
+    return {"txs": rows}
+
+
+def test_classify_reads_the_two_vault_signs():
+    assert fl.classify(-1, 1) == "buy"     # tokens out, SOL in
+    assert fl.classify(1, -1) == "sell"
+    assert fl.classify(-1, -1) == "pull"   # both out = withdrawal
+    assert fl.classify(1, 1) == "add"
+    assert fl.classify(0, 0) == "other"
+
+
+def test_slot_flow_counts_buys_and_carries_price():
+    flow = fl.slot_flow(_rec())
+    slots = {s["slot"]: s for s in flow["slots"]}
+    assert slots[100]["n_buys"] == 5 and slots[100]["buy_sol"] > 9      # 5 x ~2 SOL
+    assert slots[101]["n_buys"] == 5
+    assert slots[101]["price"] > slots[100]["price"] > 0               # price rose over the continuation
+    assert flow["pull_slot"] is None
+
+
+def test_slot_flow_flags_the_pull_slot():
+    flow = fl.slot_flow(_rec(pull=True))
+    assert flow["pull_slot"] == 101
+
+
+def test_scalp_is_positive_on_continuation_flat_on_quiet_and_minus_100_on_a_pull():
+    flow = fl.slot_flow(_rec())
+    slots = flow["slots"]
+    i100 = next(i for i, s in enumerate(slots) if s["slot"] == 100)
+    i90 = next(i for i, s in enumerate(slots) if s["slot"] == 90)
+    assert fl._scalp(slots, None, i100, 1, 0.01) > 0        # flurry + continuation beats 1% cost
+    assert fl._scalp(slots, None, i90, 1, 0.01) < 0         # quiet slot -> flat minus cost
+    pflow = fl.slot_flow(_rec(pull=True))
+    pslots = pflow["slots"]
+    pi = next(i for i, s in enumerate(pslots) if s["slot"] == 100)
+    assert fl._scalp(pslots, pflow["pull_slot"], pi, 1, 0.01) == -1.0   # pull inside the hold = trapped
+
+
+def _run(monkeypatch, rec, n=80):
+    from tradingbot import pool_tracker as pt
+    pools = {f"P{i}": {"create_ts": 1.0, "token_mint": "M"} for i in range(n)}
+    monkeypatch.setattr(pt, "scorer_rows", lambda q, since: pools)
+    monkeypatch.setattr(pt, "feint_pools", lambda q, since: {})
+
+    class S:
+        def execute(self, *a):
+            pass
+
+        def query(self, sql, params=()):
+            if "watch_flurry" in sql:
+                return [{"pool": p, "data": json.dumps(rec)} for p in pools]
+            return []
+
+    class J:
+        def query(self, *a, **k):
+            return []
+
+    return fl.study(J(), S(), helius=None, now=10.0)
+
+
+def test_study_finds_a_planted_slot_scale_flurry_edge(monkeypatch):
+    out = _run(monkeypatch, _rec(continuation=True))
+    assert out["best"] is not None
+    assert out["best"]["mean"] > out["best"]["control"]
+    assert "BEST CELL" in fl.render(out)
+
+
+def test_study_reports_no_edge_when_flurries_burst_and_stop(monkeypatch):
+    out = _run(monkeypatch, _rec(continuation=False))
+    assert out["best"] is None
+    assert "NO CELL" in fl.render(out)
