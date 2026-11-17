@@ -181,6 +181,7 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                             "Set-Cookie": self._cookie(dashpasskey.CHAL_COOKIE, chal, dashpasskey.CHALLENGE_MAX_AGE_S)})
                 return
             if path not in ("/", "/api/stream", "/api/summary", "/api/canary/rotate/log", "/api/canary/topup/log",
+                            "/api/canary/sweep/log",
                             "/api/canary/settings", "/api/canary/probes", "/api/deploy/log", "/api/auth/passkeys",
                             "/api/auth/register/options"):
                 self.send_error(404)
@@ -214,6 +215,9 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                 return
             if path == "/api/canary/topup/log":  # progress of a running wallet top-up (addresses + amounts only)
                 self._send(200, json.dumps(dash.topup_log(cfg)).encode(), "application/json")
+                return
+            if path == "/api/canary/sweep/log":  # progress of a running dust sweep (addresses + amounts only)
+                self._send(200, json.dumps(dash.sweep_log(cfg)).encode(), "application/json")
                 return
             if path == "/api/canary/settings":  # current canary settings + presets for the menu
                 self._send(200, json.dumps(dash.canary_settings_menu(cfg)).encode(), "application/json")
@@ -277,6 +281,7 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                                            self._cookie(dash.COOKIE, "", 0)]})
                 return
             if path not in ("/api/canary/stop", "/api/canary/start", "/api/canary/rotate", "/api/canary/topup",
+                            "/api/canary/sweep",
                             "/api/canary/settings", "/api/canary/journey", "/api/canary/probe-smoke",
                             "/api/canary/probe-one",
                             "/api/canary/probe-all", "/api/canary/abort", "/api/deploy",
@@ -317,6 +322,9 @@ def start_health_server(journal: Journal, cfg: Config, dashboard=None) -> Thread
                     data = json.loads(body or b"{}")
                     res = dash.canary_topup(cfg, data.get("level"), data.get("wallets"))
                     log.info("dashboard wallet top-up: %s", res.get("msg"))
+                elif path == "/api/canary/sweep":  # sweep dust + rent from every trading wallet now (on demand)
+                    res = dash.canary_sweep(cfg)
+                    log.info("dashboard dust sweep: %s", res.get("msg"))
                 elif path == "/api/canary/abort":  # sell this open position now + stop all further rounds on its pool
                     res = dash.canary_abort(journal, json.loads(body or b"{}").get("mint"))
                     log.info("dashboard canary abort: %s", res.get("msg"))

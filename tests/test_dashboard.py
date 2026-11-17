@@ -691,6 +691,66 @@ def test_topup_endpoint_is_behind_the_password(cfg, monkeypatch):
         server.shutdown()
 
 
+def test_canary_sweep_launches_canary_sweep_without_halting(cfg, tmp_path, monkeypatch):
+    from tradingbot.engine import CANARY_HALT
+    dash._SWEEP.update(proc=None, started=0.0)
+    cfg.db_path = str(tmp_path / "j.db")
+    j = Journal(cfg.db_path)
+    calls = {}
+
+    class FakeProc:
+        done = False
+        returncode = 0
+
+        def poll(self):
+            return 0 if self.done else None
+
+    fp = FakeProc()
+
+    def fake_popen(argv, **kw):
+        calls["argv"] = argv
+        kw["stdout"].write("sweeping dust…\n")
+        return fp
+
+    monkeypatch.setattr(dash.subprocess, "Popen", fake_popen)
+    res = dash.canary_sweep(cfg)
+    assert res["started"] is True
+    assert j.get_state(CANARY_HALT) is None  # a sweep is safe mid-trade: it NEVER halts the canary
+    assert calls["argv"] == [dash.sys.executable, "-m", "tradingbot", "canary-sweep", "--apply"]
+    lg = dash.sweep_log(cfg)
+    assert lg["running"] is True and "sweeping dust" in lg["log"]
+    assert dash.canary_sweep(cfg)["started"] is False  # refused while one runs
+    fp.done = True
+    assert dash.sweep_log(cfg)["running"] is False and dash.sweep_log(cfg)["returncode"] == 0
+    dash._SWEEP.update(proc=None, started=0.0)
+
+
+def test_sweep_endpoints_are_behind_the_password(cfg, monkeypatch):
+    monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
+    cfg.health_port = 18779
+    j = Journal(":memory:")
+    board = dash.Dashboard(j, cfg)
+    board.refresh()
+    monkeypatch.setattr(dash, "canary_sweep", lambda c: {"started": True, "msg": "ok"})
+    monkeypatch.setattr(dash, "sweep_log", lambda c: {"running": False, "log": "done", "started": 0.0})
+    server = health.start_health_server(j, cfg, board)
+
+    def req(method, path, cookie=None):
+        c = http.client.HTTPConnection("127.0.0.1", 18779, timeout=5)
+        h = {"Cookie": cookie} if cookie else {}
+        c.request(method, path, headers=h)
+        r = c.getresponse()
+        return r.status, r.read()
+    try:
+        assert req("POST", "/api/canary/sweep")[0] == 401  # no password
+        assert req("GET", "/api/canary/sweep/log")[0] == 401
+        code, body = req("POST", "/api/canary/sweep", cookie="tb_dash=s3cret")
+        assert code == 200 and json.loads(body)["started"] is True
+        assert req("GET", "/api/canary/sweep/log", cookie="tb_dash=s3cret")[0] == 200
+    finally:
+        server.shutdown()
+
+
 def test_canary_settings_endpoint_is_behind_the_password(cfg, tmp_path, monkeypatch):
     monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
     cfg.health_port = 18773

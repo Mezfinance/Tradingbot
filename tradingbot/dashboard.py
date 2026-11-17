@@ -285,6 +285,8 @@ _ROTATE = {"proc": None, "started": 0.0, "args": None}
 _ROTATE_LOCK = threading.Lock()
 _TOPUP = {"proc": None, "started": 0.0, "args": None}
 _TOPUP_LOCK = threading.Lock()
+_SWEEP = {"proc": None, "started": 0.0}  # on-demand dust sweep (background `canary-sweep --apply`)
+_SWEEP_LOCK = threading.Lock()
 
 
 def _provision_log(cfg) -> str:
@@ -293,6 +295,10 @@ def _provision_log(cfg) -> str:
 
 def _topup_log_path(cfg) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(cfg.db_path)), "topup.log")
+
+
+def _sweep_log_path(cfg) -> str:
+    return os.path.join(os.path.dirname(os.path.abspath(cfg.db_path)), "sweep.log")
 
 
 def _rotation_running() -> bool:
@@ -356,6 +362,42 @@ def topup_log(cfg, lines: int = 400) -> dict:
     except OSError:
         pass
     return {"running": running, "returncode": code, "log": text, "started": started, "args": args}
+
+
+def canary_sweep(cfg) -> dict:
+    """Sweep dust + rent from every canary trading wallet NOW, on demand, as a background `canary-sweep --apply`
+    process on this machine -- the same sweep the bot runs hourly (sell each leftover dust balance back into its pool,
+    close the emptied token accounts, return the ~0.002 SOL rent each), but immediate so a trade's net balance settles
+    without waiting up to an hour. Open positions are never swept (the CLI excludes held mints). Safe mid-trade, so the
+    canary is NOT halted. Keys never reach the page (the sweep prints addresses + amounts only)."""
+    with _SWEEP_LOCK:
+        p = _SWEEP["proc"]
+        if p is not None and p.poll() is None:
+            return {"started": False, "msg": "A dust sweep is already running."}
+        with open(_sweep_log_path(cfg), "w") as fh:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "tradingbot", "canary-sweep", "--apply"],
+                stdout=fh, stderr=subprocess.STDOUT,
+                env={**os.environ, "TB_DB_PATH": cfg.db_path}, start_new_session=True)
+        _SWEEP.update(proc=proc, started=time.time())
+    log.info("dashboard: dust sweep started (all trading wallets)")
+    return {"started": True, "msg": "Sweeping dust + rent from every trading wallet. Watch the log below."}
+
+
+def sweep_log(cfg, lines: int = 400) -> dict:
+    """The tail of the running (or last) dust sweep, for the dashboard to show progress (addresses + amounts only)."""
+    with _SWEEP_LOCK:
+        p = _SWEEP["proc"]
+        running = p is not None and p.poll() is None
+        code = None if (p is None or running) else p.returncode
+        started = _SWEEP["started"]
+    text = ""
+    try:
+        with open(_sweep_log_path(cfg)) as fh:
+            text = "".join(fh.readlines()[-lines:])
+    except OSError:
+        pass
+    return {"running": running, "returncode": code, "log": text, "started": started}
 
 
 def canary_rotate(journal, cfg, wallets, sol) -> dict:
@@ -1420,6 +1462,10 @@ th.l,td.l{text-align:left}.stat .v.nm{font-size:26px;letter-spacing:-.02em}.tag.
 <div style="font-weight:700;font-size:13px;margin:0 0 4px">Which wallets</div>
 <div id="tu-wallets" style="display:flex;gap:12px;flex-wrap:wrap;margin:0 0 8px"></div>
 <pre id="tu-log" hidden style="white-space:pre-wrap;word-break:break-word;background:var(--sunken);border:2px solid var(--rule-soft);padding:10px;max-height:320px;overflow:auto;font:500 12px/1.5 var(--mono)"></pre></section>
+<section class="card"><p class="label eyebrow">Sweep · real money</p><h2>Sweep all dust</h2>
+<p class="sub">Sell the leftover dust tokens back into their pools and close the emptied token accounts across every trading wallet now, returning the ~0.002 SOL rent each — the same sweep the bot runs hourly, on demand so a trade's net balance settles right away instead of waiting up to an hour. Open positions are never touched. Safe mid-trade; the canary keeps running.</p>
+<button id="sw-go" onclick="canarySweep()" style="padding:8px 18px;border:2px solid #000;background:#c9f24d;color:#000;cursor:pointer;font:inherit;font-weight:800">Sweep all dust</button>
+<pre id="sw-log" hidden style="white-space:pre-wrap;word-break:break-word;background:var(--sunken);border:2px solid var(--rule-soft);padding:10px;max-height:320px;overflow:auto;font:500 12px/1.5 var(--mono);margin-top:10px"></pre></section>
 <section class="card"><p class="label eyebrow">Rotate · real money</p><h2>Rotate trading wallets</h2>
 <p class="sub">Mint a fresh set of wallets and a new treasury, sweep every current wallet and the treasury into it, and fund each new wallet (topping up from the reserve). This <b>halts the canary</b>; restart the bot (fly deploy) to trade the new set, then press Start on the overview. Keys never appear here — only addresses and the plan.</p>
 <div style="display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap;margin:4px 0 10px">
@@ -1829,7 +1875,7 @@ const live=W.live||[],arch=W.archive||[],trading=live.filter(w=>w.role==="tradin
 const when=W.fetched_ts?new Date(W.fetched_ts*1000).toLocaleTimeString([],{hour12:false}):"–";
 tiles("w-tiles",[["Trading wallets",String(trading.length),W.rotate?"rotating · "+(W.route||"direct"):(W.route||"direct")],["Trading SOL",fmt(W.trading_sol||0,3),"across the live set"],["Treasury",tre?fmt(tre.sol||0,3):"–","SOL · idle funds"],["Reserve",res?fmt(res.sol||0,3):"–","SOL · tops up wallets"],["Updated",when,"public RPC, each minute"]]);
 $("w-live").innerHTML=`<tr><th>#</th><th>Role</th><th>Address</th><th>SOL</th><th>Txs</th><th class="l">Label</th></tr>`+(live.length?live.map(walletRow).join(""):`<tr><td class="muted">No wallets loaded (the canary may be off or no wallets file is set).</td></tr>`);
-tuBuild(trading);checkRotate();checkTopup();
+tuBuild(trading);checkRotate();checkTopup();checkSweep();
 $("w-arch").innerHTML=`<tr><th>Address</th><th class="l">Label</th><th>SOL</th><th>First recorded</th></tr>`+(arch.length?arch.map(w=>`<tr><td>${walletLink(w.address)}</td><td class="l">${esc(w.label||"")}</td><td class="num">${w.sol!=null?fmt(w.sol,4):"–"}</td><td class="mono">${w.created?esc(String(w.created).slice(0,10)):"–"}</td></tr>`).join(""):`<tr><td class="muted">No archived wallets.</td></tr>`)}
 const PLIQ=v=>v==null?"–":(Math.abs(v)>=1000?"$"+(v/1000).toFixed(1)+"k":"$"+v.toFixed(0));
 const PAGE2=s=>s==null?"–":agoStr(Math.round(s));
@@ -1920,6 +1966,15 @@ function pollTopup(){tuPoll=true;fetch("api/canary/topup/log").then(r=>r.json())
 $("tu-log").hidden=false;$("tu-log").textContent=(d.log||"(no output yet)")+(d.running?"\n\n… running …":d.returncode===0?"\n\n✓ Done. Balances refresh within a minute.":"\n\n✗ Top-up exited with code "+d.returncode+" — read the log.");
 const lg=$("tu-log");lg.scrollTop=lg.scrollHeight;if(d.running)setTimeout(pollTopup,2000);else{tuPoll=false;$("tu-go").disabled=false}}).catch(()=>setTimeout(pollTopup,3000))}
 function checkTopup(){if(tuPoll)return;fetch("api/canary/topup/log").then(r=>r.json()).then(d=>{if(d&&d.started){$("tu-log").hidden=false;$("tu-log").textContent=d.log||"";if(d.running){$("tu-go").disabled=true;pollTopup()}}}).catch(()=>{})}
+let swPoll=false;
+function canarySweep(){const go=$("sw-go");go.disabled=true;$("sw-log").hidden=false;$("sw-log").textContent="Starting the sweep…";
+fetch("api/canary/sweep",{method:"POST"}).then(r=>r.json()).then(d=>{
+if(d&&d.started){$("sw-log").textContent=(d.msg||"Started.")+"\n\n";pollSweep()}else{go.disabled=false;$("sw-log").textContent=(d&&(d.msg||d.error))||"Could not start the sweep."}
+}).catch(e=>{go.disabled=false;$("sw-log").textContent="Could not reach the sweep endpoint: "+e})}
+function pollSweep(){swPoll=true;fetch("api/canary/sweep/log").then(r=>r.json()).then(d=>{
+$("sw-log").hidden=false;$("sw-log").textContent=(d.log||"(no output yet)")+(d.running?"\n\n… running …":d.returncode===0?"\n\n✓ Done. Balances refresh within a minute.":"\n\n✗ Sweep exited with code "+d.returncode+" — read the log.");
+const lg=$("sw-log");lg.scrollTop=lg.scrollHeight;if(d.running)setTimeout(pollSweep,2000);else{swPoll=false;$("sw-go").disabled=false}}).catch(()=>setTimeout(pollSweep,3000))}
+function checkSweep(){if(swPoll)return;fetch("api/canary/sweep/log").then(r=>r.json()).then(d=>{if(d&&d.started){$("sw-log").hidden=false;$("sw-log").textContent=d.log||"";if(d.running){$("sw-go").disabled=true;pollSweep()}}}).catch(()=>{})}
 function csHoldParse(s){const out=[];(""+(s||"")).split(",").forEach(it=>{it=it.trim();if(!it)return;const p=it.split(":");const h=parseFloat(p[0]);if(isNaN(h)||h<=0)return;const w=(p.length>1&&p[1].trim()!=="")?parseFloat(p[1]):0;out.push([h,isNaN(w)?0:w])});return out}
 function csHoldStr(rows){return rows.filter(r=>r[0]>0).map((r,i,a)=>i===a.length-1?(""+r[0]):(r[0]+":"+r[1])).join(",")}
 function csHoldRowsHtml(rows){if(!rows.length)return '<div class="sub" style="margin:4px 0">No holds — using the Hold-for / pool-age sell.</div>';
