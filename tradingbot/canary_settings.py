@@ -58,6 +58,10 @@ FIELDS: list[dict] = [
     {"key": "launch_canary_probe2_usd", "label": "Second probe size ($)", "type": "float", "group": "Entry",
      "live": True, "lo": 0, "hi": 100, "help": "The 'one more hit' probe: some ruggers fire only on the second commit. "
      "0 = turn the second probe off (enter straight after the gates)."},
+    {"key": "launch_canary_entry_gap_s", "label": "Entry survival gap (s)", "type": "float", "group": "Entry",
+     "live": True, "lo": 0, "hi": 120, "help": "Wait this long after the probes before the real entry, re-reading the "
+     "pool: the probe's committed money is the bait, so a reactive pull in the gap is caught and the full stake is "
+     "never committed (the ~1 s reactive rug). 0 = enter immediately after the gates."},
     {"key": "launch_canary_vol_gate", "label": "Volatility gate", "type": "bool", "group": "Entry", "live": True,
      "help": "Enter only if the confirmation-window price range clears the minimum below (via live Helius)."},
     {"key": "launch_canary_vol_min_pct", "label": "Min confirmation range (%)", "type": "float", "group": "Entry",
@@ -536,6 +540,14 @@ def trade_journey(state: dict) -> dict:
                                     "survives too (some ruggers fire on the second commit)."})
         else:
             steps.append({"on": False, "title": "Second probe - off", "detail": "No second probe (size 0)."})
+        gap = float(g("launch_canary_entry_gap_s", 10) or 0)
+        if gap > 0:
+            steps.append({"on": True, "title": f"Survival gap - wait {_num(gap)}s",
+                          "detail": "Re-read the pool before committing: the probe's money is the bait, so a reactive "
+                                    "pull in the gap aborts the entry (never commits the full stake)."})
+        else:
+            steps.append({"on": False, "title": "Survival gap - off",
+                          "detail": "Enter immediately after the gates (no re-read)."})
         if g("launch_canary_lp_entry"):
             commit = (f"Enter as a liquidity provider (atomic buy + deposit), ${_num(g('launch_canary_entry_usd', 25))} - "
                       "a proportional rug leaves our SOL half (~50% recovered). Probes stay direct.")

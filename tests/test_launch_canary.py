@@ -690,6 +690,7 @@ def _probe_engine(cfg, good_pair):
     cfg.launch_live = cfg.launch_canary = cfg.launch_canary_probe = True
     cfg.launch_canary_route, cfg.live_confirm = "direct", LIVE_CONFIRM_PHRASE
     cfg.launch_canary_probe_watch_s, cfg.launch_canary_probe_margin_s = 48.0, 12.0
+    cfg.launch_canary_entry_gap_s = 0.0  # immediate commit by default; the gap path is driven explicitly in its own tests
     j = Journal(":memory:")
     live = ProbeExec(cfg)
     eng = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
@@ -840,6 +841,51 @@ def test_entry_aborts_when_the_pool_is_unreadable_before_the_buy(cfg, good_pair)
     live.sol_now["A"] = None                             # unreadable -> fail closed, never commit on faith
     eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
     assert not j.open_positions(mb.CANARY4)
+
+
+def test_entry_gap_waits_then_commits_when_the_pool_survives(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    cfg.launch_canary_entry_gap_s = 10.0                 # wait and re-read before committing
+    live.verdict = "ok"
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert not j.open_positions(mb.CANARY4)              # the probes passed but nothing is committed yet
+    assert "A" in eng._entry_gaps                        # an entry is parked on its survival gap
+    eng._run_entry_gaps()                                # not due yet -> still waiting
+    assert not j.open_positions(mb.CANARY4)
+    eng._entry_gaps["A"]["due"] = time.time() - 1        # the gap is up and the pool is still alive (sol_now default 10)
+    eng._run_entry_gaps()
+    pos = j.open_positions(mb.CANARY4)
+    assert pos and pos[0].token_address == "A"           # committed for real after surviving the gap
+
+
+def test_entry_gap_dodges_a_reactive_pull_during_the_gap(cfg, good_pair):
+    import json
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    cfg.launch_canary_entry_gap_s = 10.0
+    live.verdict = "ok"
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert "A" in eng._entry_gaps
+    live.sol_now["A"] = 0.5                              # pulled during the gap: SOL < 10% of the gap-start baseline (10)
+    eng._entry_gaps["A"]["due"] = time.time() - 1
+    eng._run_entry_gaps()
+    assert not j.open_positions(mb.CANARY4)              # the reactive pull was caught -> full stake never committed
+    g = j.query("SELECT detail FROM events WHERE kind='canary_entry_gap'")
+    assert g and json.loads(g[0]["detail"])["verdict"] == "rugged"
+
+
+def test_entry_gap_re_arms_after_a_restart(cfg, good_pair):
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    cfg.launch_canary_entry_gap_s = 10.0
+    live.verdict = "ok"
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert "A" in eng._entry_gaps                        # armed in memory and in an event
+    eng2 = Engine(cfg, FakeDex(good_pair), SimpleNamespace(report=lambda m: None), None, PaperExecutor(cfg), j,
+                  model_executor=PaperExecutor(cfg), launch_canary_executor=live)
+    assert "A" in eng2._entry_gaps                       # re-armed from canary_entry_gap_arm on restart
+    assert eng2._entry_gaps["A"]["w"]["mint"] == "A"
 
 
 def test_two_stage_entry_volatility_gate_blocks_a_flat_pool(cfg, good_pair):

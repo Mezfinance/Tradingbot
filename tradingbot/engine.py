@@ -131,6 +131,7 @@ class Engine:
         self._probe_watches = self._load_probe_watches()  # pool -> a 1-slot probe awaiting its survival read
         self._reentry_watches = self._load_reentry_watches()  # pool -> a safe-zone hold-probe awaiting its re-entry read
         self._hold_rounds = self._load_hold_rounds()  # pool -> the next multi-round hold due after its wait
+        self._entry_gaps = self._load_entry_gaps()  # mint -> a passed-probes entry awaiting its survival gap before commit
         self._canary_climbs = self._load_canary_climbs()  # position id -> the two-stage entry's reserve-priced climb check
         self._canary_trails = self._load_canary_trails()  # position id -> the two-stage entry's reserve-priced trailing stop
         self._canary_helius = None  # lazy live Helius client for the entry volatility gate (main key)
@@ -396,8 +397,8 @@ class Engine:
             return set()
 
     def _clear_canary_schedules(self, mint: str) -> None:
-        """Drop every pending re-entry / hold-round / probe watch for this mint so an abort stops all further buys."""
-        for d in (self._hold_rounds, self._reentry_watches, self._probe_watches):
+        """Drop every pending re-entry / hold-round / probe watch / entry gap for this mint so an abort stops all buys."""
+        for d in (self._hold_rounds, self._reentry_watches, self._probe_watches, self._entry_gaps):
             for k in [k for k, w in list(d.items()) if (w or {}).get("mint") == mint]:
                 d.pop(k, None)
 
@@ -418,6 +419,7 @@ class Engine:
         self._run_probe_watches()  # record rugger/survivor for probes whose watch window is up (read only)
         self._run_reentry_watches()  # safe-zone hold-probes whose watch is up: holding-rug (dodged) vs clean -> re-enter
         self._run_hold_rounds()  # multi-round holds whose wait is up: read the pool, then re-enter for the next round
+        self._run_entry_gaps()  # passed-probes entries whose survival gap is up: re-read the pool, commit only if alive
         self._run_manual_entries()  # operator pressed Enter on a tracked pool: fire a real entry with a TP + hold
         from tradingbot import model_book as mb
         jobs: list[tuple] = []
@@ -1101,6 +1103,21 @@ class Engine:
                              "created_ts": d.get("created_ts")}
         return out
 
+    def _load_entry_gaps(self) -> dict:
+        """Pending entry survival gaps, re-armed after a restart: canary_entry_gap_arm events whose mint has no
+        canary_entry_gap resolution yet (an overdue one fires on the next monitor pass)."""
+        done = {r["token"] for r in self.journal.query(
+            "SELECT DISTINCT token FROM events WHERE kind='canary_entry_gap'")}
+        out: dict = {}
+        for r in self.journal.query("SELECT token, detail FROM events WHERE kind='canary_entry_gap_arm'"):
+            if r["token"] in done:
+                continue
+            d = json.loads(r["detail"] or "{}")
+            if d.get("w") and d.get("due") is not None:
+                out[r["token"]] = {"mint": r["token"], "pool": d.get("pool"), "due": d["due"],
+                                   "gap_sol": d.get("gap_sol"), "book": d.get("book"), "w": d["w"]}
+        return out
+
     def _load_canary_climbs(self) -> dict[int, dict]:
         """Pending two-stage-entry climb checks of open positions, re-armed after a restart."""
         open_ids = {p.id for p in self.journal.open_positions(strategy=None)}
@@ -1280,10 +1297,85 @@ class Engine:
             self.journal.log_event("canary_probe2", mint, json.dumps({**res2, "pool": pool}), strategy=cbook.name)
             if res2.get("verdict") != "ok":  # trapped / honeypot / buy_failed: it insta-rugged on the second hit, skip
                 return
+        if c.launch_canary_entry_gap_s > 0:  # wait and re-read: catch a reactive pull in the gap before committing
+            self._schedule_entry_gap(cbook, w)
+        else:
+            self._canary_commit(cbook, w)
+
+    def _canary_commit(self, cbook, w: dict) -> None:
+        """Commit real money on a confirmed pool: final halt / max-open / same-mint / daily-loss guards, then the
+        safe-zone hold-probe or the straight minute-6 hold. Called from _canary_enter (gap off) or _run_entry_gaps
+        (after the survival gap). The guards are re-checked here because the gap can pass minutes after _canary_enter."""
+        c = self.cfg
+        mint = w["mint"]
+        if self.journal.get_state(CANARY_HALT):
+            return
+        open_ = self.journal.open_positions(cbook.name)
+        if len(open_) >= c.launch_canary_max_open or any(p.token_address == mint for p in open_):
+            return
+        day_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        if c.launch_canary_daily_loss_usd > 0 \
+                and -self.journal.realized_since(day_start, cbook.name) >= c.launch_canary_daily_loss_usd:
+            return
         if c.launch_canary_safe_zone:  # a third, held probe: ride to the safe-zone age, dodge the holding rug, then watch
             self._canary_hold_probe(cbook, w)
         else:
             self._canary_final_entry(cbook, w)  # commit straight to the minute-6 hold
+
+    def _schedule_entry_gap(self, cbook, w: dict) -> None:
+        """After the probes pass, wait launch_canary_entry_gap_s and re-read the pool before committing. The second
+        probe's committed money is the bait: a reactive operator that pulls within the gap is caught here, so the full
+        entry stake is never committed (the ~1 s reactive rug the single-shot path walked straight into). Baseline = the
+        pool's SOL now; the gap fires the real entry only if the pool is still alive. Survives a restart via the event."""
+        mint, pool = w["mint"], w.get("pool")
+        ex = cbook.executor
+        gap_sol = None
+        if hasattr(ex, "pool_sol"):
+            try:
+                gap_sol = ex.pool_sol(mint)
+            except Exception:  # noqa: BLE001 (a read failure must never stop the monitor loop)
+                gap_sol = None
+        due = time.time() + self.cfg.launch_canary_entry_gap_s
+        self._entry_gaps[mint] = {"mint": mint, "pool": pool, "due": due, "gap_sol": gap_sol, "book": cbook.name, "w": w}
+        self.journal.log_event("canary_entry_gap_arm", mint, json.dumps(
+            {"pool": pool, "due": due, "gap_sol": gap_sol, "book": cbook.name, "w": w}), strategy=cbook.name)
+
+    def _run_entry_gaps(self) -> None:
+        """The survival gap between the probes and the real entry: re-read each pool once its gap is up and commit only
+        if it is still alive (SOL not collapsed below PROBE_PULLED_SHARE of the gap-start baseline). Rugged in the gap /
+        unreadable / halted -> skip (fails closed: never commit on a pool we cannot read). Read only until the commit."""
+        if not self._entry_gaps:
+            return
+        from tradingbot import model_book as mb
+        now = time.time()
+        cbook = next((b for b in self.books.values() if b.name in mb.CANARY_BOOKS), None)
+        ex = cbook.executor if cbook else None
+        for mint in [m for m, g in self._entry_gaps.items() if now >= g["due"]]:
+            g = self._entry_gaps.pop(mint)
+            sol_now = None
+            if cbook is None or self.journal.get_state(CANARY_HALT):
+                verdict = "halted"
+            else:
+                if ex is not None and hasattr(ex, "pool_sol"):
+                    try:
+                        sol_now = ex.pool_sol(mint)
+                    except Exception:  # noqa: BLE001
+                        sol_now = None
+                base = g.get("gap_sol") or 0.0
+                if sol_now is None:
+                    verdict = "unreadable"  # fail closed: do not commit on a pool we cannot read
+                elif base and sol_now < PROBE_PULLED_SHARE * base:
+                    verdict = "rugged"  # pulled during the gap -- the reactive rug, dodged
+                else:
+                    verdict = "alive"
+            self.journal.log_event("canary_entry_gap", mint, json.dumps(
+                {"pool": g.get("pool"), "verdict": verdict, "gap_sol": g.get("gap_sol"), "sol_now": sol_now}),
+                strategy=g.get("book"))
+            if verdict == "alive":
+                try:
+                    self._canary_commit(cbook, g["w"])
+                except Exception:  # noqa: BLE001 (an entry failure must never stop the monitor loop)
+                    log.exception("canary gap entry failed")
 
     def _canary_entry_sig(self, w: dict, exit_age_s: float | None = None, safe_zone: bool = False,
                           hold_for_s: float | None = None) -> dict:

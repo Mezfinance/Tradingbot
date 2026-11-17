@@ -157,6 +157,9 @@ class Config:
     launch_canary_enter: bool = False  # REAL MONEY: enter confirmed double-survivors (else the probe is measure-only)
     launch_canary_entry_usd: float = 25.0  # the real commit size after both probes pass
     launch_canary_probe2_usd: float = 25.0  # the second ("one more hit") probe size
+    launch_canary_entry_gap_s: float = 10.0  # wait this long after the probes before the real entry, re-reading the pool:
+    # the second probe's committed money is the bait, so a reactive operator that pulls within the gap is caught here and
+    # the full stake is never committed (the ~1s reactive rug the single-shot path walked into). 0 = enter immediately
     launch_canary_vol_min_pct: float = 2.0  # enter only if the confirmation-window peak-to-trough range >= this %
     launch_canary_vol_gate: bool = True  # gate entry on the volatility range (via live Helius); off = enter every survivor
     launch_canary_climb_check_s: float = 60.0  # run the climb check this many seconds after entry
