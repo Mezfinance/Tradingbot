@@ -601,6 +601,11 @@ class Dashboard:
         self._pool_paths: dict = self._load_pool_paths()
         self._paths_logged = False  # log the resolved save path once, so /data placement is verifiable in the logs
         self._mdb = None
+        # fetch_pools gets its OWN read-only connections (journal + watch.db): its 1 s full-history scans must not
+        # serialize on self.live's shared connection, which the SSE stream threads read every POLL_S. The contention
+        # stalled the live `pools` push, so a new probe only appeared after a page refresh.
+        self._pjdb = None
+        self._pwdb = None
 
     def _pool_paths_file(self) -> str | None:
         if self.cfg.db_path == ":memory:":
@@ -802,15 +807,31 @@ class Dashboard:
             # (bounded to actual probes), and scorer rows are fetched BY those pools (indexed PK), so neither read
             # scans the whole watch_launch_live table however long history grows. The reserve path (the one
             # reconstructable-only piece) is persisted to /data and never dropped by age below.
-            feints = pt.feint_pools(self.live._q, 0.0)
-            wq = (lambda sql, p: self.live.wdb.execute(sql, p).fetchall()) if self.live.wdb is not None \
-                else (lambda sql, p: [])
+            # Dedicated read-only connections (opened once, reused on the single dashboard-pools thread) so these
+            # four full-history scans a second never block the SSE stream / live-poller reads on self.live.
+            jpath = self.cfg.db_path
+            if jpath and jpath != ":memory:":
+                if self._pjdb is None:
+                    self._pjdb = Live._open(jpath)
+                jq = lambda sql, p=(): self._pjdb.execute(sql, p).fetchall()
+            else:
+                jq = self.live._q
+            wpath = getattr(self.store, "path", None)
+            if wpath and wpath != ":memory:" and os.path.exists(wpath):
+                if self._pwdb is None:
+                    self._pwdb = Live._open(wpath)
+                wq = lambda sql, p=(): self._pwdb.execute(sql, p).fetchall()
+            elif self.live.wdb is not None:
+                wq = lambda sql, p=(): self.live.wdb.execute(sql, p).fetchall()
+            else:
+                wq = lambda sql, p=(): []
+            feints = pt.feint_pools(jq, 0.0)
             scorer = pt.scorer_rows(wq, 0.0, pools=list(feints))
             # the two-stage lifecycle (gates, probe2, entries, re-entry verdict) and the REAL canary trades, so the
             # pool tracker shows the whole journey -- the probe entries, the actual entry/exit and the % we banked.
-            stages = pt.lifecycle(self.live._q, 0.0)
-            real = pt.real_trades(self.live._q, [f.get("mint") for f in feints.values() if f.get("mint")])
-            costs = pt.probe_costs(self.live._q, 0.0)  # fees/dust spent probing each pool
+            stages = pt.lifecycle(jq, 0.0)
+            real = pt.real_trades(jq, [f.get("mint") for f in feints.values() if f.get("mint")])
+            costs = pt.probe_costs(jq, 0.0)  # fees/dust spent probing each pool
             su = pt._sol_usd(wq)
             # The live reserve read is BEST-EFFORT: a slow / rate-limited public RPC must never hide the pools
             # themselves (feints + probes come from the journal + watch.db, no RPC) -- it only fills the live liq /

@@ -168,6 +168,21 @@ def test_fetch_pools_persists_to_data_even_when_the_live_read_fails(cfg, tmp_pat
         assert "P1" in _json.load(fh)
 
 
+def test_fetch_pools_reads_on_its_own_connections_not_the_shared_live_one(cfg, tmp_path):
+    """fetch_pools scans the full probe history four times a second; it must do so on its OWN read-only
+    connections, never self.live's, which the SSE stream / live poller read every POLL_S. The contention on
+    the shared connection stalled the live `pools` push (a new probe only appeared after a page refresh)."""
+    from tradingbot.watcher import WatchStore
+    db = str(tmp_path / "bot.db")
+    cfg.db_path = db
+    store = WatchStore(str(tmp_path / "watch.db"))
+    board = dash.Dashboard(Journal(db), cfg, store)
+    assert board._pjdb is None and board._pwdb is None  # opened lazily on the first poll
+    board.fetch_pools(rpc=lambda m, p: {})
+    assert board._pjdb is not None and board._pjdb is not board.live.jdb  # own journal connection
+    assert board._pwdb is not None and board._pwdb is not board.live.wdb  # own watch.db connection
+
+
 def test_fetch_pools_keeps_finalized_scalars_for_aged_pools_and_only_drops_the_samples(cfg):
     """A pool past the live-sampling window (but still in the tracker's window) keeps its finalized peak / conf / opt
     scalars so the 2h+ survivor row still shows them; only the big pts sample list is cleared. A pool out of the
