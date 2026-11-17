@@ -2,8 +2,10 @@
 
 The operators appear to pull once they recognise our wallet: a brand-new wallet's first trade
 survives, then the next trades on that same wallet rug. Rotation spreads each trade across up to
-``MAX_WALLETS`` wallets and never lets a wallet hold more than one open trade at a time, so every
-buy enters on the least-recently-used (freshest) free wallet. Built for the direct route only
+``MAX_WALLETS`` wallets, preferring the least-recently-used (freshest) free wallet so every buy
+enters on the wallet least likely to be recognised. With a single wallet set up — or when every
+wallet is already busy — it reuses the least-recently-used wallet rather than skip the trade, so
+rotation runs with one wallet as well as many. Built for the direct route only
 (the LP route needs the same wallet to withdraw its own liquidity, which rotation would complicate,
 and Jupiter routing is a separate experiment).
 
@@ -146,11 +148,15 @@ class RotatingExecutor:
     def _candidates(self, token: str) -> tuple[int | None, list[int]]:
         """Wallets to try for a fresh action on `token`, freshest (lowest `_used`) first. A mint that already holds a
         stake/position keeps its wallet (no fallthrough); otherwise every free wallet is a candidate, so a drained one
-        is skipped and the rotation moves to the next. Returns (pre-assigned idx or None, ordered candidate list)."""
+        is skipped and the rotation moves to the next. When no wallet is free (one wallet set up, or all busy), the
+        least-recently-used wallet is reused rather than the trade skipped. Returns (pre-assigned idx or None, list)."""
         pre = self._assign.get(token)
         if pre is not None:
             return pre, [pre]
-        return None, sorted(self._free_indices(), key=lambda i: self._used.get(i, 0.0))
+        free = self._free_indices()
+        if not free:  # none free: reuse the least-recently-used wallet (so a single wallet keeps trading)
+            free = list(range(len(self.subs)))
+        return None, sorted(free, key=lambda i: self._used.get(i, 0.0))
 
     def _holder(self, token: str) -> int:
         idx = self._assign.get(token)

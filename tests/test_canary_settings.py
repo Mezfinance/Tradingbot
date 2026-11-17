@@ -49,6 +49,17 @@ def test_apply_sets_live_fields_now_persists_and_flags_restart(tmp_path):
     assert overlay["launch_canary_max_open"] == 8 and overlay["launch_canary_route"] == "direct"
 
 
+def test_wallet_rotation_is_a_restart_field_and_needs_the_direct_route(tmp_path):
+    assert "launch_canary_rotate" in cs.FIELD_BY_KEY and cs.FIELD_BY_KEY["launch_canary_rotate"]["live"] is False
+    cfg = _cfg(tmp_path)  # default route is jupiter
+    with pytest.raises(ValueError):  # rotation needs the direct route
+        cs.apply(cfg, None, {"launch_canary_rotate": True})
+    assert cfg.launch_canary_rotate is False
+    res = cs.apply(cfg, None, {"launch_canary_rotate": True, "launch_canary_route": "direct"})
+    assert cfg.launch_canary_rotate is True
+    assert "launch_canary_rotate" in res["restart_needed"]  # executor-bound, takes effect on restart
+
+
 def test_coherent_rejects_feint_without_the_direct_route(tmp_path):
     cfg = _cfg(tmp_path)  # default route is jupiter
     with pytest.raises(ValueError):

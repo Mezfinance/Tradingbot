@@ -125,6 +125,9 @@ FIELDS: list[dict] = [
     # --- execution (restart) ---
     {"key": "launch_canary_route", "label": "Route", "type": "str", "group": "Execution", "live": False,
      "choices": ["direct", "jupiter", "lp"], "help": "How buys execute. direct = swap on the pumpswap pool."},
+    {"key": "launch_canary_rotate", "label": "Wallet rotation", "type": "bool", "group": "Execution", "live": False,
+     "help": "Spread trades across the loaded wallets, freshest first (needs the direct route; runs with one "
+             "wallet too, reusing it). Takes effect after a restart."},
     {"key": "launch_canary_budget_usd", "label": "Book budget ($)", "type": "float", "group": "Execution",
      "live": False, "lo": 1, "hi": 100000, "help": "The book's starting cash; keep about this much in the wallet."},
     {"key": "launch_canary_priority_fee_sol", "label": "Priority fee cap (SOL)", "type": "float", "group": "Execution",
@@ -267,6 +270,9 @@ _DEPS: list = [
      "Feint only needs Feint before buying on.", "Feint before buying"),
     (lambda s: s.get("launch_canary_clips", 1) > 1, "launch_canary_route", "direct",
      "Clip buys need the direct route.", "Route = direct"),
+    (lambda s: s.get("launch_canary_rotate"), "launch_canary_route", "direct",
+     "Wallet rotation is built for the direct route — set Route to direct first (takes effect after restart).",
+     "Route = direct"),
     (lambda s: s.get("launch_canary_probe"), "launch_canary_route", "direct",
      "The 1-slot probe needs the direct route — set Route to direct first (takes effect after restart).",
      "Route = direct"),

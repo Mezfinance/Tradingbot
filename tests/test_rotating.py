@@ -90,22 +90,33 @@ def test_each_trade_gets_a_distinct_wallet():
     assert all(len(s.bought) == 1 for s in r.subs)
 
 
-def test_one_trade_per_wallet_blocks_when_all_are_busy():
+def test_all_busy_reuses_the_least_recently_used_wallet():
     r = rot(2)
+    assert r.buy("A", 5.0, 1e-6) is not None  # wallet 0 (used first)
+    assert r.buy("B", 5.0, 1e-6) is not None  # wallet 1
+    assert r.buy("C", 5.0, 1e-6) is not None  # no free wallet: reuse the least-recently-used one (0), not skip
+    assert r._assign["C"] == 0
+    assert r.subs[0].bought == ["A", "C"]
+    assert "no free wallet" not in r.last_note
+
+
+def test_a_single_wallet_is_reused_for_every_trade():
+    r = rot(1)
     assert r.buy("A", 5.0, 1e-6) is not None
-    assert r.buy("B", 5.0, 1e-6) is not None
-    assert r.buy("C", 5.0, 1e-6) is None  # both wallets hold an open trade
-    assert "no free wallet (all 2 busy)" in r.last_note
+    assert r.buy("B", 5.0, 1e-6) is not None  # the only wallet is reused rather than the trade skipped
+    assert r._assign == {"A": 0, "B": 0}
+    assert r.subs[0].bought == ["A", "B"]
+    assert "no free wallet" not in r.last_note
 
 
 def test_a_successful_sell_frees_the_wallet_for_reuse():
     r = rot(2)
     r.buy("A", 5.0, 1e-6)  # wallet 0
     r.buy("B", 5.0, 1e-6)  # wallet 1
-    assert r.buy("C", 5.0, 1e-6) is None  # full
     assert r.sell("A", 1000.0, 1e-6).ok  # frees wallet 0
     assert "A" not in r._assign
-    assert r.buy("C", 5.0, 1e-6) is not None  # wallet 0 reused
+    assert r.buy("C", 5.0, 1e-6) is not None  # wallet 0, now free again
+    assert r._assign["C"] == 0
 
 
 def test_sell_routes_to_the_wallet_that_holds_the_token():
@@ -167,9 +178,10 @@ def test_a_stuck_rug_is_reclaimed_after_the_timeout():
         r.buy(m, 5.0, 1e-6)
         r.subs[r._assign[m]].fail_sell = True
     assert not r.sell("A", 1000.0, 1e-6).ok  # stuck, wallet still busy
-    assert r.buy("C", 5.0, 1e-6) is None      # all busy, nothing reclaimable yet
+    assert r._assign == {"A": 0, "B": 1}      # both wallets held by stuck trades
     clock["t"] = 700.0                         # past reclaim_s
-    assert r.buy("C", 5.0, 1e-6) is not None   # a stuck wallet is reclaimed
+    assert r.buy("C", 5.0, 1e-6) is not None   # the stuck wallets are reclaimed and one reused
+    assert "A" not in r._assign and "B" not in r._assign  # the stuck trades were written off
 
 
 def test_assignment_survives_a_restart(tmp_path):

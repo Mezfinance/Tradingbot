@@ -40,7 +40,7 @@ def canary_executor(cfg: Config, jupiter):
         from tradingbot.execution.rotating import RotatingExecutor, read_canary_wallets
 
         wallets = read_canary_wallets(cfg)
-        if len(wallets) >= 2:
+        if len(wallets) >= 1:  # rotation runs with a single wallet too: it reuses that one wallet for every trade
             subs = [make(k) for k in wallets]
             for s in subs:  # the rotator owns pool persistence; stop the per-wallet executors sharing one pool file
                 s._pool_file = None
