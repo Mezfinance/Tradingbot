@@ -461,6 +461,246 @@ def render_char(out: dict) -> str:
     return "\n".join(L)
 
 
+# --- discover: let the data name the event (no hand-picked list) -----------------------------------
+# Unsupervised complement to characterize(): mechanically generate a large bank of candidate rules per
+# slot (thresholds across every numeric, wallet-archetype booleans, and 1-3 slot symbol motifs), then
+# keep only the ones whose lead on "N+1 is a flurry" SURVIVES a time-holdout -- discover the pools in
+# the earlier half, confirm on the later half -- with a family-wise z guard for the number of rules
+# tested, so a flattering-but-spurious rule is reported as noise rather than a signal. The survivor's
+# rule string IS the discovered event: readable, so you can name it.
+
+NUMERIC_FIELDS = [
+    "n_buys", "buy_sol", "max_buy", "net_sol", "n_sells", "sell_sol", "distinct_buyers", "new_buyers",
+    "mean_buy", "abs_move", "slots_since_flurry", "age_slots",
+    "prev_buys", "prev_buy_sol", "prev_new_buyers", "prev_net_sol",
+]
+BOOL_FIELDS = ["outside_buy", "dominant_bought", "new_present", "sell_present", "price_up"]
+THRESH_Q = (50, 75, 90)   # quantiles (of the train slice) each numeric is cut at
+DISC_MIN_SUPPORT = 30     # a rule must have >= this many present AND absent slots in BOTH halves
+DISC_TOP = 20             # survivors reported
+SYM_DESC = {"F": "N was itself a flurry", "S": "net sellers in N", "N": "a brand-new wallet bought in N",
+            "O": "an outsider (non-top-3) bought in N", "B": "the dominant wallet looped in N",
+            "b": "light buying in N", ".": "a dead slot"}
+
+
+def _slot_bank(flow: dict, flurry_min: int, create_ts: float) -> list[dict]:
+    """Per active slot N: a generic numeric feature dict, a discrete symbol, 2- and 3-slot motifs ending at N,
+    the target (N+1 is a flurry) and the pool's create_ts (for the time split). No hand-picked events."""
+    slots = flow["slots"]
+    by_slot = {s["slot"]: s for s in slots}
+    cnt: Counter = Counter()
+    for s in slots:
+        cnt.update(s.get("buyers") or [])
+    top3 = {w for w, _ in cnt.most_common(3)}
+    top1 = cnt.most_common(1)[0][0] if cnt else None
+    seen: set = set()
+    last_flurry = None
+    first = slots[0]["slot"]
+    recs = []
+    prev_sym, prev2_sym, prev = ".", ".", None
+    for idx, s in enumerate(slots):
+        slot = s["slot"]
+        buyers = s.get("buyers") or []
+        new_b = [b for b in buyers if b not in seen]
+        seen.update(buyers)
+        pprice = slots[idx - 1]["price"] if idx > 0 else s["price"]
+        move = (s["price"] / pprice - 1.0) if pprice else 0.0
+        since = float(min(slot - last_flurry, 50)) if last_flurry is not None else 50.0
+        outsider = 1.0 if any(b not in top3 for b in buyers) else 0.0
+        dominant = 1.0 if (top1 and top1 in buyers) else 0.0
+        nbuys = float(s["n_buys"])
+        f = {
+            "n_buys": nbuys, "buy_sol": float(s["buy_sol"]), "max_buy": float(s["max_buy"]),
+            "net_sol": float(s["net_sol"]), "n_sells": float(s["n_sells"]), "sell_sol": float(s["sell_sol"]),
+            "distinct_buyers": float(len(set(buyers))), "new_buyers": float(len(new_b)),
+            "mean_buy": (float(s["buy_sol"]) / nbuys if nbuys else 0.0), "abs_move": abs(move),
+            "slots_since_flurry": since, "age_slots": float(min(slot - first, 1000)),
+            "outside_buy": outsider, "dominant_bought": dominant,
+            "new_present": 1.0 if new_b else 0.0, "sell_present": 1.0 if s["n_sells"] > 0 else 0.0,
+            "price_up": 1.0 if move > 0 else 0.0,
+            "prev_buys": (prev["n_buys"] if prev else 0.0), "prev_buy_sol": (prev["buy_sol"] if prev else 0.0),
+            "prev_new_buyers": (prev["new_buyers"] if prev else 0.0),
+            "prev_net_sol": (prev["net_sol"] if prev else 0.0),
+        }
+        if s["n_buys"] >= flurry_min:
+            sym = "F"
+        elif s["n_sells"] > s["n_buys"]:
+            sym = "S"
+        elif new_b:
+            sym = "N"
+        elif outsider:
+            sym = "O"
+        elif dominant:
+            sym = "B"
+        elif s["n_buys"] > 0:
+            sym = "b"
+        else:
+            sym = "."
+        nxt = by_slot.get(slot + 1)
+        target = 1.0 if (nxt and nxt["n_buys"] >= flurry_min) else 0.0
+        recs.append({"f": f, "sym": sym, "m2": prev_sym + sym, "m3": prev2_sym + prev_sym + sym,
+                     "target": target, "create_ts": create_ts})
+        prev2_sym, prev_sym, prev = prev_sym, sym, f
+        if s["n_buys"] >= flurry_min:
+            last_flurry = slot
+    return recs
+
+
+def _build_specs(train: list[dict]) -> list[dict]:
+    """Mechanically generate the candidate-rule bank from the TRAIN slice only (no look-ahead): a threshold at
+    each quantile of every numeric, each wallet-archetype boolean, each slot symbol, and every 2-/3-slot motif
+    with enough train support. Each spec carries a fn(rec)->bool and a readable rule string."""
+    specs: list[dict] = []
+    for fld in NUMERIC_FIELDS:
+        vals = np.array([r["f"][fld] for r in train], float)
+        if vals.std() == 0:
+            continue
+        for q in THRESH_Q:
+            thr = float(np.quantile(vals, q / 100.0))
+            if thr <= float(vals.min()):
+                continue                                  # a threshold at the floor selects everything
+            specs.append({"rule": f"{fld} >= {thr:.3g} (q{q})", "kind": "numeric",
+                          "fn": (lambda r, _f=fld, _t=thr: r["f"][_f] >= _t)})
+    for fld in BOOL_FIELDS:
+        specs.append({"rule": f"{fld}", "kind": "bool", "fn": (lambda r, _f=fld: r["f"][_f] >= 1.0)})
+    syms = {r["sym"] for r in train}
+    for x in sorted(syms):
+        specs.append({"rule": f"sym == {x}  ({SYM_DESC.get(x, x)})", "kind": "symbol",
+                      "fn": (lambda r, _x=x: r["sym"] == _x)})
+    for key, label in (("m2", "N-1..N"), ("m3", "N-2..N")):
+        counts = Counter(r[key] for r in train)
+        for mot, c in counts.items():
+            if c >= DISC_MIN_SUPPORT and len(train) - c >= DISC_MIN_SUPPORT:
+                specs.append({"rule": f"{label} = {mot}", "kind": "motif",
+                              "fn": (lambda r, _k=key, _m=mot: r[_k] == _m)})
+    return specs
+
+
+def _eval_spec(spec: dict, recs: list[dict], tgt: np.ndarray, base: float) -> dict | None:
+    """Present-slot flurry rate, lift and a z-score vs base for one rule on one slice. None if support is thin."""
+    pres = np.fromiter((1 if spec["fn"](r) else 0 for r in recs), dtype=bool, count=len(recs))
+    n = int(pres.sum())
+    if n < DISC_MIN_SUPPORT or len(recs) - n < DISC_MIN_SUPPORT:
+        return None
+    rate = float(tgt[pres].mean())
+    se = (base * (1.0 - base) / n) ** 0.5
+    z = (rate - base) / se if se > 0 else 0.0
+    return {"n": n, "rate": rate, "lift": (rate / base if base else 0.0), "z": z}
+
+
+def discover(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: float = DEFAULT_SPAN_S,
+             flurry_min: int = DEFAULT_FLURRY_MIN, probed_only: bool = False, max_credits: int = 20_000,
+             progress=None, now: float | None = None) -> dict:
+    """Data-driven discovery of the slot-N event that precedes an N+1 flurry: no event named in advance, a large
+    auto-generated rule bank + sequence motifs, kept only where the lead survives a time-holdout with a
+    family-wise z guard. Complements characterize(); same Helius-cached slot flows, read only."""
+    import math
+    import time
+    now = now if now is not None else time.time()
+    since = now - hours * 3600
+    scorer = pool_tracker.scorer_rows(store.query, since)
+    pools = set(scorer)
+    if probed_only:
+        pools &= set(pool_tracker.feint_pools(journal.query, since))
+    metas = [{"pool": p, "token_mint": (scorer[p] or {}).get("token_mint"),
+              "create_ts": (scorer[p] or {}).get("create_ts")}
+             for p in pools if (scorer[p] or {}).get("token_mint") and (scorer[p] or {}).get("create_ts")]
+    have, credits = fetch_flows(store, helius, metas, span_s, max_credits, progress)
+    recs: list[dict] = []
+    n_flows = 0
+    for m in metas:
+        rec = have.get(m["pool"])
+        if not rec:
+            continue
+        flow = slot_flow(rec)
+        if not flow:
+            continue
+        n_flows += 1
+        recs.extend(_slot_bank(flow, flurry_min, m["create_ts"] or 0.0))
+    out = {"hours": hours, "span_s": span_s, "flurry_min": flurry_min, "probed_only": probed_only,
+           "credits": credits, "n_pools": len(metas), "n_flows": n_flows, "n_slots": len(recs),
+           "survivors": [], "tested": 0, "base_train": 0.0, "base_hold": 0.0, "split": "none", "zc": 0.0}
+    if len(recs) < 4 * DISC_MIN_SUPPORT:
+        return out
+    # time split by pool create_ts so the holdout pools are disjoint in time from the discovery pools
+    tss = sorted({r["create_ts"] for r in recs})
+    cut = tss[len(tss) // 2] if len(tss) > 1 else None
+    train = [r for r in recs if cut is not None and r["create_ts"] < cut]
+    hold = [r for r in recs if cut is not None and r["create_ts"] >= cut]
+    if len(train) < 2 * DISC_MIN_SUPPORT or len(hold) < 2 * DISC_MIN_SUPPORT:
+        rng = random.Random(0)                            # fall back to a random slot split (pools too clustered in time)
+        idx = list(range(len(recs)))
+        rng.shuffle(idx)
+        k = len(idx) // 2
+        train = [recs[i] for i in idx[:k]]
+        hold = [recs[i] for i in idx[k:]]
+        out["split"] = "random"
+    else:
+        out["split"] = "time"
+    tgt_tr = np.array([r["target"] for r in train], float)
+    tgt_ho = np.array([r["target"] for r in hold], float)
+    base_tr, base_ho = float(tgt_tr.mean()), float(tgt_ho.mean())
+    out["base_train"], out["base_hold"] = base_tr, base_ho
+    specs = _build_specs(train)
+    evaluated = []
+    for spec in specs:
+        tr = _eval_spec(spec, train, tgt_tr, base_tr)
+        if tr is None or tr["lift"] == 1.0:
+            continue
+        ho = _eval_spec(spec, hold, tgt_ho, base_ho)
+        if ho is None:
+            continue
+        evaluated.append((spec, tr, ho))
+    k = max(len(evaluated), 2)
+    zc = max(3.0, math.sqrt(2.0 * math.log(k)))           # family-wise guard: ~max of k standard normals
+    out["tested"] = len(evaluated)
+    out["zc"] = zc
+    survivors = []
+    for spec, tr, ho in evaluated:
+        same_dir = (tr["lift"] > 1) == (ho["lift"] > 1)   # the lead must point the same way in both halves
+        if same_dir and abs(ho["z"]) >= zc:
+            survivors.append({"rule": spec["rule"], "kind": spec["kind"],
+                              "lift_train": tr["lift"], "lift_hold": ho["lift"], "rate_hold": ho["rate"],
+                              "z_hold": ho["z"], "n_hold": ho["n"]})
+    survivors.sort(key=lambda d: abs(d["z_hold"]), reverse=True)
+    out["survivors"] = survivors[:DISC_TOP]
+    out["n_survivors"] = len(survivors)
+    return out
+
+
+def render_discover(out: dict) -> str:
+    L = []
+    L.append("DISCOVERED EVENTS: what in slot N leads an N+1 flurry  (data-driven, holdout-confirmed, no event named)")
+    L.append(f"  pools {out['n_pools']} ({out['n_flows']} with a flow){', probed only' if out['probed_only'] else ''}; "
+             f"span {out['span_s']:.0f}s; flurry = >={out['flurry_min']} buys/slot; {out['credits']} research credits")
+    L.append(f"  {out['n_slots']} active slots; {out['split']} split; "
+             f"base rate of a next-slot flurry train {out['base_train']*100:.1f}% / holdout {out['base_hold']*100:.1f}%")
+    if not out["n_slots"] or out["tested"] == 0:
+        L.append("  too few slots to discover anything.")
+        return "\n".join(L)
+    L.append(f"  {out['tested']} candidate rules auto-generated and holdout-tested; "
+             f"family-wise z threshold {out['zc']:.2f} (guards against spurious winners)")
+    L.append("")
+    if out["survivors"]:
+        L.append(f"  {'discovered rule (slot N)':<34}{'train lift':>11}{'hold lift':>11}{'P(flurry)':>11}{'z':>7}{'n':>7}")
+        for r in out["survivors"]:
+            L.append(f"  {r['rule']:<34}{r['lift_train']:10.2f}x{r['lift_hold']:10.2f}x"
+                     f"{r['rate_hold']*100:10.1f}%{r['z_hold']:+7.1f}{r['n_hold']:7d}")
+        L.append("")
+        top = out["survivors"][0]
+        direction = "more" if top["lift_hold"] > 1 else "less"
+        L.append(f"  DISCOVERED ({out['n_survivors']} rule(s) survive the holdout): the strongest is "
+                 f"'{top['rule']}' -> a next-slot flurry is {top['lift_hold']:.1f}x {'likelier' if top['lift_hold']>1 else 'rarer'} "
+                 f"when it holds ({direction} than base).")
+        L.append("  -> these are candidate precursors the data named itself, confirmed out of sample. Next: fold them into")
+        L.append("     a 1-slot-ahead flurry predictor, cross-check against characterize(), and validate live with the 1-slot probe.")
+    else:
+        L.append(f"  NOTHING SURVIVES THE HOLDOUT: of {out['tested']} auto-generated rules, none leads a next-slot flurry")
+        L.append("  on the held-out pools beyond chance. Any in-sample pattern was overfit -- consistent with NO SIGNAL:")
+        L.append("  flurries are ~memoryless one slot ahead, so there is no event to key a ShredStream backrun on. Drop it.")
+    return "\n".join(L)
+
+
 # --- render (scalp) --------------------------------------------------------------------------------
 
 def _c(a: dict) -> str:

@@ -181,3 +181,45 @@ def test_characterize_reports_no_signal_on_a_memoryless_stream(monkeypatch):
     assert out["base_rate"] > 0                                 # flurries do occur
     assert all(abs(r["corr"]) < 0.1 for r in out["events"])     # but nothing in N predicts N+1
     assert "NO SIGNAL" in fl.render_char(out)
+
+
+# --- discovery (auto rule bank + motifs, holdout-confirmed; no event named in advance) --------------
+
+def _run_disc(monkeypatch, make_rec, n):
+    """Each pool gets its own record (distinct create_ts), so the time-holdout pools are independent draws."""
+    from tradingbot import pool_tracker as pt
+    pools = {f"P{i}": {"create_ts": float(i + 1), "token_mint": "M"} for i in range(n)}
+    recs = {f"P{i}": make_rec(i) for i in range(n)}
+    monkeypatch.setattr(pt, "scorer_rows", lambda q, since: pools)
+    monkeypatch.setattr(pt, "feint_pools", lambda q, since: {})
+
+    class S:
+        def execute(self, *a):
+            pass
+
+        def query(self, sql, params=()):
+            return [{"pool": p, "data": json.dumps(recs[p])} for p in pools] if "watch_flurry" in sql else []
+
+    class J:
+        def query(self, *a, **k):
+            return []
+
+    return fl.discover(J(), S(), helius=None, now=1000.0)
+
+
+def test_discover_names_the_precursor_and_it_survives_the_holdout(monkeypatch):
+    out = _run_disc(monkeypatch, lambda i: _rec_causal(), n=8)
+    assert out["tested"] > 0 and out["split"] == "time"
+    assert out["n_survivors"] >= 1
+    rules = {s["rule"] for s in out["survivors"]}
+    # the data should name the new-wallet precursor without it being specified: a symbol, a boolean or a motif
+    assert any("sym == N" in r or "new_present" in r or "new_buyers" in r or "N-1..N" in r for r in rules)
+    assert all(s["lift_hold"] > 1 for s in out["survivors"] if s["z_hold"] > 0)
+    assert "DISCOVERED" in fl.render_discover(out)
+
+
+def test_discover_reports_nothing_survives_on_a_memoryless_stream(monkeypatch):
+    out = _run_disc(monkeypatch, lambda i: _rec_random(slots=1500, seed=100 + i), n=6)
+    assert out["tested"] > 0                                    # rules were generated and holdout-tested
+    assert out["n_survivors"] == 0                              # none leads a next-slot flurry out of sample
+    assert "NOTHING SURVIVES" in fl.render_discover(out)

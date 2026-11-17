@@ -196,6 +196,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--probed-only", action="store_true", help="flurry-study: restrict to pools we have probed/feinted")
     parser.add_argument("--flurry-min", type=int, default=3, help="flurry-study: a slot is a flurry at >= this many buys")
     parser.add_argument("--scalp", action="store_true", help="flurry-study: run the after-the-flurry continuation table instead of the lead-lag characterization")
+    parser.add_argument("--discover", action="store_true", help="flurry-study: data-driven discovery (auto rule bank + motifs, holdout-confirmed) instead of the named-event characterization")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
     parser.add_argument("--apply", action="store_true", help="canary-sweep: close the empty accounts (default: list)")
@@ -769,6 +770,12 @@ def main(argv: list[str] | None = None) -> None:
                             span_s=args.span_s, cost_pct=args.cost_pct, probed_only=args.probed_only,
                             helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog)
             print(json.dumps(out, indent=2, default=str) if args.json else _fl.render(out))
+            return
+        if args.discover:  # data-driven: let the auto rule bank + motifs name the precursor, holdout-confirmed
+            out = _fl.discover(_FlJournal(cfg.db_path), _FlWS(_fl_wdp(cfg)), cfg=cfg, hours=args.hours or 720.0,
+                               span_s=args.span_s, flurry_min=args.flurry_min, probed_only=args.probed_only,
+                               helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog)
+            print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_discover(out))
             return
         out = _fl.characterize(_FlJournal(cfg.db_path), _FlWS(_fl_wdp(cfg)), cfg=cfg, hours=args.hours or 720.0,
                                span_s=args.span_s, flurry_min=args.flurry_min, probed_only=args.probed_only,
