@@ -109,3 +109,75 @@ def test_study_reports_no_edge_when_flurries_burst_and_stop(monkeypatch):
     out = _run(monkeypatch, _rec(continuation=False))
     assert out["best"] is None
     assert "NO CELL" in fl.render(out)
+
+
+# --- characterization (lead-lag: what in slot N predicts a flurry in N+1) ---------------------------
+
+def _add(res, rows, sec0, slot, n, dsol, wallet):
+    sec = sec0
+    for _ in range(n):
+        dtok, dsolv = _buy(res, dsol)
+        rows.append([sec, slot, wallet, round(dtok, 6), round(dsolv, 9), round(res[0], 6), round(res[1], 9)])
+        sec += 0.05
+    return sec
+
+
+def _rec_causal(cycles=40):
+    """A new outsider wallet buys in slot k, then the bot fires a 5-buy flurry in k+1, then quiet. So a first-ever
+    buyer in slot N reliably precedes a flurry in N+1."""
+    res, rows, sec, slot = [1e9, 100.0], [], 0.0, 10
+    for c in range(cycles):
+        sec = _add(res, rows, sec, slot, 1, 0.2, f"out{c}")     # a brand-new wallet arrives
+        sec = _add(res, rows, sec, slot + 1, 5, 0.3, "bot")     # the bot wash-pumps the next slot
+        sec = _add(res, rows, sec, slot + 2, 1, 0.1, "bot")     # quiet
+        slot += 3
+    return {"txs": rows}
+
+
+def _rec_random(slots=1500, seed=1):
+    """Buy counts drawn independently per slot by random wallets: flurries happen but nothing in N predicts N+1."""
+    import random as _r
+    rng = _r.Random(seed)
+    res, rows, sec = [1e9, 100.0], [], 0.0
+    for s in range(10, 10 + slots):
+        for _ in range(rng.randint(0, 6)):
+            sec = _add(res, rows, sec, s, 1, 0.1, f"w{rng.randint(0, 50)}")
+    return {"txs": rows}
+
+
+def _run_char(monkeypatch, rec, n=40):
+    from tradingbot import pool_tracker as pt
+    pools = {f"P{i}": {"create_ts": 1.0, "token_mint": "M"} for i in range(n)}
+    monkeypatch.setattr(pt, "scorer_rows", lambda q, since: pools)
+    monkeypatch.setattr(pt, "feint_pools", lambda q, since: {})
+
+    class S:
+        def execute(self, *a):
+            pass
+
+        def query(self, sql, params=()):
+            return [{"pool": p, "data": json.dumps(rec)} for p in pools] if "watch_flurry" in sql else []
+
+    class J:
+        def query(self, *a, **k):
+            return []
+
+    return fl.characterize(J(), S(), helius=None, now=10.0)
+
+
+def test_characterize_finds_the_event_that_precedes_a_next_slot_flurry(monkeypatch):
+    out = _run_char(monkeypatch, _rec_causal())
+    assert out["base_rate"] > 0
+    ev = {r["event"]: r for r in out["events"]}
+    nb = ev["new_buyers"]                                       # the planted positive precursor
+    assert nb["corr"] > 0.2 and nb["auc"] > 0.6 and nb["lift"] > 1.0
+    # a flurry follows when the dominant bot is NOT the one buying this slot -> strong negative corr (also valid)
+    assert ev["dominant_bought"]["corr"] < -0.2
+    assert "SIGNAL:" in fl.render_char(out)
+
+
+def test_characterize_reports_no_signal_on_a_memoryless_stream(monkeypatch):
+    out = _run_char(monkeypatch, _rec_random(), n=6)
+    assert out["base_rate"] > 0                                 # flurries do occur
+    assert all(abs(r["corr"]) < 0.1 for r in out["events"])     # but nothing in N predicts N+1
+    assert "NO SIGNAL" in fl.render_char(out)

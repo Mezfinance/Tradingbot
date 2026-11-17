@@ -30,6 +30,9 @@ import hashlib
 import json
 import random
 import statistics
+from collections import Counter
+
+import numpy as np
 
 from tradingbot import pool_tracker
 from tradingbot.data import helius as he
@@ -51,8 +54,8 @@ DEFAULT_COST_PCT = 1.0  # round-trip pool fee (~0.6%) + a modest Jito tip, as a 
 CONTROL_PER_POOL = 60   # random non-flurry active slots sampled per pool for the baseline
 
 
-# row indices from helius.launch_record txs
-_SLOT, _TOKD, _SOLD, _TOKA, _SOLA = 1, 3, 4, 5, 6
+# row indices from helius.launch_record txs: [sec, slot, payer, tokΔ, solΔ, tok_after, sol_after]
+_SLOT, _PAYER, _TOKD, _SOLD, _TOKA, _SOLA = 1, 2, 3, 4, 5, 6
 
 
 def classify(tok_change: float, sol_change: float) -> str:
@@ -82,10 +85,13 @@ def slot_flow(rec: dict) -> dict | None:
         tok_after, sol_after = r[_TOKA], r[_SOLA]
         kind = classify(r[_TOKD] or 0.0, r[_SOLD] or 0.0)
         s = by_slot.setdefault(slot, {"slot": slot, "n_buys": 0, "buy_sol": 0.0, "n_sells": 0, "sell_sol": 0.0,
-                                      "price": None})
+                                      "price": None, "buyers": [], "max_buy": 0.0})
         if kind == "buy":
             s["n_buys"] += 1
-            s["buy_sol"] += float(r[_SOLD] or 0.0)        # SOL added to the pool
+            dsol = float(r[_SOLD] or 0.0)                 # SOL added to the pool
+            s["buy_sol"] += dsol
+            s["max_buy"] = max(s["max_buy"], dsol)
+            s["buyers"].append(r[_PAYER])
         elif kind == "sell":
             s["n_sells"] += 1
             s["sell_sol"] += -float(r[_SOLD] or 0.0)
@@ -254,7 +260,208 @@ def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: f
     }
 
 
-# --- render ----------------------------------------------------------------------------------------
+# --- lead-lag: what in slot N correlates with a buy flurry in slot N+1 -----------------------------
+# The horse (not the scalp): no presupposed cause -- every candidate slot-N event is scored for its
+# correlation / AUC / lift with "the very next slot is a buy flurry". The events rank themselves.
+
+DEFAULT_FLURRY_MIN = 3    # a slot is a flurry if it has >= this many buys (sweepable with --flurry-min)
+MAXLAG = 10               # autocorrelation of buys/slot out to this many slots (periodicity / a clock)
+
+# event feature at slot N -> does slot N+1 have a flurry.  (name, human description)
+EVENTS = [
+    ("buys", "buy count in N (does a burst beget a burst)"),
+    ("buy_sol", "SOL bought in N"),
+    ("max_buy", "biggest single buy in N"),
+    ("net_sol", "net buy-minus-sell SOL in N"),
+    ("sells", "sell count in N (a dip the bot defends)"),
+    ("distinct_buyers", "distinct buyer wallets in N"),
+    ("new_buyers", "first-ever buyers in N (a new wallet arrives)"),
+    ("outside_buy", "a non-top-3 wallet bought in N (an outsider shows up)"),
+    ("dominant_bought", "the pool's #1 buyer bought in N (its own loop)"),
+    ("is_flurry_N", "N itself was a flurry (persistence)"),
+    ("price_move", "price change over N"),
+    ("price_up", "price rose in N"),
+    ("slots_since_flurry", "slots since the previous flurry (a clock)"),
+    ("age_slots", "pool age in slots at N"),
+]
+
+
+def _rank_auc(feat: np.ndarray, label: np.ndarray) -> float:
+    """Tie-aware Mann-Whitney AUC = P(feature higher when N+1 is a flurry). 0.5 = no lead-lag signal."""
+    n1 = float(label.sum())
+    n0 = float(len(label) - n1)
+    if n1 == 0 or n0 == 0:
+        return 0.5
+    order = np.argsort(feat, kind="mergesort")
+    sf = feat[order]
+    ranks_sorted = np.arange(1, len(feat) + 1, dtype=float)
+    start = 0
+    for i in range(1, len(feat) + 1):               # average ranks within tie groups
+        if i == len(feat) or sf[i] != sf[start]:
+            ranks_sorted[start:i] = (start + i + 1) / 2.0
+            start = i
+    ranks = np.empty(len(feat))
+    ranks[order] = ranks_sorted
+    return float((ranks[label == 1].sum() - n1 * (n1 + 1) / 2.0) / (n1 * n0))
+
+
+def _pool_rows(flow: dict, flurry_min: int) -> list[tuple[dict, float]]:
+    """Per active slot N: the event features and the target (slot N+1 is a flurry)."""
+    slots = flow["slots"]
+    by_slot = {s["slot"]: s for s in slots}
+    cnt: Counter = Counter()
+    for s in slots:
+        cnt.update(s.get("buyers") or [])
+    top3 = {w for w, _ in cnt.most_common(3)}
+    top1 = cnt.most_common(1)[0][0] if cnt else None
+    seen: set = set()
+    last_flurry = None
+    first_slot = slots[0]["slot"]
+    out = []
+    for idx, s in enumerate(slots):
+        slot = s["slot"]
+        buyers = s.get("buyers") or []
+        new_b = {b for b in buyers if b not in seen}
+        seen.update(buyers)
+        prev_price = slots[idx - 1]["price"] if idx > 0 else s["price"]
+        move = (s["price"] / prev_price - 1.0) if prev_price else 0.0
+        since = float(min(slot - last_flurry, 50)) if last_flurry is not None else 50.0
+        feat = {
+            "buys": float(s["n_buys"]), "buy_sol": float(s["buy_sol"]), "max_buy": float(s["max_buy"]),
+            "net_sol": float(s["net_sol"]), "sells": float(s["n_sells"]),
+            "distinct_buyers": float(len(set(buyers))), "new_buyers": float(len(new_b)),
+            "outside_buy": 1.0 if any(b not in top3 for b in buyers) else 0.0,
+            "dominant_bought": 1.0 if (top1 and top1 in buyers) else 0.0,
+            "is_flurry_N": 1.0 if s["n_buys"] >= flurry_min else 0.0,
+            "price_move": move, "price_up": 1.0 if move > 0 else 0.0,
+            "slots_since_flurry": since, "age_slots": float(min(slot - first_slot, 1000)),
+        }
+        nxt = by_slot.get(slot + 1)
+        target = 1.0 if (nxt and nxt["n_buys"] >= flurry_min) else 0.0
+        out.append((feat, target))
+        if s["n_buys"] >= flurry_min:
+            last_flurry = slot
+    return out
+
+
+def _dense_buys(flow: dict) -> list[float]:
+    """Buy count per slot over [first, last], zero-filled, for autocorrelation."""
+    slots = flow["slots"]
+    lo, hi = slots[0]["slot"], slots[-1]["slot"]
+    series = [0.0] * (hi - lo + 1)
+    for s in slots:
+        series[s["slot"] - lo] = float(s["n_buys"])
+    return series
+
+
+def _autocorr(series: list[float], maxlag: int) -> list[float]:
+    x = np.asarray(series, float)
+    x = x - x.mean()
+    denom = float((x * x).sum())
+    if denom == 0 or len(x) < 2:
+        return [0.0] * maxlag
+    return [float((x[:-k] * x[k:]).sum() / denom) if 0 < k < len(x) else 0.0 for k in range(1, maxlag + 1)]
+
+
+def characterize(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: float = DEFAULT_SPAN_S,
+                 flurry_min: int = DEFAULT_FLURRY_MIN, probed_only: bool = False, max_credits: int = 20_000,
+                 progress=None, now: float | None = None) -> dict:
+    """For every candidate slot-N event, its correlation / AUC / lift with a buy flurry in slot N+1, plus the
+    autocorrelation of buys/slot (a clock). Answers 'what predicts a next-slot flurry' with no presupposed cause."""
+    import time
+    now = now if now is not None else time.time()
+    since = now - hours * 3600
+    scorer = pool_tracker.scorer_rows(store.query, since)
+    pools = set(scorer)
+    if probed_only:
+        pools &= set(pool_tracker.feint_pools(journal.query, since))
+    metas = [{"pool": p, "token_mint": (scorer[p] or {}).get("token_mint"),
+              "create_ts": (scorer[p] or {}).get("create_ts")}
+             for p in pools if (scorer[p] or {}).get("token_mint") and (scorer[p] or {}).get("create_ts")]
+    have, credits = fetch_flows(store, helius, metas, span_s, max_credits, progress)
+    rows: list[tuple[dict, float]] = []
+    autos: list[tuple[list[float], int]] = []
+    n_flows = 0
+    for m in metas:
+        rec = have.get(m["pool"])
+        if not rec:
+            continue
+        flow = slot_flow(rec)
+        if not flow:
+            continue
+        n_flows += 1
+        rows.extend(_pool_rows(flow, flurry_min))
+        series = _dense_buys(flow)
+        autos.append((_autocorr(series, MAXLAG), len(series)))
+    out = {"hours": hours, "span_s": span_s, "flurry_min": flurry_min, "probed_only": probed_only,
+           "credits": credits, "n_pools": len(metas), "n_flows": n_flows, "n_slots": len(rows)}
+    if not rows:
+        out["events"] = []
+        out["base_rate"] = 0.0
+        out["autocorr"] = [0.0] * MAXLAG
+        return out
+    label = np.array([t for _f, t in rows])
+    base = float(label.mean())
+    results = []
+    for name, desc in EVENTS:
+        feat = np.array([f[name] for f, _t in rows], float)
+        if feat.std() == 0:
+            continue
+        auc = _rank_auc(feat, label)
+        corr = float(np.corrcoef(feat, label)[0, 1])
+        thr = float(np.median(feat))
+        hi = feat > thr
+        if hi.sum() == 0 or hi.sum() == len(feat):
+            hi = feat > 0
+        rate_hi = float(label[hi].mean()) if hi.sum() else 0.0
+        rate_lo = float(label[~hi].mean()) if (~hi).sum() else 0.0
+        results.append({"event": name, "desc": desc, "corr": corr, "auc": auc,
+                        "rate_present": rate_hi, "rate_absent": rate_lo,
+                        "lift": (rate_hi / base) if base else 0.0, "n_present": int(hi.sum())})
+    results.sort(key=lambda r: abs(r["corr"]), reverse=True)
+    tw = float(sum(w for _a, w in autos)) or 1.0
+    autocorr = [sum(a[k] * w for a, w in autos) / tw for k in range(MAXLAG)]
+    out.update({"base_rate": base, "events": results, "autocorr": autocorr})
+    return out
+
+
+def render_char(out: dict) -> str:
+    L = []
+    L.append("WHAT IN SLOT N CORRELATES WITH A BUY FLURRY IN SLOT N+1  (lead-lag, no presupposed cause)")
+    L.append(f"  pools {out['n_pools']} ({out['n_flows']} with a flow){', probed only' if out['probed_only'] else ''}; "
+             f"span {out['span_s']:.0f}s; flurry = >={out['flurry_min']} buys/slot; {out['credits']} research credits")
+    L.append(f"  {out['n_slots']} active slots; base rate of a flurry in the NEXT slot = {out['base_rate']*100:.1f}%")
+    if not out["events"]:
+        L.append("  no usable slots.")
+        return "\n".join(L)
+    L.append("")
+    L.append(f"  {'event (slot N)':<20}{'corr':>8}{'AUC':>7}{'P(flurry N+1)':>15}{'lift':>7}{'n':>8}   description")
+    for r in out["events"]:
+        L.append(f"  {r['event']:<20}{r['corr']:+8.3f}{r['auc']:7.3f}"
+                 f"{r['rate_present']*100:13.1f}% {r['lift']:6.2f}x{r['n_present']:8d}   {r['desc']}")
+    L.append("")
+    ac = out["autocorr"]
+    L.append("  buys/slot autocorrelation by lag (a clock shows as a peak at the period):")
+    L.append("    " + "  ".join(f"L{k+1}:{ac[k]:+.2f}" for k in range(len(ac))))
+    L.append("")
+    top = out["events"][0]
+    strong = [r for r in out["events"] if abs(r["corr"]) >= 0.1 and abs(r["auc"] - 0.5) >= 0.05]
+    peak = max(range(len(ac)), key=lambda k: ac[k]) if ac else 0
+    if strong:
+        names = ", ".join(f"{r['event']} (corr {r['corr']:+.2f}, {r['lift']:.1f}x)" for r in strong[:4])
+        L.append(f"  SIGNAL: a next-slot flurry is predicted by: {names}.")
+        L.append("  -> there is one-slot-ahead structure. Next: fit these into a 1-slot-ahead flurry predictor and")
+        L.append("     test positioning BEFORE the flurry (buy in N, ride N+1), validated live with the 1-slot probe.")
+        if ac[peak] >= 0.2:
+            L.append(f"  (buys also cluster at ~lag {peak+1} slots -- a partial clock.)")
+    else:
+        L.append(f"  NO SIGNAL: nothing in slot N predicts a flurry in N+1 (top: {top['event']} corr {top['corr']:+.3f}, "
+                 f"AUC {top['auc']:.3f}); autocorr flat. Flurries are ~memoryless one slot ahead, so no detector can")
+        L.append("  position us ahead of them -- the ShredStream backrun has no predictable event to key on. Drop it.")
+    return "\n".join(L)
+
+
+# --- render (scalp) --------------------------------------------------------------------------------
 
 def _c(a: dict) -> str:
     if not a or not a.get("n"):
