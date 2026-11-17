@@ -40,6 +40,7 @@ CANARY = "canary"
 CANARY_HALT = "launch_canary:halted"  # state key: set = the real-money launch canary buys nothing (kill switch)
 CANARY_ALLOW = "launch_canary:allow"  # state key: buys left before the canary waits (canary-one sets 1); absent = no limit
 CANARY_ABORT = "launch_canary:abort"  # state key: JSON list of mints to abort now (sell the position + stop all rounds)
+CANARY_ENTER = "launch_canary:enter"  # state key: JSON list of manual Enter requests {mint,pool,usd,tp_pct,hold_s} (dashboard)
 PROBE_PULLED_SHARE = 0.10  # the probe survival watch calls a pool rugged when its SOL falls below this share of probe-time
 CANARY_PROBED_CAP = 10_000  # bound on the per-session "already probed" mint set (cleared past this; old pools are dead)
 BOOK_PRIORITY = {MAIN: 0, CANARY: 1, "canary_rw50_sz": 1}  # real-money books are exited before simulated baselines
@@ -417,6 +418,7 @@ class Engine:
         self._run_probe_watches()  # record rugger/survivor for probes whose watch window is up (read only)
         self._run_reentry_watches()  # safe-zone hold-probes whose watch is up: holding-rug (dodged) vs clean -> re-enter
         self._run_hold_rounds()  # multi-round holds whose wait is up: read the pool, then re-enter for the next round
+        self._run_manual_entries()  # operator pressed Enter on a tracked pool: fire a real entry with a TP + hold
         from tradingbot import model_book as mb
         jobs: list[tuple] = []
         for pos in positions:
@@ -908,7 +910,9 @@ class Engine:
                 {"verdict": verdict, "note": getattr(book.executor, "last_note", "") or "",
                  **(getattr(book.executor, "last_feint", None) or {})}), strategy=book.name)
             return f"feint only: pool {verdict}"
-        if canary and sig.get("entry"):
+        if canary and sig.get("manual") and sig.get("usd") is not None:
+            base = sig["usd"]  # manual Enter: the operator typed the size for this specific pool
+        elif canary and sig.get("entry"):
             base = c.launch_canary_entry_usd  # two-stage entry: the real commit on a confirmed double-survivor
         elif canary and c.launch_canary_flat_usd > 0:
             base = c.launch_canary_flat_usd  # one tiny size for every pick: does any real buy set the operators off?
@@ -953,8 +957,10 @@ class Engine:
                 return self._jup_failure("no swap route")
             if rt[0] > c.max_round_trip_loss_pct:
                 return f"round-trip loss {rt[0]:.1f}% (honeypot/tax/thin pool)"
-        if canary and c.launch_canary_feint and not c.launch_canary_feint_only and hasattr(book.executor, "feint"):
+        if canary and not sig.get("manual") and c.launch_canary_feint and not c.launch_canary_feint_only \
+                and hasattr(book.executor, "feint"):
             # Commit path: poke the pool, commit only if it wasn't pulled in reaction (feint-only is handled above).
+            # A manual Enter skips the feint: the operator chose a proven pool, and the honeypot sim above still gates.
             verdict = book.executor.feint(sig["mint"], c.launch_canary_feint_usd, commit=True)
             self.journal.log_event("canary_feint", sig["mint"], json.dumps(
                 {"verdict": verdict, "note": getattr(book.executor, "last_note", "") or "",
@@ -1000,7 +1006,17 @@ class Engine:
             self.journal.log_event("model_climb_check", sig["mint"],
                                    json.dumps({"position_id": pos.id, "at": check[0], "price": check[1]}),
                                    strategy=book.name)
-        if canary and sig.get("entry") and not sig.get("safe_zone") \
+        if canary and sig.get("manual") and sig.get("tp") and hasattr(book.executor, "pool_price"):
+            # Manual Enter take-profit: the direct executor has no feed price, so the TP is reserve-priced like the
+            # two-stage exits -- one pool-price read here is the baseline, and _canary_hold_exit sells "manual_tp" when
+            # the pool is up by `tp`. The optional hold time is the deadline set above. Re-armed from canary_trail_arm.
+            entry_px = book.executor.pool_price(sig["mint"])
+            if entry_px:
+                rec = {"position_id": pos.id, "peak": entry_px, "entry_px": entry_px, "tp": sig["tp"],
+                       "trail": 0.0, "window_s": 0.0, "thr": 0.0}
+                self._canary_trails[pos.id] = rec
+                self.journal.log_event("canary_trail_arm", sig["mint"], json.dumps(rec), strategy=book.name)
+        if canary and sig.get("entry") and not sig.get("safe_zone") and not sig.get("manual") \
                 and (c.launch_canary_climb_check_s > 0 or c.launch_canary_trail_pct > 0
                      or c.launch_canary_stall_window_s > 0):
             # Two-stage entry exits (11-13), all priced from the pool's own reserves via the paid Helius RPC (Jupiter
@@ -1025,7 +1041,7 @@ class Engine:
             self._holds[pos.id] = {"at": list(checks), "last": None}
             self.journal.log_event("model_hold_check", sig["mint"],
                                    json.dumps({"position_id": pos.id, "at": checks}), strategy=book.name)
-        self.journal.log_event("model_buy", sig["mint"], f"score {sig['score']:.3f} liq ${sig['liq']:,.0f}",
+        self.journal.log_event("model_buy", sig["mint"], f"score {sig['score']:.3f} liq ${sig.get('liq') or 0:,.0f}",
                                strategy=book.name)
         if sig.get("kind") in ("early", "launch"):  # where the seconds between the pool's creation and our fill go
             self.journal.log_event("early_timing", sig["mint"], json.dumps(
@@ -1283,6 +1299,56 @@ class Engine:
         self.journal.log_event("canary_entry", w["mint"], json.dumps(
             {"pool": w.get("pool"), "result": note or "bought", "stage": "final"}), strategy=cbook.name)
 
+    def _run_manual_entries(self) -> None:
+        """Operator pressed Enter on a tracked pool (dashboard): fire a REAL entry on that exact pool with a typed size,
+        a reserve-priced take-profit and an optional hold time. Each request fires once (the queue is consumed this
+        pass, pass or fail). The honeypot round_trip sim and the pre-buy liquidity check in _buy_model still gate it;
+        it bypasses the auto-prober's halt / max-open (a deliberate per-pool action) but respects the abort list and
+        the book's cash. A pool already held by a canary book is skipped. The TP + hold survive a restart via the
+        canary_trail_arm / model_exit_deadline events."""
+        raw = self.journal.get_state(CANARY_ENTER)
+        if not raw:
+            return
+        self.journal.set_state(CANARY_ENTER, "[]")  # consume now: a request fires once, whether it lands or is refused
+        try:
+            reqs = json.loads(raw)
+        except (ValueError, TypeError):
+            reqs = []
+        if not reqs:
+            return
+        from tradingbot import model_book as mb
+        cbook = next((b for b in self.books.values() if b.name in mb.CANARY_BOOKS), None)
+        if cbook is None:
+            for req in reqs:
+                self.journal.log_event("canary_manual_enter", req.get("mint", ""),
+                                       json.dumps({**req, "note": "no canary book running"}), strategy=mb.CANARY4)
+            return
+        held = {p.token_address for p in self.journal.open_positions(strategy=None) if p.strategy in mb.CANARY_BOOKS}
+        for req in reqs:
+            mint = req.get("mint")
+            if not mint:
+                continue
+            if mint in held:
+                self.journal.log_event("canary_manual_enter", mint,
+                                       json.dumps({**req, "note": "already held by a canary book"}), strategy=cbook.name)
+                continue
+            try:
+                usd = float(req["usd"])
+                tp = float(req["tp_pct"]) / 100.0 if req.get("tp_pct") not in (None, "") else None
+                hold_s = float(req["hold_s"]) if req.get("hold_s") not in (None, "") else None
+            except (KeyError, ValueError, TypeError):
+                self.journal.log_event("canary_manual_enter", mint,
+                                       json.dumps({**req, "note": "bad request (size/tp/hold)"}), strategy=cbook.name)
+                continue
+            sig = {"mint": mint, "pool": req.get("pool"), "name": (req.get("name") or mint)[:16], "score": 0.0,
+                   "liq": None, "price": 0.0, "entry": True, "manual": True, "usd": usd, "tp": tp,
+                   "sol_before": req.get("sol_before")}
+            if hold_s is not None:
+                sig["hold_for_s"] = hold_s
+            note = self._buy_model(cbook, sig)
+            self.journal.log_event("canary_manual_enter", mint,
+                                   json.dumps({**req, "note": note or "bought"}), strategy=cbook.name)
+
     def _canary_hold_probe(self, cbook, w: dict) -> None:
         """Buy and sell at the safe-zone age (before the ~1m40 holding-rug cluster) -- a held third probe that induces
         and dodges the holding rug while banking the pre-cluster peak. With a hold-for duration or a hold schedule set,
@@ -1471,6 +1537,12 @@ class Engine:
         px = book.executor.pool_price(pos.token_address) if hasattr(book.executor, "pool_price") else None
         if not px:
             return None  # can't read the pool now; try again next pass
+        base, tp = rec.get("entry_px"), rec.get("tp", 0.0)
+        if tp and base and px / base - 1.0 >= tp:  # manual Enter: reserve-priced take-profit
+            self._canary_trails.pop(pos.id, None)
+            self.journal.log_event("canary_tp_result", pos.token_address, json.dumps(
+                {"position_id": pos.id, "entry_px": base, "price": px, "gain": px / base - 1.0}), strategy=book.name)
+            return "manual_tp"
         if px > rec["peak"]:
             rec["peak"] = px
         trail = rec.get("trail", 0.0)

@@ -205,6 +205,8 @@ def exit_deadline(cfg: Config, name: str, sig: dict) -> float | None:
     if name == CANARY_FAST:  # time-based exit from pool creation, independent of the launch books' pool minutes
         return sig["created_ts"] + cfg.launch_fast_canary_exit_s if sig.get("created_ts") else None
     if name == CANARY4:  # the two-stage entry's exit, at the configurable pool minute
+        if sig.get("manual"):  # a manual Enter carries its own hold (hold_for_s) or none; never a pool-minute deadline
+            return None
         if sig.get("created_ts") is None:
             return None
         # the safe-zone hold-probe sets exit_age_s (sell at ~90s); the real entry has none (hold to minute 6)

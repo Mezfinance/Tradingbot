@@ -486,6 +486,25 @@ def test_fetch_pools_joins_feints_to_the_scorer_and_reads_young_reserves(cfg):
     assert board.pools["rows"] and board.pools["rows"][0]["pool"] == "PoolY"
 
 
+def test_canary_enter_validates_and_queues_one_request_per_mint():
+    from tradingbot.engine import CANARY_ENTER
+    j = Journal(":memory:")
+    assert dash.canary_enter(j, "", usd=20, tp_pct=50)["ok"] is False          # no mint
+    assert dash.canary_enter(j, "MintX", usd="oops", tp_pct=50)["ok"] is False  # bad size
+    assert dash.canary_enter(j, "MintX", usd=20, tp_pct=0)["ok"] is False       # TP must be > 0
+    assert dash.canary_enter(j, "MintX", usd=20, tp_pct=-5)["ok"] is False      # hold must be > 0 if given... (tp here)
+    assert dash.canary_enter(j, "MintX", pool="PX", usd=20, tp_pct=50, hold_s=0)["ok"] is False  # hold > 0 or blank
+    res = dash.canary_enter(j, "MintX", pool="PX", usd=20, tp_pct=50)
+    assert res["ok"] is True
+    q = json.loads(j.get_state(CANARY_ENTER))
+    assert len(q) == 1 and q[0]["mint"] == "MintX" and q[0]["usd"] == 20.0 and q[0]["tp_pct"] == 50.0
+    dash.canary_enter(j, "MintX", pool="PX", usd=99, tp_pct=200, hold_s=120)    # replaces the pending request for MintX
+    q = json.loads(j.get_state(CANARY_ENTER))
+    assert len(q) == 1 and q[0]["usd"] == 99.0 and q[0]["hold_s"] == 120.0
+    dash.canary_enter(j, "MintY", usd=10, tp_pct=25)
+    assert len(json.loads(j.get_state(CANARY_ENTER))) == 2
+
+
 def test_canary_abort_writes_the_mint_and_dedups():
     from tradingbot.engine import CANARY_ABORT
     j = Journal(":memory:")
@@ -747,6 +766,33 @@ def test_sweep_endpoints_are_behind_the_password(cfg, monkeypatch):
         code, body = req("POST", "/api/canary/sweep", cookie="tb_dash=s3cret")
         assert code == 200 and json.loads(body)["started"] is True
         assert req("GET", "/api/canary/sweep/log", cookie="tb_dash=s3cret")[0] == 200
+    finally:
+        server.shutdown()
+
+
+def test_canary_enter_endpoint_is_behind_the_password(cfg, monkeypatch):
+    from tradingbot.engine import CANARY_ENTER
+    monkeypatch.setenv("DASHBOARD_TOKEN", "s3cret")
+    cfg.health_port = 18781
+    j = Journal(":memory:")
+    board = dash.Dashboard(j, cfg)
+    board.refresh()
+    server = health.start_health_server(j, cfg, board)
+
+    def post(path, payload, cookie=None):
+        c = http.client.HTTPConnection("127.0.0.1", 18781, timeout=5)
+        h = {"Content-Type": "application/json"}
+        if cookie:
+            h["Cookie"] = cookie
+        c.request("POST", path, body=json.dumps(payload), headers=h)
+        r = c.getresponse()
+        return r.status, r.read()
+    try:
+        assert post("/api/canary/enter", {"mint": "M", "usd": 20, "tp_pct": 50})[0] == 401  # no password
+        code, body = post("/api/canary/enter", {"mint": "M", "pool": "PM", "usd": 20, "tp_pct": 50},
+                          cookie="tb_dash=s3cret")
+        assert code == 200 and json.loads(body)["ok"] is True
+        assert json.loads(j.get_state(CANARY_ENTER))[0]["mint"] == "M"
     finally:
         server.shutdown()
 

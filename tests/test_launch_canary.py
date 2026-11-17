@@ -1180,3 +1180,51 @@ def test_hold_for_needs_the_safe_zone_on():
         Config(launch_canary=True, launch_canary_probe=True, launch_canary_route="direct", launch_canary_enter=True,
                launch_canary_safe_zone=True, launch_canary_hold_schedule="8:oops",
                live_confirm=LIVE_CONFIRM_PHRASE).validate()
+
+
+def test_manual_enter_fires_a_real_entry_with_a_reserve_priced_tp(cfg, good_pair):
+    # the dashboard "Enter" button: an operator queues a real entry on a tracked (even 53h-old) pool with a typed
+    # size + take-profit; it fires once, arms a reserve-priced TP, and carries NO pool-minute deadline.
+    import json
+    from tradingbot.engine import CANARY_ENTER
+    eng, j, live = _probe_engine(cfg, good_pair)
+    book = eng.books[mb.CANARY4]
+    live.price_now["A"] = 1.0  # entry fill price + the TP baseline (reserve ratio)
+    j.set_state(CANARY_ENTER, json.dumps([{"mint": "A", "pool": "PA", "usd": 20.0, "tp_pct": 50.0}]))
+    eng._run_manual_entries()
+    pos = j.open_positions(book.name)
+    assert len(pos) == 1 and pos[0].strategy == book.name       # a real position opened
+    assert j.get_state(CANARY_ENTER) == "[]"                    # the queue was consumed (fires once)
+    assert pos[0].id in eng._canary_trails and eng._canary_trails[pos[0].id]["tp"] == 0.5
+    assert pos[0].id not in eng._deadlines                      # no minute-6 deadline on an old pool
+    # below the target -> holds; up +50% -> take profit
+    assert eng._canary_hold_exit(book, pos[0], time.time()) is None
+    live.price_now["A"] = 1.6
+    assert eng._canary_hold_exit(book, pos[0], time.time()) == "manual_tp"
+
+
+def test_manual_enter_with_a_hold_time_sets_a_duration_deadline(cfg, good_pair):
+    import json
+    from tradingbot.engine import CANARY_ENTER
+    eng, j, live = _probe_engine(cfg, good_pair)
+    book = eng.books[mb.CANARY4]
+    live.price_now["A"] = 1.0
+    j.set_state(CANARY_ENTER, json.dumps([{"mint": "A", "pool": "PA", "usd": 10.0, "tp_pct": 100.0, "hold_s": 120.0}]))
+    eng._run_manual_entries()
+    pos = j.open_positions(book.name)[0]
+    assert abs(eng._deadlines[pos.id] - (pos.opened_at + 120.0)) < 1.0   # a duration backstop from the fill
+
+
+def test_manual_enter_skips_a_pool_already_held_and_handles_a_bad_request(cfg, good_pair):
+    import json
+    from tradingbot.engine import CANARY_ENTER
+    from tradingbot.models import Position
+    eng, j, live = _probe_engine(cfg, good_pair)
+    book = eng.books[mb.CANARY4]
+    j.save_position(Position(None, "A", "A", 1.0, 1.0, 1.0, 1.0, time.time(), 0.0, 1.0, strategy=book.name))
+    j.set_state(CANARY_ENTER, json.dumps([{"mint": "A", "pool": "PA", "usd": 10.0, "tp_pct": 50.0},
+                                          {"mint": "B", "pool": "PB", "usd": "oops", "tp_pct": 50.0}]))
+    eng._run_manual_entries()
+    assert len(j.open_positions(book.name)) == 1                 # A already held (not re-bought), B refused
+    notes = [json.loads(r["detail"])["note"] for r in j.query("SELECT detail FROM events WHERE kind='canary_manual_enter'")]
+    assert any("already held" in n for n in notes) and any("bad request" in n for n in notes)

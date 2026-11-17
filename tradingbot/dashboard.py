@@ -155,6 +155,40 @@ def canary_abort(journal, mint) -> dict:
     return {"ok": True, "msg": f"Aborting {mint[:8]}: selling now and stopping all rounds."}
 
 
+def canary_enter(journal, mint, pool=None, usd=None, tp_pct=None, hold_s=None, name=None, sol_before=None) -> dict:
+    """Queue a REAL manual entry on a tracked pool from the dashboard (the "Enter" button): the engine fires it on its
+    next 1s pass with the typed size, a reserve-priced take-profit and an optional hold-time backstop. Writes a request
+    into the CANARY_ENTER state list. Real money -- the honeypot sim + the pre-buy liquidity check still gate it, and
+    the position shows on the tracker with an Abort button; but it bypasses the auto-prober's halt / max-open."""
+    from tradingbot.engine import CANARY_ENTER
+    if not mint or not isinstance(mint, str):
+        return {"ok": False, "msg": "No token mint given."}
+    try:
+        size = float(usd)
+        tp = float(tp_pct)
+        hold = float(hold_s) if hold_s not in (None, "") else None
+    except (TypeError, ValueError):
+        return {"ok": False, "msg": "Size and take-profit must be numbers."}
+    if size <= 0:
+        return {"ok": False, "msg": "Size must be more than $0."}
+    if tp <= 0:
+        return {"ok": False, "msg": "Take-profit must be more than 0%."}
+    if hold is not None and hold <= 0:
+        return {"ok": False, "msg": "Hold time must be more than 0 seconds (leave blank for no hold)."}
+    try:
+        cur = json.loads(journal.get_state(CANARY_ENTER) or "[]")
+        if not isinstance(cur, list):
+            cur = []
+    except Exception:  # noqa: BLE001
+        cur = []
+    cur = [r for r in cur if isinstance(r, dict) and r.get("mint") != mint]  # one pending request per mint
+    cur.append({"mint": mint, "pool": pool, "usd": size, "tp_pct": tp,
+                "hold_s": hold, "name": name, "sol_before": sol_before})
+    journal.set_state(CANARY_ENTER, json.dumps(cur[-100:]))
+    held = f", hold {hold:.0f}s" if hold else ""
+    return {"ok": True, "msg": f"Entering {mint[:8]}: ${size:,.2f}, TP +{tp:.0f}%{held}. The engine fires on its next pass."}
+
+
 def _probe_detail(r) -> dict:
     try:
         return json.loads(r["detail"] or "{}")
@@ -1914,6 +1948,13 @@ return '<b class="'+c+'">'+esc(t)+'</b>'}
 function abortBtn(r){return (r.real&&r.real.open&&r.mint)?'<button class="abort" title="sell this position now and stop all further rounds on this pool" onclick="abortTrade(\''+r.mint+'\')">Abort</button>':''}
 function abortTrade(mint){if(!confirm("Sell this position NOW and stop all further rounds / re-entries on this pool?\n\nReal money. The engine acts on its next 1-second pass."))return;
 fetch("api/canary/abort",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mint})}).then(r=>r.json()).then(d=>{if(!(d&&d.ok))alert((d&&d.msg)||"Abort failed.")}).catch(e=>alert("Could not reach the abort endpoint: "+e))}
+// manual real-money entry on a tracked, still-alive pool (clean survivor OR a skipped pool with legs): typed size, TP, optional hold
+function enterBtn(r){return (r.mint&&!r.pulled&&!(r.real&&r.real.open))?'<button class="abort" style="border-color:#000;background:#c9f24d;color:#000" title="enter this pool with real money: typed size, take-profit, optional hold time" onclick="enterTrade(\''+r.mint+'\',\''+(r.pool||'')+'\')">Enter</button>':''}
+function enterTrade(mint,pool){const usd=prompt("REAL MONEY — enter "+mint.slice(0,8)+"\n\nSize in USD:","25");if(usd===null)return;
+const tp=prompt("Take-profit % — sell when the pool price is up this much:","50");if(tp===null)return;
+const hold=prompt("Hold time in seconds (optional backstop — leave blank for none):","");if(hold===null)return;
+if(!confirm("Enter "+mint.slice(0,8)+" with $"+usd+", TP +"+tp+"%"+(hold?(", hold "+hold+"s"):"")+"?\n\nReal money. The engine fires on its next 1s pass; manage the exit with Abort."))return;
+fetch("api/canary/enter",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mint:mint,pool:pool||null,usd:parseFloat(usd),tp_pct:parseFloat(tp),hold_s:hold?parseFloat(hold):null})}).then(r=>r.json()).then(d=>alert((d&&d.msg)||"queued")).catch(e=>alert("Could not reach the enter endpoint: "+e))}
 // after our safe-zone exit: did the pool stay liquid (clean) or rug (holding rug — we induced and dodged it)?
 function afterCell(r){const v=r.reentry;
 if(v==="clean")return jtag("clean","lime","pool stayed liquid after our safe-zone exit");
@@ -1926,7 +1967,7 @@ function poolRow(r){const t=r.real,win=t&&t.ret!=null&&t.ret>0,neg=t&&t.ret!=nul
 const open=r.pool&&poolExpanded.has(r.pool);
 const car=r.pool?`<button class="exp" title="ideal / hindsight numbers" onclick="togglePool('${r.pool}')">${open?"▾":"▸"}</button> `:"";
 const lk=r.pool?`<a class="lk mono" href="https://dexscreener.com/solana/${encodeURIComponent(r.pool)}" target="_blank" rel="noopener">${esc((r.mint||r.pool).slice(0,8))}</a>`:esc((r.mint||"").slice(0,8));
-const row=`<tr><td>${car}${lk}</td><td>${walletCell(r.wallet)}</td><td>${statusCell(r)}${abortBtn(r)}</td><td>${journeyCell(r)}</td><td class="num agelive" data-age="${r.pool_age_s!=null?r.pool_age_s:''}">${PSEC(r.pool_age_s)}</td><td class="num">${PSEC(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PSEC(r.pull_pool_age_s):"–"}</td><td class="num">${t?PSEC(t.entry_pool_age_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${holdCell(r)}</td><td>${afterCell(r)}</td><td class="num" title="fees + dust spent probing this pool (both 1-slot probes)">${USD2(r.probe_cost_usd)}</td><td class="num" title="running result: probe fees + entry P&L (live while holding)">${USD2(r.pnl_so_far)}</td></tr>`;
+const row=`<tr><td>${car}${lk}</td><td>${walletCell(r.wallet)}</td><td>${statusCell(r)}${abortBtn(r)}${enterBtn(r)}</td><td>${journeyCell(r)}</td><td class="num agelive" data-age="${r.pool_age_s!=null?r.pool_age_s:''}">${PSEC(r.pool_age_s)}</td><td class="num">${PSEC(r.probe_pool_age_s)}</td><td class="num">${PLIQ(r.liq_probe)}</td><td class="num">${PLIQ(r.live_liq)}</td><td class="num">${PLIQ(r.peak_liq)}</td><td class="num${r.pulled?' neg':''}">${r.pulled?PSEC(r.pull_pool_age_s):"–"}</td><td class="num">${t?PSEC(t.entry_pool_age_s):"–"}</td><td class="num${neg?' neg':win?' pos':''}">${holdCell(r)}</td><td>${afterCell(r)}</td><td class="num" title="fees + dust spent probing this pool (both 1-slot probes)">${USD2(r.probe_cost_usd)}</td><td class="num" title="running result: probe fees + entry P&L (live while holding)">${USD2(r.pnl_so_far)}</td></tr>`;
 if(!open)return row;
 const pnl25=r.pnl25!=null?(r.pnl25>=0?"+":"")+"$"+r.pnl25.toFixed(1):"–";
 const conf='<span class="'+(r.conf_ret>0?'pos':r.conf_ret<0?'neg':'muted')+'">'+PPCT(r.conf_ret)+'</span>';
