@@ -284,6 +284,9 @@ EVENTS = [
     ("slots_since_flurry", "slots since the previous flurry (a clock)"),
     ("age_slots", "pool age in slots at N"),
 ]
+# static conditions, not slot-N events you can detect and react to: reported, but never counted as a
+# tradeable precursor (age just says flurries cluster early; slots_since_flurry is a clock).
+STATIC_EVENTS = {"age_slots", "slots_since_flurry"}
 
 
 def _rank_auc(feat: np.ndarray, label: np.ndarray) -> float:
@@ -444,20 +447,32 @@ def render_char(out: dict) -> str:
     L.append("  buys/slot autocorrelation by lag (a clock shows as a peak at the period):")
     L.append("    " + "  ".join(f"L{k+1}:{ac[k]:+.2f}" for k in range(len(ac))))
     L.append("")
-    top = out["events"][0]
-    strong = [r for r in out["events"] if abs(r["corr"]) >= 0.1 and abs(r["auc"] - 0.5) >= 0.05]
-    peak = max(range(len(ac)), key=lambda k: ac[k]) if ac else 0
-    if strong:
-        names = ", ".join(f"{r['event']} (corr {r['corr']:+.2f}, {r['lift']:.1f}x)" for r in strong[:4])
-        L.append(f"  SIGNAL: a next-slot flurry is predicted by: {names}.")
-        L.append("  -> there is one-slot-ahead structure. Next: fit these into a 1-slot-ahead flurry predictor and")
-        L.append("     test positioning BEFORE the flurry (buy in N, ride N+1), validated live with the 1-slot probe.")
-        if ac[peak] >= 0.2:
-            L.append(f"  (buys also cluster at ~lag {peak+1} slots -- a partial clock.)")
+    lag1 = ac[0] if ac else 0.0
+    # actionable = a real slot-N EVENT (not a static condition) that discriminates the next-slot flurry.
+    # Pearson corr is suppressed by the ~1% base rate, so gate on AUC + lift, not corr.
+    actionable = [r for r in out["events"]
+                  if r["event"] not in STATIC_EVENTS and (r["auc"] - 0.5) >= 0.1 and r["lift"] >= 1.5]
+    best_p = max((r["rate_present"] for r in actionable), default=0.0)
+    static_hit = next((r for r in out["events"] if r["event"] in STATIC_EVENTS and abs(r["corr"]) >= 0.1), None)
+    if actionable and best_p >= 0.25:
+        names = ", ".join(f"{r['event']} ({r['auc']:.2f} AUC, {r['lift']:.1f}x)" for r in actionable[:4])
+        L.append(f"  SIGNAL: an actionable slot-N precursor makes the next-slot flurry likely -- {names} "
+                 f"(P {best_p*100:.0f}%, base {out['base_rate']*100:.1f}%).")
+        L.append("  -> fit a 1-slot-ahead predictor, position BEFORE the flurry (buy in N, ride N+1), validate live")
+        L.append("     with the 1-slot probe; read --scalp for the price edge first.")
+    elif actionable:
+        names = ", ".join(f"{r['event']} ({r['auc']:.2f} AUC, {r['lift']:.1f}x)" for r in actionable[:4])
+        L.append(f"  WEAK CONDITIONAL PRECURSOR ONLY: a busier slot N leads the next-slot flurry -- {names} -- but")
+        L.append(f"  P(flurry next) rises only to {best_p*100:.1f}% (base {out['base_rate']*100:.1f}%)"
+                 + (f", the top raw correlation is {static_hit['event']} (a static condition, not a precursor)," if static_hit else ",")
+                 + f" and buys mean-revert at lag 1 ({lag1:+.2f}).")
+        L.append("  -> too weak to position on alone. The go/no-go is whether a flurry slot PAYS a 1-2 slot scalp (--scalp)")
+        L.append("     and whether --discover finds a combination; otherwise ShredStream has little to key on.")
     else:
+        top = out["events"][0]
         L.append(f"  NO SIGNAL: nothing in slot N predicts a flurry in N+1 (top: {top['event']} corr {top['corr']:+.3f}, "
-                 f"AUC {top['auc']:.3f}); autocorr flat. Flurries are ~memoryless one slot ahead, so no detector can")
-        L.append("  position us ahead of them -- the ShredStream backrun has no predictable event to key on. Drop it.")
+                 f"AUC {top['auc']:.3f}); lag-1 autocorr {lag1:+.2f}. Flurries are ~memoryless one slot ahead, so no")
+        L.append("  detector can position ahead of them -- the ShredStream backrun has nothing to key on. Drop it.")
     return "\n".join(L)
 
 
