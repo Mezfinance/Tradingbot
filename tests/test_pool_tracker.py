@@ -342,9 +342,12 @@ def test_lifecycle_status_reads_the_pool_s_stage_in_the_journey():
     assert L("probe", "ok", "survivor", True, {"open": True}, None, None, "hold_probe") == "holding (hold-probe)"
     assert L("probe", "ok", "survivor", True, {"open": False, "pnl": 0.75}, None, None, "final") == "exited: win"
     assert L("probe", "ok", "survivor", True, {"open": False, "pnl": -5.0}, None, None, "final") == "exited: loss"
-    # safe-zone hold-probe sold, then the pool rugged while we were out = we dodged it
-    assert L("probe", "ok", "survivor", True, {"open": False, "pnl": 0.2}, None, "holding_rug",
+    # safe-zone hold-probe sold with the stake recovered, then the pool rugged while we were out = we dodged it
+    assert L("probe", "ok", "survivor", True, {"open": False, "pnl": 0.2, "ret": 0.01}, None, "holding_rug",
              "hold_probe") == "exited: dodged the rug"
+    # the exit sold into a draining pool for ~nothing (near-total loss) then it rugged = we were caught, not dodged
+    assert L("probe", "ok", "survivor", True, {"open": False, "pnl": -24.8, "ret": -0.99}, None, "holding_rug",
+             "hold_probe") == "exited: caught the rug"
     # safe-zone hold-probe sold, re-entry read not in yet
     assert L("probe", "ok", "survivor", True, {"open": False, "pnl": 0.2}, None, None,
              "hold_probe") == "exited: watching for re-entry"

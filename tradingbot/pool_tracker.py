@@ -221,7 +221,10 @@ def _lifecycle(kind, pv, watch_verdict, committed, primary, final, reentry, entr
                 return "holding (re-entry)"
             return "exited: win" if (final.get("pnl") or 0) >= 0 else "exited: loss"
         if reentry == "holding_rug":
-            return "exited: dodged the rug"        # we sold at the safe zone, the pool rugged after
+            # the pool rugged after our safe-zone exit; whether WE got out is the primary trade's own result:
+            # a recovered stake (ret > -0.5) = dodged, a near-total loss = we were caught holding it when it pulled.
+            caught = primary.get("ret") is not None and primary.get("ret") <= -0.5
+            return "exited: caught the rug" if caught else "exited: dodged the rug"
         if reentry == "clean":
             return "exited: clean (re-entry off/ pending)"
         if entry_stage == "hold_probe":
