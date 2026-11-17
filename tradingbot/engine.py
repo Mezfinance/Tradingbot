@@ -1270,6 +1270,8 @@ class Engine:
         if cbook is None or self.journal.get_state(CANARY_HALT):
             return
         mint, pool = w["mint"], w.get("pool")
+        if mint in self._canary_abort():
+            return  # operator aborted during the survivor wait: no gates, no second probe, no entry
         open_ = self.journal.open_positions(cbook.name)
         if len(open_) >= c.launch_canary_max_open or any(p.token_address == mint for p in open_):
             return
@@ -1290,6 +1292,8 @@ class Engine:
         ex = cbook.executor
         if pool and hasattr(ex, "remember_pool"):
             ex.remember_pool(mint, pool)
+        if mint in self._canary_abort():
+            return  # aborted during the gates (seconds of live Helius): do not fire the second real-money probe
         if c.launch_canary_probe2_usd > 0:  # a SECOND 1-slot probe ("one more hit"); set the size to 0 to skip it
             if not hasattr(ex, "probe_1slot"):
                 return
@@ -1297,6 +1301,8 @@ class Engine:
             self.journal.log_event("canary_probe2", mint, json.dumps({**res2, "pool": pool}), strategy=cbook.name)
             if res2.get("verdict") != "ok":  # trapped / honeypot / buy_failed: it insta-rugged on the second hit, skip
                 return
+        if mint in self._canary_abort():
+            return  # aborted during the second probe: do not commit real money or arm the survival gap
         if c.launch_canary_entry_gap_s > 0:  # wait and re-read: catch a reactive pull in the gap before committing
             self._schedule_entry_gap(cbook, w)
         else:
@@ -1310,6 +1316,8 @@ class Engine:
         mint = w["mint"]
         if self.journal.get_state(CANARY_HALT):
             return
+        if mint in self._canary_abort():
+            return  # operator aborted before or within the survival gap: do not commit real money
         open_ = self.journal.open_positions(cbook.name)
         if len(open_) >= c.launch_canary_max_open or any(p.token_address == mint for p in open_):
             return

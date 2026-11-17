@@ -137,9 +137,10 @@ def canary_switch(journal, action: str) -> dict:
 
 
 def canary_abort(journal, mint) -> dict:
-    """Abort one open canary position from the dashboard: the engine sells it on its next pass (1s monitor) and runs no
-    more rounds / re-entries on that pool. Writes the mint into the CANARY_ABORT state list the engine reads each pass.
-    Per-position, unlike the kill switch (which only stops new buys)."""
+    """Abort one canary pool from the dashboard at ANY stage: the engine sells any open position on its next pass (1s
+    monitor) AND cancels any pending probe / survivor-wait / gate / survival-gap entry on that pool, so no money commits.
+    Writes the mint into the CANARY_ABORT state list the engine reads each pass. Per-pool, unlike the kill switch (which
+    only stops new buys)."""
     from tradingbot.engine import CANARY_ABORT
     if not mint or not isinstance(mint, str):
         return {"ok": False, "msg": "No token mint given."}
@@ -152,7 +153,7 @@ def canary_abort(journal, mint) -> dict:
     if mint not in cur:
         cur.append(mint)
     journal.set_state(CANARY_ABORT, json.dumps(cur[-500:]))  # keep the list bounded (dead pools stay aborted)
-    return {"ok": True, "msg": f"Aborting {mint[:8]}: selling now and stopping all rounds."}
+    return {"ok": True, "msg": f"Aborting {mint[:8]}: selling any open position now and cancelling any pending entry."}
 
 
 def canary_enter(journal, mint, pool=None, usd=None, tp_pct=None, hold_s=None, name=None, sol_before=None) -> dict:
@@ -1945,8 +1946,16 @@ function statusCell(r){const t=r.lifecycle||"–";let c="muted";
 if(/lost|loss|trapped|caught|no money|feint: pulled/.test(t))c="neg";else if(/safe|clean|win|alive|dodged|holding/.test(t))c="pos";
 return '<b class="'+c+'">'+esc(t)+'</b>'}
 // a per-trade kill switch: on an OPEN real canary position, sell now and stop all further rounds/re-entries on its pool
-function abortBtn(r){return (r.real&&r.real.open&&r.mint)?'<button class="abort" title="sell this position now and stop all further rounds on this pool" onclick="abortTrade(\''+r.mint+'\')">Abort</button>':''}
-function abortTrade(mint){if(!confirm("Sell this position NOW and stop all further rounds / re-entries on this pool?\n\nReal money. The engine acts on its next 1-second pass."))return;
+function abortBtn(r){if(!r.mint)return '';
+// show the whole time a pool is actionable: holding a position, OR still in the pre-entry pipeline (probe / survivor
+// wait / gates / survival gap) on a pool that has not been closed out or pulled-and-dodged. Hidden only once there is
+// nothing left to stop (a closed trade, or a pulled pool we never entered).
+var open=r.real&&r.real.open, closed=r.real&&!r.real.open;
+var show=open||(!r.real&&!r.pulled);
+if(!show)return '';
+var t=open?"sell this position now and stop all further rounds on this pool":"cancel the pending probe / survivor-wait / entry on this pool before any money commits";
+return '<button class="abort" title="'+t+'" onclick="abortTrade(\''+r.mint+'\')">Abort</button>'}
+function abortTrade(mint){if(!confirm("Abort this pool NOW:\n• sell any open position\n• cancel any pending probe / survivor-wait / gate / entry on it\n\nReal money. The engine acts on its next 1-second pass."))return;
 fetch("api/canary/abort",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({mint})}).then(r=>r.json()).then(d=>{if(!(d&&d.ok))alert((d&&d.msg)||"Abort failed.")}).catch(e=>alert("Could not reach the abort endpoint: "+e))}
 // manual real-money entry on a tracked, still-alive pool (clean survivor OR a skipped pool with legs): typed size, TP, optional hold
 function enterBtn(r){return (r.mint&&!r.pulled&&!(r.real&&r.real.open))?'<button class="abort" style="border-color:#000;background:#c9f24d;color:#000" title="enter this pool with real money: typed size, take-profit, optional hold time" onclick="enterTrade(\''+r.mint+'\',\''+(r.pool||'')+'\')">Enter</button>':''}

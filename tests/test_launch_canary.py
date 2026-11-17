@@ -843,6 +843,36 @@ def test_entry_aborts_when_the_pool_is_unreadable_before_the_buy(cfg, good_pair)
     assert not j.open_positions(mb.CANARY4)
 
 
+def test_abort_before_the_entry_skips_the_second_probe_and_never_commits(cfg, good_pair):
+    # operator pressed Abort during the survivor wait (before the entry ran): no gates, no second probe, no buy.
+    import json as _json
+    from tradingbot.engine import CANARY_ABORT
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    live.verdict = "ok"
+    j.set_state(CANARY_ABORT, _json.dumps(["A"]))
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert live.probed == []                             # the second real-money probe never fired
+    assert not j.open_positions(mb.CANARY4)              # and nothing was committed
+
+
+def test_abort_during_the_second_probe_blocks_the_commit(cfg, good_pair):
+    # the exact race the operator hit: Abort pressed while the seconds-long second probe runs -> re-checked before commit.
+    import json as _json
+    from tradingbot.engine import CANARY_ABORT
+    eng, j, live = _probe_engine(cfg, good_pair)
+    cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
+    live.verdict = "ok"
+    orig = live.probe_1slot
+    def probe_then_abort(token, usd):
+        j.set_state(CANARY_ABORT, _json.dumps([token]))  # operator hits Abort mid-probe
+        return orig(token, usd)
+    live.probe_1slot = probe_then_abort
+    eng._canary_enter(_survivor_w(eng.books[mb.CANARY4].name))
+    assert live.probed == [("A", cfg.launch_canary_probe2_usd)]  # the probe did run
+    assert not j.open_positions(mb.CANARY4)                      # but the pre-commit abort re-check stopped the buy
+
+
 def test_entry_gap_waits_then_commits_when_the_pool_survives(cfg, good_pair):
     eng, j, live = _probe_engine(cfg, good_pair)
     cfg.launch_canary_enter, cfg.launch_canary_vol_gate = True, False
