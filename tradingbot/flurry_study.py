@@ -65,7 +65,50 @@ MOTIF_ENTRIES = [
     ("sym==F persistence", lambda r: r["sym"] == "F"),
     (".F quiet->flurry",   lambda r: r["m2"] == ".F"),
 ]
-MOTIF_HOLDS = (1, 2)    # the lead predicts a flurry in N+1, so sell 1-2 slots after the lead slot
+MOTIF_HOLDS = (1, 2)    # the lead predicts the move in N+1, so sell 1-2 slots after the lead slot
+
+DEFAULT_FLURRY_MIN = 3    # a slot is a flurry if it has >= this many buys (sweepable with --flurry-min)
+MAXLAG = 10               # autocorrelation of buys/slot out to this many slots (periodicity / a clock)
+
+# --- the predicted target ---------------------------------------------------------------------------
+# The whole point of the 11-18 reframe: predict what MAKES MONEY (a price move), not what merely clusters
+# (a buy-count flurry). A flurry of a few tiny wash buys is a reliable thing to predict (discover found it
+# at z+25) but it moves price a fraction of a % over 1-2 slots, so its scalp dies at cost. "price" asks the
+# right question -- does price rise enough next slot(s) to beat a round trip -- so a surviving rule predicts
+# money. "flurry" is kept for comparison (--target flurry).
+DEFAULT_TARGET = "price"    # "price" (an up-move) | "flurry" (next slot has >= flurry_min buys)
+DEFAULT_MOVE_PCT = 1.0      # price target: a rise of this many % counts as a hit (default = the round-trip cost)
+DEFAULT_HORIZON = 2         # price target: the up-move may land within the next this-many slots (the scalp window)
+
+
+def _tgt(kind=DEFAULT_TARGET, flurry_min=DEFAULT_FLURRY_MIN, horizon=DEFAULT_HORIZON, move=DEFAULT_MOVE_PCT) -> dict:
+    return {"kind": kind, "flurry_min": flurry_min, "horizon": horizon, "move": move}
+
+
+def _target_hit(slots: list[dict], by_slot: dict, idx: int, tgt: dict) -> float:
+    """1.0 if slot N (=slots[idx]) is followed by the predicted thing, else 0.0. kind 'flurry' = slot N+1 has
+    >= flurry_min buys; kind 'price' = price rises >= move% within the next `horizon` slots (end-of-slot
+    granularity, carried forward). The price target is what a scalp needs, so a rule that predicts it predicts
+    money. `_price_at` resolves at call time, so it may be defined below this helper."""
+    s = slots[idx]
+    if tgt["kind"] == "flurry":
+        nxt = by_slot.get(s["slot"] + 1)
+        return 1.0 if (nxt and nxt["n_buys"] >= tgt["flurry_min"]) else 0.0
+    base = s["price"]
+    if not base:
+        return 0.0
+    thr = tgt["move"] / 100.0
+    for k in range(1, tgt["horizon"] + 1):
+        p = _price_at(slots, s["slot"] + k)
+        if p and p / base - 1.0 >= thr:
+            return 1.0
+    return 0.0
+
+
+def target_label(tgt: dict) -> str:
+    if tgt["kind"] == "flurry":
+        return f"a buy flurry (>={tgt['flurry_min']} buys) in slot N+1"
+    return f"a >={tgt['move']:.1f}% price up-move in the next {tgt['horizon']} slot(s)"
 
 
 # row indices from helius.launch_record txs: [sec, slot, payer, tokΔ, solΔ, tok_after, sol_after]
@@ -168,6 +211,28 @@ def _agg(rets: list[float]) -> dict:
             "rugged_pct": 100.0 * sum(1 for r in rets if r <= -0.999) / len(rets)}
 
 
+def _best_cell(rows: list[dict], ctrl: dict, holds, key: str) -> dict | None:
+    """Pick the strongest cell that beats the control on mean AND median AND win% at n>=50. The triple guard
+    is the point: with the +300% cap a single reserve-ratio outlier (a +300% artifact at a ~1% win rate) can
+    lift the MEAN above the control, so mean alone declared false edges ('BEST LEAD ... win 1% -> pays'). A
+    real price edge also beats the control's median and wins at least as often; an outlier beats neither."""
+    best = None
+    for row in rows:
+        for h in holds:
+            a, c = row[f"h{h}"], ctrl.get(f"h{h}", {})
+            if a.get("n", 0) < 50 or a.get("mean", -9) <= 0:
+                continue
+            if a["mean"] <= c.get("mean", 0) or a.get("median", -9) < c.get("median", -9) \
+                    or a.get("win_pct", 0) < c.get("win_pct", 0):
+                continue
+            edge = a["mean"] - c.get("mean", 0)
+            if best is None or edge > best["edge"]:
+                best = {key: row[key], "hold": h, "mean": a["mean"], "control": c.get("mean"), "edge": edge,
+                        "n": a["n"], "win_pct": a["win_pct"], "median": a.get("median"),
+                        "rugged_pct": a.get("rugged_pct", 0.0)}
+    return best
+
+
 def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: int, progress=None) -> tuple[dict, int]:
     """Cache the first `span_s` of each pool's trading in watch.db `watch_flurry` (research key, stable hash order
     so a credit cap leaves an even sample). Returns {pool: launch_record dict} and the research credits spent."""
@@ -201,11 +266,13 @@ def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: in
 
 def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: float = DEFAULT_SPAN_S,
           cost_pct: float = DEFAULT_COST_PCT, probed_only: bool = False, max_credits: int = 20_000,
-          progress=None, now: float | None = None, seed: int = 0) -> dict:
+          progress=None, now: float | None = None, seed: int = 0, target: str = DEFAULT_TARGET,
+          move_pct: float = DEFAULT_MOVE_PCT, horizon: int = DEFAULT_HORIZON) -> dict:
     """Assemble the pool sample, fetch/read each pool's slot flow, and aggregate the scalp returns per flurry
-    definition x hold vs a random-slot control. Population = the scorer's finished liquid pools (or only pools we
-    probed, with --probed-only). Read only; Helius only with `helius` set."""
+    definition x hold vs a random-slot control, plus the motif-entry and discovered-rule scalps (both pointed at
+    `target`). Population = the scorer's finished liquid pools (or only --probed-only). Read only."""
     import time
+    tgt = _tgt(target, DEFAULT_FLURRY_MIN, horizon, move_pct)
     now = now if now is not None else time.time()
     since = now - hours * 3600
     scorer = pool_tracker.scorer_rows(store.query, since)
@@ -256,7 +323,7 @@ def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: f
                     control[h].append(r)
         # motif-entry scalp: enter on a discovered lead slot (buy front of N+1), sell 1-2 slots later. bank is
         # aligned to `slots` by index, so a matched rec i is the same slot _scalp enters on.
-        bank = _slot_bank(flow, DEFAULT_FLURRY_MIN, 0.0)
+        bank = _slot_bank(flow, 0.0, tgt)
         for label, fn in MOTIF_ENTRIES:
             for i, rec_s in enumerate(bank):
                 if fn(rec_s):
@@ -271,17 +338,8 @@ def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: f
             row[f"h{h}"] = _agg(flurry[label][h])
         results.append(row)
     ctrl = {f"h{h}": _agg(control[h]) for h in HOLDS}
-    # best cell: the flurry x hold with the highest mean that clears the control and has a sane n
-    best = None
-    for row in results:
-        for h in HOLDS:
-            a = row[f"h{h}"]
-            c = ctrl[f"h{h}"]
-            if a.get("n", 0) >= 50 and a.get("mean", -9) > 0 and a.get("mean", -9) > c.get("mean", 0):
-                edge = a["mean"] - c.get("mean", 0)
-                if best is None or edge > best["edge"]:
-                    best = {"flurry": row["flurry"], "hold": h, "mean": a["mean"], "control": c.get("mean"),
-                            "edge": edge, "n": a["n"], "win_pct": a["win_pct"], "rugged_pct": a["rugged_pct"]}
+    # best cell: the flurry x hold that beats the control on mean, median AND win% at a sane n (_best_cell)
+    best = _best_cell(results, ctrl, HOLDS, "flurry")
     # motif-entry scalp: aggregate each discovered-lead entry vs the same control, pick the best lead
     motif_results = []
     for label, _fn in MOTIF_ENTRIES:
@@ -289,32 +347,20 @@ def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: f
         for h in MOTIF_HOLDS:
             row[f"h{h}"] = _agg(motif[label][h])
         motif_results.append(row)
-    motif_best = None
-    for row in motif_results:
-        for h in MOTIF_HOLDS:
-            a = row[f"h{h}"]
-            c = ctrl[f"h{h}"]
-            if a.get("n", 0) >= 50 and a.get("mean", -9) > 0 and a.get("mean", -9) > c.get("mean", 0):
-                edge = a["mean"] - c.get("mean", 0)
-                if motif_best is None or edge > motif_best["edge"]:
-                    motif_best = {"motif": row["motif"], "hold": h, "mean": a["mean"], "control": c.get("mean"),
-                                  "edge": edge, "n": a["n"], "win_pct": a["win_pct"], "rugged_pct": a["rugged_pct"]}
+    motif_best = _best_cell(motif_results, ctrl, MOTIF_HOLDS, "motif")
     return {
         "hours": hours, "span_s": span_s, "cost_pct": cost_pct, "probed_only": probed_only, "credits": credits,
-        "n_pools": len(metas), "n_flows": n_flows, "flurries_total": flurries_total,
+        "n_pools": len(metas), "n_flows": n_flows, "flurries_total": flurries_total, "target": tgt,
         "median_buys_per_slot": statistics.median(buys_per_slot) if buys_per_slot else 0,
         "results": results, "control": ctrl, "best": best,
         "motif_results": motif_results, "motif_best": motif_best,
-        "discovered": discovered_scalp(have, metas, DEFAULT_FLURRY_MIN, cost, MOTIF_HOLDS, seed),
+        "discovered": discovered_scalp(have, metas, tgt, cost, MOTIF_HOLDS, seed),
     }
 
 
 # --- lead-lag: what in slot N correlates with a buy flurry in slot N+1 -----------------------------
 # The horse (not the scalp): no presupposed cause -- every candidate slot-N event is scored for its
 # correlation / AUC / lift with "the very next slot is a buy flurry". The events rank themselves.
-
-DEFAULT_FLURRY_MIN = 3    # a slot is a flurry if it has >= this many buys (sweepable with --flurry-min)
-MAXLAG = 10               # autocorrelation of buys/slot out to this many slots (periodicity / a clock)
 
 # event feature at slot N -> does slot N+1 have a flurry.  (name, human description)
 EVENTS = [
@@ -357,8 +403,8 @@ def _rank_auc(feat: np.ndarray, label: np.ndarray) -> float:
     return float((ranks[label == 1].sum() - n1 * (n1 + 1) / 2.0) / (n1 * n0))
 
 
-def _pool_rows(flow: dict, flurry_min: int) -> list[tuple[dict, float]]:
-    """Per active slot N: the event features and the target (slot N+1 is a flurry)."""
+def _pool_rows(flow: dict, tgt: dict) -> list[tuple[dict, float]]:
+    """Per active slot N: the event features and the target (what we predict follows, per `tgt`)."""
     slots = flow["slots"]
     by_slot = {s["slot"]: s for s in slots}
     cnt: Counter = Counter()
@@ -384,14 +430,13 @@ def _pool_rows(flow: dict, flurry_min: int) -> list[tuple[dict, float]]:
             "distinct_buyers": float(len(set(buyers))), "new_buyers": float(len(new_b)),
             "outside_buy": 1.0 if any(b not in top3 for b in buyers) else 0.0,
             "dominant_bought": 1.0 if (top1 and top1 in buyers) else 0.0,
-            "is_flurry_N": 1.0 if s["n_buys"] >= flurry_min else 0.0,
+            "is_flurry_N": 1.0 if s["n_buys"] >= tgt["flurry_min"] else 0.0,
             "price_move": move, "price_up": 1.0 if move > 0 else 0.0,
             "slots_since_flurry": since, "age_slots": float(min(slot - first_slot, 1000)),
         }
-        nxt = by_slot.get(slot + 1)
-        target = 1.0 if (nxt and nxt["n_buys"] >= flurry_min) else 0.0
+        target = _target_hit(slots, by_slot, idx, tgt)
         out.append((feat, target))
-        if s["n_buys"] >= flurry_min:
+        if s["n_buys"] >= tgt["flurry_min"]:
             last_flurry = slot
     return out
 
@@ -417,10 +462,13 @@ def _autocorr(series: list[float], maxlag: int) -> list[float]:
 
 def characterize(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: float = DEFAULT_SPAN_S,
                  flurry_min: int = DEFAULT_FLURRY_MIN, probed_only: bool = False, max_credits: int = 20_000,
-                 progress=None, now: float | None = None) -> dict:
-    """For every candidate slot-N event, its correlation / AUC / lift with a buy flurry in slot N+1, plus the
-    autocorrelation of buys/slot (a clock). Answers 'what predicts a next-slot flurry' with no presupposed cause."""
+                 progress=None, now: float | None = None, target: str = DEFAULT_TARGET,
+                 move_pct: float = DEFAULT_MOVE_PCT, horizon: int = DEFAULT_HORIZON) -> dict:
+    """For every candidate slot-N event, its correlation / AUC / lift with the predicted thing in the next
+    slot(s) (a price up-move by default; a buy flurry with target='flurry'), plus the buys/slot autocorrelation.
+    Answers 'what predicts a next-slot MOVE' with no presupposed cause."""
     import time
+    tgt = _tgt(target, flurry_min, horizon, move_pct)
     now = now if now is not None else time.time()
     since = now - hours * 3600
     scorer = pool_tracker.scorer_rows(store.query, since)
@@ -442,11 +490,11 @@ def characterize(journal, store, cfg=None, helius=None, hours: float = 720.0, sp
         if not flow:
             continue
         n_flows += 1
-        rows.extend(_pool_rows(flow, flurry_min))
+        rows.extend(_pool_rows(flow, tgt))
         series = _dense_buys(flow)
         autos.append((_autocorr(series, MAXLAG), len(series)))
     out = {"hours": hours, "span_s": span_s, "flurry_min": flurry_min, "probed_only": probed_only,
-           "credits": credits, "n_pools": len(metas), "n_flows": n_flows, "n_slots": len(rows)}
+           "credits": credits, "n_pools": len(metas), "n_flows": n_flows, "n_slots": len(rows), "target": tgt}
     if not rows:
         out["events"] = []
         out["base_rate"] = 0.0
@@ -478,16 +526,18 @@ def characterize(journal, store, cfg=None, helius=None, hours: float = 720.0, sp
 
 
 def render_char(out: dict) -> str:
+    tgt = out.get("target") or _tgt()
+    tl = target_label(tgt)
     L = []
-    L.append("WHAT IN SLOT N CORRELATES WITH A BUY FLURRY IN SLOT N+1  (lead-lag, no presupposed cause)")
+    L.append(f"WHAT IN SLOT N PREDICTS {tl.upper()}  (lead-lag, no presupposed cause)")
     L.append(f"  pools {out['n_pools']} ({out['n_flows']} with a flow){', probed only' if out['probed_only'] else ''}; "
-             f"span {out['span_s']:.0f}s; flurry = >={out['flurry_min']} buys/slot; {out['credits']} research credits")
-    L.append(f"  {out['n_slots']} active slots; base rate of a flurry in the NEXT slot = {out['base_rate']*100:.1f}%")
+             f"span {out['span_s']:.0f}s; target = {tl}; {out['credits']} research credits")
+    L.append(f"  {out['n_slots']} active slots; base rate of the target = {out['base_rate']*100:.1f}%")
     if not out["events"]:
         L.append("  no usable slots.")
         return "\n".join(L)
     L.append("")
-    L.append(f"  {'event (slot N)':<20}{'corr':>8}{'AUC':>7}{'P(flurry N+1)':>15}{'lift':>7}{'n':>8}   description")
+    L.append(f"  {'event (slot N)':<20}{'corr':>8}{'AUC':>7}{'P(target)':>15}{'lift':>7}{'n':>8}   description")
     for r in out["events"]:
         L.append(f"  {r['event']:<20}{r['corr']:+8.3f}{r['auc']:7.3f}"
                  f"{r['rate_present']*100:13.1f}% {r['lift']:6.2f}x{r['n_present']:8d}   {r['desc']}")
@@ -503,25 +553,27 @@ def render_char(out: dict) -> str:
                   if r["event"] not in STATIC_EVENTS and (r["auc"] - 0.5) >= 0.1 and r["lift"] >= 1.5]
     best_p = max((r["rate_present"] for r in actionable), default=0.0)
     static_hit = next((r for r in out["events"] if r["event"] in STATIC_EVENTS and abs(r["corr"]) >= 0.1), None)
+    price = tgt["kind"] == "price"
     if actionable and best_p >= 0.25:
         names = ", ".join(f"{r['event']} ({r['auc']:.2f} AUC, {r['lift']:.1f}x)" for r in actionable[:4])
-        L.append(f"  SIGNAL: an actionable slot-N precursor makes the next-slot flurry likely -- {names} "
+        L.append(f"  SIGNAL: an actionable slot-N precursor makes {tl} likely -- {names} "
                  f"(P {best_p*100:.0f}%, base {out['base_rate']*100:.1f}%).")
-        L.append("  -> fit a 1-slot-ahead predictor, position BEFORE the flurry (buy in N, ride N+1), validate live")
-        L.append("     with the 1-slot probe; read --scalp for the price edge first.")
+        L.append("  -> fit a 1-slot-ahead predictor, position in N and ride N+1, validate live with the 1-slot probe;")
+        L.append("     confirm it PAYS with the motif / discovered-rule scalp (--scalp).")
     elif actionable:
         names = ", ".join(f"{r['event']} ({r['auc']:.2f} AUC, {r['lift']:.1f}x)" for r in actionable[:4])
-        L.append(f"  WEAK CONDITIONAL PRECURSOR ONLY: a busier slot N leads the next-slot flurry -- {names} -- but")
-        L.append(f"  P(flurry next) rises only to {best_p*100:.1f}% (base {out['base_rate']*100:.1f}%)"
+        L.append(f"  WEAK CONDITIONAL PRECURSOR ONLY: a busier slot N leads {tl} -- {names} -- but")
+        L.append(f"  P(target) rises only to {best_p*100:.1f}% (base {out['base_rate']*100:.1f}%)"
                  + (f", the top raw correlation is {static_hit['event']} (a static condition, not a precursor)," if static_hit else ",")
                  + f" and buys mean-revert at lag 1 ({lag1:+.2f}).")
-        L.append("  -> too weak to position on alone. The go/no-go is whether a flurry slot PAYS a 1-2 slot scalp (--scalp)")
-        L.append("     and whether --discover finds a combination; otherwise ShredStream has little to key on.")
+        L.append("  -> too weak to position on alone. The go/no-go is whether it PAYS a 1-2 slot scalp (--scalp) and")
+        L.append("     whether --discover finds a combination; otherwise ShredStream has little to key on.")
     else:
         top = out["events"][0]
-        L.append(f"  NO SIGNAL: nothing in slot N predicts a flurry in N+1 (top: {top['event']} corr {top['corr']:+.3f}, "
-                 f"AUC {top['auc']:.3f}); lag-1 autocorr {lag1:+.2f}. Flurries are ~memoryless one slot ahead, so no")
-        L.append("  detector can position ahead of them -- the ShredStream backrun has nothing to key on. Drop it.")
+        tail = ("price is ~a random walk one slot ahead" if price else "flurries are ~memoryless one slot ahead")
+        L.append(f"  NO SIGNAL: nothing in slot N predicts {tl} (top: {top['event']} corr {top['corr']:+.3f}, "
+                 f"AUC {top['auc']:.3f}); lag-1 autocorr {lag1:+.2f}. {tail}, so no")
+        L.append("  detector can position ahead of it -- the ShredStream backrun has nothing to key on. Drop it.")
     return "\n".join(L)
 
 
@@ -548,9 +600,11 @@ SYM_DESC = {"F": "N was itself a flurry", "S": "net sellers in N", "N": "a brand
             "b": "light buying in N", ".": "a dead slot"}
 
 
-def _slot_bank(flow: dict, flurry_min: int, create_ts: float) -> list[dict]:
+def _slot_bank(flow: dict, create_ts: float, tgt: dict) -> list[dict]:
     """Per active slot N: a generic numeric feature dict, a discrete symbol, 2- and 3-slot motifs ending at N,
-    the target (N+1 is a flurry) and the pool's create_ts (for the time split). No hand-picked events."""
+    the target (what `tgt` predicts follows) and the pool's create_ts (for the time split). No hand-picked
+    events. The symbol "F" still uses the buy-count flurry threshold; only the TARGET follows `tgt`."""
+    flurry_min = tgt["flurry_min"]
     slots = flow["slots"]
     by_slot = {s["slot"]: s for s in slots}
     cnt: Counter = Counter()
@@ -601,8 +655,7 @@ def _slot_bank(flow: dict, flurry_min: int, create_ts: float) -> list[dict]:
             sym = "b"
         else:
             sym = "."
-        nxt = by_slot.get(slot + 1)
-        target = 1.0 if (nxt and nxt["n_buys"] >= flurry_min) else 0.0
+        target = _target_hit(slots, by_slot, idx, tgt)
         recs.append({"f": f, "sym": sym, "m2": prev_sym + sym, "m3": prev2_sym + prev_sym + sym,
                      "target": target, "create_ts": create_ts})
         prev2_sym, prev_sym, prev = prev_sym, sym, f
@@ -655,12 +708,14 @@ def _eval_spec(spec: dict, recs: list[dict], tgt: np.ndarray, base: float) -> di
 
 def discover(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: float = DEFAULT_SPAN_S,
              flurry_min: int = DEFAULT_FLURRY_MIN, probed_only: bool = False, max_credits: int = 20_000,
-             progress=None, now: float | None = None) -> dict:
-    """Data-driven discovery of the slot-N event that precedes an N+1 flurry: no event named in advance, a large
-    auto-generated rule bank + sequence motifs, kept only where the lead survives a time-holdout with a
-    family-wise z guard. Complements characterize(); same Helius-cached slot flows, read only."""
+             progress=None, now: float | None = None, target: str = DEFAULT_TARGET,
+             move_pct: float = DEFAULT_MOVE_PCT, horizon: int = DEFAULT_HORIZON) -> dict:
+    """Data-driven discovery of the slot-N event that precedes the predicted thing (a price up-move by default;
+    a buy flurry with target='flurry'): no event named in advance, a large auto-generated rule bank + sequence
+    motifs, kept only where the lead survives a time-holdout with a family-wise z guard. Read only."""
     import math
     import time
+    tgt = _tgt(target, flurry_min, horizon, move_pct)
     now = now if now is not None else time.time()
     since = now - hours * 3600
     scorer = pool_tracker.scorer_rows(store.query, since)
@@ -681,8 +736,8 @@ def discover(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s
         if not flow:
             continue
         n_flows += 1
-        recs.extend(_slot_bank(flow, flurry_min, m["create_ts"] or 0.0))
-    out = {"hours": hours, "span_s": span_s, "flurry_min": flurry_min, "probed_only": probed_only,
+        recs.extend(_slot_bank(flow, m["create_ts"] or 0.0, tgt))
+    out = {"hours": hours, "span_s": span_s, "flurry_min": flurry_min, "probed_only": probed_only, "target": tgt,
            "credits": credits, "n_pools": len(metas), "n_flows": n_flows, "n_slots": len(recs),
            "survivors": [], "tested": 0, "base_train": 0.0, "base_hold": 0.0, "split": "none", "zc": 0.0}
     if len(recs) < 4 * DISC_MIN_SUPPORT:
@@ -734,12 +789,14 @@ def discover(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s
 
 
 def render_discover(out: dict) -> str:
+    tgt = out.get("target") or _tgt()
+    tl = target_label(tgt)
     L = []
-    L.append("DISCOVERED EVENTS: what in slot N leads an N+1 flurry  (data-driven, holdout-confirmed, no event named)")
+    L.append(f"DISCOVERED EVENTS: what in slot N leads {tl}  (data-driven, holdout-confirmed, no event named)")
     L.append(f"  pools {out['n_pools']} ({out['n_flows']} with a flow){', probed only' if out['probed_only'] else ''}; "
-             f"span {out['span_s']:.0f}s; flurry = >={out['flurry_min']} buys/slot; {out['credits']} research credits")
+             f"span {out['span_s']:.0f}s; target = {tl}; {out['credits']} research credits")
     L.append(f"  {out['n_slots']} active slots; {out['split']} split; "
-             f"base rate of a next-slot flurry train {out['base_train']*100:.1f}% / holdout {out['base_hold']*100:.1f}%")
+             f"base rate of the target train {out['base_train']*100:.1f}% / holdout {out['base_hold']*100:.1f}%")
     if not out["n_slots"] or out["tested"] == 0:
         L.append("  too few slots to discover anything.")
         return "\n".join(L)
@@ -747,7 +804,7 @@ def render_discover(out: dict) -> str:
              f"family-wise z threshold {out['zc']:.2f} (guards against spurious winners)")
     L.append("")
     if out["survivors"]:
-        L.append(f"  {'discovered rule (slot N)':<34}{'train lift':>11}{'hold lift':>11}{'P(flurry)':>11}{'z':>7}{'n':>7}")
+        L.append(f"  {'discovered rule (slot N)':<34}{'train lift':>11}{'hold lift':>11}{'P(target)':>11}{'z':>7}{'n':>7}")
         for r in out["survivors"]:
             L.append(f"  {r['rule']:<34}{r['lift_train']:10.2f}x{r['lift_hold']:10.2f}x"
                      f"{r['rate_hold']*100:10.1f}%{r['z_hold']:+7.1f}{r['n_hold']:7d}")
@@ -755,14 +812,15 @@ def render_discover(out: dict) -> str:
         top = out["survivors"][0]
         direction = "more" if top["lift_hold"] > 1 else "less"
         L.append(f"  DISCOVERED ({out['n_survivors']} rule(s) survive the holdout): the strongest is "
-                 f"'{top['rule']}' -> a next-slot flurry is {top['lift_hold']:.1f}x {'likelier' if top['lift_hold']>1 else 'rarer'} "
+                 f"'{top['rule']}' -> the target is {top['lift_hold']:.1f}x {'likelier' if top['lift_hold']>1 else 'rarer'} "
                  f"when it holds ({direction} than base).")
-        L.append("  -> these are candidate precursors the data named itself, confirmed out of sample. Next: fold them into")
-        L.append("     a 1-slot-ahead flurry predictor, cross-check against characterize(), and validate live with the 1-slot probe.")
+        L.append("  -> candidate precursors the data named itself, confirmed out of sample. Next: confirm they PAY with the")
+        L.append("     discovered-rule scalp (--scalp), cross-check characterize(), then validate live with the 1-slot probe.")
     else:
-        L.append(f"  NOTHING SURVIVES THE HOLDOUT: of {out['tested']} auto-generated rules, none leads a next-slot flurry")
+        tail = ("price is ~a random walk one slot ahead" if tgt["kind"] == "price" else "flurries are ~memoryless")
+        L.append(f"  NOTHING SURVIVES THE HOLDOUT: of {out['tested']} auto-generated rules, none leads {tl}")
         L.append("  on the held-out pools beyond chance. Any in-sample pattern was overfit -- consistent with NO SIGNAL:")
-        L.append("  flurries are ~memoryless one slot ahead, so there is no event to key a ShredStream backrun on. Drop it.")
+        L.append(f"  {tail}, so there is no event to key a ShredStream backrun on. Drop it.")
     return "\n".join(L)
 
 
@@ -772,7 +830,7 @@ def render_discover(out: dict) -> str:
 # actually PAYS on price -- on the same holdout pools the rule was confirmed on, so it is out of sample too.
 # A rule can lead a flurry yet not move price enough to beat cost; that gap is the whole question.
 
-def discovered_scalp(have: dict, metas: list[dict], flurry_min: int, cost: float,
+def discovered_scalp(have: dict, metas: list[dict], tgt: dict, cost: float,
                      holds=MOTIF_HOLDS, seed: int = 0) -> dict:
     import math
     pools = []
@@ -781,7 +839,7 @@ def discovered_scalp(have: dict, metas: list[dict], flurry_min: int, cost: float
         flow = slot_flow(rec) if rec else None
         if not flow:
             continue
-        pools.append({"flow": flow, "bank": _slot_bank(flow, flurry_min, m.get("create_ts") or 0.0),
+        pools.append({"flow": flow, "bank": _slot_bank(flow, m.get("create_ts") or 0.0, tgt),
                       "ct": m.get("create_ts") or 0.0})
     out = {"n_pools": len(pools), "n_survivors": 0, "results": [], "control": {}, "best": None,
            "split": "none", "zc": 0.0}
@@ -826,15 +884,18 @@ def discovered_scalp(have: dict, metas: list[dict], flurry_min: int, cost: float
     results = []
     for spec, ho in survivors:                            # scalp each survivor on the HOLDOUT pools (out of sample)
         agg = {h: [] for h in holds}
+        hits = []                                         # per fire: did the predicted target follow (proves the rule fires on real target slots)
         for p in hold:
             slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
             for i, rec_s in enumerate(p["bank"]):
                 if spec["fn"](rec_s):
+                    hits.append(rec_s["target"])
                     for h in holds:
                         r = _scalp(slots, pull, i, h, cost)
                         if r is not None:
                             agg[h].append(r)
-        row = {"rule": spec["rule"], "lift_hold": ho["lift"], "z_hold": ho["z"]}
+        row = {"rule": spec["rule"], "lift_hold": ho["lift"], "z_hold": ho["z"], "fires": len(hits),
+               "target_hit": (statistics.fmean(hits) if hits else 0.0)}
         for h in holds:
             row[f"h{h}"] = _agg(agg[h])
         results.append(row)
@@ -849,15 +910,7 @@ def discovered_scalp(have: dict, metas: list[dict], flurry_min: int, cost: float
                 if r is not None:
                     control[h].append(r)
     ctrl = {f"h{h}": _agg(control[h]) for h in holds}
-    best = None
-    for row in results:
-        for h in holds:
-            a, c = row[f"h{h}"], ctrl[f"h{h}"]
-            if a.get("n", 0) >= 50 and a.get("mean", -9) > 0 and a.get("mean", -9) > c.get("mean", 0):
-                edge = a["mean"] - c.get("mean", 0)
-                if best is None or edge > best["edge"]:
-                    best = {"rule": row["rule"], "hold": h, "mean": a["mean"], "control": c.get("mean"),
-                            "edge": edge, "n": a["n"], "win_pct": a["win_pct"], "median": a["median"]}
+    best = _best_cell(results, ctrl, holds, "rule")
     out.update({"results": results, "control": ctrl, "best": best, "n_hold": len(hold)})
     return out
 
@@ -874,11 +927,13 @@ def _c(a: dict) -> str:
 
 
 def render(out: dict) -> str:
+    tgt = out.get("target") or _tgt()
     L = []
     L.append("BUY-FLURRY SLOT-CONTINUATION STUDY  (reactive-backrun scalp: buy front of N+1, sell N+h)")
     L.append(f"  pools {out['n_pools']} ({out['n_flows']} with a slot flow){', probed only' if out['probed_only'] else ''}; "
              f"span {out['span_s']:.0f}s; cost {out['cost_pct']:.2f}%; {out['credits']} research credits")
-    L.append(f"  median buys/slot {out['median_buys_per_slot']:.0f}; flurries (buys>=3) {out['flurries_total']}")
+    L.append(f"  median buys/slot {out['median_buys_per_slot']:.0f}; flurries (buys>=3) {out['flurries_total']}; "
+             f"discover/motif target = {target_label(tgt)}")
     L.append(f"  each cell = net scalp mean (capped +-{RET_CAP*100:.0f}%) / median / win% / n")
     L.append("")
     head = f"  {'flurry':<11}" + "".join(f"{'hold '+str(h):>28}" for h in HOLDS)
@@ -910,26 +965,31 @@ def render(out: dict) -> str:
                      f"win {mb['win_pct']:.0f}%, rugged {mb['rugged_pct']:.0f}%")
             L.append("  -> the discovered precursor pays as an entry. Validate live with the 1-slot probe before ShredStream.")
         else:
-            L.append("  NO LEAD clears cost + the control: the discovered precursor leads a flurry but not enough PRICE")
-            L.append("  to scalp. The lead-lag is real yet not tradeable at slot scale on untouched pools.")
+            L.append("  NO LEAD clears cost + the control on mean/median/win%: the precursor leads the target but entering")
+            L.append("  on it doesn't pay a 1-2 slot scalp. Not tradeable at slot scale on untouched pools.")
     d = out.get("discovered")
     if d is not None:
         L.append("")
         L.append("  DISCOVERED-RULE SCALP  (auto-fed from discover's survivors; scalped OUT OF SAMPLE on the holdout pools)")
         L.append(f"  {d['n_survivors']} holdout-confirmed rule(s), {d['split']} split, {d.get('n_hold', 0)} holdout pools; "
-                 f"each scalps buy front of N+1, sell N+h")
+                 f"target = {target_label(tgt)}")
         if d["results"]:
-            L.append(f"  {'discovered rule (enter on it)':<34}" + "".join(f"{'hold '+str(h):>28}" for h in MOTIF_HOLDS))
+            L.append(f"  {'discovered rule':<28}{'target%':>8}{'fires':>7}" + "".join(f"{'hold '+str(h):>28}" for h in MOTIF_HOLDS))
             for row in d["results"]:
-                L.append(f"  {row['rule'][:34]:<34}" + "".join(f"  {_c(row[f'h{h}'])}" for h in MOTIF_HOLDS))
-            L.append(f"  {'control':<34}" + "".join(f"  {_c(d['control'][f'h{h}'])}" for h in MOTIF_HOLDS))
+                L.append(f"  {row['rule'][:28]:<28}{row.get('target_hit', 0.0)*100:7.0f}%{row.get('fires', 0):7d}"
+                         + "".join(f"  {_c(row[f'h{h}'])}" for h in MOTIF_HOLDS))
+            L.append(f"  {'control':<28}{'':>8}{'':>7}" + "".join(f"  {_c(d['control'][f'h{h}'])}" for h in MOTIF_HOLDS))
+            L.append("  (target% = share of fires the predicted move actually followed -- proves the rule fires on real target slots)")
         db = d.get("best")
         if db:
             L.append(f"  BEST DISCOVERED RULE: '{db['rule']}' hold {db['hold']} -> net {db['mean']*100:+.1f}% "
                      f"(median {db['median']*100:+.1f}%, control {db['control']*100:+.1f}%, edge {db['edge']*100:+.1f} pts) "
                      f"n={db['n']}, win {db['win_pct']:.0f}%")
-            L.append("  -> a discovered lead that also PAYS on price out of sample. Validate live with the 1-slot probe.")
+            L.append("  -> a discovered lead that also PAYS out of sample. Validate live with the 1-slot probe before ShredStream.")
+        elif tgt["kind"] == "price":
+            L.append("  NO DISCOVERED RULE pays out of sample: even pointed straight at PRICE, no slot-N rule predicts a")
+            L.append("  tradeable 1-2 slot up-move beyond chance -> price is ~a random walk at slot scale, drop ShredStream.")
         else:
-            L.append("  NO DISCOVERED RULE pays on price out of sample: the leads predict a next-slot flurry but the price")
-            L.append("  move doesn't beat cost. Lead-lag real, scalp not -> ShredStream has nothing profitable to key on.")
+            L.append("  NO DISCOVERED RULE pays on price: the leads predict a next-slot flurry (target%) but it doesn't move")
+            L.append("  price enough. Re-run with --target price to point discovery at the move itself.")
     return "\n".join(L)

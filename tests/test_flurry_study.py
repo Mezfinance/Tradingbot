@@ -128,8 +128,9 @@ def test_discovered_rule_scalp_auto_feeds_the_survivors_and_scalps_them(monkeypa
     out = _run(monkeypatch, _rec_causal())
     d = out["discovered"]
     assert d["n_survivors"] >= 1                              # discover's own rules were carried in
-    assert d["best"] is not None                              # at least one leads a flurry AND pays on price
+    assert d["best"] is not None                              # at least one predicts the move AND pays on price
     assert d["best"]["mean"] > d["best"]["control"]
+    assert any(r.get("target_hit", 0) > 0 for r in d["results"])   # the rules fire on real target slots
     assert "DISCOVERED-RULE SCALP" in fl.render(out)
 
 
@@ -145,25 +146,39 @@ def _add(res, rows, sec0, slot, n, dsol, wallet):
 
 
 def _rec_causal(cycles=40):
-    """A new outsider wallet buys in slot k, then the bot fires a 5-buy flurry in k+1, then quiet. So a first-ever
-    buyer in slot N reliably precedes a flurry in N+1."""
+    """A new outsider wallet buys in slot k, then the bot pumps k+1 with real SOL (a clear PRICE up-move),
+    then a long quiet stretch. So a first-ever buyer in slot N reliably precedes both a flurry AND a price
+    move in N+1 -- the price target and the flurry target both get a strong, low-base-rate precursor."""
     res, rows, sec, slot = [1e9, 100.0], [], 0.0, 10
     for c in range(cycles):
-        sec = _add(res, rows, sec, slot, 1, 0.2, f"out{c}")     # a brand-new wallet arrives
-        sec = _add(res, rows, sec, slot + 1, 5, 0.3, "bot")     # the bot wash-pumps the next slot
-        sec = _add(res, rows, sec, slot + 2, 1, 0.1, "bot")     # quiet
-        slot += 3
+        sec = _add(res, rows, sec, slot, 1, 0.2, f"out{c}")     # a brand-new wallet arrives (the precursor)
+        sec = _add(res, rows, sec, slot + 1, 5, 3.0, "bot")     # the bot pumps the next slot -> price up >1%
+        for q in range(2, 6):                                   # a long quiet stretch -> no move, keeps the base rate low
+            sec = _add(res, rows, sec, slot + q, 1, 0.02, "bot")
+        slot += 6
     return {"txs": rows}
 
 
 def _rec_random(slots=1500, seed=1):
-    """Buy counts drawn independently per slot by random wallets: flurries happen but nothing in N predicts N+1."""
+    """Buys AND sells drawn independently per slot -> price is a random walk, so nothing in N predicts the next
+    slot's move. The proper null for the PRICE target (a buys-only stream trends up, which is trivially
+    'predictable' and would plant a false signal)."""
     import random as _r
     rng = _r.Random(seed)
     res, rows, sec = [1e9, 100.0], [], 0.0
     for s in range(10, 10 + slots):
         for _ in range(rng.randint(0, 6)):
-            sec = _add(res, rows, sec, s, 1, 0.1, f"w{rng.randint(0, 50)}")
+            tok, sol = res
+            if rng.random() < 0.5:                          # sell: tokens in, SOL out (price down)
+                new_sol = max(sol - 0.1, 1.0)
+                new_tok = (tok * sol) / new_sol
+                dtok, dsolv = new_tok - tok, new_sol - sol
+                res[0], res[1] = new_tok, new_sol
+            else:                                           # buy: tokens out, SOL in (price up)
+                dtok, dsolv = _buy(res, 0.1)
+            rows.append([sec, s, f"w{rng.randint(0, 50)}", round(dtok, 6), round(dsolv, 9),
+                         round(res[0], 6), round(res[1], 9)])
+            sec += 0.05
     return {"txs": rows}
 
 

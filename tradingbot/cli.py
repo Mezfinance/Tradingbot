@@ -195,6 +195,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--cost-pct", type=float, default=1.0, help="flurry-study: round-trip cost (pool fee + tip) as a %% of notional")
     parser.add_argument("--probed-only", action="store_true", help="flurry-study: restrict to pools we have probed/feinted")
     parser.add_argument("--flurry-min", type=int, default=3, help="flurry-study: a slot is a flurry at >= this many buys")
+    parser.add_argument("--target", choices=["price", "flurry"], default="price", help="flurry-study: what discover/characterize/motif predict -- a price up-move (default) or a buy-count flurry")
+    parser.add_argument("--move-pct", type=float, default=1.0, help="flurry-study: price target -- a rise of this many %% counts as a hit (default = round-trip cost)")
+    parser.add_argument("--horizon", type=int, default=2, help="flurry-study: price target -- the up-move may land within the next this-many slots")
     parser.add_argument("--scalp", action="store_true", help="flurry-study: run the after-the-flurry continuation table instead of the lead-lag characterization")
     parser.add_argument("--discover", action="store_true", help="flurry-study: data-driven discovery (auto rule bank + motifs, holdout-confirmed) instead of the named-event characterization")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
@@ -765,21 +768,22 @@ def main(argv: list[str] | None = None) -> None:
             fl_helius = _FlHelius(client=_fl_httpx.Client(timeout=60))  # research (backup) key, never the live key
             fl_helius.min_interval_s = 1 / max(args.rps, 0.1)
         prog = lambda i, n, c: print(f"flows {i}/{n}, {c} credits", flush=True)
+        _tp = dict(target=args.target, move_pct=args.move_pct, horizon=args.horizon)
         if args.scalp:  # the after-the-flurry continuation scalp table (secondary)
             out = _fl.study(_FlJournal(cfg.db_path), _FlWS(_fl_wdp(cfg)), cfg=cfg, hours=args.hours or 720.0,
                             span_s=args.span_s, cost_pct=args.cost_pct, probed_only=args.probed_only,
-                            helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog)
+                            helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog, **_tp)
             print(json.dumps(out, indent=2, default=str) if args.json else _fl.render(out))
             return
         if args.discover:  # data-driven: let the auto rule bank + motifs name the precursor, holdout-confirmed
             out = _fl.discover(_FlJournal(cfg.db_path), _FlWS(_fl_wdp(cfg)), cfg=cfg, hours=args.hours or 720.0,
                                span_s=args.span_s, flurry_min=args.flurry_min, probed_only=args.probed_only,
-                               helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog)
+                               helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog, **_tp)
             print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_discover(out))
             return
         out = _fl.characterize(_FlJournal(cfg.db_path), _FlWS(_fl_wdp(cfg)), cfg=cfg, hours=args.hours or 720.0,
                                span_s=args.span_s, flurry_min=args.flurry_min, probed_only=args.probed_only,
-                               helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog)
+                               helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog, **_tp)
         print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_char(out))
         return
 
