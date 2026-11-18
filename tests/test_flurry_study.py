@@ -134,6 +134,24 @@ def test_discovered_rule_scalp_auto_feeds_the_survivors_and_scalps_them(monkeypa
     assert "DISCOVERED-RULE SCALP" in fl.render(out)
 
 
+def test_tail_report_breaks_down_the_discovered_edge(monkeypatch):
+    # the tail breakdown should re-discover survivors and report concentration: distinct winning pools, the
+    # top-5/20 share of the positive return, and capped vs uncapped mean. On the planted data the edge is
+    # spread across many pools (a broad tail), not one or two.
+    rec = _rec_causal()
+    pools = [f"P{i}" for i in range(80)]
+    have = {p: rec for p in pools}
+    metas = [{"pool": p, "token_mint": "M", "create_ts": float(i)} for i, p in enumerate(pools)]
+    tgt = fl._tgt("price", 3, 2, 1.0)
+    out = fl.tail_report(have, metas, tgt, 0.01, hold=2)
+    assert out["rules"], "no survivors re-discovered"
+    r = out["rules"][0]
+    assert r["n"] > 0 and r["win_pools"] >= 1
+    assert 0.0 <= r["top5_share"] <= 1.0 and 0.0 <= r["top20_share"] <= 1.0
+    assert r["pools"] >= r["win_pools"]
+    assert "TAIL-CONCENTRATION" in fl.render_tail(out)
+
+
 # --- characterization (lead-lag: what in slot N predicts a flurry in N+1) ---------------------------
 
 def _add(res, rows, sec0, slot, n, dsol, wallet):

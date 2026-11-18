@@ -915,6 +915,159 @@ def discovered_scalp(have: dict, metas: list[dict], tgt: dict, cost: float,
     return out
 
 
+def _raw_scalp(slots: list[dict], pull_slot, s_idx: int, hold: int, cost: float):
+    """(raw, capped) return of the same scalp as _scalp, so the tail report can see whether the capped
+    mean rests on a few uncapped reserve-ratio spikes. raw has no +RET_CAP ceiling (pulls are still -1.0)."""
+    s0 = slots[s_idx]["slot"]
+    entry = slots[s_idx]["price"]
+    if not entry:
+        return None
+    if pull_slot is not None and s0 < pull_slot <= s0 + hold:
+        return (-1.0, -1.0)
+    exit_price = _price_at(slots, s0 + hold)
+    if not exit_price:
+        return None
+    raw = exit_price / entry - 1.0 - cost
+    return (max(-1.0, raw), max(-1.0, min(raw, RET_CAP)))
+
+
+def tail_report(have: dict, metas: list[dict], tgt: dict, cost: float,
+                hold: int = 2, top_rules: int = 6, seed: int = 0) -> dict:
+    """Is the discovered edge a broad tail or a few pools? Re-discovers the holdout-confirmed survivors
+    (same train/holdout split and z guard as discovered_scalp), then for each, on the OUT-OF-SAMPLE
+    holdout pools at one hold, breaks the per-trade returns down by concentration: winners, capped vs
+    uncapped mean, how much of the summed positive return sits in the top few winners, distinct pools,
+    and the biggest single trades. A real positive-skew edge has many winning pools; a fragile one is
+    a handful of capped +300% spikes. Read only."""
+    import math
+    pools = []
+    for m in metas:
+        rec = have.get(m["pool"])
+        flow = slot_flow(rec) if rec else None
+        if not flow:
+            continue
+        pools.append({"pool": m["pool"], "flow": flow,
+                      "bank": _slot_bank(flow, m.get("create_ts") or 0.0, tgt),
+                      "ct": m.get("create_ts") or 0.0})
+    out = {"n_pools": len(pools), "hold": hold, "target": tgt, "cost": cost, "rules": [], "control": {}}
+    if len(pools) < 4:
+        return out
+    tss = sorted({p["ct"] for p in pools})
+    cut = tss[len(tss) // 2] if len(tss) > 1 else None
+    train = [p for p in pools if cut is not None and p["ct"] < cut]
+    hold_pools = [p for p in pools if cut is not None and p["ct"] >= cut]
+    if len(train) < 2 or len(hold_pools) < 2:
+        rng0 = random.Random(0)
+        idx = list(range(len(pools)))
+        rng0.shuffle(idx)
+        k = len(idx) // 2
+        train, hold_pools, out["split"] = [pools[i] for i in idx[:k]], [pools[i] for i in idx[k:]], "random"
+    else:
+        out["split"] = "time"
+    out["n_hold"] = len(hold_pools)
+    train_recs = [r for p in train for r in p["bank"]]
+    hold_recs = [r for p in hold_pools for r in p["bank"]]
+    if len(train_recs) < 2 * DISC_MIN_SUPPORT or len(hold_recs) < 2 * DISC_MIN_SUPPORT:
+        return out
+    tgt_tr = np.array([r["target"] for r in train_recs], float)
+    tgt_ho = np.array([r["target"] for r in hold_recs], float)
+    base_tr, base_ho = float(tgt_tr.mean()), float(tgt_ho.mean())
+    evald = []
+    for spec in _build_specs(train_recs):
+        tr = _eval_spec(spec, train_recs, tgt_tr, base_tr)
+        if tr is None or tr["lift"] == 1.0:
+            continue
+        ho = _eval_spec(spec, hold_recs, tgt_ho, base_ho)
+        if ho is None:
+            continue
+        evald.append((spec, tr, ho))
+    zc = max(3.0, math.sqrt(2.0 * math.log(max(len(evald), 2))))
+    out["zc"] = zc
+    survivors = [(spec, ho) for spec, tr, ho in evald
+                 if ((tr["lift"] > 1) == (ho["lift"] > 1)) and ho["lift"] > 1 and ho["z"] >= zc]
+    survivors.sort(key=lambda x: x[1]["z"], reverse=True)
+    survivors = survivors[:top_rules]
+    out["n_survivors"] = len(survivors)
+
+    def _breakdown(trades: list[tuple]) -> dict:
+        # trades = [(pool, raw, capped)]
+        if not trades:
+            return {"n": 0}
+        capped = [t[2] for t in trades]
+        raw = [t[1] for t in trades]
+        wins = sorted(((t[2], t[0]) for t in trades if t[2] > 0), reverse=True)
+        pos_sum = sum(c for c, _ in wins) or 1.0
+        top5 = sum(c for c, _ in wins[:5]) / pos_sum
+        top20 = sum(c for c, _ in wins[:20]) / pos_sum
+        return {"n": len(trades), "win": len(wins),
+                "capped_mean": statistics.fmean(capped), "raw_mean": statistics.fmean(raw),
+                "median": statistics.median(capped),
+                "top5_share": top5, "top20_share": top20,
+                "pools": len({t[0] for t in trades}), "win_pools": len({p for _, p in wins}),
+                "max": max(raw), "top_winners": [(p, c) for c, p in wins[:10]]}
+
+    for spec, ho in survivors:
+        trades = []
+        for p in hold_pools:
+            slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
+            for i, rec_s in enumerate(p["bank"]):
+                if spec["fn"](rec_s):
+                    r = _raw_scalp(slots, pull, i, hold, cost)
+                    if r is not None:
+                        trades.append((p["pool"], r[0], r[1]))
+        b = _breakdown(trades)
+        b["rule"] = spec["rule"]
+        b["z_hold"] = ho["z"]
+        out["rules"].append(b)
+    rng = random.Random(seed)
+    ctrl_trades = []
+    for p in hold_pools:
+        slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
+        quiet = [i for i, s in enumerate(slots) if s["n_buys"] < 3]
+        rng.shuffle(quiet)
+        for i in quiet[:CONTROL_PER_POOL]:
+            r = _raw_scalp(slots, pull, i, hold, cost)
+            if r is not None:
+                ctrl_trades.append((p["pool"], r[0], r[1]))
+    out["control"] = _breakdown(ctrl_trades)
+    return out
+
+
+def render_tail(out: dict) -> str:
+    tgt = out.get("target") or _tgt()
+    L = []
+    L.append("TAIL-CONCENTRATION BREAKDOWN  (is the discovered edge a broad tail or a few pools?)")
+    L.append(f"  {out['n_pools']} cached pools; {out.get('split', '?')} split; {out.get('n_hold', 0)} holdout pools; "
+             f"hold {out['hold']} slot(s); cost {out['cost']*100:.1f}%; target = {target_label(tgt)}")
+    if not out.get("rules"):
+        L.append("  not enough cached flow to re-discover survivors.")
+        return "\n".join(L)
+    c = out.get("control") or {}
+    cm = c.get("capped_mean", 0.0)
+    L.append(f"  control (random quiet slots): capped-mean {cm*100:+.2f}%, raw-mean {c.get('raw_mean',0)*100:+.2f}%, "
+             f"win {c.get('win',0)}/{c.get('n',0)}")
+    L.append("")
+    L.append(f"  {'discovered rule':<26}{'n':>6}{'win':>6}{'cap-mn':>8}{'edge':>7}{'raw-mn':>8}"
+             f"{'top5':>6}{'top20':>7}{'pools':>6}{'win-pl':>7}{'max':>8}")
+    for r in out["rules"]:
+        if not r.get("n"):
+            continue
+        edge = (r["capped_mean"] - cm) * 100
+        L.append(f"  {r['rule'][:26]:<26}{r['n']:>6}{r['win']:>6}{r['capped_mean']*100:>7.1f}%{edge:>+7.1f}"
+                 f"{r['raw_mean']*100:>7.1f}%{r['top5_share']*100:>5.0f}%{r['top20_share']*100:>6.0f}%"
+                 f"{r['pools']:>6}{r['win_pools']:>7}{r['max']*100:>+7.0f}%")
+    L.append("")
+    L.append("  edge = capped-mean - control capped-mean;  raw-mn = uncapped mean (if >> cap-mn, a few spikes carry it)")
+    L.append("  top5/top20 = share of the summed POSITIVE return from the top 5/20 winning trades (high = fragile)")
+    L.append("  pools = distinct pools that fired;  win-pl = distinct pools with a winning trade (high = broad tail)")
+    best = out["rules"][0] if out["rules"] else None
+    if best and best.get("n"):
+        L.append("")
+        L.append(f"  TOP WINNERS for '{best['rule']}': "
+                 + ", ".join(f"{p[:6]} {c*100:+.0f}%" for p, c in best.get("top_winners", [])))
+    return "\n".join(L)
+
+
 # --- render (scalp) --------------------------------------------------------------------------------
 
 def _c(a: dict) -> str:
