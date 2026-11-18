@@ -122,6 +122,17 @@ def test_motif_entry_scalp_pays_on_the_discovered_lead(monkeypatch):
     assert "MOTIF-ENTRY SCALP" in r and "BEST LEAD:" in r
 
 
+def test_discovered_rule_scalp_auto_feeds_the_survivors_and_scalps_them(monkeypatch):
+    # the scalp should use the ACTUAL discovered rules (not a hardcoded list): run discover's search, then
+    # scalp each holdout-confirmed survivor out of sample. On the planted causal data a survivor should pay.
+    out = _run(monkeypatch, _rec_causal())
+    d = out["discovered"]
+    assert d["n_survivors"] >= 1                              # discover's own rules were carried in
+    assert d["best"] is not None                              # at least one leads a flurry AND pays on price
+    assert d["best"]["mean"] > d["best"]["control"]
+    assert "DISCOVERED-RULE SCALP" in fl.render(out)
+
+
 # --- characterization (lead-lag: what in slot N predicts a flurry in N+1) ---------------------------
 
 def _add(res, rows, sec0, slot, n, dsol, wallet):

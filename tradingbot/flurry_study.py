@@ -139,9 +139,14 @@ def _price_at(slots: list[dict], slot: int) -> float | None:
     return price
 
 
+RET_CAP = 3.0   # +300%, as every other pumpswap study: bounds reserve-ratio spikes (a near-full buy can leave
+#               # ~0 tokens for one tx, exploding sol_after/tok_after) so a single artifact can't swamp the mean
+
+
 def _scalp(slots: list[dict], pull_slot, s_idx: int, hold: int, cost: float) -> float | None:
     """Return of buying at the end of flurry slot `slots[s_idx]` (front of the next slot) and selling `hold`
-    slots later: exit/entry - 1 - cost, or -1.0 if a pull lands in (s, s+hold]. None if no exit price."""
+    slots later: exit/entry - 1 - cost, capped to [-1.0, +RET_CAP], or -1.0 if a pull lands in (s, s+hold].
+    None if no exit price."""
     s0 = slots[s_idx]["slot"]
     entry = slots[s_idx]["price"]
     if not entry:
@@ -151,7 +156,7 @@ def _scalp(slots: list[dict], pull_slot, s_idx: int, hold: int, cost: float) -> 
     exit_price = _price_at(slots, s0 + hold)
     if not exit_price:
         return None
-    return exit_price / entry - 1.0 - cost
+    return max(-1.0, min(exit_price / entry - 1.0 - cost, RET_CAP))
 
 
 def _agg(rets: list[float]) -> dict:
@@ -300,6 +305,7 @@ def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: f
         "median_buys_per_slot": statistics.median(buys_per_slot) if buys_per_slot else 0,
         "results": results, "control": ctrl, "best": best,
         "motif_results": motif_results, "motif_best": motif_best,
+        "discovered": discovered_scalp(have, metas, DEFAULT_FLURRY_MIN, cost, MOTIF_HOLDS, seed),
     }
 
 
@@ -536,6 +542,7 @@ BOOL_FIELDS = ["outside_buy", "dominant_bought", "new_present", "sell_present", 
 THRESH_Q = (50, 75, 90)   # quantiles (of the train slice) each numeric is cut at
 DISC_MIN_SUPPORT = 30     # a rule must have >= this many present AND absent slots in BOTH halves
 DISC_TOP = 20             # survivors reported
+DISC_SCALP_TOP = 12       # holdout-confirmed survivor rules carried into the discovered-rule scalp
 SYM_DESC = {"F": "N was itself a flurry", "S": "net sellers in N", "N": "a brand-new wallet bought in N",
             "O": "an outsider (non-top-3) bought in N", "B": "the dominant wallet looped in N",
             "b": "light buying in N", ".": "a dead slot"}
@@ -759,12 +766,111 @@ def render_discover(out: dict) -> str:
     return "\n".join(L)
 
 
+# --- discovered-rule scalp: scalp the holdout-confirmed survivors, out of sample ------------------
+# Closes the loop between discover() and the scalp: discover names the rules that LEAD a next-slot flurry
+# out of sample; this measures whether ENTERING on each of those exact rules (buy front of N+1, sell N+h)
+# actually PAYS on price -- on the same holdout pools the rule was confirmed on, so it is out of sample too.
+# A rule can lead a flurry yet not move price enough to beat cost; that gap is the whole question.
+
+def discovered_scalp(have: dict, metas: list[dict], flurry_min: int, cost: float,
+                     holds=MOTIF_HOLDS, seed: int = 0) -> dict:
+    import math
+    pools = []
+    for m in metas:
+        rec = have.get(m["pool"])
+        flow = slot_flow(rec) if rec else None
+        if not flow:
+            continue
+        pools.append({"flow": flow, "bank": _slot_bank(flow, flurry_min, m.get("create_ts") or 0.0),
+                      "ct": m.get("create_ts") or 0.0})
+    out = {"n_pools": len(pools), "n_survivors": 0, "results": [], "control": {}, "best": None,
+           "split": "none", "zc": 0.0}
+    if len(pools) < 4:
+        return out
+    tss = sorted({p["ct"] for p in pools})
+    cut = tss[len(tss) // 2] if len(tss) > 1 else None
+    train = [p for p in pools if cut is not None and p["ct"] < cut]
+    hold = [p for p in pools if cut is not None and p["ct"] >= cut]
+    if len(train) < 2 or len(hold) < 2:                   # pools clustered in time -> random pool split
+        rng0 = random.Random(0)
+        idx = list(range(len(pools)))
+        rng0.shuffle(idx)
+        k = len(idx) // 2
+        train, hold, out["split"] = [pools[i] for i in idx[:k]], [pools[i] for i in idx[k:]], "random"
+    else:
+        out["split"] = "time"
+    train_recs = [r for p in train for r in p["bank"]]
+    hold_recs = [r for p in hold for r in p["bank"]]
+    if len(train_recs) < 2 * DISC_MIN_SUPPORT or len(hold_recs) < 2 * DISC_MIN_SUPPORT:
+        return out
+    tgt_tr = np.array([r["target"] for r in train_recs], float)
+    tgt_ho = np.array([r["target"] for r in hold_recs], float)
+    base_tr, base_ho = float(tgt_tr.mean()), float(tgt_ho.mean())
+    evald = []
+    for spec in _build_specs(train_recs):                 # discover the rules on the train pools only
+        tr = _eval_spec(spec, train_recs, tgt_tr, base_tr)
+        if tr is None or tr["lift"] == 1.0:
+            continue
+        ho = _eval_spec(spec, hold_recs, tgt_ho, base_ho)
+        if ho is None:
+            continue
+        evald.append((spec, tr, ho))
+    zc = max(3.0, math.sqrt(2.0 * math.log(max(len(evald), 2))))
+    out["zc"] = zc
+    survivors = [(spec, ho) for spec, tr, ho in evald
+                 if ((tr["lift"] > 1) == (ho["lift"] > 1)) and ho["lift"] > 1 and ho["z"] >= zc]
+    survivors.sort(key=lambda x: x[1]["z"], reverse=True)
+    survivors = survivors[:DISC_SCALP_TOP]
+    out["n_survivors"] = len(survivors)
+    rng = random.Random(seed)
+    results = []
+    for spec, ho in survivors:                            # scalp each survivor on the HOLDOUT pools (out of sample)
+        agg = {h: [] for h in holds}
+        for p in hold:
+            slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
+            for i, rec_s in enumerate(p["bank"]):
+                if spec["fn"](rec_s):
+                    for h in holds:
+                        r = _scalp(slots, pull, i, h, cost)
+                        if r is not None:
+                            agg[h].append(r)
+        row = {"rule": spec["rule"], "lift_hold": ho["lift"], "z_hold": ho["z"]}
+        for h in holds:
+            row[f"h{h}"] = _agg(agg[h])
+        results.append(row)
+    control = {h: [] for h in holds}
+    for p in hold:
+        slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
+        quiet = [i for i, s in enumerate(slots) if s["n_buys"] < 3]
+        rng.shuffle(quiet)
+        for i in quiet[:CONTROL_PER_POOL]:
+            for h in holds:
+                r = _scalp(slots, pull, i, h, cost)
+                if r is not None:
+                    control[h].append(r)
+    ctrl = {f"h{h}": _agg(control[h]) for h in holds}
+    best = None
+    for row in results:
+        for h in holds:
+            a, c = row[f"h{h}"], ctrl[f"h{h}"]
+            if a.get("n", 0) >= 50 and a.get("mean", -9) > 0 and a.get("mean", -9) > c.get("mean", 0):
+                edge = a["mean"] - c.get("mean", 0)
+                if best is None or edge > best["edge"]:
+                    best = {"rule": row["rule"], "hold": h, "mean": a["mean"], "control": c.get("mean"),
+                            "edge": edge, "n": a["n"], "win_pct": a["win_pct"], "median": a["median"]}
+    out.update({"results": results, "control": ctrl, "best": best, "n_hold": len(hold)})
+    return out
+
+
 # --- render (scalp) --------------------------------------------------------------------------------
 
 def _c(a: dict) -> str:
+    # mean is capped at +/-RET_CAP so skewed memecoin returns don't drown the average; median + win% are the
+    # robust reads (a scalp edge needs a mean clearly > cost AND the median/win% to agree, not one outlier).
     if not a or not a.get("n"):
         return f"{'-':>26}"
-    return f"{a['mean']*100:+6.2f}% n{a['n']:<5d} w{a['win_pct']:3.0f} r{a['rugged_pct']:3.0f}"
+    s = f"{a['mean']*100:+.0f}% md{a['median']*100:+.0f}% w{a['win_pct']:.0f} n{a['n']}"
+    return f"{s:>26}"
 
 
 def render(out: dict) -> str:
@@ -773,7 +879,7 @@ def render(out: dict) -> str:
     L.append(f"  pools {out['n_pools']} ({out['n_flows']} with a slot flow){', probed only' if out['probed_only'] else ''}; "
              f"span {out['span_s']:.0f}s; cost {out['cost_pct']:.2f}%; {out['credits']} research credits")
     L.append(f"  median buys/slot {out['median_buys_per_slot']:.0f}; flurries (buys>=3) {out['flurries_total']}")
-    L.append("  each cell = net scalp mean / n / win% / rugged% (rugged = pulled inside the hold)")
+    L.append(f"  each cell = net scalp mean (capped +-{RET_CAP*100:.0f}%) / median / win% / n")
     L.append("")
     head = f"  {'flurry':<11}" + "".join(f"{'hold '+str(h):>28}" for h in HOLDS)
     L.append(head)
@@ -806,4 +912,24 @@ def render(out: dict) -> str:
         else:
             L.append("  NO LEAD clears cost + the control: the discovered precursor leads a flurry but not enough PRICE")
             L.append("  to scalp. The lead-lag is real yet not tradeable at slot scale on untouched pools.")
+    d = out.get("discovered")
+    if d is not None:
+        L.append("")
+        L.append("  DISCOVERED-RULE SCALP  (auto-fed from discover's survivors; scalped OUT OF SAMPLE on the holdout pools)")
+        L.append(f"  {d['n_survivors']} holdout-confirmed rule(s), {d['split']} split, {d.get('n_hold', 0)} holdout pools; "
+                 f"each scalps buy front of N+1, sell N+h")
+        if d["results"]:
+            L.append(f"  {'discovered rule (enter on it)':<34}" + "".join(f"{'hold '+str(h):>28}" for h in MOTIF_HOLDS))
+            for row in d["results"]:
+                L.append(f"  {row['rule'][:34]:<34}" + "".join(f"  {_c(row[f'h{h}'])}" for h in MOTIF_HOLDS))
+            L.append(f"  {'control':<34}" + "".join(f"  {_c(d['control'][f'h{h}'])}" for h in MOTIF_HOLDS))
+        db = d.get("best")
+        if db:
+            L.append(f"  BEST DISCOVERED RULE: '{db['rule']}' hold {db['hold']} -> net {db['mean']*100:+.1f}% "
+                     f"(median {db['median']*100:+.1f}%, control {db['control']*100:+.1f}%, edge {db['edge']*100:+.1f} pts) "
+                     f"n={db['n']}, win {db['win_pct']:.0f}%")
+            L.append("  -> a discovered lead that also PAYS on price out of sample. Validate live with the 1-slot probe.")
+        else:
+            L.append("  NO DISCOVERED RULE pays on price out of sample: the leads predict a next-slot flurry but the price")
+            L.append("  move doesn't beat cost. Lead-lag real, scalp not -> ShredStream has nothing profitable to key on.")
     return "\n".join(L)
