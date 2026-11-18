@@ -800,8 +800,12 @@ def main(argv: list[str] | None = None) -> None:
                           for p in _scorer if (_scorer[p] or {}).get("token_mint") and (_scorer[p] or {}).get("create_ts")]
             _have = _flows_have if _flows_have is not None else _fl.fetch_flows(_ws, fl_helius, _metas, args.span_s, int(args.max_credits or 0), prog)[0]
             _tgt = _fl._tgt(args.target, args.flurry_min, args.horizon, args.move_pct)
-            out = _fl.entry_window(_have, _metas, _tgt, args.cost_pct / 100.0, window=args.entry_window)
-            print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_entry_window(out))
+            if args.discover:   # discover version: auto rule bank on train, z-guarded on the holdout
+                out = _fl.entry_window_discover(_have, _metas, _tgt, args.cost_pct / 100.0, window=args.entry_window)
+                print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_entry_window_discover(out))
+            else:
+                out = _fl.entry_window(_have, _metas, _tgt, args.cost_pct / 100.0, window=args.entry_window)
+                print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_entry_window(out))
             return
         if args.tail:  # tail-concentration of the discovered survivors (broad tail vs a few pools)
             import time as _fl_time

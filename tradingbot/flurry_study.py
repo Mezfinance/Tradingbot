@@ -1137,15 +1137,16 @@ def render_tail(out: dict) -> str:
 # guessing it lands next slot. So: is there a signal at N that makes a 1-2 slot buy EV+ somewhere in the
 # next WINDOW entry slots, and can we pick that slot causally? Out of sample on the time-holdout.
 
-# candidate slot-N signals (readable, computed from _slot_bank features). Add/remove freely.
+# candidate slot-N signals, surf-readable only (shreds give buys+payers+counts, not sell SIZE, so no
+# sell_sol/buy-size thresholds here -- those are ~0 on reconstructed flows). abs_move uses the DATA's own
+# q90 (built per run in entry_window), not a hardcoded cut from the offline distribution. Add/remove freely.
 ENTRY_SIGNALS = [
     ("sell_present",      lambda r: r["f"]["sell_present"] >= 1),      # a washbot sell leg (the 11-18 lead)
     ("new_present",       lambda r: r["f"]["new_present"] >= 1),       # a brand-new wallet bought
     ("outside_buy",       lambda r: r["f"]["outside_buy"] >= 1),       # a non-top-3 wallet bought
     ("dominant_bought",   lambda r: r["f"]["dominant_bought"] >= 1),   # the #1 wallet looped
     ("n_buys>=3",         lambda r: r["f"]["n_buys"] >= 3),            # a buy flurry
-    ("abs_move>=1.88%",   lambda r: r["f"]["abs_move"] >= 0.0188),     # the q90 move
-    ("sell_sol>=0.5",     lambda r: r["f"]["sell_sol"] >= 0.5),        # a sized sell leg
+    ("n_sells>=1",        lambda r: r["f"]["n_sells"] >= 1),           # any sell leg (count, readable on surf)
 ]
 
 
@@ -1216,7 +1217,14 @@ def entry_window(have, metas, tgt, cost, window: int = 10, holds=(1, 2), seed: i
 
     cpk, cceil, ccausal = run(lambda r: (r["f"]["n_buys"] > 0 or r["f"]["n_sells"] > 0))   # control = any active slot
     out["control"] = {"per_k": {k: _agg(v) for k, v in cpk.items()}, "ceiling": _agg(cceil), "causal": _agg(ccausal)}
-    for name, fn in ENTRY_SIGNALS:
+    # abs_move signal uses the DATA's own q90 (a fixed cut from the offline distribution rarely fires on surf)
+    moves = [r["f"]["abs_move"] for p in hold_pools for r in p["bank"] if r["f"]["abs_move"] > 0]
+    sigs = list(ENTRY_SIGNALS)
+    if len(moves) >= 20:
+        q90 = sorted(moves)[int(0.90 * (len(moves) - 1))]
+        out["abs_move_q90"] = q90
+        sigs.append((f"abs_move>=q90({q90*100:.2f}%)", lambda r, _t=q90: r["f"]["abs_move"] >= _t))
+    for name, fn in sigs:
         pk, ceil, causal = run(fn)
         best_k = None
         for k in range(1, window + 1):
@@ -1227,6 +1235,127 @@ def entry_window(have, metas, tgt, cost, window: int = 10, holds=(1, 2), seed: i
         out["signals"].append({"signal": name, "per_k": {k: _agg(v) for k, v in pk.items()},
                                "ceiling": _agg(ceil), "causal": _agg(causal), "best_k": best_k})
     return out
+
+
+def _ew_causal(pools, fn, window, holds, cost) -> list:
+    """The causal 'wait for the first up-tick in the window, then take the 1-2 slot ride' returns for a signal,
+    across pools. One value per signal firing (or none if no live up-tick in the window). Pool must be alive
+    at entry (a pull during the wait = no entry)."""
+    vals = []
+    for p in pools:
+        slots, pull, bank, n = p["slots"], p["pull"], p["bank"], len(p["slots"])
+        for i, rec in enumerate(bank):
+            if not fn(rec):
+                continue
+            for k in range(1, window + 1):
+                j = i + k
+                if j >= n:
+                    break
+                if pull is not None and pull <= slots[j]["slot"]:
+                    break
+                if bank[j]["f"]["price_up"] >= 1:          # first up-tick in the window
+                    sc = _ew_scalp_best(slots, pull, j, holds, cost)
+                    if sc is not None:
+                        vals.append(sc)
+                    break
+    return vals
+
+
+def entry_window_discover(have, metas, tgt, cost, window: int = 10, holds=(1, 2), seed: int = 0) -> dict:
+    """Discover version of the patience study: no signal named in advance. Auto-generate the candidate rule
+    bank on the TRAIN half (_build_specs), then for each candidate run the causal entry-window rule (wait for
+    the first up-tick in N+1..N+W, take the 1-2 slot ride) on the HOLDOUT, and keep only the signals whose
+    holdout EV beats the random-active-slot control past the family-wise z guard (same direction on train),
+    so a flattering-but-spurious signal is reported as noise. The causal rule is a single deterministic value
+    per signal (no entry-slot cherry-pick), so the only multiple comparison is across rules -> the zc guard."""
+    import math
+    pools = []
+    for m in metas:
+        rec = have.get(m["pool"])
+        flow = slot_flow(rec) if rec else None
+        if not flow:
+            continue
+        pools.append({"ct": m.get("create_ts") or 0.0, "slots": flow["slots"], "pull": flow["pull_slot"],
+                      "bank": _slot_bank(flow, m.get("create_ts") or 0.0, tgt)})
+    out = {"n_pools": len(pools), "window": window, "holds": list(holds), "cost": cost, "target": tgt,
+           "survivors": [], "n_survivors": 0, "tested": 0, "zc": 0.0, "split": "none", "n_hold": 0,
+           "control_mean": 0.0, "control_n": 0}
+    if len(pools) < 4:
+        return out
+    tss = sorted({p["ct"] for p in pools})
+    cut = tss[len(tss) // 2] if len(tss) > 1 else None
+    train = [p for p in pools if cut is not None and p["ct"] < cut]
+    hold = [p for p in pools if cut is not None and p["ct"] >= cut]
+    if len(train) < 2 or len(hold) < 2:
+        rng0 = random.Random(0)
+        idx = list(range(len(pools))); rng0.shuffle(idx); k = len(idx) // 2
+        train, hold, out["split"] = [pools[i] for i in idx[:k]], [pools[i] for i in idx[k:]], "random"
+    else:
+        out["split"] = "time"
+    out["n_hold"] = len(hold)
+
+    def _any(r):
+        return r["f"]["n_buys"] > 0 or r["f"]["n_sells"] > 0
+    ctrl = _ew_causal(hold, _any, window, holds, cost)
+    if len(ctrl) < DISC_MIN_SUPPORT:
+        return out
+    cm = statistics.fmean(ctrl)
+    cv = statistics.pvariance(ctrl) if len(ctrl) > 1 else 0.0
+    out["control_mean"], out["control_n"] = cm, len(ctrl)
+
+    train_recs = [r for p in train for r in p["bank"]]
+    evald = []
+    for spec in _build_specs(train_recs):
+        tr = _ew_causal(train, spec["fn"], window, holds, cost)
+        if len(tr) < DISC_MIN_SUPPORT:
+            continue
+        ho = _ew_causal(hold, spec["fn"], window, holds, cost)
+        if len(ho) < DISC_MIN_SUPPORT:
+            continue
+        evald.append((spec, tr, ho))
+    out["tested"] = len(evald)
+    zc = max(3.0, math.sqrt(2.0 * math.log(max(len(evald), 2))))
+    out["zc"] = zc
+    survivors = []
+    for spec, tr, ho in evald:
+        trm, hom = statistics.fmean(tr), statistics.fmean(ho)
+        hv = statistics.pvariance(ho) if len(ho) > 1 else 0.0
+        se = (hv / len(ho) + cv / len(ctrl)) ** 0.5
+        z = (hom - cm) / se if se > 0 else 0.0
+        if (trm > 0) == (hom > 0) and hom > cm and z >= zc:
+            survivors.append({"rule": spec["rule"], "train_mean": trm, "hold_mean": hom, "z": z,
+                              "n_hold": len(ho), "win": 100.0 * sum(1 for x in ho if x > 0) / len(ho),
+                              "edge": hom - cm})
+    survivors.sort(key=lambda s: s["z"], reverse=True)
+    out["survivors"] = survivors[:DISC_TOP]
+    out["n_survivors"] = len(survivors)
+    return out
+
+
+def render_entry_window_discover(out: dict) -> str:
+    L = []
+    L.append("ENTRY-WINDOW DISCOVERY  (no signal named in advance; causal up-tick-ride on the holdout, z-guarded)")
+    L.append(f"  {out['n_pools']} pools; {out['split']} split; {out['n_hold']} holdout pools; window {out['window']} "
+             f"active slots; hold {out['holds']} raw slots; cost {out['cost']*100:.1f}%")
+    L.append(f"  control (up-tick ride after a random active slot): mean {out['control_mean']*100:+.2f}% over n={out['control_n']}")
+    L.append(f"  {out['tested']} rules auto-generated + holdout-tested; family-wise z threshold {out['zc']:.2f}")
+    L.append("")
+    if out["survivors"]:
+        L.append(f"  {'discovered signal (slot N)':<34}{'train':>8}{'holdout':>8}{'edge':>7}{'win':>6}{'z':>7}{'n':>7}")
+        for s in out["survivors"]:
+            L.append(f"  {s['rule'][:34]:<34}{s['train_mean']*100:>+7.1f}{s['hold_mean']*100:>+7.1f}%"
+                     f"{s['edge']*100:>+6.1f}{s['win']:>5.0f}%{s['z']:>+7.1f}{s['n_hold']:>7d}")
+        L.append("")
+        top = out["survivors"][0]
+        L.append(f"  DISCOVERED ({out['n_survivors']} signal(s) survive): the strongest is '{top['rule']}' -> waiting for the")
+        L.append(f"  first up-tick after it and taking the 1-2 slot ride nets {top['hold_mean']*100:+.1f}% out of sample "
+                 f"(control {out['control_mean']*100:+.1f}%, +{top['edge']*100:.1f} pts).")
+        L.append("  -> a patience rule the data named itself, out of sample, past the multiple-comparisons guard.")
+        L.append("     Next: cross-check on a second capture, then validate live with the 1-slot probe.")
+    else:
+        L.append("  NOTHING SURVIVES: no auto-generated slot-N signal makes the delayed 1-2 slot ride EV+ beyond the")
+        L.append("  control past the z guard. Patience doesn't rescue the scalp at slot scale on these pools.")
+    return "\n".join(L)
 
 
 def render_entry_window(out: dict) -> str:

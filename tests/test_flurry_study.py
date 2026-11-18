@@ -346,7 +346,7 @@ def test_entry_window_finds_a_delayed_ev_positive_entry(monkeypatch):
     have={f"P{i}":rec(1000+i*10,i) for i in range(80)}
     out=fl.entry_window(have,metas,fl._tgt("price",3,2,1.0),cost=0.01,window=10)
     assert out["n_hold"] >= 2 and out["split"] == "time"
-    am=next(s for s in out["signals"] if s["signal"]=="abs_move>=1.88%")
+    am=next(s for s in out["signals"] if s["signal"].startswith("abs_move"))
     # a later offset (k>=3) is EV+ (the move lands a few slots after the signal), and best_k found one
     assert am["best_k"] is not None
     assert any(am["per_k"][k].get("n",0)>=20 and am["per_k"][k]["mean"]>0 for k in range(3,8))
