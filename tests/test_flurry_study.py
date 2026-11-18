@@ -278,3 +278,33 @@ def test_discover_reports_nothing_survives_on_a_memoryless_stream(monkeypatch):
     assert out["tested"] > 0                                    # rules were generated and holdout-tested
     assert out["n_survivors"] == 0                              # none leads a next-slot flurry out of sample
     assert "NOTHING SURVIVES" in fl.render_discover(out)
+
+
+def test_metas_from_pools_loads_json_and_jsonl(tmp_path):
+    rows = [{"pool": "P1", "token_mint": "M1", "create_ts": 10.0},
+            {"pool": "P2", "token_mint": "M2", "create_ts": 20.0},
+            {"pool": "P1", "token_mint": "M1", "create_ts": 10.0},   # dup pool -> dropped
+            {"pool": "P3", "create_ts": 30.0}]                        # no mint -> dropped
+    j = tmp_path / "pools.json"
+    j.write_text(json.dumps(rows))
+    metas = fl.metas_from_pools(str(j))
+    assert [m["pool"] for m in metas] == ["P1", "P2"]
+    assert metas[0] == {"pool": "P1", "token_mint": "M1", "create_ts": 10.0}
+
+    jl = tmp_path / "pools.jsonl"
+    jl.write_text("\n".join(json.dumps(r) for r in rows[:2]) + "\n")
+    metas2 = fl.metas_from_pools(str(jl))
+    assert [m["pool"] for m in metas2] == ["P1", "P2"]
+
+
+def test_study_uses_a_passed_metas_universe_without_touching_the_scorer(monkeypatch):
+    # route #1: metas override must bypass pool_tracker.scorer_rows entirely.
+    def _boom(*a, **k):
+        raise AssertionError("scorer_rows must not be called when metas is passed")
+    monkeypatch.setattr(fl.pool_tracker, "scorer_rows", _boom)
+    rec = _rec(continuation=True)
+    have = {"P1": rec}
+    monkeypatch.setattr(fl, "fetch_flows", lambda store, helius, metas, span_s, mc, prog=None: (have, 0))
+    metas = [{"pool": "P1", "token_mint": "M1", "create_ts": 1.0}]
+    out = fl.study(None, None, hours=1.0, metas=metas, max_credits=0)
+    assert out["n_flows"] == 1

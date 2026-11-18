@@ -201,6 +201,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--scalp", action="store_true", help="flurry-study: run the after-the-flurry continuation table instead of the lead-lag characterization")
     parser.add_argument("--discover", action="store_true", help="flurry-study: data-driven discovery (auto rule bank + motifs, holdout-confirmed) instead of the named-event characterization")
     parser.add_argument("--tail", action="store_true", help="flurry-study: tail-concentration breakdown of the discovered survivors (is the edge a broad tail or a few pools)")
+    parser.add_argument("--pools", type=str, default=None, help="flurry-study: run the literal study on a live-captured pool universe (JSON/JSONL of {pool, token_mint, create_ts} from the box absmove.py MODE=capture) instead of the scorer's pools -- route #1, exact study on ShredStream-surfaced pools")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
     parser.add_argument("--apply", action="store_true", help="canary-sweep: close the empty accounts (default: list)")
@@ -770,16 +771,24 @@ def main(argv: list[str] | None = None) -> None:
             fl_helius.min_interval_s = 1 / max(args.rps, 0.1)
         prog = lambda i, n, c: print(f"flows {i}/{n}, {c} credits", flush=True)
         _tp = dict(target=args.target, move_pct=args.move_pct, horizon=args.horizon)
+        # route #1: run the literal study on the pool universe ShredStream surfaced live (box MODE=capture)
+        _pools_meta = _fl.metas_from_pools(args.pools) if args.pools else None
+        if _pools_meta is not None:
+            print(f"pool universe from {args.pools}: {len(_pools_meta)} pools", flush=True)
+        _mp = dict(metas=_pools_meta)
         if args.tail:  # tail-concentration of the discovered survivors (broad tail vs a few pools)
             import time as _fl_time
             from tradingbot import pool_tracker as _fl_pt
             _ws = _FlWS(_fl_wdp(cfg))
-            _now = _fl_time.time()
-            _since = _now - (args.hours or 720.0) * 3600
-            _scorer = _fl_pt.scorer_rows(_ws.query, _since)
-            _metas = [{"pool": p, "token_mint": (_scorer[p] or {}).get("token_mint"),
-                       "create_ts": (_scorer[p] or {}).get("create_ts")}
-                      for p in _scorer if (_scorer[p] or {}).get("token_mint") and (_scorer[p] or {}).get("create_ts")]
+            if _pools_meta is not None:
+                _metas = _pools_meta
+            else:
+                _now = _fl_time.time()
+                _since = _now - (args.hours or 720.0) * 3600
+                _scorer = _fl_pt.scorer_rows(_ws.query, _since)
+                _metas = [{"pool": p, "token_mint": (_scorer[p] or {}).get("token_mint"),
+                           "create_ts": (_scorer[p] or {}).get("create_ts")}
+                          for p in _scorer if (_scorer[p] or {}).get("token_mint") and (_scorer[p] or {}).get("create_ts")]
             _have, _cr = _fl.fetch_flows(_ws, fl_helius, _metas, args.span_s,
                                          int(args.max_credits or 0), prog)
             _tgt = _fl._tgt(args.target, args.flurry_min, args.horizon, args.move_pct)
@@ -789,18 +798,18 @@ def main(argv: list[str] | None = None) -> None:
         if args.scalp:  # the after-the-flurry continuation scalp table (secondary)
             out = _fl.study(_FlJournal(cfg.db_path), _FlWS(_fl_wdp(cfg)), cfg=cfg, hours=args.hours or 720.0,
                             span_s=args.span_s, cost_pct=args.cost_pct, probed_only=args.probed_only,
-                            helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog, **_tp)
+                            helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog, **_tp, **_mp)
             print(json.dumps(out, indent=2, default=str) if args.json else _fl.render(out))
             return
         if args.discover:  # data-driven: let the auto rule bank + motifs name the precursor, holdout-confirmed
             out = _fl.discover(_FlJournal(cfg.db_path), _FlWS(_fl_wdp(cfg)), cfg=cfg, hours=args.hours or 720.0,
                                span_s=args.span_s, flurry_min=args.flurry_min, probed_only=args.probed_only,
-                               helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog, **_tp)
+                               helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog, **_tp, **_mp)
             print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_discover(out))
             return
         out = _fl.characterize(_FlJournal(cfg.db_path), _FlWS(_fl_wdp(cfg)), cfg=cfg, hours=args.hours or 720.0,
                                span_s=args.span_s, flurry_min=args.flurry_min, probed_only=args.probed_only,
-                               helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog, **_tp)
+                               helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog, **_tp, **_mp)
         print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_char(out))
         return
 
