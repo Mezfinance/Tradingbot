@@ -1128,6 +1128,148 @@ def render_tail(out: dict) -> str:
     return "\n".join(L)
 
 
+# --- entry-window: patience study (the owner's reframe, 11-18) -------------------------------------
+# The 1-2 slot HOLD stays mandatory (it dodges the reactive LP pull -- canary-slots: pulls land >=2 slots
+# after our buy). But nothing forces us to ENTER at N+1. Given a slot-N signal, we can wait and take the
+# safe 1-2 slot ride at any entry slot in N+1..N+WINDOW. Two things this buys that immediate entry can't:
+# (1) while we wait we hold no capital, so a pull during the wait costs nothing -- we just never enter;
+# (2) we can wait for the up-move to actually start (the washbot's next buy-leg) and ride it, instead of
+# guessing it lands next slot. So: is there a signal at N that makes a 1-2 slot buy EV+ somewhere in the
+# next WINDOW entry slots, and can we pick that slot causally? Out of sample on the time-holdout.
+
+# candidate slot-N signals (readable, computed from _slot_bank features). Add/remove freely.
+ENTRY_SIGNALS = [
+    ("sell_present",      lambda r: r["f"]["sell_present"] >= 1),      # a washbot sell leg (the 11-18 lead)
+    ("new_present",       lambda r: r["f"]["new_present"] >= 1),       # a brand-new wallet bought
+    ("outside_buy",       lambda r: r["f"]["outside_buy"] >= 1),       # a non-top-3 wallet bought
+    ("dominant_bought",   lambda r: r["f"]["dominant_bought"] >= 1),   # the #1 wallet looped
+    ("n_buys>=3",         lambda r: r["f"]["n_buys"] >= 3),            # a buy flurry
+    ("abs_move>=1.88%",   lambda r: r["f"]["abs_move"] >= 0.0188),     # the q90 move
+    ("sell_sol>=0.5",     lambda r: r["f"]["sell_sol"] >= 0.5),        # a sized sell leg
+]
+
+
+def _ew_scalp_best(slots, pull, idx, holds, cost):
+    """Best 1-2 slot scalp at entry index idx (the safe hold stays raw-slot <=2 for pull safety)."""
+    best = None
+    for h in holds:
+        r = _scalp(slots, pull, idx, h, cost)
+        if r is not None:
+            best = r if best is None else max(best, r)
+    return best
+
+
+def entry_window(have, metas, tgt, cost, window: int = 10, holds=(1, 2), seed: int = 0) -> dict:
+    """For each slot-N signal, sweep the ENTRY offset 1..window (in active slots) and measure the 1-2 slot
+    scalp at each entry (pool must be ALIVE at entry, else skip -- a pull during the wait is a no-op, not a
+    loss). Reports: per-offset EV, the best-of-window ceiling (perfect timing, look-ahead), and a causal
+    'wait for the up-tick then ride' rule, all vs a random-active-slot control, on the time-holdout."""
+    pools = []
+    for m in metas:
+        rec = have.get(m["pool"])
+        flow = slot_flow(rec) if rec else None
+        if not flow:
+            continue
+        pools.append({"ct": m.get("create_ts") or 0.0, "slots": flow["slots"], "pull": flow["pull_slot"],
+                      "bank": _slot_bank(flow, m.get("create_ts") or 0.0, tgt)})
+    out = {"n_pools": len(pools), "window": window, "holds": list(holds), "cost": cost, "target": tgt,
+           "signals": [], "control": {}, "split": "none", "n_hold": 0}
+    if len(pools) < 4:
+        return out
+    tss = sorted({p["ct"] for p in pools})
+    cut = tss[len(tss) // 2] if len(tss) > 1 else None
+    hold_pools = [p for p in pools if cut is not None and p["ct"] >= cut]
+    if len(hold_pools) < 2:
+        hold_pools, out["split"] = pools, "all"
+    else:
+        out["split"] = "time"
+    out["n_hold"] = len(hold_pools)
+
+    def run(signal_fn):
+        per_k = {k: [] for k in range(1, window + 1)}
+        ceil, causal = [], []
+        for p in hold_pools:
+            slots, pull, bank, n = p["slots"], p["pull"], p["bank"], len(p["slots"])
+            for i, rec in enumerate(bank):
+                if not signal_fn(rec):
+                    continue
+                best_win = None
+                done_causal = False
+                for k in range(1, window + 1):
+                    j = i + k
+                    if j >= n:
+                        break
+                    sj = slots[j]["slot"]
+                    if pull is not None and pull <= sj:        # pool pulled at/before this entry -> we never enter
+                        break
+                    sc = _ew_scalp_best(slots, pull, j, holds, cost)
+                    if sc is None:
+                        continue
+                    per_k[k].append(sc)
+                    best_win = sc if best_win is None else max(best_win, sc)
+                    if not done_causal and bank[j]["f"]["price_up"] >= 1:   # wait for the up-tick, then ride
+                        causal.append(sc)
+                        done_causal = True
+                if best_win is not None:
+                    ceil.append(best_win)
+        return per_k, ceil, causal
+
+    cpk, cceil, ccausal = run(lambda r: (r["f"]["n_buys"] > 0 or r["f"]["n_sells"] > 0))   # control = any active slot
+    out["control"] = {"per_k": {k: _agg(v) for k, v in cpk.items()}, "ceiling": _agg(cceil), "causal": _agg(ccausal)}
+    for name, fn in ENTRY_SIGNALS:
+        pk, ceil, causal = run(fn)
+        best_k = None
+        for k in range(1, window + 1):
+            a = _agg(pk[k])
+            if a.get("n", 0) >= 30 and a.get("mean", -9) > 0 and a["mean"] > out["control"]["per_k"][k].get("mean", 0):
+                if best_k is None or a["mean"] > best_k["mean"]:
+                    best_k = {"k": k, **a}
+        out["signals"].append({"signal": name, "per_k": {k: _agg(v) for k, v in pk.items()},
+                               "ceiling": _agg(ceil), "causal": _agg(causal), "best_k": best_k})
+    return out
+
+
+def render_entry_window(out: dict) -> str:
+    tgt = out.get("target") or _tgt()
+    L = []
+    L.append("ENTRY-WINDOW (patience) STUDY  (1-2 slot hold stays; sweep WHICH entry slot in N+1..N+W to take it)")
+    L.append(f"  {out['n_pools']} pools; {out['split']} split; {out['n_hold']} holdout pools; window {out['window']} "
+             f"active slots; hold {out['holds']} raw slots; cost {out['cost']*100:.1f}%")
+    L.append("  a pull during the wait = no entry (no loss); only a pull inside the 1-2 slot hold = -100%.")
+    L.append("")
+    ks = list(range(1, out["window"] + 1))
+    L.append(f"  {'signal':<16}" + "".join(f"{('k'+str(k)):>7}" for k in ks) + f"{'ceil':>8}{'causal':>8}{'bestK':>14}")
+    def cell(a):
+        return f"{a['mean']*100:>+6.1f}" if a and a.get("n", 0) >= 20 else f"{'-':>6} "
+    cr = out["control"]
+    L.append(f"  {'control(any)':<16}" + "".join(f"{cell(cr['per_k'][k])}" for k in ks)
+             + f"{cell(cr['ceiling']):>8}{cell(cr['causal']):>8}{'':>14}")
+    for s in out["signals"]:
+        bk = s["best_k"]
+        bkt = (f"k{bk['k']} {bk['mean']*100:+.1f}% n{bk['n']}" if bk else "none")
+        L.append(f"  {s['signal']:<16}" + "".join(f"{cell(s['per_k'][k])}" for k in ks)
+                 + f"{cell(s['ceiling']):>8}{cell(s['causal']):>8}{bkt:>14}")
+    L.append("")
+    L.append("  cells = mean 1-2 slot scalp % entering k active slots after the signal; ceil = best-of-window (look-ahead,")
+    L.append("  upper bound); causal = enter at the first up-tick slot in the window then ride (realistic).")
+    winners = [s for s in out["signals"] if s["best_k"] or (s["causal"].get("n", 0) >= 30 and s["causal"].get("mean", -9) > 0
+               and s["causal"]["mean"] > cr["causal"].get("mean", 0))]
+    if winners:
+        L.append("")
+        for s in winners:
+            c = s["causal"]
+            tail = (f"causal(up-tick ride) {c['mean']*100:+.1f}% n{c['n']} vs control {cr['causal'].get('mean',0)*100:+.1f}%"
+                    if c.get("n", 0) >= 30 else "")
+            bk = s["best_k"]
+            fx = (f"best fixed wait k{bk['k']} {bk['mean']*100:+.1f}% (control {cr['per_k'][bk['k']].get('mean',0)*100:+.1f}%)" if bk else "")
+            L.append(f"  SIGNAL '{s['signal']}': {fx}{'; ' if fx and tail else ''}{tail}")
+        L.append("  -> a 1-2 slot buy made EV+ by WAITING for the right entry slot. Validate live with the 1-slot probe.")
+    else:
+        L.append("  NO SIGNAL makes the 1-2 slot buy EV+ over the window beyond the control: patience doesn't rescue it")
+        L.append("  at slot scale on these pools.")
+    return "\n".join(L)
+
+
 # --- render (scalp) --------------------------------------------------------------------------------
 
 def _c(a: dict) -> str:

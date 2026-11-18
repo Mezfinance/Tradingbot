@@ -327,3 +327,26 @@ def test_flows_from_file_loads_live_recs_and_bypasses_fetch(tmp_path, monkeypatc
     monkeypatch.setattr(fl.pool_tracker, "scorer_rows", _boom)
     out = fl.study(None, None, hours=1.0, metas=metas, have=have, max_credits=0)
     assert out["n_flows"] == 2
+
+
+def test_entry_window_finds_a_delayed_ev_positive_entry(monkeypatch):
+    # a signal whose up-move lands a few entry-slots LATER -> entry_window surfaces a later-offset EV+ cell.
+    import random as _r
+    def rec(ct, seed):
+        rr=_r.Random(seed); sol,tok=100_000_000_000,1_000_000_000_000; txs=[]
+        for slot in range(1,40):
+            is_sell=(slot%6==0)
+            buyers=[] if is_sell else ([rr.choice(["A","B","C"])] if rr.random()<0.6 else [])
+            if slot>3 and ((slot-3)%6==0): sol=int(sol*1.04)
+            if is_sell: txs.append([0,slot,None,1.0,-0.6,tok,sol])
+            for w in buyers: txs.append([0,slot,w,-1.0,round(rr.uniform(.2,1.0),3),tok,sol])
+            if not buyers and not is_sell: txs.append([0,slot,None,1.0,-1e-9,tok,sol])
+        return {"create_ts":ct,"token_mint":f"M{seed}","txs":txs,"window_s":0,"complete":True,"fetched":len(txs)}
+    metas=[{"pool":f"P{i}","token_mint":f"M{i}","create_ts":1000+i*10} for i in range(80)]
+    have={f"P{i}":rec(1000+i*10,i) for i in range(80)}
+    out=fl.entry_window(have,metas,fl._tgt("price",3,2,1.0),cost=0.01,window=10)
+    assert out["n_hold"] >= 2 and out["split"] == "time"
+    am=next(s for s in out["signals"] if s["signal"]=="abs_move>=1.88%")
+    # a later offset (k>=3) is EV+ (the move lands a few slots after the signal), and best_k found one
+    assert am["best_k"] is not None
+    assert any(am["per_k"][k].get("n",0)>=20 and am["per_k"][k]["mean"]>0 for k in range(3,8))

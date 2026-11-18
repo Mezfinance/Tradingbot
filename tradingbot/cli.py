@@ -204,6 +204,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--pools", type=str, default=None, help="flurry-study: run the literal study on a live-captured pool universe (JSON/JSONL of {pool, token_mint, create_ts} from the box absmove.py MODE=capture) instead of the scorer's pools -- route #1, exact study on ShredStream-surfaced pools")
     parser.add_argument("--flows", type=str, default=None, help="flurry-study: run the literal walk-forward (discover/scalp/tail) on slot flows reconstructed LIVE by the box surf.py (JSONL of {pool, token_mint, create_ts, rec}); create_ts = first-seen wall-clock, so the time split is a prospective live walk-forward. No Helius.")
     parser.add_argument("--max-hold", type=int, default=None, help="flurry-study: report the scalp at EVERY slot hold 1..N as its own column (flurry/motif/discovered-rule tables), to see continuation slot by slot. A hold >2 re-exposes to the reactive LP pull, so rugged%% rises -- read it as the hold/pull tradeoff, not a safe scalp.")
+    parser.add_argument("--entry-window", type=int, nargs="?", const=10, default=None, metavar="W", help="flurry-study: patience study -- keep the safe 1-2 slot hold, but sweep WHICH entry slot (N+1..N+W, default W=10) to take it after a slot-N signal. A pull during the wait = no entry (no loss); reports per-offset EV, best-of-window ceiling, and a causal up-tick-ride rule vs a random-active-slot control, out of sample.")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
     parser.add_argument("--apply", action="store_true", help="canary-sweep: close the empty accounts (default: list)")
@@ -785,6 +786,23 @@ def main(argv: list[str] | None = None) -> None:
         elif _pools_meta is not None:
             print(f"pool universe from {args.pools}: {len(_pools_meta)} pools", flush=True)
         _mp = dict(metas=_pools_meta, have=_flows_have)
+        if args.entry_window is not None:  # patience study: sweep the entry slot in N+1..N+W, keep the 1-2 slot hold
+            import time as _fl_time
+            from tradingbot import pool_tracker as _fl_pt
+            _ws = _FlWS(_fl_wdp(cfg))
+            if _pools_meta is not None:
+                _metas = _pools_meta
+            else:
+                _since = _fl_time.time() - (args.hours or 720.0) * 3600
+                _scorer = _fl_pt.scorer_rows(_ws.query, _since)
+                _metas = [{"pool": p, "token_mint": (_scorer[p] or {}).get("token_mint"),
+                           "create_ts": (_scorer[p] or {}).get("create_ts")}
+                          for p in _scorer if (_scorer[p] or {}).get("token_mint") and (_scorer[p] or {}).get("create_ts")]
+            _have = _flows_have if _flows_have is not None else _fl.fetch_flows(_ws, fl_helius, _metas, args.span_s, int(args.max_credits or 0), prog)[0]
+            _tgt = _fl._tgt(args.target, args.flurry_min, args.horizon, args.move_pct)
+            out = _fl.entry_window(_have, _metas, _tgt, args.cost_pct / 100.0, window=args.entry_window)
+            print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_entry_window(out))
+            return
         if args.tail:  # tail-concentration of the discovered survivors (broad tail vs a few pools)
             import time as _fl_time
             from tradingbot import pool_tracker as _fl_pt
