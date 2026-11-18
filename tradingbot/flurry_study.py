@@ -53,6 +53,20 @@ DEFAULT_SPAN_S = 180.0
 DEFAULT_COST_PCT = 1.0  # round-trip pool fee (~0.6%) + a modest Jito tip, as a % of notional
 CONTROL_PER_POOL = 60   # random non-flurry active slots sampled per pool for the baseline
 
+# motif-entry scalp: enter on the DISCOVERED lead (a precursor slot), not on the flurry itself.
+# discover() named the quiet->new-wallet transition (.N / ..N / sym == N) as what precedes an N+1 flurry --
+# the lead single-feature characterize() missed. So position BEFORE the flurry: buy at the end of the lead
+# slot (front of N+1, where the predicted flurry lands) and sell at N+1/N+2. Each fn runs over a _slot_bank rec.
+MOTIF_ENTRIES = [
+    ("sym==N new wallet",  lambda r: r["sym"] == "N"),
+    (".N quiet->new",      lambda r: r["m2"] == ".N"),
+    ("..N 2quiet->new",    lambda r: r["m3"] == "..N"),
+    (".NN new->new",       lambda r: r["m3"] == ".NN"),
+    ("sym==F persistence", lambda r: r["sym"] == "F"),
+    (".F quiet->flurry",   lambda r: r["m2"] == ".F"),
+]
+MOTIF_HOLDS = (1, 2)    # the lead predicts a flurry in N+1, so sell 1-2 slots after the lead slot
+
 
 # row indices from helius.launch_record txs: [sec, slot, payer, tokΔ, solΔ, tok_after, sol_after]
 _SLOT, _PAYER, _TOKD, _SOLD, _TOKA, _SOLA = 1, 2, 3, 4, 5, 6
@@ -205,6 +219,7 @@ def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: f
     # per (def label, hold): collected scalp returns; control[hold]: scalp returns from random non-flurry slots
     flurry: dict = {d[0]: {h: [] for h in HOLDS} for d in FLURRY_DEFS}
     control: dict = {h: [] for h in HOLDS}
+    motif: dict = {label: {h: [] for h in MOTIF_HOLDS} for label, _fn in MOTIF_ENTRIES}
     n_flows = flurries_total = 0
     buys_per_slot = []
     for m in metas:
@@ -234,6 +249,16 @@ def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: f
                 r = _scalp(slots, pull_slot, i, h, cost)
                 if r is not None:
                     control[h].append(r)
+        # motif-entry scalp: enter on a discovered lead slot (buy front of N+1), sell 1-2 slots later. bank is
+        # aligned to `slots` by index, so a matched rec i is the same slot _scalp enters on.
+        bank = _slot_bank(flow, DEFAULT_FLURRY_MIN, 0.0)
+        for label, fn in MOTIF_ENTRIES:
+            for i, rec_s in enumerate(bank):
+                if fn(rec_s):
+                    for h in MOTIF_HOLDS:
+                        r = _scalp(slots, pull_slot, i, h, cost)
+                        if r is not None:
+                            motif[label][h].append(r)
     results = []
     for label, field, thr in FLURRY_DEFS:
         row = {"flurry": label}
@@ -252,11 +277,29 @@ def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: f
                 if best is None or edge > best["edge"]:
                     best = {"flurry": row["flurry"], "hold": h, "mean": a["mean"], "control": c.get("mean"),
                             "edge": edge, "n": a["n"], "win_pct": a["win_pct"], "rugged_pct": a["rugged_pct"]}
+    # motif-entry scalp: aggregate each discovered-lead entry vs the same control, pick the best lead
+    motif_results = []
+    for label, _fn in MOTIF_ENTRIES:
+        row = {"motif": label}
+        for h in MOTIF_HOLDS:
+            row[f"h{h}"] = _agg(motif[label][h])
+        motif_results.append(row)
+    motif_best = None
+    for row in motif_results:
+        for h in MOTIF_HOLDS:
+            a = row[f"h{h}"]
+            c = ctrl[f"h{h}"]
+            if a.get("n", 0) >= 50 and a.get("mean", -9) > 0 and a.get("mean", -9) > c.get("mean", 0):
+                edge = a["mean"] - c.get("mean", 0)
+                if motif_best is None or edge > motif_best["edge"]:
+                    motif_best = {"motif": row["motif"], "hold": h, "mean": a["mean"], "control": c.get("mean"),
+                                  "edge": edge, "n": a["n"], "win_pct": a["win_pct"], "rugged_pct": a["rugged_pct"]}
     return {
         "hours": hours, "span_s": span_s, "cost_pct": cost_pct, "probed_only": probed_only, "credits": credits,
         "n_pools": len(metas), "n_flows": n_flows, "flurries_total": flurries_total,
         "median_buys_per_slot": statistics.median(buys_per_slot) if buys_per_slot else 0,
         "results": results, "control": ctrl, "best": best,
+        "motif_results": motif_results, "motif_best": motif_best,
     }
 
 
@@ -747,4 +790,20 @@ def render(out: dict) -> str:
     else:
         L.append("  NO CELL clears cost + the control with a sane n: flurries burst-and-stop at slot scale, so a")
         L.append("  reactive 1-2 slot scalp has no edge. ShredStream would be chasing ~0 -- do not build it.")
+    if "motif_results" in out:
+        L.append("")
+        L.append("  MOTIF-ENTRY SCALP  (position BEFORE the flurry on the discovered lead: buy front of N+1, sell N+h)")
+        L.append(f"  {'lead slot N':<20}" + "".join(f"{'hold '+str(h):>28}" for h in MOTIF_HOLDS))
+        for row in out["motif_results"]:
+            L.append(f"  {row['motif']:<20}" + "".join(f"  {_c(row[f'h{h}'])}" for h in MOTIF_HOLDS))
+        L.append(f"  {'control':<20}" + "".join(f"  {_c(out['control'][f'h{h}'])}" for h in MOTIF_HOLDS))
+        mb = out.get("motif_best")
+        if mb:
+            L.append(f"  BEST LEAD: {mb['motif']} hold {mb['hold']} -> net {mb['mean']*100:+.2f}% "
+                     f"(control {mb['control']*100:+.2f}%, edge {mb['edge']*100:+.2f} pts) over n={mb['n']}, "
+                     f"win {mb['win_pct']:.0f}%, rugged {mb['rugged_pct']:.0f}%")
+            L.append("  -> the discovered precursor pays as an entry. Validate live with the 1-slot probe before ShredStream.")
+        else:
+            L.append("  NO LEAD clears cost + the control: the discovered precursor leads a flurry but not enough PRICE")
+            L.append("  to scalp. The lead-lag is real yet not tradeable at slot scale on untouched pools.")
     return "\n".join(L)

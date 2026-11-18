@@ -111,6 +111,17 @@ def test_study_reports_no_edge_when_flurries_burst_and_stop(monkeypatch):
     assert "NO CELL" in fl.render(out)
 
 
+def test_motif_entry_scalp_pays_on_the_discovered_lead(monkeypatch):
+    # _rec_causal: a new wallet buys in slot k, the bot wash-pumps k+1 -> entering on the quiet->new-wallet
+    # lead (buy front of k+1) and selling at the flurry should beat the random-slot control.
+    out = _run(monkeypatch, _rec_causal())
+    assert out["motif_best"] is not None
+    assert "N" in out["motif_best"]["motif"]                 # the discovered quiet->new-wallet precursor
+    assert out["motif_best"]["mean"] > out["motif_best"]["control"]
+    r = fl.render(out)
+    assert "MOTIF-ENTRY SCALP" in r and "BEST LEAD:" in r
+
+
 # --- characterization (lead-lag: what in slot N predicts a flurry in N+1) ---------------------------
 
 def _add(res, rows, sec0, slot, n, dsol, wallet):
