@@ -308,3 +308,22 @@ def test_study_uses_a_passed_metas_universe_without_touching_the_scorer(monkeypa
     metas = [{"pool": "P1", "token_mint": "M1", "create_ts": 1.0}]
     out = fl.study(None, None, hours=1.0, metas=metas, max_credits=0)
     assert out["n_flows"] == 1
+
+
+def test_flows_from_file_loads_live_recs_and_bypasses_fetch(tmp_path, monkeypatch):
+    # route #1 (live): box surf.py writes launch_record-shaped recs; study must run on them without Helius.
+    rec = _rec(continuation=True)
+    rows = [{"pool": "P1", "token_mint": "M1", "create_ts": 100.0, "rec": rec},
+            {"pool": "P2", "token_mint": "M2", "create_ts": 200.0, "rec": rec}]
+    p = tmp_path / "surf.jsonl"
+    p.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    metas, have = fl.flows_from_file(str(p))
+    assert [m["pool"] for m in metas] == ["P1", "P2"]
+    assert metas[0]["create_ts"] == 100.0 and set(have) == {"P1", "P2"}
+
+    def _boom(*a, **k):
+        raise AssertionError("fetch_flows must not run when have is passed")
+    monkeypatch.setattr(fl, "fetch_flows", _boom)
+    monkeypatch.setattr(fl.pool_tracker, "scorer_rows", _boom)
+    out = fl.study(None, None, hours=1.0, metas=metas, have=have, max_credits=0)
+    assert out["n_flows"] == 2

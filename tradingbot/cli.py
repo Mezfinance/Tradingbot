@@ -202,6 +202,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--discover", action="store_true", help="flurry-study: data-driven discovery (auto rule bank + motifs, holdout-confirmed) instead of the named-event characterization")
     parser.add_argument("--tail", action="store_true", help="flurry-study: tail-concentration breakdown of the discovered survivors (is the edge a broad tail or a few pools)")
     parser.add_argument("--pools", type=str, default=None, help="flurry-study: run the literal study on a live-captured pool universe (JSON/JSONL of {pool, token_mint, create_ts} from the box absmove.py MODE=capture) instead of the scorer's pools -- route #1, exact study on ShredStream-surfaced pools")
+    parser.add_argument("--flows", type=str, default=None, help="flurry-study: run the literal walk-forward (discover/scalp/tail) on slot flows reconstructed LIVE by the box surf.py (JSONL of {pool, token_mint, create_ts, rec}); create_ts = first-seen wall-clock, so the time split is a prospective live walk-forward. No Helius.")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
     parser.add_argument("--apply", action="store_true", help="canary-sweep: close the empty accounts (default: list)")
@@ -771,11 +772,16 @@ def main(argv: list[str] | None = None) -> None:
             fl_helius.min_interval_s = 1 / max(args.rps, 0.1)
         prog = lambda i, n, c: print(f"flows {i}/{n}, {c} credits", flush=True)
         _tp = dict(target=args.target, move_pct=args.move_pct, horizon=args.horizon)
-        # route #1: run the literal study on the pool universe ShredStream surfaced live (box MODE=capture)
+        # route #1: run the literal study on the pool universe ShredStream surfaced live (box MODE=capture),
+        # or on slot flows reconstructed live by the box surf.py (prospective walk-forward, no Helius).
         _pools_meta = _fl.metas_from_pools(args.pools) if args.pools else None
-        if _pools_meta is not None:
+        _flows_have = None
+        if args.flows:
+            _pools_meta, _flows_have = _fl.flows_from_file(args.flows)
+            print(f"live flows from {args.flows}: {len(_pools_meta)} pools (prospective walk-forward by first-seen)", flush=True)
+        elif _pools_meta is not None:
             print(f"pool universe from {args.pools}: {len(_pools_meta)} pools", flush=True)
-        _mp = dict(metas=_pools_meta)
+        _mp = dict(metas=_pools_meta, have=_flows_have)
         if args.tail:  # tail-concentration of the discovered survivors (broad tail vs a few pools)
             import time as _fl_time
             from tradingbot import pool_tracker as _fl_pt
@@ -789,8 +795,11 @@ def main(argv: list[str] | None = None) -> None:
                 _metas = [{"pool": p, "token_mint": (_scorer[p] or {}).get("token_mint"),
                            "create_ts": (_scorer[p] or {}).get("create_ts")}
                           for p in _scorer if (_scorer[p] or {}).get("token_mint") and (_scorer[p] or {}).get("create_ts")]
-            _have, _cr = _fl.fetch_flows(_ws, fl_helius, _metas, args.span_s,
-                                         int(args.max_credits or 0), prog)
+            if _flows_have is not None:
+                _have = _flows_have
+            else:
+                _have, _cr = _fl.fetch_flows(_ws, fl_helius, _metas, args.span_s,
+                                             int(args.max_credits or 0), prog)
             _tgt = _fl._tgt(args.target, args.flurry_min, args.horizon, args.move_pct)
             out = _fl.tail_report(_have, _metas, _tgt, args.cost_pct / 100.0, hold=args.horizon)
             print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_tail(out))

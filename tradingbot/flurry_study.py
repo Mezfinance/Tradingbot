@@ -257,6 +257,27 @@ def metas_from_pools(path: str) -> list[dict]:
     return metas
 
 
+def flows_from_file(path: str) -> tuple[list[dict], dict]:
+    """Load launch_record recs reconstructed live by the box surf.py (MODE=surf): a JSON list or JSONL of
+    {pool, token_mint, create_ts, rec}, where rec is a helius.launch_record-shaped dict {create_ts, txs:[...]}.
+    Returns (metas, have) so study/discover/characterize run their LITERAL code on live-captured slot flows,
+    bypassing Helius. create_ts = the pool's first-seen wall-clock, so discover's time split is a true
+    prospective live walk-forward (early-session pools train, later-session pools test). Route #1 (live)."""
+    with open(path) as fh:
+        text = fh.read().strip()
+    rows = json.loads(text) if text.startswith("[") else [json.loads(x) for x in text.splitlines() if x.strip()]
+    metas, have, seen = [], {}, set()
+    for r in rows:
+        pool, mint, rec = r.get("pool"), r.get("token_mint"), r.get("rec")
+        if not pool or not mint or not rec or pool in seen:
+            continue
+        seen.add(pool)
+        ct = r.get("create_ts") or rec.get("create_ts") or 0
+        metas.append({"pool": pool, "token_mint": mint, "create_ts": ct})
+        have[pool] = rec
+    return metas, have
+
+
 def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: int, progress=None) -> tuple[dict, int]:
     """Cache the first `span_s` of each pool's trading in watch.db `watch_flurry` (research key, stable hash order
     so a credit cap leaves an even sample). Returns {pool: launch_record dict} and the research credits spent."""
@@ -291,7 +312,7 @@ def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: in
 def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: float = DEFAULT_SPAN_S,
           cost_pct: float = DEFAULT_COST_PCT, probed_only: bool = False, max_credits: int = 20_000,
           progress=None, now: float | None = None, seed: int = 0, target: str = DEFAULT_TARGET,
-          move_pct: float = DEFAULT_MOVE_PCT, horizon: int = DEFAULT_HORIZON, metas=None) -> dict:
+          move_pct: float = DEFAULT_MOVE_PCT, horizon: int = DEFAULT_HORIZON, metas=None, have=None) -> dict:
     """Assemble the pool sample, fetch/read each pool's slot flow, and aggregate the scalp returns per flurry
     definition x hold vs a random-slot control, plus the motif-entry and discovered-rule scalps (both pointed at
     `target`). Population = the scorer's finished liquid pools (or only --probed-only), or a live-captured pool
@@ -311,7 +332,10 @@ def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: f
             create, mint = s.get("create_ts"), s.get("token_mint")
             if create and mint:
                 metas.append({"pool": pool, "token_mint": mint, "create_ts": create})
-    have, credits = fetch_flows(store, helius, metas, span_s, max_credits, progress)
+    if have is None:
+        have, credits = fetch_flows(store, helius, metas, span_s, max_credits, progress)
+    else:
+        credits = 0
     cost = cost_pct / 100.0
     rng = random.Random(seed)
     # per (def label, hold): collected scalp returns; control[hold]: scalp returns from random non-flurry slots
@@ -489,7 +513,7 @@ def _autocorr(series: list[float], maxlag: int) -> list[float]:
 def characterize(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: float = DEFAULT_SPAN_S,
                  flurry_min: int = DEFAULT_FLURRY_MIN, probed_only: bool = False, max_credits: int = 20_000,
                  progress=None, now: float | None = None, target: str = DEFAULT_TARGET,
-                 move_pct: float = DEFAULT_MOVE_PCT, horizon: int = DEFAULT_HORIZON, metas=None) -> dict:
+                 move_pct: float = DEFAULT_MOVE_PCT, horizon: int = DEFAULT_HORIZON, metas=None, have=None) -> dict:
     """For every candidate slot-N event, its correlation / AUC / lift with the predicted thing in the next
     slot(s) (a price up-move by default; a buy flurry with target='flurry'), plus the buys/slot autocorrelation.
     Answers 'what predicts a next-slot MOVE' with no presupposed cause. `metas` overrides the scorer universe
@@ -506,7 +530,10 @@ def characterize(journal, store, cfg=None, helius=None, hours: float = 720.0, sp
         metas = [{"pool": p, "token_mint": (scorer[p] or {}).get("token_mint"),
                   "create_ts": (scorer[p] or {}).get("create_ts")}
                  for p in pools if (scorer[p] or {}).get("token_mint") and (scorer[p] or {}).get("create_ts")]
-    have, credits = fetch_flows(store, helius, metas, span_s, max_credits, progress)
+    if have is None:
+        have, credits = fetch_flows(store, helius, metas, span_s, max_credits, progress)
+    else:
+        credits = 0
     rows: list[tuple[dict, float]] = []
     autos: list[tuple[list[float], int]] = []
     n_flows = 0
@@ -737,7 +764,7 @@ def _eval_spec(spec: dict, recs: list[dict], tgt: np.ndarray, base: float) -> di
 def discover(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: float = DEFAULT_SPAN_S,
              flurry_min: int = DEFAULT_FLURRY_MIN, probed_only: bool = False, max_credits: int = 20_000,
              progress=None, now: float | None = None, target: str = DEFAULT_TARGET,
-             move_pct: float = DEFAULT_MOVE_PCT, horizon: int = DEFAULT_HORIZON, metas=None) -> dict:
+             move_pct: float = DEFAULT_MOVE_PCT, horizon: int = DEFAULT_HORIZON, metas=None, have=None) -> dict:
     """Data-driven discovery of the slot-N event that precedes the predicted thing (a price up-move by default;
     a buy flurry with target='flurry'): no event named in advance, a large auto-generated rule bank + sequence
     motifs, kept only where the lead survives a time-holdout with a family-wise z guard. `metas` overrides the
@@ -755,7 +782,10 @@ def discover(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s
         metas = [{"pool": p, "token_mint": (scorer[p] or {}).get("token_mint"),
                   "create_ts": (scorer[p] or {}).get("create_ts")}
                  for p in pools if (scorer[p] or {}).get("token_mint") and (scorer[p] or {}).get("create_ts")]
-    have, credits = fetch_flows(store, helius, metas, span_s, max_credits, progress)
+    if have is None:
+        have, credits = fetch_flows(store, helius, metas, span_s, max_credits, progress)
+    else:
+        credits = 0
     recs: list[dict] = []
     n_flows = 0
     for m in metas:
