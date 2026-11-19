@@ -205,6 +205,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--discover-econ", action="store_true", help="flurry-study: economics-ranked discovery -- SELECT rules by the scalp P&L they'd have made (significant vs the control on mean OR median, holdout-confirmed, family-wise guarded), not by lift. Surfaces rules whose lift was unremarkable but whose median/mean%% pays, labelled broad vs tail with move direction; runs both sides (momentum + reversion) so the up-side fat tail can be distrusted while the down-side tail is read as the fills-favoured bounce.")
     parser.add_argument("--creation", action="store_true", help="flurry-study: reactive first-buy backrun -- see the pool's FIRST BUY in slot N (ShredStream), enter front of N+1 ('straight away'), hold k slots AFTER entry; reports the return per hold, where the first LP pull lands relative to OUR entry (does the 2-slot dodge hold at creation), and the raw move the first buy leads to. Free off the cached flows.")
     parser.add_argument("--slot0", action="store_true", help="flurry-study: slot-0 landing -- if we land in the creation slot, sweep the hold length and report the smallest hold that is EV+ (if any), with the raw opening drift and the cumulative rug-by-hold, i.e. how long we must hold and whether EV+ means holding past the ~2-slot safe window. Free off the cached flows.")
+    parser.add_argument("--multibuy", action="store_true", help="flurry-study: band each flurry slot by its buy count (0-15, 15-25, ... 95+), enter the slot after (front of N+1) and sweep the hold 1-10 slots, reporting the net scalp per band x hold so the hold where the mean peaks is the ideal exit for that band -- the dynamics change once we are in, so the ideal exit is a few slots after entry. Free off the cached flows.")
     parser.add_argument("--pools", type=str, default=None, help="flurry-study: run the literal study on a live-captured pool universe (JSON/JSONL of {pool, token_mint, create_ts} from the box absmove.py MODE=capture) instead of the scorer's pools -- route #1, exact study on ShredStream-surfaced pools")
     parser.add_argument("--flows", type=str, default=None, help="flurry-study: run the literal walk-forward (discover/scalp/tail) on slot flows reconstructed LIVE by the box surf.py (JSONL of {pool, token_mint, create_ts, rec}); create_ts = first-seen wall-clock, so the time split is a prospective live walk-forward. No Helius.")
     parser.add_argument("--max-hold", type=int, default=None, help="flurry-study: report the scalp at EVERY slot hold 1..N as its own column (flurry/motif/discovered-rule tables), to see continuation slot by slot. A hold >2 re-exposes to the reactive LP pull, so rugged%% rises -- read it as the hold/pull tradeoff, not a safe scalp.")
@@ -811,7 +812,7 @@ def main(argv: list[str] | None = None) -> None:
                 out = _fl.entry_window(_have, _metas, _tgt, args.cost_pct / 100.0, window=args.entry_window)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_entry_window(out))
             return
-        if args.tail or args.discover_econ or args.creation or args.slot0:  # tail / econ-discovery / creation-moment / slot-0 landing (all read flows the same way)
+        if args.tail or args.discover_econ or args.creation or args.slot0 or args.multibuy:  # tail / econ-discovery / creation / slot-0 / multibuy (all read flows the same way)
             import time as _fl_time
             from tradingbot import pool_tracker as _fl_pt
             _ws = _FlWS(_fl_wdp(cfg))
@@ -830,7 +831,10 @@ def main(argv: list[str] | None = None) -> None:
                 _have, _cr = _fl.fetch_flows(_ws, fl_helius, _metas, args.span_s,
                                              int(args.max_credits or 0), prog)
             _tgt = _fl._tgt(args.target, args.flurry_min, args.horizon, args.move_pct)
-            if args.slot0:  # land in the creation slot, sweep the hold: how long to EV+?
+            if args.multibuy:  # band flurries by buy count, enter the slot after, sweep the hold 1-10
+                out = _fl.multibuy_study(_have, _metas, args.cost_pct / 100.0)
+                print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_multibuy(out))
+            elif args.slot0:  # land in the creation slot, sweep the hold: how long to EV+?
                 out = _fl.slot0_study(_have, _metas, args.cost_pct / 100.0)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_slot0(out))
             elif args.creation:  # reactive first-buy backrun: enter front of first-buy+1, hold k slots

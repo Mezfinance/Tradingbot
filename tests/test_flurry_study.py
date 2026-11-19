@@ -699,3 +699,40 @@ def test_slot0_not_ev_when_the_rug_eats_the_drift():
     out = fl.slot0_study(have, metas, 0.035)
     assert out["break_even"] is None and out["raw_break_even"] == 4
     assert "NOT EV+ AT ANY HOLD" in fl.render_slot0(out)
+
+
+# --- buy-flurry banded by buy count, enter the slot after, hold 1-10 slots -------------------------
+
+def _mb(per_slot):
+    """A launch_record with `per_slot` = [(n_buys, price), ...]; slot i (number 10+i) has n_buys buy rows at price."""
+    rows, sec = [], 0.0
+    for idx, (nb, pr) in enumerate(per_slot):
+        for _ in range(nb):
+            rows.append([sec, 10 + idx, f"w{idx}", -1.0, 1.0, 1e9, pr * 1e9]); sec += 0.001
+    return {"txs": rows}
+
+
+def test_multibuy_bands_and_per_slot_hold_find_the_ideal_exit():
+    # each pool: flat prefix (2 buys), a 20-buy flurry (band 15-25) at slot idx 8, then a ramp peaking at hold 5.
+    flat = [(2, 100.0)] * 8
+    ramp = [(20, 100.0), (2, 108.0), (2, 116.0), (2, 124.0), (2, 132.0), (2, 150.0),
+            (2, 120.0), (2, 110.0), (2, 105.0), (2, 102.0), (2, 100.0)]
+    have = {f"P{i}": _mb(flat + ramp) for i in range(60)}
+    metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
+    out = fl.multibuy_study(have, metas, 0.0)
+    assert out["holds"] == list(range(1, 11))
+    labels = [b["band"] for b in out["bands"]]
+    assert labels == ["0-15", "15-25", "25-35", "35-45", "45-55", "55-65", "65-75", "75-85", "85-95", "95+"]
+    row = next(b for b in out["bands"] if b["band"] == "15-25")
+    assert row["best_hold"] == 5 and row["pays"]          # entering front of N+1, the ramp peaks 5 slots later
+    assert out["best"] is not None and out["best"]["band"] == "15-25"
+    assert abs(out["best"]["agg"]["median"] - 0.50) < 1e-6
+    assert "ENTER SLOT AFTER" in fl.render_multibuy(out)
+
+
+def test_multibuy_no_edge_when_flat():
+    have = {f"P{i}": _mb([(2, 100.0)] * 20) for i in range(60)}
+    metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
+    out = fl.multibuy_study(have, metas, 0.01)        # a round-trip cost, so a flat hold is negative
+    assert out["best"] is None
+    assert "NO BAND x EXIT-HOLD PAYS" in fl.render_multibuy(out)

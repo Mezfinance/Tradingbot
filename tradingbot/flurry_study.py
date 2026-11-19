@@ -2073,6 +2073,122 @@ def render_slot0(out: dict) -> str:
     return "\n".join(L)
 
 
+# --- buy-flurry banded by buy count, enter the slot after, sweep the hold 1-10 slots -------------------
+# The owner's reframe: entering CHANGES the dynamics, so the ideal exit is a few SLOTS after entry (their read:
+# 4-10 slots), not a 5-10 SECOND window. So band each flurry slot by its buy count and, entering front of N+1,
+# measure the net scalp at every hold 1..10 slots -- the hold where the mean peaks is the ideal exit for that
+# band. A hold past ~2 slots re-exposes to the reactive LP pull, so rugged% climbs with the hold (read the grid
+# as the move-vs-rug tradeoff per band). Read only, mid-to-mid on untouched pools; the live arbiter is a real
+# NET reactive entry. Free off the cached flows.
+MULTIBUY_BANDS = [(0, 15), (15, 25), (25, 35), (35, 45), (45, 55),
+                  (55, 65), (65, 75), (75, 85), (85, 95), (95, 10 ** 9)]
+MULTIBUY_HOLDS = tuple(range(1, 11))     # slots held after entering front of N+1
+MULTIBUY_MIN_N = 45                      # sample floor for calling a band x hold a candidate exit
+
+
+def _mb_label(lo: int, hi: int) -> str:
+    return f"{lo}+" if hi >= 10 ** 9 else f"{lo}-{hi}"
+
+
+def multibuy_study(have: dict, metas: list[dict], cost: float,
+                   bands=MULTIBUY_BANDS, holds=MULTIBUY_HOLDS, seed: int = 0) -> dict:
+    """Band each flurry slot by its buy count, enter front of N+1, sweep the hold 1..10 slots, and report the
+    net scalp (mean/median/win/rugged/n) per band x hold -- so the hold where the mean peaks is the ideal exit
+    for that band. Read only, mid-to-mid on untouched pools."""
+    labels = [_mb_label(lo, hi) for lo, hi in bands]
+    coll = {lab: {h: [] for h in holds} for lab in labels}
+    control = {h: [] for h in holds}
+    rng = random.Random(seed)
+    n_flows = 0
+    for m in metas:
+        rec = have.get(m["pool"])
+        flow = slot_flow(rec) if rec else None
+        if not flow:
+            continue
+        n_flows += 1
+        slots, pull = flow["slots"], flow["pull_slot"]
+        for i, s in enumerate(slots):
+            nb = s.get("n_buys", 0)
+            lab = next((l for (lo, hi), l in zip(bands, labels) if lo <= nb < hi), None)
+            if lab is None:
+                continue
+            for h in holds:
+                r = _scalp(slots, pull, i, h, cost)
+                if r is not None:
+                    coll[lab][h].append(r)
+        quiet = [i for i, s in enumerate(slots) if s.get("n_buys", 0) < 3]   # reference: random light slots
+        rng.shuffle(quiet)
+        for i in quiet[:CONTROL_PER_POOL]:
+            for h in holds:
+                r = _scalp(slots, pull, i, h, cost)
+                if r is not None:
+                    control[h].append(r)
+    out = {"n_flows": n_flows, "cost": cost, "holds": list(holds), "min_n": MULTIBUY_MIN_N,
+           "control": {h: _agg(control[h]) for h in holds}, "bands": [], "best": None}
+    best = None
+    for lab in labels:
+        cells = {h: _agg(coll[lab][h]) for h in holds}
+        # ideal exit = the hold with the highest mean at a sane n; `pays` if it also clears 0 on mean AND median
+        exits = [h for h in holds if cells[h].get("n", 0) >= MULTIBUY_MIN_N]
+        be = max(exits, key=lambda h: cells[h]["mean"]) if exits else None
+        pays = bool(be is not None and cells[be]["mean"] > 0 and cells[be]["median"] > 0
+                    and cells[be]["mean"] > out["control"][be].get("mean", -9))
+        out["bands"].append({"band": lab, "cells": cells, "best_hold": be, "pays": pays,
+                             "n": cells[holds[0]].get("n", 0)})
+        if pays and (best is None or cells[be]["median"] > best["agg"]["median"]):
+            best = {"band": lab, "hold": be, "agg": cells[be]}
+    out["best"] = best
+    return out
+
+
+def render_multibuy(out: dict) -> str:
+    holds = out["holds"]
+    L = []
+    L.append("BUY-FLURRY BY BUY COUNT -> ENTER SLOT AFTER -> HOLD 1-10 SLOTS  (ideal exit = where the mean peaks)")
+    L.append(f"  pools {out['n_flows']}; cost {out['cost']*100:.2f}%; ~0.4s/slot so hold 10 ~= 4s; min n {out['min_n']}")
+    L.append("")
+    head = f"  {'buys/slot':<9}  " + "".join(f"{('h'+str(h)):>5}" for h in holds) + f"  {'ideal':>6} {'n':>6}"
+    L.append(head + "   (cells = net mean %)")
+    for row in out["bands"]:
+        cells = row["cells"]
+        line = f"  {row['band']:<9}  "
+        for h in holds:
+            a = cells[h]
+            line += f"{a['mean']*100:>+5.0f}" if a.get("n") else f"{'-':>5}"
+        be = row["best_hold"]
+        mark = (f"h{be}{'*' if row['pays'] else ''}") if be is not None else "-"
+        line += f"  {mark:>6} {row['n']:>6}"
+        L.append(line)
+    c = out["control"]
+    cline = f"  {'control':<9}  " + "".join(f"{c[h]['mean']*100:>+5.0f}" if c[h].get('n') else f"{'-':>5}" for h in holds)
+    L.append(cline)
+    L.append("")
+    # at the ideal-exit hold, show the robust reads (median/win/rugged) per band so a mean peak isn't an outlier
+    L.append("  AT THE IDEAL-EXIT HOLD (median / win% / rugged% / n):")
+    for row in out["bands"]:
+        be = row["best_hold"]
+        if be is None:
+            L.append(f"    {row['band']:<9}  (n below {out['min_n']} at every hold)")
+            continue
+        a = row["cells"][be]
+        L.append(f"    {row['band']:<9}  h{be}: mean {a['mean']*100:+.1f}%  md {a['median']*100:+.1f}%  "
+                 f"win {a['win_pct']:.0f}%  rug {a.get('rugged_pct',0):.0f}%  n {a['n']}")
+    b = out.get("best")
+    L.append("")
+    if b:
+        a = b["agg"]
+        L.append(f"  BEST: {b['band']} buys/slot, exit at hold {b['hold']} -> mean {a['mean']*100:+.1f}%, "
+                 f"median {a['median']*100:+.1f}%, win {a['win_pct']:.0f}%, rugged {a.get('rugged_pct',0):.0f}% (n {a['n']})")
+        L.append("  -> a band x exit-hold that pays on mean AND median and beats the control. Validate live (NET).")
+    else:
+        L.append("  NO BAND x EXIT-HOLD PAYS: no buy-count band has a hold 1-10 positive on mean AND median that")
+        L.append("  beats the control -- entering after a flurry and holding a few slots has no mid-to-mid edge here.")
+    L.append("")
+    L.append("  Mid-to-mid on untouched pools -> a hypothesis. A hold > ~2 slots re-exposes to the reactive pull")
+    L.append("  (rugged% climbs with the hold); the live arbiter is a real reactive NET entry.")
+    return "\n".join(L)
+
+
 def render(out: dict) -> str:
     tgt = out.get("target") or _tgt()
     L = []
