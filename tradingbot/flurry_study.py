@@ -969,7 +969,7 @@ def render_discover(out: dict) -> str:
                 L.append(f"  {rule:<62}{r['lift_hold']:9.2f}x{r['rate_hold']*100:7.1f}%{r['z_hold']:+7.1f}{r['n_hold']:6d}")
             best_s = max(out["survivors"], key=lambda s: s["lift_hold"], default=None)
             best_single = best_s["lift_hold"] if best_s else 1.0
-            b = out["combos"][0]
+            b = max(out["combos"], key=lambda c: c["lift_hold"])
             if b["lift_hold"] > best_single:
                 L.append(f"  -> STACKED EDGE: '{b['rule']}' ({b['depth']} filters) leads {tl} {b['lift_hold']:.1f}x out of sample,")
                 L.append(f"     BEATING the best single rule ({best_single:.1f}x). Confirm it PAYS (--scalp), then the live 1-slot probe.")

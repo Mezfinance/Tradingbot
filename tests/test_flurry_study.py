@@ -338,7 +338,16 @@ def test_discover_combos_surfaces_a_planted_conjunction(monkeypatch):
     assert top["depth"] >= 2 and "  AND  " in top["rule"]       # it is a conjunction
     assert top["gain_vs_part"] > 0.5                            # clearly sharper out of sample than its best single filter
     assert any("new" in c["rule"] and "prev" in c["rule"] for c in out["combos"])  # recovered the A AND B structure
-    assert "COMBINATIONS" in fl.render_discover(out)           # the section renders (verdict is STACKED EDGE vs best single, conditional)
+    # the verdict must compare the strongest-edge conjunction (best by holdout LIFT, never the z-sorted top row)
+    # against the best single rule, and must not contradict its own table (the bug: it picked combos[0] by z).
+    r = fl.render_discover(out)
+    best_combo = max(c["lift_hold"] for c in out["combos"])
+    best_single = max(s["lift_hold"] for s in out["survivors"])
+    if best_combo > best_single + 1e-9:
+        assert "STACKED EDGE" in r                              # a conjunction out-lifts every single -> say so
+    else:
+        assert "does NOT beat" in r                             # tie or weaker -> single-dimensional, honestly
+    assert "COMBINATIONS" in r
 
 
 def test_metas_from_pools_loads_json_and_jsonl(tmp_path):
