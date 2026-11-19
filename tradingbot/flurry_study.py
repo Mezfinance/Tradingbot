@@ -66,6 +66,9 @@ MOTIF_ENTRIES = [
     (".F quiet->flurry",   lambda r: r["m2"] == ".F"),
 ]
 MOTIF_HOLDS = (1, 2)    # the lead predicts the move in N+1, so sell 1-2 slots after the lead slot
+# abs_move entry-threshold sweep: the base 0.0188 is abs_move q90 on the Fly scorer universe; step it up to
+# see whether requiring a BIGGER slot move -- deeper into the tail -- nets a higher mean scalp.
+ABSMOVE_GRID = (0.0188, 0.025, 0.035, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30)
 
 DEFAULT_FLURRY_MIN = 3    # a slot is a flurry if it has >= this many buys (sweepable with --flurry-min)
 MAXLAG = 10               # autocorrelation of buys/slot out to this many slots (periodicity / a clock)
@@ -405,6 +408,7 @@ def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: f
         "results": results, "control": ctrl, "best": best,
         "motif_results": motif_results, "motif_best": motif_best,
         "discovered": discovered_scalp(have, metas, tgt, cost, MOTIF_HOLDS, seed),
+        "abs_sweep": abs_move_sweep(have, metas, tgt, cost, MOTIF_HOLDS, seed),
     }
 
 
@@ -1106,6 +1110,61 @@ def discovered_scalp(have: dict, metas: list[dict], tgt: dict, cost: float,
     return out
 
 
+def abs_move_sweep(have: dict, metas: list[dict], tgt: dict, cost: float,
+                   holds=MOTIF_HOLDS, seed: int = 0, grid=ABSMOVE_GRID) -> dict:
+    """Sweep the abs_move ENTRY threshold: fire the scalp (buy front of N+1, sell N+h) on every slot whose
+    abs_move >= t, for an ascending grid of t. The base (0.0188 = abs_move q90) is the reference; the sweep
+    answers whether requiring a BIGGER move -- deeper into the tail -- nets a higher mean. A fixed threshold is
+    a pre-specified hypothesis (not a rule discovered from the data), so there is nothing to overfit: this runs
+    on EVERY pool (more n), no holdout split. `q` per row = the quantile the threshold sits at (share of active
+    slots below it), so 0.0188->~q90 and the higher rows show how far into the tail they reach."""
+    pools = []
+    for m in metas:
+        rec = have.get(m["pool"])
+        flow = slot_flow(rec) if rec else None
+        if flow:
+            pools.append({"flow": flow, "bank": _slot_bank(flow, m.get("create_ts") or 0.0, tgt)})
+    out = {"n_pools": len(pools), "rows": [], "control": {}, "best": None}
+    if not pools:
+        return out
+    allmoves = sorted(r["f"]["abs_move"] for p in pools for r in p["bank"] if r["f"]["abs_move"] > 0)
+
+    def _q(t: float) -> float:                            # share of active (moving) slots below t = its quantile
+        return 100.0 * sum(1 for m in allmoves if m < t) / len(allmoves) if allmoves else 0.0
+
+    rows = []
+    for t in grid:
+        agg = {h: [] for h in holds}
+        fires = 0
+        for p in pools:
+            slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
+            for i, rec in enumerate(p["bank"]):
+                if rec["f"]["abs_move"] >= t:
+                    fires += 1
+                    for h in holds:
+                        r = _scalp(slots, pull, i, h, cost)
+                        if r is not None:
+                            agg[h].append(r)
+        row = {"thresh": t, "q": _q(t), "fires": fires}
+        for h in holds:
+            row[f"h{h}"] = _agg(agg[h])
+        rows.append(row)
+    rng = random.Random(seed)
+    control = {h: [] for h in holds}
+    for p in pools:
+        slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
+        quiet = [i for i, s in enumerate(slots) if s["n_buys"] < 3]
+        rng.shuffle(quiet)
+        for i in quiet[:CONTROL_PER_POOL]:
+            for h in holds:
+                r = _scalp(slots, pull, i, h, cost)
+                if r is not None:
+                    control[h].append(r)
+    ctrl = {f"h{h}": _agg(control[h]) for h in holds}
+    out.update({"rows": rows, "control": ctrl, "best": _best_cell(rows, ctrl, holds, "thresh")})
+    return out
+
+
 def _raw_scalp(slots: list[dict], pull_slot, s_idx: int, hold: int, cost: float):
     """(raw, capped) return of the same scalp as _scalp, so the tail report can see whether the capped
     mean rests on a few uncapped reserve-ratio spikes. raw has no +RET_CAP ceiling (pulls are still -1.0)."""
@@ -1624,4 +1683,24 @@ def render(out: dict) -> str:
                 L.append("  -> a STACKED lead that also PAYS. Compare its edge to the best single above; validate live before ShredStream.")
             else:
                 L.append("  NO DISCOVERED COMBO pays out of sample beyond its control: stacking leads but doesn't pay more than a single.")
+    sw = out.get("abs_sweep")
+    if sw and sw.get("rows"):
+        L.append("")
+        L.append(f"  ABS_MOVE THRESHOLD SWEEP  (enter on every slot with abs_move >= t, buy front of N+1, sell N+h; "
+                 f"{sw['n_pools']} pools, every slot -- fixed thresholds, no holdout)")
+        L.append(f"  {'abs_move>=':<11}{'~q':>5}{'fires':>8}" + "".join(f"{'hold '+str(h):>28}" for h in MOTIF_HOLDS))
+        for row in sw["rows"]:
+            tag = "  (base q90)" if abs(row["thresh"] - 0.0188) < 1e-9 else ""
+            L.append(f"  {row['thresh']*100:>7.2f}%  {row['q']:>4.0f}{row['fires']:>8d}"
+                     + "".join(f"  {_c(row[f'h{h}'])}" for h in MOTIF_HOLDS) + tag)
+        L.append(f"  {'control':<11}{'':>5}{'':>8}" + "".join(f"  {_c(sw['control'][f'h{h}'])}" for h in MOTIF_HOLDS))
+        sb = sw.get("best")
+        if sb:
+            L.append(f"  BEST THRESHOLD: abs_move >= {sb['thresh']*100:.2f}% hold {sb['hold']} -> net {sb['mean']*100:+.1f}% "
+                     f"(median {sb['median']*100:+.1f}%, control {sb['control']*100:+.1f}%, edge {sb['edge']*100:+.1f} pts) "
+                     f"n={sb['n']}, win {sb['win_pct']:.0f}%")
+            L.append("  -> read the mean column down the rows: if it RISES with the threshold, a bigger move pays a higher mean")
+            L.append("     (raise the live CUT); if it flattens/falls or n collapses, the tail is thin -- keep the 0.0188 base.")
+        else:
+            L.append("  NO THRESHOLD beats the control on mean/median/win at n>=50: a bigger abs_move does not net a cleaner mean.")
     return "\n".join(L)

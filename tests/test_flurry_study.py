@@ -168,6 +168,21 @@ def test_discovered_combo_scalp_scalps_the_best_conjunctions(monkeypatch):
     assert "DISCOVERED-COMBO SCALP" in fl.render(out)
 
 
+def test_abs_move_threshold_sweep_steps_the_entry_cut_up(monkeypatch):
+    # sweep the abs_move entry threshold from the 0.0188 base upward, to read whether a BIGGER move nets a
+    # higher mean. A higher threshold must fire on a SUBSET (monotonically fewer slots), the quantile column is
+    # a share, and the table + best/none verdict must render.
+    out = _run(monkeypatch, _rec_causal())
+    sw = out["abs_sweep"]
+    assert [r["thresh"] for r in sw["rows"]] == list(fl.ABSMOVE_GRID)   # the whole grid, base first
+    fires = [r["fires"] for r in sw["rows"]]
+    assert fires == sorted(fires, reverse=True)                        # a higher cut can only fire on fewer slots
+    assert all(0.0 <= r["q"] <= 100.0 for r in sw["rows"])             # each row's quantile is a share
+    r = fl.render(out)
+    assert "ABS_MOVE THRESHOLD SWEEP" in r and "(base q90)" in r
+    assert ("BEST THRESHOLD" in r) or ("NO THRESHOLD beats" in r)
+
+
 def test_tail_report_breaks_down_the_discovered_edge(monkeypatch):
     # the tail breakdown should re-discover survivors and report concentration: distinct winning pools, the
     # top-5/20 share of the positive return, and capped vs uncapped mean. On the planted data the edge is
