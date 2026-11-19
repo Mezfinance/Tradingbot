@@ -134,6 +134,40 @@ def test_discovered_rule_scalp_auto_feeds_the_survivors_and_scalps_them(monkeypa
     assert "DISCOVERED-RULE SCALP" in fl.render(out)
 
 
+def test_discovered_combo_scalp_scalps_the_best_conjunctions(monkeypatch):
+    # the scalp must also run on the best CONJUNCTIONS (not just singles): rebuild each discovered combo's
+    # predicate by AND-ing its component rules, scalp it out of sample. On the planted A AND B price pump,
+    # the stacked rule fires and PAYS beyond the control.
+    from tradingbot import pool_tracker as pt
+    n = 60
+    pools = {f"P{i}": {"create_ts": float(i), "token_mint": "M"} for i in range(n)}
+    recs = {f"P{i}": _rec_combo(seed=i) for i in range(n)}
+    monkeypatch.setattr(pt, "scorer_rows", lambda q, since: pools)
+    monkeypatch.setattr(pt, "feint_pools", lambda q, since: {})
+
+    class S:
+        def execute(self, *a):
+            pass
+
+        def query(self, sql, params=()):
+            if "watch_flurry" in sql:
+                return [{"pool": p, "data": json.dumps(recs[p])} for p in pools]
+            return []
+
+    class J:
+        def query(self, *a, **k):
+            return []
+
+    out = fl.study(J(), S(), helius=None, now=10.0)
+    d = out["discovered"]
+    assert d["combo_results"], "no conjunction was scalped"
+    assert any("  AND  " in r["rule"] for r in d["combo_results"])          # they are real conjunctions
+    assert any("new" in r["rule"] and "prev" in r["rule"] for r in d["combo_results"])  # the planted A AND B
+    cb = d["combo_best"]
+    assert cb is not None and cb["mean"] > cb["control"]                    # the stacked lead pays out of sample
+    assert "DISCOVERED-COMBO SCALP" in fl.render(out)
+
+
 def test_tail_report_breaks_down_the_discovered_edge(monkeypatch):
     # the tail breakdown should re-discover survivors and report concentration: distinct winning pools, the
     # top-5/20 share of the positive return, and capped vs uncapped mean. On the planted data the edge is

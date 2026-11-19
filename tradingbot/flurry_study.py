@@ -1072,7 +1072,37 @@ def discovered_scalp(have: dict, metas: list[dict], tgt: dict, cost: float,
                     control[h].append(r)
     ctrl = {f"h{h}": _agg(control[h]) for h in holds}
     best = _best_cell(results, ctrl, holds, "rule")
-    out.update({"results": results, "control": ctrl, "best": best, "n_hold": len(hold)})
+    # also scalp the best CONJUNCTIONS, out of sample on the same holdout pools. A combo's predicate is
+    # rebuilt by AND-ing its component single rules (looked up by rule string), so nothing non-serialisable
+    # is stored and the combo scalp uses the exact same fires -> scalp machinery as the singles.
+    combo_results = []
+    combo_best = None
+    if len(evald) >= 2:
+        clay = _combo_layer(evald, train_recs, hold_recs, tgt_tr, tgt_ho, base_tr, base_ho)
+        spec_by_rule = {spec["rule"]: spec for spec, _, _ in evald}
+        for c in clay["combos"][:DISC_SCALP_TOP]:
+            fns = [spec_by_rule[p]["fn"] for p in c["rule"].split("  AND  ") if p in spec_by_rule]
+            if len(fns) != c["depth"]:
+                continue
+            agg = {h: [] for h in holds}
+            hits = []
+            for p in hold:
+                slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
+                for i, rec_s in enumerate(p["bank"]):
+                    if all(f(rec_s) for f in fns):
+                        hits.append(rec_s["target"])
+                        for h in holds:
+                            r = _scalp(slots, pull, i, h, cost)
+                            if r is not None:
+                                agg[h].append(r)
+            row = {"rule": c["rule"], "depth": c["depth"], "lift_hold": c["lift_hold"], "z_hold": c["z_hold"],
+                   "fires": len(hits), "target_hit": (statistics.fmean(hits) if hits else 0.0)}
+            for h in holds:
+                row[f"h{h}"] = _agg(agg[h])
+            combo_results.append(row)
+        combo_best = _best_cell(combo_results, ctrl, holds, "rule")
+    out.update({"results": results, "control": ctrl, "best": best, "n_hold": len(hold),
+                "combo_results": combo_results, "combo_best": combo_best, "n_combos": len(combo_results)})
     return out
 
 
@@ -1577,4 +1607,21 @@ def render(out: dict) -> str:
         else:
             L.append("  NO DISCOVERED RULE pays on price: the leads predict a next-slot flurry (target%) but it doesn't move")
             L.append("  price enough. Re-run with --target price to point discovery at the move itself.")
+        cres = d.get("combo_results") or []
+        if cres:
+            L.append("")
+            L.append(f"  DISCOVERED-COMBO SCALP  ({len(cres)} holdout-confirmed conjunction(s); same holdout pools, out of sample)")
+            L.append(f"  {'discovered conjunction':<40}{'target%':>8}{'fires':>7}" + "".join(f"{'hold '+str(h):>28}" for h in MOTIF_HOLDS))
+            for row in cres:
+                L.append(f"  {row['rule'][:40]:<40}{row.get('target_hit', 0.0)*100:7.0f}%{row.get('fires', 0):7d}"
+                         + "".join(f"  {_c(row[f'h{h}'])}" for h in MOTIF_HOLDS))
+            L.append(f"  {'control':<40}{'':>8}{'':>7}" + "".join(f"  {_c(d['control'][f'h{h}'])}" for h in MOTIF_HOLDS))
+            cb = d.get("combo_best")
+            if cb:
+                L.append(f"  BEST DISCOVERED COMBO: '{cb['rule']}' hold {cb['hold']} -> net {cb['mean']*100:+.1f}% "
+                         f"(median {cb['median']*100:+.1f}%, control {cb['control']*100:+.1f}%, edge {cb['edge']*100:+.1f} pts) "
+                         f"n={cb['n']}, win {cb['win_pct']:.0f}%")
+                L.append("  -> a STACKED lead that also PAYS. Compare its edge to the best single above; validate live before ShredStream.")
+            else:
+                L.append("  NO DISCOVERED COMBO pays out of sample beyond its control: stacking leads but doesn't pay more than a single.")
     return "\n".join(L)
