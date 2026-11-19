@@ -203,6 +203,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--combos", action="store_true", help="flurry-study --discover: also beam-search CONJUNCTIONS of filters (AND them together), kept only where the stacked rule clears a stricter family-wise z guard AND is sharper out of sample than any of its single filters -- does stacking filters surface a cleaner edge")
     parser.add_argument("--tail", action="store_true", help="flurry-study: tail-concentration breakdown of the discovered survivors (is the edge a broad tail or a few pools)")
     parser.add_argument("--discover-econ", action="store_true", help="flurry-study: economics-ranked discovery -- SELECT rules by the scalp P&L they'd have made (significant vs the control on mean OR median, holdout-confirmed, family-wise guarded), not by lift. Surfaces rules whose lift was unremarkable but whose median/mean%% pays, labelled broad vs tail with move direction; runs both sides (momentum + reversion) so the up-side fat tail can be distrusted while the down-side tail is read as the fills-favoured bounce.")
+    parser.add_argument("--creation", action="store_true", help="flurry-study: creation-moment scalp -- buy at the e-th slot from creation (slot-1 prize), sell h slots later, over the first few slots of every pool; reports the move per entry-slot x hold, where the first LP pull lands relative to creation (does the 2-slot dodge hold at creation), and the opening ramp. Free off the cached flows.")
     parser.add_argument("--pools", type=str, default=None, help="flurry-study: run the literal study on a live-captured pool universe (JSON/JSONL of {pool, token_mint, create_ts} from the box absmove.py MODE=capture) instead of the scorer's pools -- route #1, exact study on ShredStream-surfaced pools")
     parser.add_argument("--flows", type=str, default=None, help="flurry-study: run the literal walk-forward (discover/scalp/tail) on slot flows reconstructed LIVE by the box surf.py (JSONL of {pool, token_mint, create_ts, rec}); create_ts = first-seen wall-clock, so the time split is a prospective live walk-forward. No Helius.")
     parser.add_argument("--max-hold", type=int, default=None, help="flurry-study: report the scalp at EVERY slot hold 1..N as its own column (flurry/motif/discovered-rule tables), to see continuation slot by slot. A hold >2 re-exposes to the reactive LP pull, so rugged%% rises -- read it as the hold/pull tradeoff, not a safe scalp.")
@@ -809,7 +810,7 @@ def main(argv: list[str] | None = None) -> None:
                 out = _fl.entry_window(_have, _metas, _tgt, args.cost_pct / 100.0, window=args.entry_window)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_entry_window(out))
             return
-        if args.tail or args.discover_econ:  # tail-concentration, or economics-ranked discovery (both read flows the same way)
+        if args.tail or args.discover_econ or args.creation:  # tail / economics-ranked discovery / creation-moment (all read flows the same way)
             import time as _fl_time
             from tradingbot import pool_tracker as _fl_pt
             _ws = _FlWS(_fl_wdp(cfg))
@@ -828,7 +829,10 @@ def main(argv: list[str] | None = None) -> None:
                 _have, _cr = _fl.fetch_flows(_ws, fl_helius, _metas, args.span_s,
                                              int(args.max_credits or 0), prog)
             _tgt = _fl._tgt(args.target, args.flurry_min, args.horizon, args.move_pct)
-            if args.discover_econ:  # rules SELECTED by scalp economics (mean OR median), not lift
+            if args.creation:  # buy at the e-th slot from creation, sell h slots later -- the slot-1 prize
+                out = _fl.creation_study(_have, _metas, args.cost_pct / 100.0)
+                print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_creation(out))
+            elif args.discover_econ:  # rules SELECTED by scalp economics (mean OR median), not lift
                 out = _fl.discover_econ(_have, _metas, _tgt, args.cost_pct / 100.0)
                 out["target"] = _tgt
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_econ(out))

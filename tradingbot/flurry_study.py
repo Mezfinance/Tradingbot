@@ -1851,6 +1851,115 @@ def render_econ(out: dict) -> str:
     return "\n".join(L)
 
 
+# --- creation-moment scalp: is there a capturable move in the first slots after a pool is created? -----
+# The reactive-backrun exits in <=2 slots, which dodges the operator's LP pull (canary-slots: 100% land >=2
+# slots after our mid-life buy). That settles the RISK side; the open question is RETURN -- a move we can
+# reliably capture. This measures the opening sequence: buy at the e-th slot from creation (e=0 is the first
+# tradeable slot, "landing in slot 1"), sell h slots later, over the first few slots only. It also reports
+# where the first LP pull lands relative to creation (does the >=2-slot dodge even hold at creation, when the
+# operator controls the whole opening?) and the raw opening ramp. Read only, free off the cached flows.
+CREATION_ENTRIES = (0, 1, 2)       # buy at the e-th tradeable slot from creation
+CREATION_HOLDS = (1, 2, 3, 4)      # sell this many slots later
+
+
+def creation_study(have: dict, metas: list[dict], cost: float,
+                   entries=CREATION_ENTRIES, holds=CREATION_HOLDS) -> dict:
+    """Buy at the e-th slot from creation, sell h slots later, over the first few slots of every pool. Reports
+    the move per (entry slot x hold), where the first LP pull lands relative to creation, and the opening ramp.
+    Read only -- the move is measured on untouched pools; capturing it live is a slot-1 sniper race, and the
+    2-slot rug dodge is only known to hold mid-life (the pull-position histogram tests it at creation)."""
+    pools = []
+    for m in metas:
+        rec = have.get(m["pool"])
+        flow = slot_flow(rec) if rec else None
+        if flow and len(flow["slots"]) >= 2:
+            pools.append(flow)
+    out = {"n_pools": len(pools), "entries": list(entries), "holds": list(holds), "cost": cost,
+           "cells": [], "pull_dist": {}, "ramp": [], "best": None}
+    if not pools:
+        return out
+    for e in entries:                                         # per entry slot x hold: the scalp return
+        row = {"entry": e}
+        for h in holds:
+            rets = []
+            for flow in pools:
+                slots, pull = flow["slots"], flow["pull_slot"]
+                if e < len(slots):
+                    r = _scalp(slots, pull, e, h, cost)
+                    if r is not None:
+                        rets.append(r)
+            row[f"h{h}"] = _agg(rets)
+        out["cells"].append(row)
+    buckets = {"0": 0, "1": 0, "2": 0, "3-5": 0, "6+": 0, "none": 0}   # slots from creation to the first pull
+    for flow in pools:
+        slots, pull = flow["slots"], flow["pull_slot"]
+        if pull is None:
+            buckets["none"] += 1
+            continue
+        pos = pull - slots[0]["slot"]
+        key = ("0" if pos <= 0 else "1" if pos == 1 else "2" if pos == 2 else "3-5" if pos <= 5 else "6+")
+        buckets[key] += 1
+    out["pull_dist"] = buckets
+    for e in entries:                                         # opening ramp: price at slot e vs the creation slot
+        if e == 0:
+            continue
+        moves = [flow["slots"][e]["price"] / flow["slots"][0]["price"] - 1.0
+                 for flow in pools
+                 if e < len(flow["slots"]) and flow["slots"][0]["price"] and flow["slots"][e]["price"]]
+        if moves:
+            out["ramp"].append({"to": e, "n": len(moves),
+                                "mean": statistics.fmean(moves), "median": statistics.median(moves)})
+    best = None                                               # the prize: a cell positive on mean AND median at n>=50
+    for row in out["cells"]:
+        for h in holds:
+            a = row[f"h{h}"]
+            if a.get("n", 0) < 50 or a.get("mean", -9) <= 0 or a.get("median", -9) <= 0:
+                continue
+            if best is None or a["median"] > best["median"]:
+                best = {"entry": row["entry"], "hold": h, **a}
+    out["best"] = best
+    return out
+
+
+def render_creation(out: dict) -> str:
+    L = []
+    L.append("CREATION-MOMENT SCALP  (buy at the e-th slot from creation, sell h slots later -- the slot-1 prize)")
+    L.append(f"  pools {out['n_pools']}; cost {out['cost']*100:.2f}%; each cell = mean / median / win% / n")
+    pd = out.get("pull_dist") or {}
+    if pd:
+        tot = sum(pd.values()) or 1
+        rugged = tot - pd.get("none", 0)
+        L.append("")
+        L.append("  WHERE THE FIRST LP PULL LANDS (slots from creation) -- does the 2-slot dodge hold here?")
+        L.append("    " + "  ".join(f"{k}: {pd[k]} ({100.0*pd[k]/tot:.0f}%)" for k in ("0", "1", "2", "3-5", "6+", "none")))
+        early = pd.get("0", 0) + pd.get("1", 0) + pd.get("2", 0)
+        L.append(f"    -> {100.0*early/tot:.0f}% of pools pull within the first 2 slots of creation"
+                 f" ({100.0*rugged/tot:.0f}% pull at all); a 2-slot hold is only safe if this is ~0.")
+    ramp = out.get("ramp") or []
+    if ramp:
+        L.append("")
+        L.append("  OPENING RAMP (price at slot e vs the creation-slot price):")
+        for r in ramp:
+            L.append(f"    to slot {r['to']}: mean {r['mean']*100:+.1f}%  median {r['median']*100:+.1f}%  (n {r['n']})")
+    L.append("")
+    L.append(f"  {'entry':<8}" + "".join(f"{'hold '+str(h):>28}" for h in out["holds"]))
+    for row in out["cells"]:
+        L.append(f"  slot {row['entry']:<3}" + "".join(f"  {_c(row[f'h{h}'])}" for h in out["holds"]))
+    b = out.get("best")
+    L.append("")
+    if b:
+        L.append(f"  PRIZE: enter slot {b['entry']}, hold {b['hold']} -> mean {b['mean']*100:+.1f}%, "
+                 f"median {b['median']*100:+.1f}%, win {b['win_pct']:.0f}%, rugged {b.get('rugged_pct',0):.0f}% (n {b['n']})")
+        L.append("  -> a move positive on the TYPICAL fire. BUT capturing it is a slot-1 sniper race, and check the")
+        L.append("     pull histogram above: if pulls land in the first 2 slots, the 2-slot dodge does NOT hold at creation.")
+    else:
+        L.append("  NO CAPTURABLE MOVE: no entry-slot x hold is positive on mean AND median at a sane n -- the opening")
+        L.append("  sequence doesn't hand a reliable move to a slot-1 buyer on untouched pools.")
+    L.append("")
+    L.append("  Mid-to-mid on untouched pools -> a hypothesis. The live arbiter is a slot-1 entry with real NET fills.")
+    return "\n".join(L)
+
+
 def render(out: dict) -> str:
     tgt = out.get("target") or _tgt()
     L = []

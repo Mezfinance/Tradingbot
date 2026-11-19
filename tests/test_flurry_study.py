@@ -602,3 +602,49 @@ def test_discover_econ_significance_separates_a_broad_edge_from_a_positive_skew_
     assert _st.median(skew) < 0 < _st.fmean(skew)
     assert fl._welch_z(skew, [0.0] * 100) > 0                     # a mean edge (the tail)...
     assert fl._mw_z(skew, [0.0] * 100)[0] < 0.5                   # ...but does NOT dominate in distribution
+
+
+# --- creation-moment scalp: the slot-1 prize ------------------------------------------------------
+
+def _cre(prices, pull_pos=None):
+    """A launch_record with one buy per slot at the given reserve-ratio prices (slot 0 = creation), and
+    optionally an LP pull at slot position `pull_pos`."""
+    rows, sec = [], 0.0
+    for i, pr in enumerate(prices):
+        rows.append([sec, 10 + i, f"w{i}", -1.0, 1.0, 1e9, pr * 1e9]); sec += 0.05
+    if pull_pos is not None:
+        rows.append([sec, 10 + pull_pos, "op", -1.0, -1.0, 1.0, 1.0])     # both vaults out = pull
+    return {"txs": rows}
+
+
+def test_creation_study_finds_the_opening_ramp_prize():
+    # a deterministic opening ramp 100 -> 110 -> 120 -> 125 -> flat: buying at the creation slot and selling
+    # 2 slots later captures +20% before cost, so the prize is (entry slot 0, hold 2).
+    prices = [100.0, 110.0, 120.0, 125.0, 125.0, 125.0]
+    have = {f"P{i}": _cre(prices) for i in range(60)}
+    metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
+    out = fl.creation_study(have, metas, 0.0)
+    assert out["best"] is not None
+    assert out["best"]["entry"] == 0 and out["best"]["mean"] > 0 and out["best"]["median"] > 0
+    assert out["pull_dist"]["none"] == 60                         # no pulls planted
+    assert any(r["to"] == 2 and r["mean"] > 0 for r in out["ramp"])
+    assert "PRIZE" in fl.render_creation(out)
+
+
+def test_creation_study_no_prize_on_a_flat_open():
+    have = {f"P{i}": _cre([100.0] * 6) for i in range(60)}
+    metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
+    out = fl.creation_study(have, metas, 0.0)
+    assert out["best"] is None
+    assert "NO CAPTURABLE MOVE" in fl.render_creation(out)
+
+
+def test_creation_study_pull_histogram_locates_early_creation_rugs():
+    # every pool pulls at slot position 1 -> the dodge does NOT hold at creation, and a slot-0 hold-2 entry rugs.
+    have = {f"P{i}": _cre([100.0, 100.0, 100.0, 100.0], pull_pos=1) for i in range(60)}
+    metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
+    out = fl.creation_study(have, metas, 0.0)
+    assert out["pull_dist"]["1"] == 60 and out["pull_dist"]["none"] == 0
+    cell = out["cells"][0]["h2"]                                  # entry slot 0, hold 2
+    assert cell["rugged_pct"] > 0                                # pull at slot 1 traps the 2-slot hold
+    assert "does the 2-slot dodge hold" in fl.render_creation(out)
