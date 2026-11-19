@@ -650,8 +650,10 @@ THRESH_Q = (50, 75, 90)   # quantiles (of the train slice) each numeric is cut a
 DISC_MIN_SUPPORT = 30     # a rule must have >= this many present AND absent slots in BOTH halves
 DISC_TOP = 20             # survivors reported
 DISC_SCALP_TOP = 12       # holdout-confirmed survivor rules carried into the discovered-rule scalp
-COMBO_MAX_DEPTH = 3       # AND together up to this many single filters (conjunction depth)
-COMBO_BEAM = 8            # beam search: keep this many best partial conjunctions at each depth
+COMBO_MAX_DEPTH = 4       # AND together up to this many single filters (conjunction depth: pairs, triples, quads)
+COMBO_BEAM = 24           # beam search: keep this many best partial conjunctions at each depth (wide so high-lift
+                          # small-n pairs are not pruned by big-n/high-z ones before a deeper stack off them is tested;
+                          # the family-wise z guard auto-widens with the search, so a wider beam cannot overfit)
 COMBO_TOP = 15            # conjunction survivors reported
 SYM_DESC = {"F": "N was itself a flurry", "S": "net sellers in N", "N": "a brand-new wallet bought in N",
             "O": "an outsider (non-top-3) bought in N", "B": "the dominant wallet looped in N",
