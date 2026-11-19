@@ -189,6 +189,31 @@ def test_abs_move_threshold_sweep_steps_the_entry_cut_up(monkeypatch):
     assert ("BEST BAND" in r) or ("NO BAND beats" in r)
 
 
+def test_moveval_isolates_the_chosen_side():
+    down = {"f": {"move": -0.05, "abs_move": 0.05}}
+    up = {"f": {"move": 0.05, "abs_move": 0.05}}
+    assert fl._moveval(down, "down") == 0.05 and fl._moveval(up, "down") == 0.0     # down side sees only down-moves
+    assert fl._moveval(up, "up") == 0.05 and fl._moveval(down, "up") == 0.0         # up side sees only up-moves
+    assert fl._moveval(down, "abs") == 0.05 and fl._moveval(up, "abs") == 0.05      # abs sees both
+
+
+def test_sell_side_down_move_sweep_captures_the_reversion(monkeypatch):
+    # the sell-side (down-move) sweep fires AFTER a down-spike and scalps the bounce. On a planted
+    # down-then-bounce, the down side's base-threshold hold-2 scalp must be positive and beat its control,
+    # which the absolute sweep (mixing in the up-spike that reverts flat) need not be.
+    out = _run(monkeypatch, _rec_reversion())
+    dsw = out["down_sweep"]
+    assert dsw["side"] == "down"
+    base = dsw["rows"][0]
+    assert base["fires"] > 0                                          # down-moves fire the sell side
+    assert base["h2"]["n"] >= 50                                      # enough to judge
+    assert base["h2"]["mean"] > dsw["control"]["h2"]["mean"]          # the reversion beats the quiet-slot control
+    assert base["h2"]["mean"] > 0                                     # buy the trough, sell the bounce -> positive
+    r = fl.render(out)
+    assert "DOWN_MOVE THRESHOLD SWEEP" in r and "SELL SIDE" in r
+    assert "DOWN_MOVE BANDS" in r
+
+
 def test_tail_report_breaks_down_the_discovered_edge(monkeypatch):
     # the tail breakdown should re-discover survivors and report concentration: distinct winning pools, the
     # top-5/20 share of the positive return, and capped vs uncapped mean. On the planted data the edge is
@@ -227,6 +252,28 @@ def _rec_causal(cycles=40):
         sec = _add(res, rows, sec, slot, 1, 0.2, f"out{c}")     # a brand-new wallet arrives (the precursor)
         sec = _add(res, rows, sec, slot + 1, 5, 3.0, "bot")     # the bot pumps the next slot -> price up >1%
         for q in range(2, 6):                                   # a long quiet stretch -> no move, keeps the base rate low
+            sec = _add(res, rows, sec, slot + q, 1, 0.02, "bot")
+        slot += 6
+    return {"txs": rows}
+
+
+def _rec_reversion(cycles=40):
+    """A big SELL drops the price in slot k (a down-spike), then the bot buys it back in k+1 (the bounce), then a
+    quiet stretch. So a DOWN move in slot N reliably precedes an UP move in N+1 -- the reversion the sell-side
+    sweep must capture: fire after the down-spike, buy the trough front of N+1, sell the bounce. The absolute
+    sweep mixes this with the up-spike slot (which reverts flat), so only the down side should beat its control."""
+    res, rows, sec, slot = [1e9, 100.0], [], 0.0, 10
+    for c in range(cycles):
+        for _ in range(3):                                      # a big sell -> SOL out, price DOWN
+            tok, sol = res
+            new_sol = max(sol - 1.0, 1.0)
+            new_tok = (tok * sol) / new_sol
+            dtok, dsolv = new_tok - tok, new_sol - sol
+            res[0], res[1] = new_tok, new_sol
+            rows.append([sec, slot, f"sell{c}", round(dtok, 6), round(dsolv, 9), round(res[0], 6), round(res[1], 9)])
+            sec += 0.05
+        sec = _add(res, rows, sec, slot + 1, 5, 3.0, "bot")     # the bot buys it back -> price UP (the bounce)
+        for q in range(2, 6):                                   # quiet -> keeps the base rate low
             sec = _add(res, rows, sec, slot + q, 1, 0.02, "bot")
         slot += 6
     return {"txs": rows}

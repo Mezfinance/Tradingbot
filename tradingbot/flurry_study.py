@@ -412,6 +412,7 @@ def study(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: f
         "motif_results": motif_results, "motif_best": motif_best,
         "discovered": discovered_scalp(have, metas, tgt, cost, MOTIF_HOLDS, seed),
         "abs_sweep": abs_move_sweep(have, metas, tgt, cost, MOTIF_HOLDS, seed),
+        "down_sweep": abs_move_sweep(have, metas, tgt, cost, MOTIF_HOLDS, seed, side="down"),
     }
 
 
@@ -699,7 +700,7 @@ def _slot_bank(flow: dict, create_ts: float, tgt: dict) -> list[dict]:
             "n_buys": nbuys, "buy_sol": float(s["buy_sol"]), "max_buy": float(s["max_buy"]),
             "net_sol": float(s["net_sol"]), "n_sells": float(s["n_sells"]), "sell_sol": float(s["sell_sol"]),
             "distinct_buyers": float(len(set(buyers))), "new_buyers": float(len(new_b)),
-            "mean_buy": (float(s["buy_sol"]) / nbuys if nbuys else 0.0), "abs_move": abs(move),
+            "mean_buy": (float(s["buy_sol"]) / nbuys if nbuys else 0.0), "abs_move": abs(move), "move": move,
             "slots_since_flurry": since, "age_slots": float(min(slot - first, 1000)),
             "outside_buy": outsider, "dominant_bought": dominant,
             "new_present": 1.0 if new_b else 0.0, "sell_present": 1.0 if s["n_sells"] > 0 else 0.0,
@@ -1113,24 +1114,39 @@ def discovered_scalp(have: dict, metas: list[dict], tgt: dict, cost: float,
     return out
 
 
+def _moveval(rec: dict, side: str) -> float:
+    """Signed-move magnitude on the chosen side. side='abs' -> |move| (both directions); 'down' -> the down-move
+    magnitude (0 if the slot moved up); 'up' -> the up-move magnitude. The sell side ('down') is the reversion
+    test: fire after a down-spike, buy the trough front of N+1, sell the bounce N+h -- the one direction where
+    the mid-to-mid study is a floor not a ceiling (our own impact still costs, but the market move between the
+    fills works WITH us: buy low, sell the recovery), unlike buying an up-spike top that reverts against us."""
+    mv = rec["f"].get("move", 0.0)
+    if side == "down":
+        return -mv if mv < 0 else 0.0
+    if side == "up":
+        return mv if mv > 0 else 0.0
+    return rec["f"]["abs_move"]
+
+
 def abs_move_sweep(have: dict, metas: list[dict], tgt: dict, cost: float,
-                   holds=MOTIF_HOLDS, seed: int = 0, grid=ABSMOVE_GRID) -> dict:
-    """Sweep the abs_move ENTRY threshold: fire the scalp (buy front of N+1, sell N+h) on every slot whose
-    abs_move >= t, for an ascending grid of t. The base (0.0188 = abs_move q90) is the reference; the sweep
-    answers whether requiring a BIGGER move -- deeper into the tail -- nets a higher mean. A fixed threshold is
-    a pre-specified hypothesis (not a rule discovered from the data), so there is nothing to overfit: this runs
-    on EVERY pool (more n), no holdout split. `q` per row = the quantile the threshold sits at (share of active
-    slots below it), so 0.0188->~q90 and the higher rows show how far into the tail they reach."""
+                   holds=MOTIF_HOLDS, seed: int = 0, grid=ABSMOVE_GRID, side: str = "abs") -> dict:
+    """Sweep the move ENTRY threshold: fire the scalp (buy front of N+1, sell N+h) on every slot whose move on
+    `side` >= t, for an ascending grid of t. side='abs' is the absolute move (both directions); side='down' is
+    the SELL-SIDE reversion test (fire after a down-spike, bet on the bounce). The base (0.0188 = abs_move q90)
+    is the reference; the sweep answers whether requiring a BIGGER move -- deeper into the tail -- nets a higher
+    mean. A fixed threshold is a pre-specified hypothesis (not discovered from the data), so there is nothing to
+    overfit: this runs on EVERY pool (more n), no holdout split. `q` per row = the quantile the threshold sits
+    at (share of active slots below it, on this side)."""
     pools = []
     for m in metas:
         rec = have.get(m["pool"])
         flow = slot_flow(rec) if rec else None
         if flow:
             pools.append({"flow": flow, "bank": _slot_bank(flow, m.get("create_ts") or 0.0, tgt)})
-    out = {"n_pools": len(pools), "rows": [], "control": {}, "best": None}
+    out = {"n_pools": len(pools), "rows": [], "control": {}, "best": None, "side": side}
     if not pools:
         return out
-    allmoves = sorted(r["f"]["abs_move"] for p in pools for r in p["bank"] if r["f"]["abs_move"] > 0)
+    allmoves = sorted(_moveval(r, side) for p in pools for r in p["bank"] if _moveval(r, side) > 0)
 
     def _q(t: float) -> float:                            # share of active (moving) slots below t = its quantile
         return 100.0 * sum(1 for m in allmoves if m < t) / len(allmoves) if allmoves else 0.0
@@ -1142,7 +1158,7 @@ def abs_move_sweep(have: dict, metas: list[dict], tgt: dict, cost: float,
         for p in pools:
             slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
             for i, rec in enumerate(p["bank"]):
-                if rec["f"]["abs_move"] >= t:
+                if _moveval(rec, side) >= t:
                     fires += 1
                     for h in holds:
                         r = _scalp(slots, pull, i, h, cost)
@@ -1171,7 +1187,7 @@ def abs_move_sweep(have: dict, metas: list[dict], tgt: dict, cost: float,
         for p in pools:
             slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
             for i, rec in enumerate(p["bank"]):
-                mv = rec["f"]["abs_move"]
+                mv = _moveval(rec, side)
                 if lo <= mv < hi:
                     fires += 1
                     for h in holds:
@@ -1706,41 +1722,42 @@ def render(out: dict) -> str:
                 L.append("  -> a STACKED lead that also PAYS. Compare its edge to the best single above; validate live before ShredStream.")
             else:
                 L.append("  NO DISCOVERED COMBO pays out of sample beyond its control: stacking leads but doesn't pay more than a single.")
-    sw = out.get("abs_sweep")
-    if sw and sw.get("rows"):
+    def _sweep_block(sw, mv, extra):
+        if not (sw and sw.get("rows")):
+            return
         L.append("")
-        L.append(f"  ABS_MOVE THRESHOLD SWEEP  (enter on every slot with abs_move >= t, buy front of N+1, sell N+h; "
-                 f"{sw['n_pools']} pools, every slot -- fixed thresholds, no holdout)")
-        L.append(f"  {'abs_move>=':<11}{'~q':>5}{'fires':>8}" + "".join(f"{'hold '+str(h):>28}" for h in MOTIF_HOLDS))
+        L.append(f"  {mv.upper()} THRESHOLD SWEEP  (enter on every slot with {mv} >= t, buy front of N+1, sell N+h; "
+                 f"{sw['n_pools']} pools, every slot -- fixed thresholds, no holdout){extra}")
+        L.append(f"  {mv+'>=':<13}{'~q':>5}{'fires':>8}" + "".join(f"{'hold '+str(h):>28}" for h in MOTIF_HOLDS))
         for row in sw["rows"]:
             tag = "  (base q90)" if abs(row["thresh"] - 0.0188) < 1e-9 else ""
-            L.append(f"  {row['thresh']*100:>7.2f}%  {row['q']:>4.0f}{row['fires']:>8d}"
+            L.append(f"  {row['thresh']*100:>9.2f}%  {row['q']:>4.0f}{row['fires']:>8d}"
                      + "".join(f"  {_c(row[f'h{h}'])}" for h in MOTIF_HOLDS) + tag)
-        L.append(f"  {'control':<11}{'':>5}{'':>8}" + "".join(f"  {_c(sw['control'][f'h{h}'])}" for h in MOTIF_HOLDS))
+        L.append(f"  {'control':<13}{'':>5}{'':>8}" + "".join(f"  {_c(sw['control'][f'h{h}'])}" for h in MOTIF_HOLDS))
         sb = sw.get("best")
         if sb:
-            L.append(f"  BEST THRESHOLD: abs_move >= {sb['thresh']*100:.2f}% hold {sb['hold']} -> net {sb['mean']*100:+.1f}% "
+            L.append(f"  BEST THRESHOLD: {mv} >= {sb['thresh']*100:.2f}% hold {sb['hold']} -> net {sb['mean']*100:+.1f}% "
                      f"(median {sb['median']*100:+.1f}%, control {sb['control']*100:+.1f}%, edge {sb['edge']*100:+.1f} pts) "
                      f"n={sb['n']}, win {sb['win_pct']:.0f}%")
-            L.append("  -> read the mean column down the rows: if it RISES with the threshold, a bigger move pays a higher mean")
-            L.append("     (raise the live CUT); if it flattens/falls or n collapses, the tail is thin -- keep the 0.0188 base.")
         else:
-            L.append("  NO THRESHOLD beats the control on mean/median/win at n>=50: a bigger abs_move does not net a cleaner mean.")
+            L.append(f"  NO THRESHOLD beats the control on mean/median/win at n>=50: a bigger {mv} does not net a cleaner mean.")
         bands = sw.get("bands") or []
         if bands:
             L.append("")
-            L.append("  ABS_MOVE BANDS  (non-overlapping lo<=abs_move<hi -- isolates WHICH move size pays, vs the cumulative >=t above)")
-            L.append(f"  {'abs_move band %':<16}{'fires':>8}" + "".join(f"{'hold '+str(h):>28}" for h in MOTIF_HOLDS))
+            L.append(f"  {mv.upper()} BANDS  (non-overlapping lo<={mv}<hi -- isolates WHICH move size pays, vs the cumulative >=t above)")
+            L.append(f"  {mv+' band %':<18}{'fires':>8}" + "".join(f"{'hold '+str(h):>28}" for h in MOTIF_HOLDS))
             for row in bands:
-                L.append(f"  {row['band']:<16}{row['fires']:>8d}" + "".join(f"  {_c(row[f'h{h}'])}" for h in MOTIF_HOLDS))
-            L.append(f"  {'control':<16}{'':>8}" + "".join(f"  {_c(sw['control'][f'h{h}'])}" for h in MOTIF_HOLDS))
+                L.append(f"  {row['band']:<18}{row['fires']:>8d}" + "".join(f"  {_c(row[f'h{h}'])}" for h in MOTIF_HOLDS))
+            L.append(f"  {'control':<18}{'':>8}" + "".join(f"  {_c(sw['control'][f'h{h}'])}" for h in MOTIF_HOLDS))
             bb = sw.get("band_best")
             if bb:
-                L.append(f"  BEST BAND: abs_move {bb['band']}% hold {bb['hold']} -> net {bb['mean']*100:+.1f}% "
+                L.append(f"  BEST BAND: {mv} {bb['band']}% hold {bb['hold']} -> net {bb['mean']*100:+.1f}% "
                          f"(median {bb['median']*100:+.1f}%, control {bb['control']*100:+.1f}%, edge {bb['edge']*100:+.1f} pts) "
                          f"n={bb['n']}, win {bb['win_pct']:.0f}%")
-                L.append("  -> the edge lives in THIS move-size band, not just 'bigger is better'. Set the live CUT to its low edge; a")
-                L.append("     higher MAX_MOVE (skip above the band's top) is worth testing if the bands above it pay less.")
             else:
-                L.append("  NO BAND beats the control on mean/median/win at n>=50: no single move-size slice carries a clean edge.")
+                L.append(f"  NO BAND beats the control on mean/median/win at n>=50: no single move-size slice carries a clean edge.")
+
+    _sweep_block(out.get("abs_sweep"), "abs_move", "")
+    _sweep_block(out.get("down_sweep"), "down_move",
+                 "  [SELL SIDE: fire after a DOWN-spike, buy the trough, bet the bounce -- the reversion test]")
     return "\n".join(L)
