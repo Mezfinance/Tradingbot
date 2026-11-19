@@ -649,3 +649,53 @@ def test_first_buy_reactive_pull_histogram_is_relative_to_our_entry():
     h2 = next(c for c in out["cells"] if c["hold"] == 2)["agg"]
     assert h2["rugged_pct"] > 0                                   # a pull within 2 slots of entry traps the stake
     assert "relative to OUR ENTRY" in fl.render_creation(out)
+
+
+# --- slot-0 landing: how many slots to hold for EV+? ----------------------------------------------
+
+def _cre2(prices, pull_pos=None):
+    """Like _cre but the pull leaves no readable reserve (tok_after=0), so the price carries forward past it --
+    lets a test keep a clean raw drift AFTER the pull slot while the net is still trapped by the rug."""
+    rows, sec = [], 0.0
+    for i, pr in enumerate(prices):
+        rows.append([sec, 10 + i, f"w{i}", -1.0, 1.0, 1e9, pr * 1e9]); sec += 0.05
+    if pull_pos is not None:
+        rows.append([sec, 10 + pull_pos, "op", -1.0, -1.0, 0.0, 0.0])
+    return {"txs": rows}
+
+
+def test_slot0_ev_positive_within_the_safe_window():
+    # a clean opening ramp, no pull: landing in slot 0 is EV+ from hold 1 (<= the 2-slot safe window) -> the prize.
+    have = {f"P{i}": _cre([100.0, 110.0, 120.0, 125.0, 125.0, 125.0]) for i in range(60)}
+    metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
+    out = fl.slot0_study(have, metas, 0.0)
+    assert out["break_even"] == 1 and out["break_even"] <= out["safe_hold"]
+    txt = fl.render_slot0(out)
+    assert "EV+ FROM HOLD 1" in txt and "WITHIN" in txt
+
+
+def test_slot0_ev_positive_only_past_the_safe_window():
+    # a dip then a rise: negative for holds 1-2, positive only at hold 3 -> EV+ but past the 2-slot safe window.
+    have = {f"P{i}": _cre([100.0, 99.0, 99.0, 115.0, 120.0, 120.0]) for i in range(60)}
+    metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
+    out = fl.slot0_study(have, metas, 0.0)
+    assert out["break_even"] == 3 and out["break_even"] > out["safe_hold"]
+    assert "PAST the" in fl.render_slot0(out)
+
+
+def test_slot0_drift_never_covers_cost():
+    # flat opening, a 5% round-trip cost: no hold's raw drift clears cost, so none is EV+.
+    have = {f"P{i}": _cre([100.0] * 8) for i in range(60)}
+    metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
+    out = fl.slot0_study(have, metas, 0.05)
+    assert out["break_even"] is None and out["raw_break_even"] is None
+    assert "DRIFT NEVER COVERS COST" in fl.render_slot0(out)
+
+
+def test_slot0_not_ev_when_the_rug_eats_the_drift():
+    # raw drift clears cost at hold 4, but every pool is pulled at slot 13 (hold 3), so the NET is never positive.
+    have = {f"P{i}": _cre2([100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 106.0], pull_pos=3) for i in range(60)}
+    metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
+    out = fl.slot0_study(have, metas, 0.035)
+    assert out["break_even"] is None and out["raw_break_even"] == 4
+    assert "NOT EV+ AT ANY HOLD" in fl.render_slot0(out)

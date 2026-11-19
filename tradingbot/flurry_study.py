@@ -1977,6 +1977,102 @@ def render_creation(out: dict) -> str:
     return "\n".join(L)
 
 
+# --- slot-0 landing: if we land in the creation slot, how long must we hold to be EV+? ----------------
+# The most aggressive entry: land in slot 0 (the pool's first active slot, the creation/first-trade slot --
+# via ShredStream + a bundle into creation). From there we buy at the end of slot 0 and sweep the hold length.
+# Two forces pull against each other: the price drifts up over the opening slots (the wash ramp), which needs
+# a few slots to clear the round-trip cost; but every extra slot held is more exposure to the LP pull (-100%).
+# So we report, per hold: the NET scalp (with the rug), the RAW drift (no rug, = can drift alone cover cost?),
+# and the cumulative share rugged by that hold -- then name the SMALLEST hold that is EV+ (mean AND median > 0),
+# if any, and flag whether reaching it means holding past the ~2-slot safe window (i.e. re-taking rug risk).
+SLOT0_HOLDS = tuple(range(1, 13)) + (15, 20, 30)   # slots held after the slot-0 entry (~400ms each)
+SAFE_HOLD = 2                                       # the canary-slots dodge window: <=2 slots = no mid-life pull
+
+
+def slot0_study(have: dict, metas: list[dict], cost: float, holds=SLOT0_HOLDS) -> dict:
+    """Land in slot 0 (the pool's first active slot) and sweep the hold length: how many slots must we hold for
+    the trade to be EV+, if at all? Per hold: NET scalp (with the -100% rug), RAW drift (no rug), and the
+    cumulative share rugged by that hold. Names the smallest EV+ hold and whether it sits past the safe window.
+    Read only -- mid-to-mid on untouched pools; the live arbiter is a real NET entry landed in the creation slot."""
+    pools = []
+    for m in metas:
+        rec = have.get(m["pool"])
+        flow = slot_flow(rec) if rec else None
+        if flow and len(flow["slots"]) >= 2:
+            pools.append(flow)
+    out = {"n_pools": len(pools), "holds": list(holds), "cost": cost, "rows": [],
+           "break_even": None, "raw_break_even": None, "safe_hold": SAFE_HOLD}
+    if not pools:
+        return out
+
+    for h in holds:
+        nets, raws, pulled = [], [], 0
+        for flow in pools:
+            s0 = flow["slots"][0]["slot"]
+            p0 = flow["slots"][0]["price"]
+            if not p0:
+                continue
+            r = _scalp(flow["slots"], flow["pull_slot"], 0, h, cost)
+            if r is not None:
+                nets.append(r)
+            pk = _price_at(flow["slots"], s0 + h)            # raw drift: no rug, no cost (drift alone)
+            if pk:
+                raws.append(pk / p0 - 1.0)
+            pull = flow["pull_slot"]
+            if pull is not None and s0 < pull <= s0 + h:     # rugged by this hold (cumulative)
+                pulled += 1
+        agg = _agg(nets)
+        raw = {"n": len(raws), "mean": statistics.fmean(raws) if raws else 0.0,
+               "median": statistics.median(raws) if raws else 0.0}
+        agg_n = agg.get("n", 0) or 1
+        out["rows"].append({"hold": h, "agg": agg, "raw": raw,
+                            "pulled_by_pct": 100.0 * pulled / agg_n})
+
+    for row in out["rows"]:                                   # smallest EV+ hold: net mean AND median > 0, n>=50
+        a = row["agg"]
+        if a.get("n", 0) >= 50 and a.get("mean", -9) > 0 and a.get("median", -9) > 0:
+            out["break_even"] = row["hold"]
+            break
+    for row in out["rows"]:                                   # smallest hold where drift alone clears cost (no rug)
+        if row["raw"]["n"] >= 50 and row["raw"]["mean"] > cost:
+            out["raw_break_even"] = row["hold"]
+            break
+    return out
+
+
+def render_slot0(out: dict) -> str:
+    L = []
+    L.append("SLOT-0 LANDING: HOLD-TO-EV+  (land in the creation slot, sweep the hold length)")
+    L.append(f"  pools {out['n_pools']}; cost {out['cost']*100:.2f}%; ~400ms/slot; safe window = {out['safe_hold']} slots (canary-slots dodge)")
+    L.append("")
+    L.append(f"  {'hold':>5}  {'NET (mean/md/win/n)':<28}  {'RAW drift (mean/md)':<22}  rugged-by")
+    for row in out["rows"]:
+        r = row["raw"]
+        raw = f"{r['mean']*100:+.1f}% md{r['median']*100:+.1f}%"
+        L.append(f"  {row['hold']:>5}  {_c(row['agg'])}  {raw:<22}  {row['pulled_by_pct']:.0f}%")
+    L.append("")
+    be, rbe, safe = out.get("break_even"), out.get("raw_break_even"), out["safe_hold"]
+    if rbe is None:
+        L.append("  DRIFT NEVER COVERS COST: at no hold does the raw opening drift (ignoring the rug) beat the round-trip")
+        L.append(f"  cost of {out['cost']*100:.2f}% -- there is no move to capture from a slot-0 landing, so no hold is EV+.")
+    elif be is None:
+        L.append(f"  NOT EV+ AT ANY HOLD: raw drift first clears cost at hold {rbe}, but the rug (-100%) drag keeps the")
+        L.append("  NET mean/median negative at every hold -- the pull eats the drift faster than it accrues.")
+    else:
+        row = next(x for x in out["rows"] if x["hold"] == be)
+        a = row["agg"]
+        L.append(f"  EV+ FROM HOLD {be}: net mean {a['mean']*100:+.1f}%, median {a['median']*100:+.1f}%, win {a['win_pct']:.0f}%, "
+                 f"rugged-by {row['pulled_by_pct']:.0f}% (n {a['n']})")
+        if be > safe:
+            L.append(f"  -> but hold {be} is PAST the {safe}-slot safe window: reaching EV+ re-takes rug risk (the {row['pulled_by_pct']:.0f}%")
+            L.append("     rugged-by is the price). NOT a risk-free scalp -- it trades the dodge for the drift.")
+        else:
+            L.append(f"  -> and hold {be} is WITHIN the {safe}-slot safe window: EV+ AND the pull is still dodged. This is the prize.")
+    L.append("")
+    L.append("  Mid-to-mid on untouched pools -> a hypothesis. The live arbiter is a real NET entry landed in slot 0.")
+    return "\n".join(L)
+
+
 def render(out: dict) -> str:
     tgt = out.get("target") or _tgt()
     L = []
