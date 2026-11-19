@@ -69,6 +69,9 @@ MOTIF_HOLDS = (1, 2)    # the lead predicts the move in N+1, so sell 1-2 slots a
 # abs_move entry-threshold sweep: the base 0.0188 is abs_move q90 on the Fly scorer universe; step it up to
 # see whether requiring a BIGGER slot move -- deeper into the tail -- nets a higher mean scalp.
 ABSMOVE_GRID = (0.0188, 0.025, 0.035, 0.05, 0.07, 0.10, 0.15, 0.20, 0.30)
+# non-overlapping BANDS from the same edges (last open-ended): the cumulative >=t sweep keeps the whole tail in
+# every row, so a rising mean can be the top slice carrying it -- bands isolate WHICH move size actually pays.
+ABSMOVE_BANDS = tuple(zip(ABSMOVE_GRID, ABSMOVE_GRID[1:] + (float("inf"),)))
 
 DEFAULT_FLURRY_MIN = 3    # a slot is a flurry if it has >= this many buys (sweepable with --flurry-min)
 MAXLAG = 10               # autocorrelation of buys/slot out to this many slots (periodicity / a clock)
@@ -1161,7 +1164,27 @@ def abs_move_sweep(have: dict, metas: list[dict], tgt: dict, cost: float,
                 if r is not None:
                     control[h].append(r)
     ctrl = {f"h{h}": _agg(control[h]) for h in holds}
-    out.update({"rows": rows, "control": ctrl, "best": _best_cell(rows, ctrl, holds, "thresh")})
+    bands = []                                            # non-overlapping ranges: which move SIZE pays, not >=t
+    for lo, hi in ABSMOVE_BANDS:
+        agg = {h: [] for h in holds}
+        fires = 0
+        for p in pools:
+            slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
+            for i, rec in enumerate(p["bank"]):
+                mv = rec["f"]["abs_move"]
+                if lo <= mv < hi:
+                    fires += 1
+                    for h in holds:
+                        r = _scalp(slots, pull, i, h, cost)
+                        if r is not None:
+                            agg[h].append(r)
+        label = f"{lo*100:.2f}-{'inf' if hi == float('inf') else f'{hi*100:.2f}'}"
+        row = {"band": label, "lo": lo, "hi": hi, "fires": fires}
+        for h in holds:
+            row[f"h{h}"] = _agg(agg[h])
+        bands.append(row)
+    out.update({"rows": rows, "control": ctrl, "best": _best_cell(rows, ctrl, holds, "thresh"),
+                "bands": bands, "band_best": _best_cell(bands, ctrl, holds, "band")})
     return out
 
 
@@ -1703,4 +1726,21 @@ def render(out: dict) -> str:
             L.append("     (raise the live CUT); if it flattens/falls or n collapses, the tail is thin -- keep the 0.0188 base.")
         else:
             L.append("  NO THRESHOLD beats the control on mean/median/win at n>=50: a bigger abs_move does not net a cleaner mean.")
+        bands = sw.get("bands") or []
+        if bands:
+            L.append("")
+            L.append("  ABS_MOVE BANDS  (non-overlapping lo<=abs_move<hi -- isolates WHICH move size pays, vs the cumulative >=t above)")
+            L.append(f"  {'abs_move band %':<16}{'fires':>8}" + "".join(f"{'hold '+str(h):>28}" for h in MOTIF_HOLDS))
+            for row in bands:
+                L.append(f"  {row['band']:<16}{row['fires']:>8d}" + "".join(f"  {_c(row[f'h{h}'])}" for h in MOTIF_HOLDS))
+            L.append(f"  {'control':<16}{'':>8}" + "".join(f"  {_c(sw['control'][f'h{h}'])}" for h in MOTIF_HOLDS))
+            bb = sw.get("band_best")
+            if bb:
+                L.append(f"  BEST BAND: abs_move {bb['band']}% hold {bb['hold']} -> net {bb['mean']*100:+.1f}% "
+                         f"(median {bb['median']*100:+.1f}%, control {bb['control']*100:+.1f}%, edge {bb['edge']*100:+.1f} pts) "
+                         f"n={bb['n']}, win {bb['win_pct']:.0f}%")
+                L.append("  -> the edge lives in THIS move-size band, not just 'bigger is better'. Set the live CUT to its low edge; a")
+                L.append("     higher MAX_MOVE (skip above the band's top) is worth testing if the bands above it pay less.")
+            else:
+                L.append("  NO BAND beats the control on mean/median/win at n>=50: no single move-size slice carries a clean edge.")
     return "\n".join(L)

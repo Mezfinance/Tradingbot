@@ -178,9 +178,15 @@ def test_abs_move_threshold_sweep_steps_the_entry_cut_up(monkeypatch):
     fires = [r["fires"] for r in sw["rows"]]
     assert fires == sorted(fires, reverse=True)                        # a higher cut can only fire on fewer slots
     assert all(0.0 <= r["q"] <= 100.0 for r in sw["rows"])             # each row's quantile is a share
+    # non-overlapping bands: every slot lands in exactly one, so the band fires sum to the base-threshold fires
+    bands = sw["bands"]
+    assert [(b["lo"], b["hi"]) for b in bands] == list(fl.ABSMOVE_BANDS)
+    assert sum(b["fires"] for b in bands) == sw["rows"][0]["fires"]     # base >=0.0188 = union of the bands
     r = fl.render(out)
     assert "ABS_MOVE THRESHOLD SWEEP" in r and "(base q90)" in r
+    assert "ABS_MOVE BANDS" in r
     assert ("BEST THRESHOLD" in r) or ("NO THRESHOLD beats" in r)
+    assert ("BEST BAND" in r) or ("NO BAND beats" in r)
 
 
 def test_tail_report_breaks_down_the_discovered_edge(monkeypatch):
