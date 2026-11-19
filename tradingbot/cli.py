@@ -200,6 +200,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--horizon", type=int, default=2, help="flurry-study: price target -- the up-move may land within the next this-many slots")
     parser.add_argument("--scalp", action="store_true", help="flurry-study: run the after-the-flurry continuation table instead of the lead-lag characterization")
     parser.add_argument("--discover", action="store_true", help="flurry-study: data-driven discovery (auto rule bank + motifs, holdout-confirmed) instead of the named-event characterization")
+    parser.add_argument("--combos", action="store_true", help="flurry-study --discover: also beam-search CONJUNCTIONS of filters (AND them together), kept only where the stacked rule clears a stricter family-wise z guard AND is sharper out of sample than any of its single filters -- does stacking filters surface a cleaner edge")
     parser.add_argument("--tail", action="store_true", help="flurry-study: tail-concentration breakdown of the discovered survivors (is the edge a broad tail or a few pools)")
     parser.add_argument("--pools", type=str, default=None, help="flurry-study: run the literal study on a live-captured pool universe (JSON/JSONL of {pool, token_mint, create_ts} from the box absmove.py MODE=capture) instead of the scorer's pools -- route #1, exact study on ShredStream-surfaced pools")
     parser.add_argument("--flows", type=str, default=None, help="flurry-study: run the literal walk-forward (discover/scalp/tail) on slot flows reconstructed LIVE by the box surf.py (JSONL of {pool, token_mint, create_ts, rec}); create_ts = first-seen wall-clock, so the time split is a prospective live walk-forward. No Helius.")
@@ -838,6 +839,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.discover:  # data-driven: let the auto rule bank + motifs name the precursor, holdout-confirmed
             out = _fl.discover(_FlJournal(cfg.db_path), _FlWS(_fl_wdp(cfg)), cfg=cfg, hours=args.hours or 720.0,
                                span_s=args.span_s, flurry_min=args.flurry_min, probed_only=args.probed_only,
+                               combos=args.combos,
                                helius=fl_helius, max_credits=int(args.max_credits or 20_000), progress=prog, **_tp, **_mp)
             print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_discover(out))
             return

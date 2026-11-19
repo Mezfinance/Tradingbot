@@ -200,6 +200,32 @@ def _rec_random(slots=1500, seed=1):
     return {"txs": rows}
 
 
+def _rec_combo(cycles=60, seed=0):
+    """Planted CONJUNCTION: price pumps only when a NEW wallet buys in slot N (marker A) AND the prior slot was
+    busy (prev_buys high, marker B). A fires on P1(hit)+P2(miss), B on P1(hit)+P3(miss) -- each weak alone; only
+    A AND B (= P1) is a clean precursor, so discover must AND them to isolate the edge."""
+    res, rows, sec, slot = [1e9, 100.0], [], 0.0, 10
+    for c in range(cycles):
+        pat = c % 3
+        if pat == 0:                                               # P1: busy prev -> NEW wallet -> PUMP (A&B -> hit)
+            sec = _add(res, rows, sec, slot, 3, 0.05, "bot")
+            sec = _add(res, rows, sec, slot + 1, 1, 0.05, f"newA{c}")
+            sec = _add(res, rows, sec, slot + 2, 6, 1.0, "bot")    # the pump -> price up next slot
+            sec = _add(res, rows, sec, slot + 3, 1, 0.02, "bot"); sec = _add(res, rows, sec, slot + 4, 1, 0.02, "bot")
+        elif pat == 1:                                             # P2: quiet prev -> NEW wallet -> flat (A only)
+            sec = _add(res, rows, sec, slot, 1, 0.02, "bot")
+            sec = _add(res, rows, sec, slot + 1, 1, 0.05, f"newB{c}")
+            sec = _add(res, rows, sec, slot + 2, 1, 0.02, "bot")
+            sec = _add(res, rows, sec, slot + 3, 1, 0.02, "bot"); sec = _add(res, rows, sec, slot + 4, 1, 0.02, "bot")
+        else:                                                     # P3: busy prev -> existing wallet -> flat (B only)
+            sec = _add(res, rows, sec, slot, 3, 0.05, "bot")
+            sec = _add(res, rows, sec, slot + 1, 1, 0.05, "bot")
+            sec = _add(res, rows, sec, slot + 2, 1, 0.02, "bot")
+            sec = _add(res, rows, sec, slot + 3, 1, 0.02, "bot"); sec = _add(res, rows, sec, slot + 4, 1, 0.02, "bot")
+        slot += 6
+    return {"txs": rows}
+
+
 def _run_char(monkeypatch, rec, n=40):
     from tradingbot import pool_tracker as pt
     pools = {f"P{i}": {"create_ts": 1.0, "token_mint": "M"} for i in range(n)}
@@ -240,7 +266,7 @@ def test_characterize_reports_no_signal_on_a_memoryless_stream(monkeypatch):
 
 # --- discovery (auto rule bank + motifs, holdout-confirmed; no event named in advance) --------------
 
-def _run_disc(monkeypatch, make_rec, n):
+def _run_disc(monkeypatch, make_rec, n, combos=False):
     """Each pool gets its own record (distinct create_ts), so the time-holdout pools are independent draws."""
     from tradingbot import pool_tracker as pt
     pools = {f"P{i}": {"create_ts": float(i + 1), "token_mint": "M"} for i in range(n)}
@@ -259,7 +285,7 @@ def _run_disc(monkeypatch, make_rec, n):
         def query(self, *a, **k):
             return []
 
-    return fl.discover(J(), S(), helius=None, now=1000.0)
+    return fl.discover(J(), S(), helius=None, now=1000.0, combos=combos)
 
 
 def test_discover_names_the_precursor_and_it_survives_the_holdout(monkeypatch):
@@ -278,6 +304,41 @@ def test_discover_reports_nothing_survives_on_a_memoryless_stream(monkeypatch):
     assert out["tested"] > 0                                    # rules were generated and holdout-tested
     assert out["n_survivors"] == 0                              # none leads a next-slot flurry out of sample
     assert "NOTHING SURVIVES" in fl.render_discover(out)
+
+
+def test_discover_combos_search_runs_and_tightens_the_guard(monkeypatch):
+    # with --combos the conjunction search runs (beam over AND-ed filters), the family-wise bar WIDENS for the
+    # bigger search, and any reported combo is >1 filter AND-ed and sharper out of sample than its parts.
+    out = _run_disc(monkeypatch, lambda i: _rec_causal(), n=8, combos=True)
+    assert out["combo_tested"] > 0                              # conjunctions were actually searched
+    assert out["combo_zc"] >= out["zc"]                         # stricter guard than the single-rule pass
+    assert isinstance(out["combos"], list)
+    for c in out["combos"]:
+        assert "  AND  " in c["rule"] and c["depth"] >= 2       # a combo is a conjunction, not a single rule
+        assert c["gain_vs_part"] > 0                            # it improved on its best single filter out of sample
+    assert "COMBINATIONS" in fl.render_discover(out)
+
+
+def test_discover_combos_find_nothing_on_a_memoryless_stream(monkeypatch):
+    # the critical overfitting guard: a bigger (combinatorial) search must NOT manufacture a false edge on
+    # memoryless data -- the widened family-wise z threshold keeps every conjunction out.
+    out = _run_disc(monkeypatch, lambda i: _rec_random(slots=1500, seed=200 + i), n=6, combos=True)
+    assert out["combo_tested"] >= 0
+    assert out["n_combos"] == 0                                 # no conjunction survives the stricter bar
+    r = fl.render_discover(out)
+    assert "COMBINATIONS" not in r or "does not" in r
+
+
+def test_discover_combos_surfaces_a_planted_conjunction(monkeypatch):
+    # the feature's reason to exist: when A-and-B predicts but A or B alone is weak, the conjunction search
+    # must recover the stacked rule and show it is SHARPER than either single filter.
+    out = _run_disc(monkeypatch, lambda i: _rec_combo(seed=i), n=10, combos=True)
+    assert out["n_combos"] >= 1
+    top = out["combos"][0]
+    assert top["depth"] >= 2 and "  AND  " in top["rule"]       # it is a conjunction
+    assert top["gain_vs_part"] > 0.5                            # clearly sharper out of sample than its best single filter
+    assert any("new" in c["rule"] and "prev" in c["rule"] for c in out["combos"])  # recovered the A AND B structure
+    assert "STACKED EDGE" in fl.render_discover(out)
 
 
 def test_metas_from_pools_loads_json_and_jsonl(tmp_path):

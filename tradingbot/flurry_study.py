@@ -650,6 +650,9 @@ THRESH_Q = (50, 75, 90)   # quantiles (of the train slice) each numeric is cut a
 DISC_MIN_SUPPORT = 30     # a rule must have >= this many present AND absent slots in BOTH halves
 DISC_TOP = 20             # survivors reported
 DISC_SCALP_TOP = 12       # holdout-confirmed survivor rules carried into the discovered-rule scalp
+COMBO_MAX_DEPTH = 3       # AND together up to this many single filters (conjunction depth)
+COMBO_BEAM = 8            # beam search: keep this many best partial conjunctions at each depth
+COMBO_TOP = 15            # conjunction survivors reported
 SYM_DESC = {"F": "N was itself a flurry", "S": "net sellers in N", "N": "a brand-new wallet bought in N",
             "O": "an outsider (non-top-3) bought in N", "B": "the dominant wallet looped in N",
             "b": "light buying in N", ".": "a dead slot"}
@@ -764,7 +767,8 @@ def _eval_spec(spec: dict, recs: list[dict], tgt: np.ndarray, base: float) -> di
 def discover(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s: float = DEFAULT_SPAN_S,
              flurry_min: int = DEFAULT_FLURRY_MIN, probed_only: bool = False, max_credits: int = 20_000,
              progress=None, now: float | None = None, target: str = DEFAULT_TARGET,
-             move_pct: float = DEFAULT_MOVE_PCT, horizon: int = DEFAULT_HORIZON, metas=None, have=None) -> dict:
+             move_pct: float = DEFAULT_MOVE_PCT, horizon: int = DEFAULT_HORIZON, combos: bool = False,
+             metas=None, have=None) -> dict:
     """Data-driven discovery of the slot-N event that precedes the predicted thing (a price up-move by default;
     a buy flurry with target='flurry'): no event named in advance, a large auto-generated rule bank + sequence
     motifs, kept only where the lead survives a time-holdout with a family-wise z guard. `metas` overrides the
@@ -845,7 +849,80 @@ def discover(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s
     survivors.sort(key=lambda d: abs(d["z_hold"]), reverse=True)
     out["survivors"] = survivors[:DISC_TOP]
     out["n_survivors"] = len(survivors)
+    if combos and len(evaluated) >= 2:
+        out.update(_combo_layer(evaluated, train, hold, tgt_tr, tgt_ho, base_tr, base_ho))
+    else:
+        out.update({"combos": [], "n_combos": 0, "combo_zc": 0.0, "combo_tested": 0})
     return out
+
+
+def _combo_layer(evaluated, train, hold, tgt_tr, tgt_ho, base_tr, base_ho) -> dict:
+    """Beam search over CONJUNCTIONS of the single-rule filters (AND them together). A combination is kept only
+    if it (a) sharpens the TRAIN signal over its parent at each step, (b) clears a family-wise z guard WIDENED
+    for the number of conjunctions tested (so the much larger search space can't manufacture a false positive),
+    and (c) is MORE significant out of sample than ANY of its own single filters -- otherwise the combination
+    adds nothing a single rule didn't. Selection is on TRAIN only; the holdout is read once per candidate for
+    the final judgement. Candidate filters = the single rules that already have support in both halves."""
+    import math
+    cands = []
+    for spec, tr, ho in evaluated:
+        mtr = np.fromiter((1 if spec["fn"](r) else 0 for r in train), dtype=bool, count=len(train))
+        mho = np.fromiter((1 if spec["fn"](r) else 0 for r in hold), dtype=bool, count=len(hold))
+        cands.append({"spec": spec, "mtr": mtr, "mho": mho, "tr": tr, "ho": ho})
+
+    def ev(mask, tgt, base):
+        n = int(mask.sum())
+        if n < DISC_MIN_SUPPORT or len(mask) - n < DISC_MIN_SUPPORT:
+            return None
+        rate = float(tgt[mask].mean())
+        se = (base * (1.0 - base) / n) ** 0.5
+        return {"n": n, "rate": rate, "lift": (rate / base if base else 0.0),
+                "z": ((rate - base) / se if se > 0 else 0.0)}
+
+    seeds = sorted(range(len(cands)), key=lambda i: abs(cands[i]["tr"]["z"]), reverse=True)[:COMBO_BEAM]
+    beam = [{"idxs": (i,), "mtr": cands[i]["mtr"], "mho": cands[i]["mho"], "tr": cands[i]["tr"]} for i in seeds]
+    seen = {frozenset(e["idxs"]) for e in beam}
+    tested = []                                               # (idxs, train_stats, hold_stats) for every conjunction evaluated
+    k_conj = 0
+    for _ in range(2, COMBO_MAX_DEPTH + 1):
+        level = []
+        for e in beam:
+            for j in range(len(cands)):
+                if j in e["idxs"]:
+                    continue
+                key = frozenset(e["idxs"] + (j,))
+                if key in seen:
+                    continue
+                seen.add(key)
+                cmtr = e["mtr"] & cands[j]["mtr"]
+                tr = ev(cmtr, tgt_tr, base_tr)
+                if tr is None:
+                    continue
+                k_conj += 1
+                if abs(tr["z"]) <= abs(e["tr"]["z"]):          # the added filter must sharpen the TRAIN signal
+                    continue
+                cmho = e["mho"] & cands[j]["mho"]
+                ho = ev(cmho, tgt_ho, base_ho)
+                idxs = tuple(sorted(e["idxs"] + (j,)))
+                level.append({"idxs": idxs, "mtr": cmtr, "mho": cmho, "tr": tr})
+                if ho is not None:
+                    tested.append((idxs, tr, ho))
+        if not level:
+            break
+        beam = sorted(level, key=lambda x: abs(x["tr"]["z"]), reverse=True)[:COMBO_BEAM]
+    k_total = max(len(cands) + k_conj, 2)
+    zc = max(3.0, math.sqrt(2.0 * math.log(k_total)))         # stricter than the single-rule guard (bigger search)
+    survs = []
+    for idxs, tr, ho in tested:
+        same_dir = (tr["lift"] > 1) == (ho["lift"] > 1)
+        part_z = max((abs(cands[i]["ho"]["z"]) for i in idxs if cands[i]["ho"]), default=0.0)
+        part_lift = max((abs(cands[i]["ho"]["lift"] - 1.0) for i in idxs if cands[i]["ho"]), default=0.0)
+        if same_dir and abs(ho["z"]) >= zc and abs(ho["z"]) > part_z and abs(ho["lift"] - 1.0) > part_lift:
+            survs.append({"rule": "  AND  ".join(cands[i]["spec"]["rule"] for i in idxs), "depth": len(idxs),
+                          "lift_train": tr["lift"], "lift_hold": ho["lift"], "rate_hold": ho["rate"],
+                          "z_hold": ho["z"], "n_hold": ho["n"], "gain_vs_part": abs(ho["lift"] - 1.0) - part_lift})
+    survs.sort(key=lambda d: abs(d["z_hold"]), reverse=True)
+    return {"combos": survs[:COMBO_TOP], "n_combos": len(survs), "combo_zc": zc, "combo_tested": k_conj}
 
 
 def render_discover(out: dict) -> str:
@@ -881,6 +958,22 @@ def render_discover(out: dict) -> str:
         L.append(f"  NOTHING SURVIVES THE HOLDOUT: of {out['tested']} auto-generated rules, none leads {tl}")
         L.append("  on the held-out pools beyond chance. Any in-sample pattern was overfit -- consistent with NO SIGNAL:")
         L.append(f"  {tail}, so there is no event to key a ShredStream backrun on. Drop it.")
+    if out.get("combo_tested"):
+        L.append("")
+        L.append(f"  COMBINATIONS (single filters AND-ed together; {out['combo_tested']} conjunctions beam-searched; "
+                 f"stricter family-wise z threshold {out['combo_zc']:.2f}):")
+        if out["combos"]:
+            L.append(f"  {'discovered conjunction (slot N)':<62}{'hold lift':>10}{'P(tgt)':>8}{'z':>7}{'n':>6}")
+            for r in out["combos"]:
+                rule = r["rule"] if len(r["rule"]) <= 60 else r["rule"][:57] + "..."
+                L.append(f"  {rule:<62}{r['lift_hold']:9.2f}x{r['rate_hold']*100:7.1f}%{r['z_hold']:+7.1f}{r['n_hold']:6d}")
+            b = out["combos"][0]
+            L.append(f"  -> STACKED EDGE: '{b['rule']}' ({b['depth']} filters) leads {tl} {b['lift_hold']:.1f}x out of sample")
+            L.append("     and SHARPER than any of its single filters alone (cleared the stricter bar). Next: confirm it PAYS")
+            L.append("     (--scalp), then validate live with the 1-slot probe -- the stacked rule is the multi-filter edge.")
+        else:
+            L.append("  no conjunction beat BOTH the stricter z bar AND its own single filters -> stacking filters does not")
+            L.append("  surface a cleaner edge here; the signal is single-dimensional (or absent). A single rule is as good as it gets.")
     return "\n".join(L)
 
 
