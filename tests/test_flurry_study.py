@@ -522,3 +522,83 @@ def test_entry_window_finds_a_delayed_ev_positive_entry(monkeypatch):
     # a later offset (k>=3) is EV+ (the move lands a few slots after the signal), and best_k found one
     assert am["best_k"] is not None
     assert any(am["per_k"][k].get("n",0)>=20 and am["per_k"][k]["mean"]>0 for k in range(3,8))
+
+
+# --- economics-ranked discovery (discover_econ): select rules by scalp P&L, not lift ---------------
+
+def _emit(specs):
+    """Build a launch_record from per-slot specs [{buys, sells, fresh, price}, ...]. Price is set directly via
+    the reserves (tok_after fixed at 1e9), so it is independent of the buy/sell magnitudes -- lets a test plant
+    any price path with any slot classification. A fresh slot's buyers are brand-new wallets (sym N / F)."""
+    rows, sec, wid = [], 0.0, [0]
+    for slot, sp in enumerate(specs, start=10):
+        sol_after = sp["price"] * 1e9
+        for _ in range(sp.get("buys", 0)):
+            payer = f"f{slot}_{wid[0]}" if sp.get("fresh") else "w0"
+            wid[0] += 1
+            rows.append([sec, slot, payer, -1.0, 2.0, 1e9, sol_after]); sec += 0.05
+        for _ in range(sp.get("sells", 0)):
+            rows.append([sec, slot, "w0", 1.0, -2.0, 1e9, sol_after]); sec += 0.05
+        if not sp.get("buys") and not sp.get("sells"):
+            rows.append([sec, slot, "w0", -1.0, 1e-9, 1e9, sol_after]); sec += 0.05  # a quiet price-carrying tick
+    return {"txs": rows}
+
+
+def _econ(builder, n=24):
+    have = {f"P{i}": builder(i) for i in range(n)}
+    metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(n)]
+    return have, metas
+
+
+def test_discover_econ_surfaces_a_median_rule_that_lift_misses():
+    # Each flurry signal (n_buys=5) is followed by a steady +0.6% -- a positive, consistent SCALP return, but
+    # BELOW the 1% target, so lift sees ~nothing. discover_econ (economics) must surface it; discover (lift) not.
+    def broad(_i):
+        specs = [{"buys": 1, "price": 100.0}] * 3                 # warmup
+        for _ in range(40):
+            specs += [{"buys": 5, "fresh": True, "price": 100.0}, # the flurry signal
+                      {"buys": 1, "price": 100.6},                # +0.6% realization (< 1% target -> weak lift)
+                      {"buys": 1, "price": 100.3},                # gentle decay (quiet control slots ~ -0.3%/0)
+                      {"buys": 1, "price": 100.0}]
+        return _emit(specs)
+    have, metas = _econ(broad)
+    tgt = fl._tgt("price", 3, 2, 1.0)
+    econ = fl.discover_econ(have, metas, tgt, 0.0)
+    assert econ["n_survivors"] >= 1
+    assert any(s["label"] == "broad" and s["median"] > 0 and s["dir"] == "up" for s in econ["survivors"])
+    assert "PAY" in fl.render_econ(econ)
+    # the lift objective finds nothing on the SAME data (every move is < the 1% target) -> the whole point
+    disc = fl.discover(None, None, metas=metas, have=have, target="price", move_pct=1.0, horizon=2, now=10.0)
+    assert disc["n_survivors"] == 0
+
+
+def test_discover_econ_surfaces_nothing_on_a_null_flat_market():
+    # flurries with NO forward price move: every scalp is flat, so no rule can beat the control -- the
+    # family-wise guard must not fabricate an edge.
+    def null(_i):
+        specs = [{"buys": 1, "price": 100.0}] * 3
+        for _ in range(40):
+            specs += [{"buys": 5, "fresh": True, "price": 100.0}, {"buys": 1, "price": 100.0},
+                      {"buys": 1, "price": 100.0}, {"buys": 1, "price": 100.0}]
+        return _emit(specs)
+    have, metas = _econ(null)
+    econ = fl.discover_econ(have, metas, fl._tgt("price", 3, 2, 1.0), 0.0)
+    assert econ["n_survivors"] == 0
+    assert "NO RULE" in fl.render_econ(econ)
+
+
+def test_discover_econ_significance_separates_a_broad_edge_from_a_positive_skew_tail():
+    # the two significance tests that split 'broad' (trust either side) from 'tail' (+300% skew, trust only on a
+    # DOWN/reversion entry). A steady positive sample dominates the control on BOTH mean (Welch) and
+    # distribution (Mann-Whitney) -> broad. A positive-skew sample (median < 0, mean > 0 from rare big wins)
+    # clears the mean test but NOT the distribution test -> correctly labelled tail, not broad.
+    steady = [0.006, 0.005, 0.007] * 50
+    ctrl = [0.0, 0.001, -0.001] * 50
+    assert fl._welch_z(steady, ctrl) > 3.0
+    assert fl._mw_z(steady, ctrl)[1] > 3.0                        # dominates in distribution -> broad path
+
+    import statistics as _st
+    skew = [-0.01] * 90 + [3.0] * 10                              # median -1%, mean +29%
+    assert _st.median(skew) < 0 < _st.fmean(skew)
+    assert fl._welch_z(skew, [0.0] * 100) > 0                     # a mean edge (the tail)...
+    assert fl._mw_z(skew, [0.0] * 100)[0] < 0.5                   # ...but does NOT dominate in distribution

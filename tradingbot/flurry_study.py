@@ -1639,6 +1639,218 @@ def _c(a: dict) -> str:
     return f"{s:>26}"
 
 
+# --- economics-ranked discovery: select rules by the scalp P&L they'd have made, not by lift -------
+# discover() ranks the candidate rule bank by LIFT (binary separation on the price target), then scalps the
+# survivors. A rule whose lift is unremarkable -- most of its fires are flat, so it doesn't "predict" the
+# >=move_pct hit well -- but whose SCALP RETURN distribution is strong (a high median, or a fat fills-favoured
+# tail) never reaches the scalp pass. discover_econ folds the economics INTO the selection: each rule is kept
+# only where it beats the random-slot control significantly on the MEAN (Welch z) OR on the distribution/median
+# (Mann-Whitney z), out of sample on a create_ts holdout, under a family-wise z guard. Each survivor is
+# labelled broad (a median/distribution edge -- trust either side) vs tail (a mean/+300%-skew edge only --
+# trust it on a DOWN/reversion entry where the fills work WITH us, distrust it on an UP/momentum entry where
+# the spike reverts against us), and carries its move direction + tail concentration so you apply that trust.
+ECON_MIN_FIRES = 50   # per-rule fires (train and holdout) for a candidate: a sanity floor + stable significance
+
+
+def _welch_z(a, b) -> float:
+    """z of mean(a) - mean(b) under unequal variances (Welch). The +300% cap / -100% rugs make the return
+    distribution heavy-tailed, so this is deliberately conservative for a tail-carried mean."""
+    if len(a) < 2 or len(b) < 2:
+        return 0.0
+    aa, bb = np.asarray(a, float), np.asarray(b, float)
+    se = (aa.var(ddof=1) / len(aa) + bb.var(ddof=1) / len(bb)) ** 0.5
+    return float((aa.mean() - bb.mean()) / se) if se > 0 else 0.0
+
+
+def _mw_z(a, b):
+    """Mann-Whitney (auc, z) that sample a stochastically dominates b -- a distribution/median edge robust to
+    the tail. Reuses _rank_auc on the concatenated samples (auc = P(a's return > b's)); z from the normal
+    approximation of U. This is the median-side significance test that a tail-inflated mean can't fake."""
+    n1, n0 = len(a), len(b)
+    if n1 < 2 or n0 < 2:
+        return 0.5, 0.0
+    feat = np.asarray(list(a) + list(b), float)
+    lab = np.asarray([1] * n1 + [0] * n0, float)
+    auc = _rank_auc(feat, lab)
+    se = ((n1 + n0 + 1.0) / (12.0 * n1 * n0)) ** 0.5
+    return auc, (float((auc - 0.5) / se) if se > 0 else 0.0)
+
+
+def discover_econ(have: dict, metas: list[dict], tgt: dict, cost: float,
+                  holds=MOTIF_HOLDS, seed: int = 0, stake: float = 50.0) -> dict:
+    """Economics-ranked discovery (see the block comment). Same candidate rule bank as discover() plus signed
+    move thresholds (move>=+q up entries, move<=-q down entries, so momentum AND reversion rules compete), but
+    each rule is SELECTED by its scalp P&L -- significant vs the control on mean OR median, out of sample,
+    family-wise guarded -- not by lift. Read only; a surfaced rule is a hypothesis, the live 1-slot run is the
+    arbiter, and the mid-to-mid scalp overstates an UP tail (fills invert) while it is a FLOOR for a DOWN tail
+    (fills favour the bounce), which is why each survivor carries a broad/tail label and a move direction."""
+    import math
+    pools = []
+    for m in metas:
+        rec = have.get(m["pool"])
+        flow = slot_flow(rec) if rec else None
+        if not flow:
+            continue
+        pools.append({"flow": flow, "bank": _slot_bank(flow, m.get("create_ts") or 0.0, tgt),
+                      "ct": m.get("create_ts") or 0.0})
+    out = {"n_pools": len(pools), "n_survivors": 0, "survivors": [], "control": {}, "split": "none",
+           "zc": 0.0, "stake": stake, "n_specs": 0, "holds": list(holds)}
+    if len(pools) < 4:
+        return out
+    tss = sorted({p["ct"] for p in pools})
+    cut = tss[len(tss) // 2] if len(tss) > 1 else None
+    train = [p for p in pools if cut is not None and p["ct"] < cut]
+    hold = [p for p in pools if cut is not None and p["ct"] >= cut]
+    if len(train) < 2 or len(hold) < 2:                       # pools clustered in time -> random pool split
+        rng0 = random.Random(0)
+        idx = list(range(len(pools)))
+        rng0.shuffle(idx)
+        k = len(idx) // 2
+        train, hold, out["split"] = [pools[i] for i in idx[:k]], [pools[i] for i in idx[k:]], "random"
+    else:
+        out["split"] = "time"
+    train_recs = [r for p in train for r in p["bank"]]
+    hold_recs = [r for p in hold for r in p["bank"]]
+    if len(train_recs) < 2 * DISC_MIN_SUPPORT or len(hold_recs) < 2 * DISC_MIN_SUPPORT:
+        return out
+    specs = _build_specs(train_recs)                          # the standard bank (discovered on train only)...
+    mv = np.array([r["f"]["move"] for r in train_recs], float)
+    if mv.std() > 0:                                          # ...plus signed move entries so BOTH sides compete
+        for q in (75, 90, 95):
+            thr = float(np.quantile(mv, q / 100.0))
+            if thr > 0:
+                specs.append({"rule": f"move >= {thr*100:.2f}% (up q{q})", "kind": "move",
+                              "fn": (lambda r, _t=thr: r["f"]["move"] >= _t)})
+        for q in (25, 10, 5):
+            thr = float(np.quantile(mv, q / 100.0))
+            if thr < 0:
+                specs.append({"rule": f"move <= {thr*100:.2f}% (down q{q})", "kind": "move",
+                              "fn": (lambda r, _t=thr: r["f"]["move"] <= _t)})
+
+    def _fires(pool_set, fn):                                 # scalp returns per hold for the slots fn fires on
+        per = {h: [] for h in holds}
+        moves = []
+        for p in pool_set:
+            slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
+            for i, rs in enumerate(p["bank"]):
+                if fn(rs):
+                    moves.append(rs["f"].get("move", 0.0))
+                    for h in holds:
+                        r = _scalp(slots, pull, i, h, cost)
+                        if r is not None:
+                            per[h].append(r)
+        return per, moves
+
+    def _control(pool_set, rng):                              # random quiet active slots = the baseline
+        per = {h: [] for h in holds}
+        for p in pool_set:
+            slots, pull = p["flow"]["slots"], p["flow"]["pull_slot"]
+            quiet = [i for i, s in enumerate(slots) if s["n_buys"] < 3]
+            rng.shuffle(quiet)
+            for i in quiet[:CONTROL_PER_POOL]:
+                for h in holds:
+                    r = _scalp(slots, pull, i, h, cost)
+                    if r is not None:
+                        per[h].append(r)
+        return per
+
+    ctrl_tr = _control(train, random.Random(seed + 1))
+    ctrl_ho = _control(hold, random.Random(seed))
+    out["control"] = {f"h{h}": _agg(ctrl_ho[h]) for h in holds}
+    evaluated = []
+    for spec in specs:
+        tr_per, _ = _fires(train, spec["fn"])
+        if max((len(tr_per[h]) for h in holds), default=0) < ECON_MIN_FIRES:
+            continue                                          # thin on train -> not a candidate (and not in K)
+        ho_per, moves = _fires(hold, spec["fn"])
+        evaluated.append((spec, tr_per, ho_per, moves))
+    k = max(len(evaluated) * max(len(holds), 1), 2)
+    zc = max(3.0, math.sqrt(2.0 * math.log(k)))               # family-wise guard over every (rule x hold) tested
+    out["zc"], out["n_specs"] = zc, len(evaluated)
+    survivors = []
+    for spec, tr_per, ho_per, moves in evaluated:
+        best = None
+        for h in holds:
+            rr, cc, trr, tcc = ho_per[h], ctrl_ho[h], tr_per[h], ctrl_tr[h]
+            if len(rr) < ECON_MIN_FIRES or len(cc) < 10 or len(trr) < ECON_MIN_FIRES or len(tcc) < 10:
+                continue
+            ra, ca = _agg(rr), _agg(cc)
+            wz, (_, mwz) = _welch_z(rr, cc), _mw_z(rr, cc)
+            twz, (_, tmwz) = _welch_z(trr, tcc), _mw_z(trr, tcc)
+            mean_ok = wz >= zc and twz > 0 and ra["mean"] > ca["mean"]          # significant on the mean...
+            dist_ok = mwz >= zc and tmwz > 0 and ra["median"] >= ca["median"]   # ...or the distribution/median
+            if not (mean_ok or dist_ok):
+                continue
+            score = ra["median"] if dist_ok else ra["mean"]   # rank broad rules on median, tail rules on mean
+            cand = {"hold": h, "rr": list(rr), "mean": ra["mean"], "median": ra["median"],
+                    "win_pct": ra["win_pct"], "rugged_pct": ra["rugged_pct"], "n": ra["n"], "welch_z": wz,
+                    "mw_z": mwz, "ctrl_mean": ca["mean"], "ctrl_median": ca["median"], "ctrl_win": ca["win_pct"],
+                    "broad": dist_ok, "score": score}
+            if best is None or cand["score"] > best["score"]:
+                best = cand
+        if best is None:
+            continue
+        wins = sorted((r for r in best["rr"] if r > 0), reverse=True)
+        pos = sum(wins) or 1.0
+        dirn = statistics.fmean(moves) if moves else 0.0
+        survivors.append({
+            "rule": spec["rule"], "kind": spec["kind"], "hold": best["hold"], "n": best["n"],
+            "mean": best["mean"], "median": best["median"], "win_pct": best["win_pct"],
+            "rugged_pct": best["rugged_pct"], "welch_z": best["welch_z"], "mw_z": best["mw_z"],
+            "ctrl_mean": best["ctrl_mean"], "ctrl_median": best["ctrl_median"], "ctrl_win": best["ctrl_win"],
+            "edge": best["mean"] - best["ctrl_mean"], "net_per_fire": best["mean"] * stake,
+            "label": ("broad" if best["broad"] else "tail"), "dir": ("down" if dirn < 0 else "up"),
+            "move_mean": dirn, "top5_share": sum(wins[:5]) / pos})
+    # broad rules first (ranked by median, trustworthy either side), then tail rules (ranked by mean): the
+    # reader trusts a DOWN tail (reversion bounce, fills favour us) and distrusts an UP tail (spike artifact).
+    survivors.sort(key=lambda s: (0 if s["label"] == "broad" else 1,
+                                  -(s["median"] if s["label"] == "broad" else s["mean"])))
+    out["survivors"] = survivors[:DISC_TOP]
+    out["n_survivors"] = len(out["survivors"])
+    return out
+
+
+def render_econ(out: dict) -> str:
+    L = []
+    L.append("ECONOMICS-RANKED DISCOVERY  (rules SELECTED by scalp P&L -- mean OR median -- not by lift; holdout-confirmed)")
+    L.append(f"  pools {out['n_pools']}; {out['split']} split; {out.get('n_specs', 0)} candidate rules; "
+             f"zc {out['zc']:.2f} (family-wise guard); stake ${out['stake']:.0f}; holds {tuple(out.get('holds', ()))}")
+    cc = out.get("control") or {}
+    if cc:
+        L.append("  control (random quiet slots): " + "  ".join(f"h{h} {_c(cc.get(f'h{h}', {}))}" for h in out.get("holds", [])))
+    L.append("")
+    if not out["survivors"]:
+        L.append("  NO RULE beats the control significantly on mean OR median out of sample: no slot-N rule pays a")
+        L.append("  1-2 slot scalp beyond chance even ranked by economics -> consistent with price ~ a random walk at")
+        L.append("  slot scale; drop ShredStream.")
+        return "\n".join(L)
+    L.append(f"  {out['n_survivors']} rule(s) PAY out of sample.  label: broad = median/distribution edge (trust either side);")
+    L.append("  tail = mean/+300%-skew only -- trust a TAIL rule on a DOWN entry (fills favour the bounce), distrust it on an UP entry (the spike reverts).")
+    L.append("")
+    L.append(f"  {'discovered rule':<34}{'lbl':>6}{'dir':>5}{'hold':>5}{'fires':>7}{'median%':>9}{'mean%':>8}{'win%':>6}{'$/fire':>8}{'tail5':>7}{'MWz':>6}{'Wz':>6}")
+    for s in out["survivors"]:
+        L.append(f"  {s['rule'][:34]:<34}{s['label']:>6}{s['dir']:>5}{s['hold']:>5}{s['n']:>7}"
+                 f"{s['median']*100:>8.1f}%{s['mean']*100:>7.1f}%{s['win_pct']:>5.0f}%"
+                 f"{s['net_per_fire']:>+8.2f}{s['top5_share']*100:>6.0f}%{s['mw_z']:>6.1f}{s['welch_z']:>6.1f}")
+    broad = [s for s in out["survivors"] if s["label"] == "broad"]
+    downtail = [s for s in out["survivors"] if s["label"] == "tail" and s["dir"] == "down"]
+    L.append("")
+    if broad:
+        b = broad[0]
+        L.append(f"  BEST BROAD RULE: '{b['rule']}' ({b['dir']}) hold {b['hold']} -> median {b['median']*100:+.1f}%, "
+                 f"mean {b['mean']*100:+.1f}%, win {b['win_pct']:.0f}%, ${b['net_per_fire']:+.2f}/fire at ${out['stake']:.0f}")
+        L.append("  -> a broad (not tail-carried) edge that pays on the TYPICAL fire. The strongest candidate to validate live.")
+    elif downtail:
+        b = downtail[0]
+        L.append(f"  BEST DOWN-TAIL RULE: '{b['rule']}' hold {b['hold']} -> mean {b['mean']*100:+.1f}% (median {b['median']*100:+.1f}%, "
+                 f"win {b['win_pct']:.0f}%, top-5 {b['top5_share']*100:.0f}% of wins); ${b['net_per_fire']:+.2f}/fire at ${out['stake']:.0f}")
+        L.append("  -> a positive-skew REVERSION edge: the mid-to-mid study is a FLOOR here (fills favour the bounce). Validate live on NET.")
+    else:
+        L.append("  Only UP-tail rules surfaced: a mean carried by +300% spikes that revert against the fill live. Distrust -- not a live candidate.")
+    L.append("  Still mid-to-mid on untouched pools -> a hypothesis, not a go/no-go. The live 1-slot run is the arbiter.")
+    return "\n".join(L)
+
+
 def render(out: dict) -> str:
     tgt = out.get("target") or _tgt()
     L = []
