@@ -967,10 +967,16 @@ def render_discover(out: dict) -> str:
             for r in out["combos"]:
                 rule = r["rule"] if len(r["rule"]) <= 60 else r["rule"][:57] + "..."
                 L.append(f"  {rule:<62}{r['lift_hold']:9.2f}x{r['rate_hold']*100:7.1f}%{r['z_hold']:+7.1f}{r['n_hold']:6d}")
+            best_s = max(out["survivors"], key=lambda s: s["lift_hold"], default=None)
+            best_single = best_s["lift_hold"] if best_s else 1.0
             b = out["combos"][0]
-            L.append(f"  -> STACKED EDGE: '{b['rule']}' ({b['depth']} filters) leads {tl} {b['lift_hold']:.1f}x out of sample")
-            L.append("     and SHARPER than any of its single filters alone (cleared the stricter bar). Next: confirm it PAYS")
-            L.append("     (--scalp), then validate live with the 1-slot probe -- the stacked rule is the multi-filter edge.")
+            if b["lift_hold"] > best_single:
+                L.append(f"  -> STACKED EDGE: '{b['rule']}' ({b['depth']} filters) leads {tl} {b['lift_hold']:.1f}x out of sample,")
+                L.append(f"     BEATING the best single rule ({best_single:.1f}x). Confirm it PAYS (--scalp), then the live 1-slot probe.")
+            else:
+                L.append(f"  -> the best conjunction ({b['lift_hold']:.1f}x) is sharper than its own filters but does NOT beat the best")
+                L.append(f"     single rule ('{best_s['rule'] if best_s else '-'}' {best_single:.1f}x): stacking surfaces no cleaner edge --")
+                L.append("     the signal is single-dimensional, a single rule is the ceiling. Put effort into execution/sizing, not more filters.")
         else:
             L.append("  no conjunction beat BOTH the stricter z bar AND its own single filters -> stacking filters does not")
             L.append("  surface a cleaner edge here; the signal is single-dimensional (or absent). A single rule is as good as it gets.")

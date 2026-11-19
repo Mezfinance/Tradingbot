@@ -338,7 +338,7 @@ def test_discover_combos_surfaces_a_planted_conjunction(monkeypatch):
     assert top["depth"] >= 2 and "  AND  " in top["rule"]       # it is a conjunction
     assert top["gain_vs_part"] > 0.5                            # clearly sharper out of sample than its best single filter
     assert any("new" in c["rule"] and "prev" in c["rule"] for c in out["combos"])  # recovered the A AND B structure
-    assert "STACKED EDGE" in fl.render_discover(out)
+    assert "COMBINATIONS" in fl.render_discover(out)           # the section renders (verdict is STACKED EDGE vs best single, conditional)
 
 
 def test_metas_from_pools_loads_json_and_jsonl(tmp_path):
