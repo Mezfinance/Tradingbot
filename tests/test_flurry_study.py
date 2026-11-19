@@ -617,21 +617,22 @@ def _cre(prices, pull_pos=None):
     return {"txs": rows}
 
 
-def test_creation_study_finds_the_opening_ramp_prize():
-    # a deterministic opening ramp 100 -> 110 -> 120 -> 125 -> flat: buying at the creation slot and selling
-    # 2 slots later captures +20% before cost, so the prize is (entry slot 0, hold 2).
+def test_first_buy_reactive_scalp_finds_a_prize_on_a_post_first_buy_ramp():
+    # first buy in slot 0; a ramp 100 -> 110 -> 120 -> 125 after it. Backrunning (enter front of slot 1, hold
+    # 2 = exit 2 slots later) captures the ramp, so a hold is positive on mean AND median.
     prices = [100.0, 110.0, 120.0, 125.0, 125.0, 125.0]
     have = {f"P{i}": _cre(prices) for i in range(60)}
     metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
     out = fl.creation_study(have, metas, 0.0)
+    assert out["n_first_buy"] == 60 and out["pull_dist"]["none"] == 60   # every pool has a first buy, no pulls
     assert out["best"] is not None
-    assert out["best"]["entry"] == 0 and out["best"]["mean"] > 0 and out["best"]["median"] > 0
-    assert out["pull_dist"]["none"] == 60                         # no pulls planted
-    assert any(r["to"] == 2 and r["mean"] > 0 for r in out["ramp"])
+    assert out["best"]["agg"]["mean"] > 0 and out["best"]["agg"]["median"] > 0
+    assert {c["hold"] for c in out["cells"]} == {1, 2, 3}         # holds measured AFTER entry
+    assert any(r["mean"] > 0 for r in out["ramp"])
     assert "PRIZE" in fl.render_creation(out)
 
 
-def test_creation_study_no_prize_on_a_flat_open():
+def test_first_buy_reactive_scalp_no_prize_on_a_flat_open():
     have = {f"P{i}": _cre([100.0] * 6) for i in range(60)}
     metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
     out = fl.creation_study(have, metas, 0.0)
@@ -639,12 +640,12 @@ def test_creation_study_no_prize_on_a_flat_open():
     assert "NO CAPTURABLE MOVE" in fl.render_creation(out)
 
 
-def test_creation_study_pull_histogram_locates_early_creation_rugs():
-    # every pool pulls at slot position 1 -> the dodge does NOT hold at creation, and a slot-0 hold-2 entry rugs.
-    have = {f"P{i}": _cre([100.0, 100.0, 100.0, 100.0], pull_pos=1) for i in range(60)}
+def test_first_buy_reactive_pull_histogram_is_relative_to_our_entry():
+    # first buy in slot 0 (our entry = front of slot 1); a pull one slot after our entry traps the 2-slot hold.
+    have = {f"P{i}": _cre([100.0, 100.0, 100.0, 100.0], pull_pos=2) for i in range(60)}
     metas = [{"pool": f"P{i}", "token_mint": "M", "create_ts": float(i)} for i in range(60)]
     out = fl.creation_study(have, metas, 0.0)
-    assert out["pull_dist"]["1"] == 60 and out["pull_dist"]["none"] == 0
-    cell = out["cells"][0]["h2"]                                  # entry slot 0, hold 2
-    assert cell["rugged_pct"] > 0                                # pull at slot 1 traps the 2-slot hold
-    assert "does the 2-slot dodge hold" in fl.render_creation(out)
+    assert out["pull_dist"]["1"] == 60 and out["pull_dist"]["none"] == 0   # pull lands 1 slot after our entry
+    h2 = next(c for c in out["cells"] if c["hold"] == 2)["agg"]
+    assert h2["rugged_pct"] > 0                                   # a pull within 2 slots of entry traps the stake
+    assert "relative to OUR ENTRY" in fl.render_creation(out)
