@@ -87,9 +87,13 @@ def _is_truncated(fired_slot: int, flow: dict, reached: bool) -> bool:
 
 
 def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, helius=None,
-               rec: dict | None = None, span_s: float = 180.0, max_pages: int | None = None) -> dict:
+               rec: dict | None = None, span_s: float = 180.0, max_pages: int | None = None,
+               box_exact: bool = False) -> dict:
     """Replay one fired pool through the study's ground-truth path and score the box's gate on every slot.
-    `rec` (a launch_record dict) short-circuits the fetch -- used by tests and when the box dumped its own series."""
+    `rec` (a launch_record dict) short-circuits the fetch -- used by tests and when the box dumped its own series.
+    `box_exact` builds the ground truth with the box's LUT drop replicated (launch_record vis_box_exact), so a
+    `direct` gate is verified against EXACTLY what the box can see -- a MISMATCH that survives box_exact is a
+    deeper gap than LUT (shred loss); one that vanishes is the drop_lut completeness gap."""
     pool, slot, box = fire["pool"], int(fire["slot"]), fire.get("box") or {}
     gate_vis = gate.get("vis", "full")              # replay through the VIEW the gate was fit on = the box's own view
     res = {"pool": pool, "slot": slot, "box": box, "vis": gate_vis}
@@ -103,7 +107,8 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
             res["status"] = "mint unresolved"
             return res
         txs, reached, _err = helius.history_from_start(pool, span_s, max_pages or fl.MAX_PAGES)
-        rec = he.launch_record(txs, pool, mint, window_s=span_s, with_vis=(gate_vis != "full"))
+        rec = he.launch_record(txs, pool, mint, window_s=span_s, with_vis=(gate_vis != "full"),
+                               vis_box_exact=box_exact)
     saved = fl.USE_VQ
     try:
         fl.USE_VQ = False                           # the gate is price-free, so the basis cannot change a fire
@@ -150,22 +155,26 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
 
 
 def verify(fires: list[dict], gate: dict, helius=None, have: dict | None = None,
-           tier: str = "1", flurry_min: int = 3, span_s: float = 180.0, max_pages: int | None = None) -> dict:
+           tier: str = "1", flurry_min: int = 3, span_s: float = 180.0, max_pages: int | None = None,
+           box_exact: bool = False) -> dict:
     """Verify every fire. `have` (pool -> launch_record dict) injects ground-truth recs without Helius (tests)."""
     if "_terms" not in gate:
         pg.compile_gate(gate)
     rows = [verify_one(f, gate, tier, flurry_min, helius=helius,
-                       rec=(have or {}).get(f["pool"]), span_s=span_s, max_pages=max_pages) for f in fires]
+                       rec=(have or {}).get(f["pool"]), span_s=span_s, max_pages=max_pages,
+                       box_exact=box_exact) for f in fires]
     ok = [r for r in rows if r.get("status") == "ok"]
     repro = sum(1 for r in ok if r["reproduced"])
     trunc = sum(1 for r in rows if r.get("status") == "truncated")
-    return {"tier": tier, "vis": gate.get("vis", "full"), "n_fires": len(fires), "n_checked": len(ok),
-            "n_reproduced": repro, "n_diverged": len(ok) - repro, "n_truncated": trunc, "rows": rows}
+    return {"tier": tier, "vis": gate.get("vis", "full"), "box_exact": box_exact, "n_fires": len(fires),
+            "n_checked": len(ok), "n_reproduced": repro, "n_diverged": len(ok) - repro,
+            "n_truncated": trunc, "rows": rows}
 
 
 def render(out: dict) -> str:
     L = [f"FRONT-RUN FEED VERIFY  (tier {out['tier']}: top {out['tier']}%,  gate vis '{out.get('vis', 'full')}'"
-         f"{' = the box view' if out.get('vis') == 'direct' else ''})",
+         f"{' = the box view' if out.get('vis') == 'direct' else ''}"
+         f"{',  BOX-EXACT: ground truth drops LUT swaps too' if out.get('box_exact') else ''})",
          f"  fires {out['n_fires']}  checked {out['n_checked']}  "
          f"reproduced {out['n_reproduced']}  DIVERGED {out['n_diverged']}"
          + (f"  truncated {out['n_truncated']}" if out.get('n_truncated') else ""), ""]
@@ -191,9 +200,17 @@ def render(out: dict) -> str:
         L += ["", f"  {out['n_truncated']} fires were FETCH-TRUNCATED (busy pool, history capped before the slot) --",
               "  not divergences; raise --pages to fetch them. They are excluded from reproduced/DIVERGED."]
     if out["n_diverged"]:
-        L += ["", "  DIVERGED fires = the box's live slot aggregation did not reproduce on chain ground truth.",
-              "  Check, in order: the per-slot buyer wallet (fee payer = keys[0]); buy vs sell classification;",
-              "  and whether the box emits a record for EVERY slot incl. dead ones (motifs / age depend on it)."]
+        if out.get("box_exact"):
+            L += ["", "  DIVERGED under BOX-EXACT = the gap SURVIVES replicating the box's LUT drop, so it is NOT",
+                  "  drop_lut completeness -- it is deeper (shreds lost upstream, invisible to drop_parse). No",
+                  "  LUT resolver on the current feed fixes this; the complete-tx decode (LocalShred) is the answer."]
+        else:
+            L += ["", "  DIVERGED fires = the box's live slot aggregation did not reproduce on chain ground truth.",
+                  "  Re-run with --box-exact: if the mismatches VANISH, the cause is the box's drop_lut (LUT-pooled",
+                  "  direct swaps it can't resolve) and a LUT resolver / LocalShred fixes it; if they SURVIVE, the",
+                  "  gap is deeper than LUT. Otherwise check the per-slot buyer (keys[0]) and buy/sell classification."]
     elif out["n_checked"]:
-        L += ["", "  Every checked box fire reproduces on Helius ground truth -> the live feed reads slots correctly."]
+        tail = " under BOX-EXACT -> the ONLY gap was the box's LUT drop (drop_lut); resolve LUTs and the box is correct." \
+            if out.get("box_exact") else " -> the live feed reads slots correctly."
+        L += ["", "  Every checked box fire reproduces on Helius ground truth" + tail]
     return "\n".join(L)

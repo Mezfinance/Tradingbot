@@ -576,13 +576,34 @@ def _top_level_pumpswap(tx: dict) -> bool:
     return any(line.startswith(tag) for line in (tx.get("meta") or {}).get("logMessages") or [])
 
 
+def _lut_sourced(tx: dict, pubkey: str) -> bool:
+    """True iff `pubkey` entered this tx via an address lookup table (jsonParsed accountKeys
+    source == 'lookupTable'). Raw shreds carry no LUT resolution, so the live box drops a swap whose
+    POOL (swap account 0) is LUT-loaded -- front_swap's `ci.accounts[0] >= len(static keys)` -> drop_lut."""
+    keys = ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []
+    for k in keys:
+        if isinstance(k, dict) and k.get("pubkey") == pubkey:
+            return k.get("source") == "lookupTable"
+    return False
+
+
+def _box_visible(tx: dict, pool: str) -> bool:
+    """The box's ACTUAL ShredStream visibility for a swap on `pool`: a top-level pumpswap swap whose
+    pool account is a STATIC key. `_top_level_pumpswap` alone keeps LUT-pooled direct swaps the box
+    drops (drop_lut), overstating the box's direct view; this replicates the drop for the verifier."""
+    return _top_level_pumpswap(tx) and not _lut_sourced(tx, pool)
+
+
 def launch_record(txs: list[dict], pool: str, base_mint: str, window_s: float = 180,
-                  exhausted: bool | None = None, with_vis: bool = False) -> dict:
+                  exhausted: bool | None = None, with_vis: bool = False,
+                  vis_box_exact: bool = False) -> dict:
     """A pool's first `window_s` seconds from its oldest-first transactions: one row per successful tx,
     [seconds after creation, slot, fee payer, pool's token change, pool's SOL change, tokens after, SOL after].
     Positive token change with negative SOL change = someone sold to the pool; the reverse = a buy.
     `with_vis` appends an 8th element per row: True iff the trade is a top-level (box-decodable) pumpswap swap --
-    the box's actual ShredStream visibility, for the visibility-restricted refit experiment."""
+    the box's actual ShredStream visibility, for the visibility-restricted refit experiment. `vis_box_exact`
+    makes that tag ALSO drop LUT-pooled swaps (pool source 'lookupTable'), so it matches the live box's
+    drop_lut exactly -- used by the feed verifier to tell a LUT-completeness gap from a deeper one."""
     if not txs:
         return {"error": "no transactions"}
     t0 = txs[0].get("blockTime") or 0
@@ -601,7 +622,7 @@ def launch_record(txs: list[dict], pool: str, base_mint: str, window_s: float = 
         row = [bt - t0, tx.get("slot"), keys[0] if keys else None, round(b1 - b0, 6), round(q1 - q0, 9),
                round(b1, 6), round(q1, 9)]
         if with_vis:
-            row.append(_top_level_pumpswap(tx))
+            row.append(_box_visible(tx, pool) if vis_box_exact else _top_level_pumpswap(tx))
         rows.append(row)
     seed = next((r for r in rows if r[4] > 0 and r[6] == r[4]), None)  # the tx that funded the empty SOL vault
     creator = seed[2] if seed else (_keys(txs[0]) or [None])[0]

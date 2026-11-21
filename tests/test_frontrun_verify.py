@@ -115,3 +115,42 @@ def test_injected_rec_is_never_truncated():
     out = fv.verify([{"pool": "P", "slot": 999999999, "box": {}}], dict(GATE), have={"P": _cre_front(0)})
     assert out.get("n_truncated", 0) == 0
     assert out["rows"][0]["status"] == "ok" and out["rows"][0]["reproduced"] is False
+
+
+# -- box-exact: replicate the live box's LUT drop in the ground truth, to tell a LUT gap from a deeper one --
+from tradingbot.data import helius as he
+
+
+def _lut_tx(pool, mint, lut_pool, slot=100, bt=0):
+    """A minimal top-level pumpswap BUY tx (tokens out, SOL in) whose pool account is static or LUT-loaded."""
+    bal = lambda tok, sol: [
+        {"owner": pool, "mint": mint, "uiTokenAmount": {"uiAmount": tok}},
+        {"owner": pool, "mint": he.SOL_MINT, "uiTokenAmount": {"uiAmount": sol}},
+    ]
+    return {
+        "blockTime": bt, "slot": slot,
+        "transaction": {"message": {"accountKeys": [
+            {"pubkey": "PAYER", "source": "transaction"},
+            {"pubkey": pool, "source": "lookupTable" if lut_pool else "transaction"},
+        ]}},
+        "meta": {"err": None,
+                 "logMessages": ["Program %s invoke [1]" % he.PUMPSWAP_PROGRAM],
+                 "preTokenBalances": bal(1000, 10), "postTokenBalances": bal(900, 11)},
+    }
+
+
+def test_box_exact_drops_lut_pooled_direct_swaps():
+    pool, mint = "POOL", "MINT"
+    # LUT-pooled top-level pumpswap swap: direct by the log bracket, but the box can't resolve its pool (drop_lut)
+    lut = _lut_tx(pool, mint, lut_pool=True)
+    assert he._top_level_pumpswap(lut) is True          # invoke [1] -> looks direct to the study
+    assert he._lut_sourced(lut, pool) is True           # ...but the pool came from a lookup table
+    kept = he.launch_record([lut], pool, mint, with_vis=True)["txs"]
+    boxx = he.launch_record([lut], pool, mint, with_vis=True, vis_box_exact=True)["txs"]
+    assert kept and kept[0][fl._VIS] is True             # default vis keeps it -> overstates the box's view
+    assert boxx and boxx[0][fl._VIS] is False            # box-exact drops it -> matches the box's drop_lut
+
+    # a STATIC-pooled swap is seen by the box, so both modes keep it
+    stat = _lut_tx(pool, mint, lut_pool=False)
+    assert he._lut_sourced(stat, pool) is False
+    assert he.launch_record([stat], pool, mint, with_vis=True, vis_box_exact=True)["txs"][0][fl._VIS] is True
