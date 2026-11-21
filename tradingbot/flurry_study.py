@@ -47,6 +47,12 @@ MINUTE6_S = 360
 # mode's numbers stay reproducible; the frontrun mode turns it on. Needs rec["vq"], populated by fetch_flows on a
 # --fetch run (and backfilled onto the existing cache). Toggle on the CLI with --vq.
 USE_VQ = False
+# When True, the wallet-rank features (top1/top3 -> sym B/O, dominant_bought, outside_buy) are computed ONLINE
+# (only wallets seen through slot N), not over the whole flow. The global version is look-ahead: it knows who the
+# pool's dominant wallet turns out to be, so a gate using sym==B / dominant_bought fires on different slots live
+# than in the backtest. Off by default so every other mode stays byte-reproducible; frontrun forces it on so the
+# exported gate is live-valid (precursor_gate scores the same slots the study scored).
+CAUSAL_WALLET = False
 
 # flurry definitions: (label, field, threshold).  A slot is a flurry slot if field >= threshold.
 # field 'n_buys' = buy txs in the slot; 'buy_sol' = SOL bought into the pool that slot; 'net_sol' = buy - sell SOL.
@@ -707,11 +713,14 @@ def _slot_bank(flow: dict, create_ts: float, tgt: dict) -> list[dict]:
     flurry_min = tgt["flurry_min"]
     slots = flow["slots"]
     by_slot = {s["slot"]: s for s in slots}
-    cnt: Counter = Counter()
-    for s in slots:
-        cnt.update(s.get("buyers") or [])
-    top3 = {w for w, _ in cnt.most_common(3)}
-    top1 = cnt.most_common(1)[0][0] if cnt else None
+    causal = CAUSAL_WALLET
+    if not causal:                                          # global (look-ahead) wallet ranks
+        cnt: Counter = Counter()
+        for s in slots:
+            cnt.update(s.get("buyers") or [])
+        gtop3 = {w for w, _ in cnt.most_common(3)}
+        gtop1 = cnt.most_common(1)[0][0] if cnt else None
+    run_cnt: Counter = Counter()                            # online ranks: only wallets seen through slot N
     seen: set = set()
     last_flurry = None
     first = slots[0]["slot"]
@@ -722,6 +731,12 @@ def _slot_bank(flow: dict, create_ts: float, tgt: dict) -> list[dict]:
         buyers = s.get("buyers") or []
         new_b = [b for b in buyers if b not in seen]
         seen.update(buyers)
+        if causal:
+            run_cnt.update(buyers)                          # include slot N's own buyers (visible as it closes)
+            top3 = {w for w, _ in run_cnt.most_common(3)}
+            top1 = run_cnt.most_common(1)[0][0] if run_cnt else None
+        else:
+            top3, top1 = gtop3, gtop1
         pprice = slots[idx - 1]["price"] if idx > 0 else s["price"]
         move = (s["price"] / pprice - 1.0) if pprice else 0.0
         since = float(min(slot - last_flurry, 50)) if last_flurry is not None else 50.0
@@ -2591,8 +2606,20 @@ def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=
     """Can we predict a >= `move` up-move early enough to enter <=k slots before it and exit 1-2 after?
     (1) ceiling: enter T-k / exit T+j with perfect foresight; (2) indicator discovery, LEAD swept and reported
     (z-guarded time holdout, discover's discipline); (3) actionable enter-on-signal net vs a random-slot control.
-    Needs USE_VQ (effective reserves), else the target is a raw-ratio artifact. Observational -> hypothesis only."""
+    Needs USE_VQ (effective reserves), else the target is a raw-ratio artifact. Observational -> hypothesis only.
+    Forces CAUSAL_WALLET: the wallet-rank features are online (no look-ahead), so the fitted/exported gate fires
+    on the same slots live as in the backtest -- otherwise sym==B / dominant_bought would use hindsight."""
     import math
+    _saved_causal = CAUSAL_WALLET
+    try:
+        return _frontrun(have, metas, move, cost, leads, seed, flurry_min)
+    finally:
+        globals()["CAUSAL_WALLET"] = _saved_causal
+
+
+def _frontrun(have, metas, move, cost, leads, seed, flurry_min):
+    import math
+    globals()["CAUSAL_WALLET"] = True                        # live-valid features for the gate (see frontrun docstring)
     base_tgt = _tgt("price", flurry_min, 1, move * 100.0)     # for features/symbols only; target overwritten
     ct = {m["pool"]: (m.get("create_ts") or 0) for m in metas}
     ceiling, all_recs, pool_flows = {}, [], {}

@@ -46,6 +46,41 @@ def test_rule_string_parsing_is_exact_for_non_numeric_families():
             assert bool(pred(r)) == bool(spec["fn"](r)), spec["rule"]
 
 
+def test_causal_wallet_features_drop_the_lookahead():
+    # a gate using sym==B / dominant_bought must score the same slots live as in the backtest, so the wallet
+    # ranks have to be online (through slot N), not over the whole flow.
+    def slot(n, buyers):
+        return {"slot": n, "price": 1.0 + 0.001 * n, "n_buys": 1, "buy_sol": 1.0, "max_buy": 1.0,
+                "net_sol": 1.0, "n_sells": 0, "sell_sol": 0.0, "buyers": buyers}
+    # A buys once early; W dominates the flow globally (buys many times, all late)
+    flow = {"slots": [slot(0, ["A"])] + [slot(i, ["W"]) for i in range(1, 8)], "pull_slot": None}
+    tgt = fl._tgt("price", 3, 2, 1.0)
+    saved = fl.CAUSAL_WALLET
+    try:
+        fl.CAUSAL_WALLET = False
+        g = fl._slot_bank(flow, 0.0, tgt)
+        fl.CAUSAL_WALLET = True
+        c = fl._slot_bank(flow, 0.0, tgt)
+    finally:
+        fl.CAUSAL_WALLET = saved
+    # slot 0: global top1 = W (not present at 0) -> dominant 0; causal top1 = A (present) -> dominant 1
+    assert g[0]["f"]["dominant_bought"] == 0.0
+    assert c[0]["f"]["dominant_bought"] == 1.0
+
+
+def test_frontrun_forces_causal_wallet_and_restores_it():
+    saved_vq, saved_causal = fl.USE_VQ, fl.CAUSAL_WALLET
+    try:
+        fl.USE_VQ = False
+        fl.CAUSAL_WALLET = False
+        metas = [{"pool": "P%d" % i, "token_mint": "M%d" % i, "create_ts": float(i)} for i in range(6)]
+        have = {"P%d" % i: _cre_front(i) for i in range(6)}
+        fl.frontrun(have, metas, move=0.30, cost=0.01)
+        assert fl.CAUSAL_WALLET is False                      # forced on internally, restored on exit
+    finally:
+        fl.USE_VQ, fl.CAUSAL_WALLET = saved_vq, saved_causal
+
+
 def test_eta_matches_the_inline_joint_logit_score():
     recs = _recs()
     specs = {s["rule"]: s["fn"] for s in fl._build_specs(recs)}
