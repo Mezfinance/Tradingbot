@@ -23,7 +23,10 @@ Box loop sketch (pseudocode):
 """
 from collections import Counter
 
-from . import precursor_gate
+try:                                  # in-package (tradingbot.frontrun_live) and standalone on the box both work
+    from . import precursor_gate
+except ImportError:                   # noqa: E722 -- box copy sits next to precursor_gate.py
+    import precursor_gate
 
 DEFAULT_FLURRY_MIN = 3   # the 'F' symbol threshold flurry_study.frontrun uses (DEFAULT_FLURRY_MIN); only affects sym==F
 
