@@ -2490,6 +2490,61 @@ def _front_logit(tr, ho, specfn, rules, lead):
             "auc_hold": auc, "pseudo_r2": r2, "n_predictors": len(kept)}
 
 
+FRONT_GATE_PCTS = (80, 90, 95, 98, 99)   # fire the joint logit only on its top (100-pct)% of scores
+
+
+def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS):
+    """The decisive precision test: score every HOLDOUT slot with the fitted joint logit (out of sample -- it was
+    fit on train), then enter-on-signal only when that score is in its top k%. A single rule fires too broadly
+    (16k fires for ~700 moves -> -1% median); the joint gate at a high threshold fires on far fewer, far cleaner
+    slots. If it still has no positive-median cell, precision is not the lever and the base-rate wall holds."""
+    preds = (lg or {}).get("predictors") or []
+    if not preds or not ho:
+        return {"rows": []}
+    b0 = preds[0]["coef"]                                   # intercept
+    terms = [(p["coef"], specfn[p["name"]]) for p in preds[1:] if p["name"] in specfn]
+    by_pool, scores = {}, []
+    for r in ho:
+        eta = b0 + sum(c for c, fn in terms if fn(r))
+        r["_eta"] = eta
+        scores.append(eta)
+        by_pool.setdefault(r["pool"], []).append(r)
+    scores = np.array(scores, float)
+    rows = []
+    for pct in FRONT_GATE_PCTS:
+        thr = float(np.quantile(scores, pct / 100.0))
+        rr = {h: [] for h in holds}
+        n_fire = 0
+        for pool, recs in by_pool.items():
+            flow = pool_flows.get(pool)
+            if not flow:
+                continue
+            slots, pull = flow["slots"], flow["pull_slot"]
+            for rec in recs:
+                if rec["_eta"] < thr:
+                    continue
+                n_fire += 1
+                for h in holds:
+                    v = _scalp(slots, pull, rec["idx"], h, cost)
+                    if v is not None:
+                        rr[h].append(v)
+        rows.append({"pct": pct, "n": n_fire, "holds": {h: _agg(v) for h, v in rr.items()}})
+    # holdout-only random control so the comparison is out of sample too
+    rng = random.Random(0)
+    ctrl = {h: [] for h in holds}
+    for pool in by_pool:
+        flow = pool_flows.get(pool)
+        if not flow or len(flow["slots"]) < 3:
+            continue
+        slots, pull = flow["slots"], flow["pull_slot"]
+        for idx in rng.sample(range(len(slots) - 1), min(FRONT_CONTROL, len(slots) - 1)):
+            for h in holds:
+                v = _scalp(slots, pull, idx, h, cost)
+                if v is not None:
+                    ctrl[h].append(v)
+    return {"rows": rows, "control": {h: _agg(v) for h, v in ctrl.items()}}
+
+
 def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=FRONT_LEADS,
              seed=0, flurry_min=DEFAULT_FLURRY_MIN):
     """Can we predict a >= `move` up-move early enough to enter <=k slots before it and exit 1-2 after?
@@ -2604,6 +2659,7 @@ def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=
                     "holds": {h: _agg(v) for h, v in rr.items()}})
     out["net"] = net
     out["logit"] = _front_logit(tr, ho, specfn, [s["rule"] for s in survivors.get(lead_net, [])], lead_net)
+    out["logit_gate"] = _front_logit_gate(ho, pool_flows, specfn, out["logit"], cost)
     return out
 
 
@@ -2698,6 +2754,33 @@ def render_frontrun(out):
                                     else "no indicator stays significant under Bonferroni once the others are controlled -- the univariate leads are largely one signal"))
     else:
         L.append("  MULTIVARIATE LOGISTIC: no surviving indicators at the deployed lead to fit")
+
+    gate = out.get("logit_gate") or {}
+    L.append("")
+    if gate.get("rows"):
+        L.append("  LOGIT-GATE ENTER-ON-SIGNAL (out of sample on holdout pools) -- fire only when the JOINT logit")
+        L.append("  score is in its top k%; precision test vs the single-rule net. Buy front of N+1, hold H, minus cost.")
+        L.append("  %-24s%s" % ("", "".join("%28s" % ("hold %d" % h) for h in FRONT_HOLDS)))
+        gc = gate.get("control", {})
+        L.append("  %-24s%s" % ("control (holdout random)",
+                                "".join("  " + cell(gc.get(h, {})) for h in FRONT_HOLDS)))
+        paid = None
+        for row in gate["rows"]:
+            lbl = "top %d%% (n%d)" % (100 - row["pct"], row["n"])
+            L.append("  %-24s%s" % (lbl, "".join("  " + cell(row["holds"].get(h, {})) for h in FRONT_HOLDS)))
+            for h in FRONT_HOLDS:
+                a, c = row["holds"].get(h, {}), gc.get(h, {})
+                if a.get("n", 0) >= 30 and a.get("mean", -9) > 0 and a.get("median", -9) > 0 \
+                        and a["mean"] > c.get("mean", 0) and a.get("win_pct", 0) >= c.get("win_pct", 0):
+                    edge = a["mean"] - c.get("mean", 0)
+                    if paid is None or edge > paid[0]:
+                        paid = (edge, row["pct"], h, a)
+        L.append("  => LOGIT-GATE %s" % (
+            "top %d%% / hold %d PAYS out of sample: net %+.1f%% (median %+.1f%%, win %.0f%%, n%d) -- the high-precision joint gate flips it; validate LIVE (1-slot NET probe) before any ShredStream build"
+            % (100 - paid[1], paid[2], paid[3]["mean"] * 100, paid[3]["median"] * 100, paid[3]["win_pct"], paid[3]["n"]) if paid
+            else "even the high-precision joint gate has no positive-median cell -- precision is not the lever, the base-rate wall holds, drop ShredStream"))
+    else:
+        L.append("  LOGIT-GATE ENTER-ON-SIGNAL: no fitted joint logit to gate on")
 
     L.append("")
     L.append("  Mid-to-mid on untouched pools (hypothesis only, per the invariant); the live arbiter is a real reactive NET entry.")

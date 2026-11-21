@@ -842,6 +842,10 @@ def test_frontrun_finds_the_precursor_and_it_pays():
         assert nrow["coef"] > 0                                      # precursor points the right way in the joint fit
         assert all(0.0 <= p["p"] <= 1.0 and fl.np.isfinite(p["z"]) for p in lg["predictors"])
         assert lg["auc_hold"] is not None and lg["auc_hold"] > 0.5   # the joint model predicts the up-move out of sample
+        gate = out["logit_gate"]                                     # the high-precision gate test is well-formed
+        assert gate["rows"] and "control" in gate
+        assert all(r["n"] >= 0 and set(r["holds"]) == set(fl.FRONT_HOLDS) for r in gate["rows"])
+        assert gate["rows"][-1]["n"] <= gate["rows"][0]["n"]         # a stricter top-k% fires on fewer slots
         assert fl.render_frontrun(out)
     finally:
         fl.USE_VQ = saved
