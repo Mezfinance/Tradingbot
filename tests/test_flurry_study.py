@@ -736,3 +736,40 @@ def test_multibuy_no_edge_when_flat():
     out = fl.multibuy_study(have, metas, 0.01)        # a round-trip cost, so a flat hold is negative
     assert out["best"] is None
     assert "NO BAND x EXIT-HOLD PAYS" in fl.render_multibuy(out)
+
+
+def test_pool_vq_decodes_the_i128_at_offset_245():
+    raw = bytes(245) + (12345).to_bytes(16, "little", signed=True)
+    assert fl._pool_vq(raw) == 12345
+    assert fl._pool_vq(b"") == 0
+    assert fl._pool_vq(bytes(100)) == 0            # too short to hold the field
+
+
+def test_virtual_quote_basis_dampens_early_moves():
+    # Raw vault ratio inflates early-life moves (virtual_quote dominates the tiny real quote vault); adding vq
+    # gives the effective basis the live WS stream uses, so the ">=0.3" target fires on real moves, not artifacts.
+    rec = {"create_ts": 0, "txs": [
+        [0.0, 100, "w", -10.0, 1.0, 1000.0, 1.0],
+        [0.1, 101, "w", -10.0, 1.0, 990.0, 2.0],
+        [0.2, 102, "w", -10.0, 1.0, 980.0, 3.0],
+    ]}
+
+    def moves(flow):
+        p = [s["price"] for s in flow["slots"]]
+        return [p[i] / p[i - 1] - 1.0 for i in range(1, len(p))]
+
+    saved = fl.USE_VQ
+    try:
+        fl.USE_VQ = False
+        raw = moves(fl.slot_flow(rec))
+        assert raw[0] > 1.0 and raw[1] > 0.4           # raw ratio: fake +100% / +50% moves
+
+        fl.USE_VQ = True
+        rec["vq"] = 30_000_000_000                     # 30 SOL virtual_quote (raw lamports)
+        eff = moves(fl.slot_flow(rec))
+        assert all(m < 0.1 for m in eff)               # effective basis: the real move is a few %
+
+        rec.pop("vq")                                  # vq on but the rec carries none -> graceful raw fallback
+        assert moves(fl.slot_flow(rec)) == raw
+    finally:
+        fl.USE_VQ = saved

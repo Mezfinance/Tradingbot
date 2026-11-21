@@ -41,6 +41,13 @@ SCHEMA = "CREATE TABLE IF NOT EXISTS watch_flurry(pool TEXT PRIMARY KEY, data TE
 MAX_PAGES = 6          # history_from_start pages (10 credits / 100 txs)
 MINUTE6_S = 360
 
+# When True, slot_flow adds the pool's virtual_quote (raw lamports -> SOL) to the SOL reserve so the price is the
+# live EFFECTIVE (vq-aware) basis, not the raw vault ratio. Raw ratio inflates early-life moves (vq dominates the
+# quote side when little real SOL is in yet), manufacturing fake big abs-moves. Off by default so every existing
+# mode's numbers stay reproducible; the frontrun mode turns it on. Needs rec["vq"], populated by fetch_flows on a
+# --fetch run (and backfilled onto the existing cache). Toggle on the CLI with --vq.
+USE_VQ = False
+
 # flurry definitions: (label, field, threshold).  A slot is a flurry slot if field >= threshold.
 # field 'n_buys' = buy txs in the slot; 'buy_sol' = SOL bought into the pool that slot; 'net_sol' = buy - sell SOL.
 FLURRY_DEFS = [
@@ -134,6 +141,12 @@ def classify(tok_change: float, sol_change: float) -> str:
     return "other"
 
 
+def _pool_vq(raw: bytes) -> int:
+    """pumpswap Pool.virtual_quote_reserves (i128 @245), raw base units (lamports for WSOL). 0 if unreadable.
+    Mirrors execution.pumpswap_direct.pool_extra without importing the executor (and its chain deps)."""
+    return int.from_bytes(raw[245:261], "little", signed=True) if raw and len(raw) >= 261 else 0
+
+
 def slot_flow(rec: dict) -> dict | None:
     """Rebuild the per-slot series from a launch_record dict. Returns None if there is no usable price path.
     `slots` is a sorted list of per-slot dicts {slot, n_buys, buy_sol, n_sells, sell_sol, price}; `price` is the
@@ -141,6 +154,7 @@ def slot_flow(rec: dict) -> dict | None:
     txs = rec.get("txs") or []
     by_slot: dict[int, dict] = {}
     pull_slot = None
+    vq_sol = (rec.get("vq") or 0) / 1e9 if USE_VQ else 0.0   # virtual_quote (raw lamports) -> SOL: effective basis
     for r in txs:
         slot = r[_SLOT]
         if slot is None:
@@ -161,7 +175,7 @@ def slot_flow(rec: dict) -> dict | None:
         elif kind == "pull" and pull_slot is None:
             pull_slot = slot
         if tok_after and tok_after > 0:                   # price after this tx = end-of-slot price so far
-            s["price"] = float(sol_after) / float(tok_after)
+            s["price"] = (float(sol_after) + vq_sol) / float(tok_after)
     slots = [by_slot[k] for k in sorted(by_slot)]
     # carry a price forward over slots whose last tx did not leave a readable reserve
     last = None
@@ -312,6 +326,24 @@ def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: in
         have[pool] = rec
         if progress:
             progress(i + 1, len(order), credits)
+    # vq backfill: add each usable pool's virtual_quote (for the effective-reserve basis) in one batched read per
+    # 100 pools. Covers both pools fetched just now and any older cache rows that predate the vq field.
+    need = [m["pool"] for m in order
+            if (have.get(m["pool"]) or {}).get("txs") and "vq" not in have[m["pool"]]]
+    ct = {m["pool"]: (m.get("create_ts") or 0) for m in order}
+    for j in range(0, len(need), 100):
+        if credits + 1 > max_credits:
+            break
+        chunk = need[j:j + 100]
+        acc = helius.accounts(chunk)
+        credits += 1
+        if not acc:
+            continue
+        for pool in chunk:
+            data = acc.get(pool)
+            have[pool]["vq"] = _pool_vq(data[1]) if data else 0
+            store.execute("INSERT OR REPLACE INTO watch_flurry(pool, data, ts) VALUES(?,?,?)",
+                          (pool, json.dumps(have[pool]), ct.get(pool, 0)))
     return have, credits
 
 
