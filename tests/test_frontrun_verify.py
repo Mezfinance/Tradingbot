@@ -100,3 +100,18 @@ def test_parse_fires_reads_jsonl_and_a_log_blob():
 def test_render_runs():
     out = fv.verify([{"pool": "P", "slot": _firing_slots(0)[0][0], "box": {}}], dict(GATE), have={"P": _cre_front(0)})
     assert "FRONT-RUN FEED VERIFY" in fv.render(out)
+
+
+def test_truncated_fetch_is_classified_separately_from_a_divergence():
+    flow = {"slots": [{"slot": 10}, {"slot": 20}, {"slot": 30}]}
+    assert fv._is_truncated(40, flow, reached=False) is True    # capped before the slot -> truncated, not a feed bug
+    assert fv._is_truncated(40, flow, reached=True) is False    # the fetch reached the end -> a real miss
+    assert fv._is_truncated(25, flow, reached=False) is False   # within the fetched range -> a real dead-slot divergence
+    assert fv._is_truncated(5, {"slots": []}, reached=False) is True
+
+
+def test_injected_rec_is_never_truncated():
+    # an injected rec (have=) is complete, so a slot the flow lacks is a real divergence, never "truncated"
+    out = fv.verify([{"pool": "P", "slot": 999999999, "box": {}}], dict(GATE), have={"P": _cre_front(0)})
+    assert out.get("n_truncated", 0) == 0
+    assert out["rows"][0]["status"] == "ok" and out["rows"][0]["reproduced"] is False

@@ -74,13 +74,26 @@ def _resolve_mint(helius, pool: str) -> str | None:
     return parsed.get("token_mint") if parsed else None
 
 
-def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3,
-               helius=None, rec: dict | None = None, span_s: float = 180.0) -> dict:
+def _is_truncated(fired_slot: int, flow: dict, reached: bool) -> bool:
+    """True when the fetch was page-capped (reached=False) BEFORE the fired slot, so the fired slot is missing
+    from the offline flow for a fetch reason, not a feed/box bug -- raise --pages to include it. A fired slot
+    at or below the last fetched slot but still not an active slot IS a real divergence (box fired on a dead
+    slot). An injected rec (tests / a box-dumped series) is complete, so reached is True and this is never hit."""
+    if reached:
+        return False
+    slots = flow.get("slots") or []
+    last = slots[-1]["slot"] if slots else -1
+    return fired_slot > last
+
+
+def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, helius=None,
+               rec: dict | None = None, span_s: float = 180.0, max_pages: int | None = None) -> dict:
     """Replay one fired pool through the study's ground-truth path and score the box's gate on every slot.
     `rec` (a launch_record dict) short-circuits the fetch -- used by tests and when the box dumped its own series."""
     pool, slot, box = fire["pool"], int(fire["slot"]), fire.get("box") or {}
     gate_vis = gate.get("vis", "full")              # replay through the VIEW the gate was fit on = the box's own view
     res = {"pool": pool, "slot": slot, "box": box, "vis": gate_vis}
+    reached = True                                  # an injected rec is complete; only a real fetch can truncate
     if rec is None:
         if helius is None:
             res["status"] = "no helius"
@@ -89,7 +102,7 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3,
         if not mint:
             res["status"] = "mint unresolved"
             return res
-        txs, _more, _err = helius.history_from_start(pool, span_s, fl.MAX_PAGES)
+        txs, reached, _err = helius.history_from_start(pool, span_s, max_pages or fl.MAX_PAGES)
         rec = he.launch_record(txs, pool, mint, window_s=span_s, with_vis=(gate_vis != "full"))
     saved = fl.USE_VQ
     try:
@@ -119,6 +132,10 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3,
             at = {"sym": r["sym"], "m2": r["m2"], "m3": r["m3"], "eta": round(e, 4), "fires": hit,
                   "abs_move": round(float(r["f"].get("abs_move", 0.0)), 4),
                   "fwd_move": (round(fwd, 4) if fwd is not None else None)}
+    if at is None and _is_truncated(slot, flow, reached):
+        res["status"] = "truncated"
+        res["note"] = "fetch capped at %d pages before the fired slot (raise --pages; not a box error)" % (max_pages or fl.MAX_PAGES)
+        return res
     res["status"] = "ok"
     res["n_slots"] = len(flow["slots"])
     res["in_flow"] = at is not None
@@ -133,23 +150,25 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3,
 
 
 def verify(fires: list[dict], gate: dict, helius=None, have: dict | None = None,
-           tier: str = "1", flurry_min: int = 3, span_s: float = 180.0) -> dict:
+           tier: str = "1", flurry_min: int = 3, span_s: float = 180.0, max_pages: int | None = None) -> dict:
     """Verify every fire. `have` (pool -> launch_record dict) injects ground-truth recs without Helius (tests)."""
     if "_terms" not in gate:
         pg.compile_gate(gate)
     rows = [verify_one(f, gate, tier, flurry_min, helius=helius,
-                       rec=(have or {}).get(f["pool"]), span_s=span_s) for f in fires]
+                       rec=(have or {}).get(f["pool"]), span_s=span_s, max_pages=max_pages) for f in fires]
     ok = [r for r in rows if r.get("status") == "ok"]
     repro = sum(1 for r in ok if r["reproduced"])
+    trunc = sum(1 for r in rows if r.get("status") == "truncated")
     return {"tier": tier, "vis": gate.get("vis", "full"), "n_fires": len(fires), "n_checked": len(ok),
-            "n_reproduced": repro, "n_diverged": len(ok) - repro, "rows": rows}
+            "n_reproduced": repro, "n_diverged": len(ok) - repro, "n_truncated": trunc, "rows": rows}
 
 
 def render(out: dict) -> str:
     L = [f"FRONT-RUN FEED VERIFY  (tier {out['tier']}: top {out['tier']}%,  gate vis '{out.get('vis', 'full')}'"
          f"{' = the box view' if out.get('vis') == 'direct' else ''})",
          f"  fires {out['n_fires']}  checked {out['n_checked']}  "
-         f"reproduced {out['n_reproduced']}  DIVERGED {out['n_diverged']}", ""]
+         f"reproduced {out['n_reproduced']}  DIVERGED {out['n_diverged']}"
+         + (f"  truncated {out['n_truncated']}" if out.get('n_truncated') else ""), ""]
     L.append(f"  {'pool':<20}{'slot':>12}{'in?':>5}{'fires?':>7}{'sym':>5}{'m2':>5}{'eta':>8}"
              f"{'absmv@N':>9}{'fwd':>8}  kind  match")
     for r in out["rows"]:
@@ -168,6 +187,9 @@ def render(out: dict) -> str:
                  f"{('y' if o.get('fires') else 'n'):>7}{str(o.get('sym','')):>5}{str(o.get('m2','')):>5}"
                  f"{(o.get('eta') if o.get('eta') is not None else 0):>8.3f}"
                  f"{(am if am is not None else 0):>9.4f}{(fw if fw is not None else 0):>+8.3f}  {kind:<10}{ms}{flag}")
+    if out.get("n_truncated"):
+        L += ["", f"  {out['n_truncated']} fires were FETCH-TRUNCATED (busy pool, history capped before the slot) --",
+              "  not divergences; raise --pages to fetch them. They are excluded from reproduced/DIVERGED."]
     if out["n_diverged"]:
         L += ["", "  DIVERGED fires = the box's live slot aggregation did not reproduce on chain ground truth.",
               "  Check, in order: the per-slot buyer wallet (fee payer = keys[0]); buy vs sell classification;",

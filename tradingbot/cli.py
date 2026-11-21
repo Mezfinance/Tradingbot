@@ -220,6 +220,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--pairs", type=str, default=None, help="frontrun-verify: box fires by hand as 'pool:slot[:mint],pool:slot'")
     parser.add_argument("--gate", type=str, default=None, help="frontrun-verify: the exported gate JSON (flurry-study --export-gate)")
     parser.add_argument("--tier", type=str, default="1", help="frontrun-verify: gate tier to check (1 = top 1%%, 2 = top 2%%)")
+    parser.add_argument("--pages", type=int, default=None, help="frontrun-verify: history pages to fetch per pool (100 txs each; raise for busy pools so a late fired slot is fetched rather than falsely truncated; default 6)")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
     parser.add_argument("--apply", action="store_true", help="canary-sweep: close the empty accounts (default: list)")
@@ -798,7 +799,7 @@ def main(argv: list[str] | None = None) -> None:
             from tradingbot.data.helius import Helius as _FvHelius
             _fvh = _FvHelius(client=_fv_httpx.Client(timeout=60))  # research (backup) key, never the live key
             _fvh.min_interval_s = 1 / max(args.rps, 0.1)
-        _out = _fv.verify(_fires, _gate, helius=_fvh, tier=args.tier, flurry_min=args.flurry_min, span_s=args.span_s)
+        _out = _fv.verify(_fires, _gate, helius=_fvh, tier=args.tier, flurry_min=args.flurry_min, span_s=args.span_s, max_pages=args.pages)
         print(json.dumps(_out, indent=2, default=str) if args.json else _fv.render(_out))
         return
 
