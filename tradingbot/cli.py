@@ -209,6 +209,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--pools", type=str, default=None, help="flurry-study: run the literal study on a live-captured pool universe (JSON/JSONL of {pool, token_mint, create_ts} from the box absmove.py MODE=capture) instead of the scorer's pools -- route #1, exact study on ShredStream-surfaced pools")
     parser.add_argument("--flows", type=str, default=None, help="flurry-study: run the literal walk-forward (discover/scalp/tail) on slot flows reconstructed LIVE by the box surf.py (JSONL of {pool, token_mint, create_ts, rec}); create_ts = first-seen wall-clock, so the time split is a prospective live walk-forward. No Helius.")
     parser.add_argument("--max-hold", type=int, default=None, help="flurry-study: report the scalp at EVERY slot hold 1..N as its own column (flurry/motif/discovered-rule tables), to see continuation slot by slot. A hold >2 re-exposes to the reactive LP pull, so rugged%% rises -- read it as the hold/pull tradeoff, not a safe scalp.")
+    parser.add_argument("--frontrun", action="store_true", help="flurry-study: front-run study -- can an indicator predict a >= --move-pct (default 30%%) up-move early enough to enter <=3 slots before it and exit 1-2 after? Perfect-foresight ceiling + lead-swept z-guarded indicator discovery + enter-on-signal net vs control. Forces --vq (effective reserve basis).")
+    parser.add_argument("--vq", action="store_true", help="flurry-study: price on the effective (virtual_quote-aware) reserve basis, matching the live WS stream, instead of the raw vault ratio (which inflates early-life moves into basis artifacts). Needs --fetch to populate vq. Off by default so other modes stay reproducible; --frontrun forces it on.")
     parser.add_argument("--entry-window", type=int, nargs="?", const=10, default=None, metavar="W", help="flurry-study: patience study -- keep the safe 1-2 slot hold, but sweep WHICH entry slot (N+1..N+W, default W=10) to take it after a slot-N signal. A pull during the wait = no entry (no loss); reports per-offset EV, best-of-window ceiling, and a causal up-tick-ride rule vs a random-active-slot control, out of sample.")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
@@ -769,6 +771,8 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "flurry-study":  # slot-level buy-flurry continuation for the reactive-backrun scalp (11-17)
         from tradingbot import flurry_study as _fl
+        if args.vq or args.frontrun:   # effective (vq-aware) reserve basis; frontrun needs it or the target is an artifact
+            _fl.USE_VQ = True
         from tradingbot.journal import Journal as _FlJournal
         from tradingbot.watcher import WatchStore as _FlWS, watch_db_path as _fl_wdp
         fl_helius = None
@@ -812,7 +816,7 @@ def main(argv: list[str] | None = None) -> None:
                 out = _fl.entry_window(_have, _metas, _tgt, args.cost_pct / 100.0, window=args.entry_window)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_entry_window(out))
             return
-        if args.tail or args.discover_econ or args.creation or args.slot0 or args.multibuy:  # tail / econ-discovery / creation / slot-0 / multibuy (all read flows the same way)
+        if args.tail or args.discover_econ or args.creation or args.slot0 or args.multibuy or args.frontrun:  # tail / econ-discovery / creation / slot-0 / multibuy / frontrun (all read flows the same way)
             import time as _fl_time
             from tradingbot import pool_tracker as _fl_pt
             _ws = _FlWS(_fl_wdp(cfg))
@@ -844,6 +848,10 @@ def main(argv: list[str] | None = None) -> None:
                 out = _fl.discover_econ(_have, _metas, _tgt, args.cost_pct / 100.0)
                 out["target"] = _tgt
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_econ(out))
+            elif args.frontrun:   # front-run a >= move up-move: ceiling + lead-swept discovery + enter-on-signal net
+                _mv = args.move_pct / 100.0 if abs(args.move_pct - 1.0) > 1e-9 else _fl.FRONT_MOVE
+                out = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0, flurry_min=args.flurry_min)
+                print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_frontrun(out))
             else:
                 out = _fl.tail_report(_have, _metas, _tgt, args.cost_pct / 100.0, hold=args.horizon)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_tail(out))

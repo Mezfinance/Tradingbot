@@ -2343,3 +2343,252 @@ def render(out: dict) -> str:
     _sweep_block(out.get("down_sweep"), "down_move",
                  "  [SELL SIDE: fire after a DOWN-spike, buy the trough, bet the bounce -- the reversion test]")
     return "\n".join(L)
+
+
+# --- front-run study (11-21): position BEFORE a >= FRONT_MOVE up-move, so the spike is the gain, not the entry.
+# The up-side fill artifact (11-19: react = buy the spike top, sell the reversion trough) is sidestepped by being
+# IN before the spike. The only hard constraint is the trade window (enter <=k slots before T, exit 1-2 after);
+# the indicator LEAD (how far before T it fires) is swept and REPORTED, not fixed. Runs on the vq (effective)
+# basis -- set USE_VQ True (the CLI --frontrun does) or the >= 0.3 target fires on raw-ratio basis artifacts.
+FRONT_MOVE = 0.30            # the single-slot up-move (effective basis) we want to be positioned before
+FRONT_LEADS = (1, 2, 3, 5, 8)   # indicator LEAD windows (raw slots ahead), swept -- each rule's profile is reported
+FRONT_K = (1, 2, 3)         # ceiling: enter this many slots BEFORE the up-move slot T
+FRONT_J = (1, 2)            # ceiling: exit this many slots AFTER T
+FRONT_ENTRY_LEAD = 3        # the deployed enter-on-signal window: an up-move within this many slots ahead
+FRONT_HOLDS = (2, 3, 4, 5)  # enter-on-signal holds (raw slots) covering the lead + a 1-2 slot exit
+FRONT_CONTROL = 60          # random active slots per pool for the enter-on-signal control
+FRONT_NET_TOP = 6           # surviving indicators carried into the actionable-net scalp
+
+
+def _slot_moves(slots):
+    return [0.0] + [(slots[i]["price"] / slots[i - 1]["price"] - 1.0) if slots[i - 1]["price"] else 0.0
+                    for i in range(1, len(slots))]
+
+
+def _up_event_slots(slots, move):
+    """Slot NUMBERS of single-slot up-moves >= `move` -- the T's we want to front-run."""
+    mv = _slot_moves(slots)
+    return [slots[i]["slot"] for i in range(1, len(slots)) if mv[i] >= move]
+
+
+def _front_ceiling(flow, move, cost):
+    """Perfect-foresight: enter T-k, exit T+j (T = an up-move slot). Per (k,j), a list of returns.
+    -1.0 if an LP pull lands in (T-k, T+j]. The ceiling: is there money even with perfect timing."""
+    slots, pull = flow["slots"], flow["pull_slot"]
+    out = {}
+    for tn in _up_event_slots(slots, move):
+        for k in FRONT_K:
+            entry = _price_at(slots, tn - k)
+            if not entry:
+                continue
+            for j in FRONT_J:
+                if pull is not None and tn - k < pull <= tn + j:
+                    r = -1.0
+                else:
+                    ex = _price_at(slots, tn + j)
+                    if not ex:
+                        continue
+                    r = max(-1.0, min(ex / entry - 1.0 - cost, RET_CAP))
+                out.setdefault((k, j), []).append(r)
+    return out
+
+
+def _front_label(sn, events, lead):
+    """1.0 if the nearest up-move slot after `sn` lands within `lead` raw slots (events sorted ascending)."""
+    for e in events:
+        if e <= sn:
+            continue
+        return 1.0 if e - sn <= lead else 0.0
+    return 0.0
+
+
+def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=FRONT_LEADS,
+             seed=0, flurry_min=DEFAULT_FLURRY_MIN):
+    """Can we predict a >= `move` up-move early enough to enter <=k slots before it and exit 1-2 after?
+    (1) ceiling: enter T-k / exit T+j with perfect foresight; (2) indicator discovery, LEAD swept and reported
+    (z-guarded time holdout, discover's discipline); (3) actionable enter-on-signal net vs a random-slot control.
+    Needs USE_VQ (effective reserves), else the target is a raw-ratio artifact. Observational -> hypothesis only."""
+    import math
+    base_tgt = _tgt("price", flurry_min, 1, move * 100.0)     # for features/symbols only; target overwritten
+    ct = {m["pool"]: (m.get("create_ts") or 0) for m in metas}
+    ceiling, all_recs, pool_flows = {}, [], {}
+    n_events = n_slots = n_pools = 0
+    for m in metas:
+        rec = have.get(m["pool"])
+        flow = slot_flow(rec) if rec else None
+        if not flow:
+            continue
+        n_pools += 1
+        slots = flow["slots"]
+        n_slots += len(slots)
+        pool_flows[m["pool"]] = flow
+        for key, rs in _front_ceiling(flow, move, cost).items():
+            ceiling.setdefault(key, []).extend(rs)
+        events = _up_event_slots(slots, move)
+        n_events += len(events)
+        recs = _slot_bank(flow, ct.get(m["pool"], 0), base_tgt)
+        for idx, r in enumerate(recs):
+            r["target_by_lead"] = {L: _front_label(slots[idx]["slot"], events, L) for L in leads}
+            r["pool"], r["idx"] = m["pool"], idx
+        all_recs.extend(recs)
+
+    out = {"mode": "frontrun", "move": move, "cost": cost, "leads": list(leads), "use_vq": USE_VQ,
+           "pools": n_pools, "slots": n_slots, "events": n_events,
+           "event_rate": (n_events / n_slots if n_slots else 0.0),
+           "ceiling": {f"{k}-{j}": _agg(v) for (k, j), v in sorted(ceiling.items())},
+           "survivors": {L: [] for L in leads}, "profile": {}, "net": [], "control": {}, "zc": 3.0,
+           "net_lead": FRONT_ENTRY_LEAD}
+    if len(all_recs) < DISC_MIN_SUPPORT * 2:
+        return out
+
+    # time-split by create_ts (discover's discipline); fall back to a random split if a half is too thin.
+    cts = sorted(r["create_ts"] for r in all_recs)
+    split = cts[len(cts) // 2]
+    tr = [r for r in all_recs if r["create_ts"] <= split]
+    ho = [r for r in all_recs if r["create_ts"] > split]
+    rng = random.Random(seed)
+    if len(tr) < DISC_MIN_SUPPORT * 2 or len(ho) < DISC_MIN_SUPPORT * 2:
+        order = list(range(len(all_recs)))
+        rng.shuffle(order)
+        cut = len(order) // 2
+        trs = set(order[:cut])
+        tr = [all_recs[i] for i in order[:cut]]
+        ho = [all_recs[i] for i in order[cut:]]
+
+    specs = _build_specs(tr)
+    specfn = {s["rule"]: s["fn"] for s in specs}
+    zc = max(3.0, math.sqrt(2.0 * math.log(max(len(specs) * len(leads), 2))))
+    out["zc"] = zc
+    profile, survivors = {}, {L: [] for L in leads}
+    for L in leads:
+        ttr = np.array([r["target_by_lead"][L] for r in tr], float)
+        tho = np.array([r["target_by_lead"][L] for r in ho], float)
+        btr = float(ttr.mean()) if len(ttr) else 0.0
+        bho = float(tho.mean()) if len(tho) else 0.0
+        surv = []
+        for spec in specs:
+            etr = _eval_spec(spec, tr, ttr, btr)
+            eho = _eval_spec(spec, ho, tho, bho)
+            if not etr or not eho:
+                continue
+            cell = {"lift": eho["lift"], "z": eho["z"], "p": eho["rate"], "n": eho["n"], "base": bho}
+            profile.setdefault(spec["rule"], {})[L] = cell
+            if (etr["lift"] - 1.0) * (eho["lift"] - 1.0) > 0 and eho["lift"] > 1.0 and abs(eho["z"]) >= zc:
+                surv.append({"rule": spec["rule"], **cell})
+        surv.sort(key=lambda s: -s["z"])
+        survivors[L] = surv[:DISC_TOP]
+    out["survivors"] = survivors
+    out["profile"] = profile
+
+    # actionable net: enter on the signal (front of idx+1), hold H, vs a random active-slot control.
+    recs_by_pool = {}
+    for r in all_recs:
+        recs_by_pool.setdefault(r["pool"], []).append(r)
+    ctrl = {h: [] for h in FRONT_HOLDS}
+    for flow in pool_flows.values():
+        slots, pull = flow["slots"], flow["pull_slot"]
+        if len(slots) < 3:
+            continue
+        for idx in rng.sample(range(len(slots) - 1), min(FRONT_CONTROL, len(slots) - 1)):
+            for h in FRONT_HOLDS:
+                r = _scalp(slots, pull, idx, h, cost)
+                if r is not None:
+                    ctrl[h].append(r)
+    out["control"] = {h: _agg(v) for h, v in ctrl.items()}
+    lead_net = FRONT_ENTRY_LEAD if survivors.get(FRONT_ENTRY_LEAD) else next((L for L in leads if survivors.get(L)), leads[0])
+    out["net_lead"] = lead_net
+    net = []
+    for p in survivors.get(lead_net, [])[:FRONT_NET_TOP]:
+        fn = specfn.get(p["rule"])
+        if not fn:
+            continue
+        rr = {h: [] for h in FRONT_HOLDS}
+        for pool, flow in pool_flows.items():
+            slots, pull = flow["slots"], flow["pull_slot"]
+            for rec in recs_by_pool.get(pool, []):
+                if not fn(rec):
+                    continue
+                for h in FRONT_HOLDS:
+                    r = _scalp(slots, pull, rec["idx"], h, cost)
+                    if r is not None:
+                        rr[h].append(r)
+        net.append({"rule": p["rule"], "z": p["z"], "lift": p["lift"],
+                    "holds": {h: _agg(v) for h, v in rr.items()}})
+    out["net"] = net
+    return out
+
+
+def render_frontrun(out):
+    L = ["FRONT-RUN STUDY  (position BEFORE a >= %.0f%% up-move; enter <=%d before T, exit 1-2 after)"
+         % (out["move"] * 100, FRONT_K[-1])]
+    L.append("  pools %d  active slots %d  up-move events %d (%.2f%% of slots)  cost %.2f%%  vq basis %s"
+             % (out["pools"], out["slots"], out["events"], out["event_rate"] * 100, out["cost"] * 100,
+                "ON" if out.get("use_vq") else "OFF (raw ratio -- numbers are basis artifacts!)"))
+
+    def cell(a):
+        if not a or not a.get("n"):
+            return "     . "
+        return "n%-4d %+6.1f/%+6.1f %3.0f%% rug%2.0f" % (a["n"], a["mean"] * 100, a["median"] * 100,
+                                                          a["win_pct"], a.get("rugged_pct", 0))
+
+    L.append("")
+    L.append("  CEILING -- perfect foresight (enter T-k / exit T+j): is there money if we time it exactly")
+    L.append("  k=before j=after   n mean/median win rug%")
+    best = None
+    for key in sorted(out["ceiling"]):
+        a = out["ceiling"][key]
+        L.append("  T-%s  exit T+%s      %s" % (key[0], key[-1], cell(a)))
+        if a.get("n", 0) >= 50 and a.get("mean", -9) > 0 and (best is None or a["mean"] > best[1]):
+            best = (key, a["mean"], a)
+    L.append("  => CEILING %s" % ("+EV at T-%s/exit+%s (%.1f%% mean) -- a real front-run exists IF an indicator finds T"
+                                   % (best[0][0], best[0][-1], best[1] * 100) if best
+                                   else "NO +EV cell even with perfect foresight -> the move itself doesn't pay; drop"))
+
+    leads = out["leads"]
+    prof = out["profile"]
+    L.append("")
+    L.append("  INDICATOR LEAD PROFILE -- holdout z of each surviving rule at each lead (z guard %.2f); lead = raw slots the up-move lands within"
+             % out["zc"])
+    L.append("  %-40s%s" % ("rule", "".join("%8s" % ("L%d" % Ld) for Ld in leads)))
+    seen = set()
+    rows = []
+    for Ld in leads:
+        for s in out["survivors"].get(Ld, []):
+            if s["rule"] in seen:
+                continue
+            seen.add(s["rule"])
+            zs = prof.get(s["rule"], {})
+            best_z = max((abs(zs[Ld]["z"]) for Ld in leads if Ld in zs), default=0.0)
+            rows.append((best_z, s["rule"], zs))
+    rows.sort(key=lambda x: -x[0])
+    for _bz, rule, zs in rows[:DISC_TOP]:
+        L.append("  %-40s%s" % (rule[:40], "".join(
+            ("%+8.1f" % zs[Ld]["z"]) if Ld in zs else "%8s" % "." for Ld in leads)))
+    if not rows:
+        L.append("  (nothing survives the holdout at any lead -> no indicator predicts the up-move early enough)")
+
+    L.append("")
+    L.append("  ENTER-ON-SIGNAL NET (lead %d) -- fire the rule, buy front of N+1, hold H slots, minus cost; vs random-slot control"
+             % out["net_lead"])
+    L.append("  %-40s%s" % ("", "".join("%28s" % ("hold %d" % h) for h in FRONT_HOLDS)))
+    L.append("  %-40s%s" % ("control (random active slot)",
+                            "".join("  " + cell(out["control"].get(h, {})) for h in FRONT_HOLDS)))
+    paid = None
+    for nrow in out["net"]:
+        L.append("  %-40s%s" % (nrow["rule"][:40], "".join("  " + cell(nrow["holds"].get(h, {})) for h in FRONT_HOLDS)))
+        for h in FRONT_HOLDS:
+            a, c = nrow["holds"].get(h, {}), out["control"].get(h, {})
+            if a.get("n", 0) >= 50 and a.get("mean", -9) > 0 and a.get("median", -9) > 0 \
+                    and a["mean"] > c.get("mean", 0) and a["win_pct"] >= c.get("win_pct", 0):
+                edge = a["mean"] - c.get("mean", 0)
+                if paid is None or edge > paid[0]:
+                    paid = (edge, nrow["rule"], h, a)
+    if not out["net"]:
+        L.append("  (no surviving indicator to trade)")
+    L.append("  => NET %s" % ("'%s' hold %d PAYS: net %+.1f%% (median %+.1f%%, win %.0f%%) vs control %+.1f%% -- validate LIVE (1-slot probe) before sizing"
+                              % (paid[1][:40], paid[2], paid[3]["mean"] * 100, paid[3]["median"] * 100,
+                                 paid[3]["win_pct"], out["control"].get(paid[2], {}).get("mean", 0) * 100) if paid
+                              else "no surviving indicator's enter-on-signal beats the control on mean AND median -- the lead doesn't pay at the entry"))
+    L.append("")
+    L.append("  Mid-to-mid on untouched pools (hypothesis only, per the invariant); the live arbiter is a real reactive NET entry.")
+    return "\n".join(L)

@@ -773,3 +773,84 @@ def test_virtual_quote_basis_dampens_early_moves():
         assert moves(fl.slot_flow(rec)) == raw
     finally:
         fl.USE_VQ = saved
+
+
+def _cre_front(create_ts, n_ep=25, up=0.40, signal=True, seed=0):
+    """A pool where (signal) a brand-new wallet buys the slot BEFORE a >= up spike, so sym==N front-runs it;
+    (not signal) up-moves happen with no new-wallet precursor. Consecutive slot numbers, constant-product buys."""
+    import random as _r
+    rng = _r.Random("%s-%s" % (seed, create_ts))
+    sol, tok = 100.0, 100000.0
+    rows, sec, slot = [], 0.0, 0
+    up_frac = (1.0 + up) ** 0.5 - 1.0        # constant-product: price x (1+frac)^2
+
+    def buy(payer, frac):
+        nonlocal sol, tok, sec, slot
+        k = sol * tok
+        nsol = sol + frac * sol
+        ntok = k / nsol
+        rows.append([sec, slot, payer, round(ntok - tok, 6), round(frac * sol, 9), round(ntok, 6), round(nsol, 9)])
+        sol, tok, sec, slot = nsol, ntok, sec + 0.4, slot + 1
+
+    for _ in range(5):
+        buy("w0", 0.002)
+    for e in range(n_ep):
+        if signal:
+            buy("new%d_%d" % (create_ts, e), 0.01)    # precursor: brand-new wallet, ~flat -> sym N
+            buy("wb", up_frac)                          # the >= up spike (T), repeat wallet
+        else:
+            buy("wb", up_frac if rng.random() < 0.5 else 0.01)   # spike with no new-wallet before it
+            buy("new%d_%d" % (create_ts, e), 0.01)               # new wallets AFTER the move, not before
+        buy("w0", 0.002)
+        buy("w0", 0.002)
+    return {"create_ts": create_ts, "txs": rows}
+
+
+def _flat_front(create_ts):
+    """No >= 0.3 move at all: only tiny filler buys -> no events to front-run."""
+    sol, tok = 100.0, 100000.0
+    rows, sec, slot = [], 0.0, 0
+    for _ in range(90):
+        k = sol * tok
+        nsol = sol + 0.002 * sol
+        ntok = k / nsol
+        rows.append([sec, slot, "w%d" % (slot % 4), round(ntok - tok, 6), round(0.002 * sol, 9),
+                     round(ntok, 6), round(nsol, 9)])
+        sol, tok, sec, slot = nsol, ntok, sec + 0.4, slot + 1
+    return {"create_ts": create_ts, "txs": rows}
+
+
+def test_frontrun_finds_the_precursor_and_it_pays():
+    saved = fl.USE_VQ
+    try:
+        fl.USE_VQ = False
+        metas = [{"pool": "P%d" % i, "token_mint": "M%d" % i, "create_ts": float(i)} for i in range(6)]
+        have = {"P%d" % i: _cre_front(i) for i in range(6)}
+        out = fl.frontrun(have, metas, move=0.30, cost=0.01)
+        assert out["events"] > 50                                    # the planted spikes are detected
+        assert out["ceiling"]["1-1"]["mean"] > 0.10                  # enter T-1 / exit T+1 captures the spike
+        surv = [s["rule"] for L in out["leads"] for s in out["survivors"][L]]
+        assert any("sym == N" in r for r in surv)                   # the new-wallet precursor is discovered
+        assert out["net"], "a surviving indicator should reach the net"
+        top = out["net"][0]
+        # it fires on the precursor slot and the spike lands in the hold -> beats the random-slot control
+        assert any(top["holds"][h]["n"] >= 50 and top["holds"][h]["mean"] > out["control"][h]["mean"]
+                   for h in fl.FRONT_HOLDS)
+        assert fl.render_frontrun(out)
+    finally:
+        fl.USE_VQ = saved
+
+
+def test_frontrun_flat_market_has_no_events_and_no_survivor():
+    saved = fl.USE_VQ
+    try:
+        fl.USE_VQ = False
+        metas = [{"pool": "F%d" % i, "token_mint": "M%d" % i, "create_ts": float(i)} for i in range(6)]
+        have = {"F%d" % i: _flat_front(i) for i in range(6)}
+        out = fl.frontrun(have, metas, move=0.30, cost=0.01)
+        assert out["events"] == 0                                   # nothing to front-run
+        assert not out["ceiling"]                                   # no perfect-foresight cell either
+        assert all(not out["survivors"][L] for L in out["leads"])   # and no indicator fabricated
+        assert fl.render_frontrun(out)
+    finally:
+        fl.USE_VQ = saved
