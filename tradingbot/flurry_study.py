@@ -341,7 +341,14 @@ def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: in
             pass
     if helius is None:
         return have, 0
-    order = sorted(metas, key=lambda m: hashlib.sha1(("fl:" + m["pool"]).encode()).hexdigest())
+
+    def _order_key(m):
+        c = have.get(m["pool"])
+        # when tagging, re-tag already-cached flows FIRST (cheap, focuses the budget on the flow set) before
+        # spending it discovering brand-new pools; otherwise the hash order spreads it across every candidate.
+        retag = with_vis and c and c.get("txs") and not _has_vis(c)
+        return (0 if retag else 1, hashlib.sha1(("fl:" + m["pool"]).encode()).hexdigest())
+    order = sorted(metas, key=_order_key)
     credits = 0
     for i, m in enumerate(order):
         pool = m["pool"]
@@ -2960,19 +2967,22 @@ def _gate_best(gate: dict, hold: int = 2, min_n: int = 30):
 
 def vis_experiment(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0,
                    flurry_min=DEFAULT_FLURRY_MIN, hold=2):
-    """Run the front-run fit on each box-reproducible visibility and compare the precursor gate's holdout edge."""
+    """Run the front-run fit on each box-reproducible visibility and compare the precursor gate's holdout edge.
+    Runs on the VISIBILITY-TAGGED flow pools only -- an untagged pool reads as not-direct, which would silently
+    empty its direct view and over-count its buyer_plus view, so including it corrupts the restricted columns.
+    Excluding it keeps all three columns on the same pool set (apples-to-apples); fetch more to grow the sample."""
     usable = [m for m in metas if slot_flow(have.get(m["pool"]) or {}) is not None]
-    tagged = sum(1 for m in usable if _has_vis(have.get(m["pool"])))
+    tagged = [m for m in usable if _has_vis(have.get(m["pool"]))]
     res = {}
     for mode in VIS_MODES:
-        out = frontrun(have, usable, move=move, cost=cost, flurry_min=flurry_min, vis=mode)
+        out = frontrun(have, tagged, move=move, cost=cost, flurry_min=flurry_min, vis=mode)
         best, ctrl = _gate_best(out.get("logit_gate_precursor"), hold=hold)
         res[mode] = {"pools": out.get("pools"), "slots": out.get("slots"), "events": out.get("events"),
                      "event_rate": out.get("event_rate"), "gate_rows": (out.get("logit_gate_precursor") or {}).get("rows"),
                      "best": best, "control": ctrl,
                      "survivors": len((out.get("survivors") or {}).get(out.get("net_lead"), []))}
     return {"mode": "vis-experiment", "move": move, "cost": cost, "hold": hold,
-            "usable_pools": len(usable), "tagged_pools": tagged, "results": res}
+            "usable_pools": len(usable), "tagged_pools": len(tagged), "results": res}
 
 
 def render_vis_experiment(out):
@@ -2980,9 +2990,9 @@ def render_vis_experiment(out):
          "  >= %.0f%% up-move, cost %.2f%%, gate hold %d slots;  usable pools %d, visibility-tagged %d"
          % (out["move"] * 100, out["cost"] * 100, out["hold"], out["usable_pools"], out["tagged_pools"])]
     if out["tagged_pools"] < out["usable_pools"]:
-        L.append("  WARNING: %d usable pools are NOT visibility-tagged (old cache) -- rerun with --fetch so the"
-                 % (out["usable_pools"] - out["tagged_pools"]))
-        L.append("           restricted modes see real direct/aggregator splits; untagged rows read as not-direct.")
+        L.append("  NOTE: run is on the %d TAGGED pools (same set in every column). %d more flow pools are cached"
+                 % (out["tagged_pools"], out["usable_pools"] - out["tagged_pools"]))
+        L.append("        but not yet tagged -- rerun --fetch to grow the sample (it re-tags cached flows first).")
     L.append("")
     L.append("  %-11s %8s %8s %10s   %-28s %8s %8s" %
              ("visibility", "pools", "events", "evt-rate", "best precursor-gate cell (hold)", "control", "edge"))

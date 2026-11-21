@@ -976,3 +976,24 @@ def test_vis_experiment_direct_loses_the_hidden_precursor_that_buyer_plus_keeps(
         assert "VISIBILITY EXPERIMENT" in fl.render_vis_experiment(out)
     finally:
         fl.USE_VQ = saved
+
+
+def test_vis_experiment_runs_only_on_tagged_pools():
+    # a mix of visibility-tagged and untagged flow pools: the untagged ones must be EXCLUDED (they would read as
+    # not-direct and corrupt the restricted columns), so the experiment runs on the tagged set only.
+    saved = fl.USE_VQ
+    try:
+        fl.USE_VQ = False
+        metas = [{"pool": "P%d" % i, "token_mint": "M%d" % i, "create_ts": float(i)} for i in range(8)]
+        have = {"P%d" % i: (_front_vis(i) if i < 6 else _cre_front(i)) for i in range(8)}  # 6 tagged, 2 untagged
+        out = fl.vis_experiment(have, metas, move=0.30, cost=0.01)
+        assert out["usable_pools"] == 8 and out["tagged_pools"] == 6   # both flow, only 6 carry the vis tag
+        # the tagged-only run reproduces the all-tagged mechanism: direct loses sym==N, buyer_plus keeps it
+        surv = {}
+        for mode in ("full", "direct", "buyer_plus"):
+            o = fl.frontrun(have, [m for m in metas if fl._has_vis(have[m["pool"]])], move=0.30, cost=0.01, vis=mode)
+            surv[mode] = [s["rule"] for L in o["leads"] for s in o["survivors"][L]]
+        assert any("sym == N" in r for r in surv["buyer_plus"])
+        assert not any("sym == N" in r for r in surv["direct"])
+    finally:
+        fl.USE_VQ = saved
