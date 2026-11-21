@@ -19,6 +19,21 @@ So the box's decode has to work from **instruction bytes alone**, pre-execution,
 routed swaps. The two needs collapse into one build: own the stack from UDP shred → transaction →
 swap classification.
 
+## RESULT (2026-11-21): router/CPI decoder NOT needed — direct-only carries the edge
+
+The clean `--vis-experiment` (999 pools, all tagged, apples-to-apples) settled it: with the target
+always the real full-flow ≥20% up-move and only the FEATURES restricted, the precursor-gate edge is
+**full +13.0, direct-only +11.6 (~89%), buyer_plus +9.7**. So the box's *existing* top-level pumpswap
+decode carries almost the whole edge, and `buyer_plus` (counting aggregator fee-payers as directionless
+buyers) is *worse* than direct — adding CPI recovery hurts. **Conclusion: do not build the router-aware
+CPI decoder (layer 1 below) or even the fee-payer recovery.** Tomorrow's work collapses to the feed
+migration — LocalShred proxy → transactions → the box's existing top-level pumpswap decode → the
+precursor gate. The layer-1 spec below is kept for the record but is shelved as not-needed.
+
+**Still unproven (honest):** this is the shred *view* carrying a mid-to-mid, untouched-pool,
+positive-skew tail (win ~10-14%, median −1.0), per the invariant. The next real gate is a **live
+reactive NET probe** (up-side exit-fill risk), not a build.
+
 ## Verdict: feasible, and simpler than feared
 
 The de-risking insight from the Jupiter v6 account layout (confirmed below): **we do not parse the
