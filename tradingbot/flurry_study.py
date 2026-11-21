@@ -2768,11 +2768,14 @@ def render_frontrun(out):
     else:
         L.append("  MULTIVARIATE LOGISTIC: no surviving indicators at the deployed lead to fit")
 
-    def gate_block(gate, title, front_run):
+    TAIL_MARGIN = 0.03  # mean must beat control by >=3 pts to count as a concentrated tail
+
+    def gate_block(gate, title, front_run, backrun=None):
+        # returns (best_tail_edge or None) so the precursor block can compare itself to the backrun gate
         if not (gate or {}).get("rows"):
             L.append("")
             L.append("  %s: no fitted joint logit to gate on" % title)
-            return
+            return None
         L.append("")
         L.append("  %s (out of sample on holdout pools) -- fire only when the JOINT logit" % title)
         kind = "excludes abs_move/move/price_up -> fires on the wallet SETUP before the move = a true front-run" \
@@ -2782,29 +2785,50 @@ def render_frontrun(out):
         gc = gate.get("control", {})
         L.append("  %-24s%s" % ("control (holdout random)",
                                 "".join("  " + cell(gc.get(h, {})) for h in FRONT_HOLDS)))
-        paid = None
+        broad = None  # triple guard (mean AND median AND win): a BROAD edge
+        tail = None   # mean clearly beats control, median at the cost floor: a positive-skew TAIL
         for row in gate["rows"]:
             lbl = "top %d%% (n%d)" % (100 - row["pct"], row["n"])
             L.append("  %-24s%s" % (lbl, "".join("  " + cell(row["holds"].get(h, {})) for h in FRONT_HOLDS)))
             for h in FRONT_HOLDS:
                 a, c = row["holds"].get(h, {}), gc.get(h, {})
-                if a.get("n", 0) >= 30 and a.get("mean", -9) > 0 and a.get("median", -9) > 0 \
+                if a.get("n", 0) < 30:
+                    continue
+                edge = a.get("mean", -9) - c.get("mean", 0)
+                if a.get("mean", -9) > 0 and a.get("median", -9) > 0 \
                         and a["mean"] > c.get("mean", 0) and a.get("win_pct", 0) >= c.get("win_pct", 0):
-                    edge = a["mean"] - c.get("mean", 0)
-                    if paid is None or edge > paid[0]:
-                        paid = (edge, row["pct"], h, a)
+                    if broad is None or edge > broad[0]:
+                        broad = (edge, row["pct"], h, a)
+                if a.get("mean", -9) > 0 and edge >= TAIL_MARGIN:
+                    if tail is None or edge > tail[0]:
+                        tail = (edge, row["pct"], h, a)
         tag = "GATE" if not front_run else "FRONT-RUN GATE"
-        if paid:
-            L.append("  => %s top %d%% / hold %d PAYS out of sample: net %+.1f%% (median %+.1f%%, win %.0f%%, n%d) -- validate LIVE (1-slot NET probe) before any ShredStream build"
-                     % (tag, 100 - paid[1], paid[2], paid[3]["mean"] * 100, paid[3]["median"] * 100,
-                        paid[3]["win_pct"], paid[3]["n"]))
+        side = "an UP-side tail (mid-to-mid overstates: live fills buy the spike, sell the reversion)" if front_run \
+            else "an UP-side tail (live fills work against it)"
+        if broad:
+            L.append("  => %s top %d%% / hold %d PAYS out of sample: net %+.1f%% (median %+.1f%%, win %.0f%%, n%d) -- a BROAD edge, validate LIVE (1-slot NET probe) before any ShredStream build"
+                     % (tag, 100 - broad[1], broad[2], broad[3]["mean"] * 100, broad[3]["median"] * 100,
+                        broad[3]["win_pct"], broad[3]["n"]))
+        elif tail:
+            e, pct, h, a = tail
+            L.append("  => %s top %d%% / hold %d TAIL edge: net %+.1f%% vs control %+.1f%% (median %+.1f%%, win %.0f%%, n%d) -- a positive-skew tail, not broad; the median is pinned at the cost floor because the up-move is rare, so the tail IS the edge (as in this class)."
+                     % (tag, 100 - pct, h, a["mean"] * 100, gc.get(h, {}).get("mean", 0) * 100,
+                        a["median"] * 100, a["win_pct"], a["n"]))
+            if front_run:
+                if backrun is not None and e > backrun:
+                    L.append("     precursor tail (+%.1f%%) OUT-MEANS the all-predictors/backrun gate (+%.1f%%) -- removing abs_move did NOT collapse the edge, so it is the wallet SETUP, not abs_move continuation."
+                             % (e * 100, backrun * 100))
+                L.append("     It is %s, so the mean is NOT bankable as shown -> settle with a LIVE 1-slot NET probe, do not drop on the median." % side)
+            else:
+                L.append("     It is %s -> the precursor-only gate below is the cleaner read; settle live." % side)
         elif front_run:
-            L.append("  => %s no positive-median precursor cell -- the wallet setup does NOT front-run at the entry; the only edge was abs_move continuation (backrun), which fills kill -> drop ShredStream" % tag)
+            L.append("  => %s no cell beats control on mean either -- the wallet setup does not lead the move at the entry; drop ShredStream" % tag)
         else:
-            L.append("  => %s no positive-median cell -- precision is not the lever, the base-rate wall holds" % tag)
+            L.append("  => %s no cell beats control on mean -- precision is not the lever on the backrun gate; the precursor gate below is the real test" % tag)
+        return tail[0] if tail else None
 
-    gate_block(out.get("logit_gate"), "LOGIT-GATE ENTER-ON-SIGNAL (all predictors)", False)
-    gate_block(out.get("logit_gate_precursor"), "FRONT-RUN GATE (precursors only)", True)
+    backrun_edge = gate_block(out.get("logit_gate"), "LOGIT-GATE ENTER-ON-SIGNAL (all predictors)", False)
+    gate_block(out.get("logit_gate_precursor"), "FRONT-RUN GATE (precursors only)", True, backrun=backrun_edge)
 
     L.append("")
     L.append("  Mid-to-mid on untouched pools (hypothesis only, per the invariant); the live arbiter is a real reactive NET entry.")
