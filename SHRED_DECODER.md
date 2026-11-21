@@ -185,6 +185,49 @@ program ids, one instruction's account-index list, a discriminator compare, two 
 u64. The cost is in layer 0 (RS recovery + bincode), which is well-trodden (jito-shredstream-proxy,
 `solana-ledger` shred code, Rust crates) — port or wrap, don't reinvent the RS math.
 
+## LocalShred Lite — operational setup (from the dashboard, 2026-11-21)
+
+Run the proxy on the box that hosts the decoder + executor (co-located, near Amsterdam for the N+1 budget).
+The box needs a public address and one inbound UDP port open. The key is on the dashboard — **not** in this repo.
+
+**Dataflow — three addresses, three jobs:**
+```
+  LocalShred senders  45.154.33.229 , 45.154.33.129
+     --UDP-->  box : 20000        (--src-bind-port: the client LISTENS here; the ONE inbound firewall rule)
+        --forward-->  --dest-ip-ports  (local consumer, e.g. 127.0.0.1:8001 = our shred decoder / the gRPC tap)
+```
+The client's own source/egress address is auto-registered with LocalShred (≤3 held; a 4th is refused, a 7-day-idle
+one frees a slot). The dashboard labels these "Destination IPs" but they are the address the client **connects
+from**, not the forward target — don't confuse them with `--dest-ip-ports`.
+
+**Build:** `git clone https://github.com/dedicatednodes/shredstream-proxy.git`, then either
+`docker build -t dedicatednodes/localshred-lite-proxy:latest .` or
+`cargo build --release --bin localshred-lite-proxy` (binary in `target/release`; needs `protoc` + a C toolchain;
+the image is amd64-only, build from source on arm64).
+
+**Run (source binary):**
+```
+localshred-lite-proxy shredstream \
+  --localshred-url http://localshred-lite.nlams.dedicatednodes.io:9999 \
+  --api-key <KEY>  --dest-ip-ports 127.0.0.1:8001  [--src-bind-port 20000]
+```
+Docker: prefer `--network host` with `-e LOCALSHRED_URL / API_KEY / DEST_IP_PORTS`; bridge needs
+`-p 20000:20000/udp` + `-e SRC_BIND_PORT=20000`. Endpoint is plain HTTP, port required (no HTTPS). Pass the key via
+the `API_KEY` env, not the flag. Replacing a key is immediate with no overlap and clears the registered addresses —
+update the client before replacing.
+
+**Firewall:** `sudo ufw allow 20000/udp` inbound; narrow to the senders `45.154.33.229` / `45.154.33.129` (UDP,
+dest port 20000 or your `--src-bind-port`). Behind NAT, forward that port to the box.
+
+**Healthy log:** `Starting heartbeat client` → `Shredstream started, listening on 0.0.0.0:20000/udp` →
+`Sending shreds to N destinations`, then Received + forwarded counts climbing every 15 s. **Received at 0 while
+heartbeats succeed = firewall / NAT, not the key.** `Failed to connect to block engine` = endpoint/key wrong or the
+key was replaced. Everything right but nothing forwards = key suspended (the dashboard says so).
+
+**Two taps off this proxy (per the vis verdict, we only need direct-only pumpswap):** `--dest-ip-ports` raw UDP
+shreds (we deshred ourselves; top-level pumpswap decode is enough), OR the repo's `--grpc-service-port` entry
+service (reconstructed `txns`, no deshred build) — try the entry service first.
+
 ## Latency — the gating constraint
 
 Front-running needs slot N's flow **decided** in time to land a buy at the **front of N+1** (~400 ms
