@@ -127,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -214,6 +214,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--export-gate", metavar="PATH", help="flurry-study --frontrun: write the fitted precursor front-run gate (joint-logit intercept + non-move predictor coefficients + top-k%% eta thresholds) to a JSON the live box runner loads via tradingbot.precursor_gate.")
     parser.add_argument("--gate-hold", type=int, default=2, help="flurry-study --export-gate: slots to hold after entering front of N+1 (default 2, the paying cell).")
     parser.add_argument("--entry-window", type=int, nargs="?", const=10, default=None, metavar="W", help="flurry-study: patience study -- keep the safe 1-2 slot hold, but sweep WHICH entry slot (N+1..N+W, default W=10) to take it after a slot-N signal. A pull during the wait = no entry (no loss); reports per-offset EV, best-of-window ceiling, and a causal up-tick-ride rule vs a random-active-slot control, out of sample.")
+    parser.add_argument("--fires", type=str, default=None, help="frontrun-verify: JSON/JSONL of box fires {pool, slot, token_mint?, sym?, m2?, eta?} or a raw box log to grep for 'GATE FIRE' lines")
+    parser.add_argument("--pairs", type=str, default=None, help="frontrun-verify: box fires by hand as 'pool:slot[:mint],pool:slot'")
+    parser.add_argument("--gate", type=str, default=None, help="frontrun-verify: the exported gate JSON (flurry-study --export-gate)")
+    parser.add_argument("--tier", type=str, default="1", help="frontrun-verify: gate tier to check (1 = top 1%%, 2 = top 2%%)")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
     parser.add_argument("--apply", action="store_true", help="canary-sweep: close the empty accounts (default: list)")
@@ -769,6 +773,31 @@ def main(argv: list[str] | None = None) -> None:
                         max_credits=int(args.max_credits or 20_000),
                         progress=lambda i, n, c: print(f"streams {i}/{n}, {c} credits", flush=True))
         print(json.dumps(out, indent=2, default=str) if args.json else _pw.render(out))
+        return
+
+    if args.command == "frontrun-verify":  # does the live box fire on the slots the study scored? (feed check)
+        from tradingbot import frontrun_verify as _fv
+        if not args.gate:
+            print("frontrun-verify needs --gate <gate.json>", file=sys.stderr)
+            return
+        with open(args.gate) as _gh:
+            _gate = json.load(_gh)
+        if args.fires:
+            with open(args.fires) as _fh:
+                _fires = _fv.parse_fires(_fh.read())
+        elif args.pairs:
+            _fires = _fv.parse_pairs(args.pairs)
+        else:
+            print("frontrun-verify needs --fires <path> or --pairs 'pool:slot,...'", file=sys.stderr)
+            return
+        _fvh = None
+        if args.fetch:
+            import httpx as _fv_httpx
+            from tradingbot.data.helius import Helius as _FvHelius
+            _fvh = _FvHelius(client=_fv_httpx.Client(timeout=60))  # research (backup) key, never the live key
+            _fvh.min_interval_s = 1 / max(args.rps, 0.1)
+        _out = _fv.verify(_fires, _gate, helius=_fvh, tier=args.tier, flurry_min=args.flurry_min, span_s=args.span_s)
+        print(json.dumps(_out, indent=2, default=str) if args.json else _fv.render(_out))
         return
 
     if args.command == "flurry-study":  # slot-level buy-flurry continuation for the reactive-backrun scalp (11-17)
