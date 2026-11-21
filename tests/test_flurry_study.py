@@ -884,6 +884,26 @@ def test_frontrun_flat_market_has_no_events_and_no_survivor():
         fl.USE_VQ = saved
 
 
+def test_export_gate_stamps_the_fit_visibility():
+    # the exported gate must record the ShredStream view it was fit on, so frontrun-verify (and the box) score the
+    # same features. The box sees top-level pumpswap only ('direct'); a gate not stamped would be replayed on 'full'.
+    out = {
+        "vis": "direct", "move": 0.30, "net_lead": 3, "pools": 6, "events": 120,
+        "logit_precursor": {"predictors": [{"name": "intercept", "coef": -8.0},
+                                           {"name": "sym == N  (new)", "coef": 2.0}],
+                            "auc_hold": 0.7, "n_predictors": 1},
+        "logit_gate_precursor": {"rows": [{"pct": 99, "thr": -4.0}, {"pct": 98, "thr": -5.0}]},
+        "specmeta": {"sym == N  (new)": {"kind": "symbol", "symv": "N"}},
+    }
+    gate = fl.export_gate(out)
+    assert gate is not None
+    assert gate["vis"] == "direct"
+    assert gate["threshold"]["1"] == -4.0 and gate["threshold"]["2"] == -5.0   # top 1%% / 2%% eta cuts
+    assert gate["predictors"][0]["name"] == "sym == N  (new)"
+    out["vis"] = "full"                                            # default/back-compat: the stamp follows the fit
+    assert fl.export_gate(out)["vis"] == "full"
+
+
 # -- visibility experiment ------------------------------------------------------------------------------------
 from tradingbot.data import helius as _he
 
@@ -966,6 +986,7 @@ def test_vis_experiment_direct_loses_the_hidden_precursor_that_buyer_plus_keeps(
         surv = {}
         for mode in ("full", "direct", "buyer_plus"):
             out = fl.frontrun(have, metas, move=0.30, cost=0.01, vis=mode)
+            assert out["vis"] == mode                                # the run stamps the view it fit the gate on
             surv[mode] = [s["rule"] for L in out["leads"] for s in out["survivors"][L]]
         assert any("sym == N" in r for r in surv["full"])           # the precursor is there with full sight
         assert any("sym == N" in r for r in surv["buyer_plus"])     # and recovered when aggregator buyers are added

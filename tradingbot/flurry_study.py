@@ -2611,7 +2611,12 @@ def export_gate(out, hold: int = 2):
     tradingbot.precursor_gate: the joint-logistic intercept + non-move predictor coefficients (abs_move/move/
     price_up already excluded by the precursor fit) and the eta threshold at each top-k%. The runner scores a
     live _slot_bank record, fires when eta >= threshold[k], buys front of N+1, holds `hold`, sells N+hold.
-    Returns None when no precursor predictor survived (nothing to deploy)."""
+    Returns None when no precursor predictor survived (nothing to deploy).
+
+    The gate carries the `vis` it was FIT on. The live box sees top-level pumpswap only ('direct'), so a gate
+    fit on 'full' scores the box's direct-only features with the wrong calibration and fires on the wrong slots
+    (the 2026-11-21 frontmeasure divergence). Fit AND verify on the box's own view -- run --frontrun with
+    --gate-vis direct, and frontrun-verify reads this field to replay through slot_flow(vis=)."""
     lg = out.get("logit_precursor") or {}
     gate = out.get("logit_gate_precursor") or {}
     preds = lg.get("predictors") or []
@@ -2625,6 +2630,7 @@ def export_gate(out, hold: int = 2):
     threshold = {str(100 - r["pct"]): float(r["thr"]) for r in rows if "thr" in r}
     return {
         "kind": "frontrun_precursor",
+        "vis": out.get("vis", "full"),            # the ShredStream visibility the gate was fit on (box view = direct)
         "move": float(out.get("move", FRONT_MOVE)),
         "lead": int(out.get("net_lead", FRONT_ENTRY_LEAD)),
         "entry": "front of N+1 (immediately after the signal slot)",
@@ -2784,6 +2790,10 @@ def render_frontrun(out):
     L.append("  pools %d  active slots %d  up-move events %d (%.2f%% of slots)  cost %.2f%%  vq basis %s"
              % (out["pools"], out["slots"], out["events"], out["event_rate"] * 100, out["cost"] * 100,
                 "ON" if out.get("use_vq") else "OFF (raw ratio -- numbers are basis artifacts!)"))
+    _vis = out.get("vis", "full")
+    L.append("  gate FEATURES fit on the '%s' view%s (target/ceiling always FULL flow)"
+             % (_vis, "  <-- the box's own ShredStream view: deployable gate" if _vis == "direct"
+                else "  (historical full-flow study; the box sees direct-only)" if _vis == "full" else ""))
 
     def cell(a):
         if not a or not a.get("n"):

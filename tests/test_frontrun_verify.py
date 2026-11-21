@@ -55,6 +55,39 @@ def test_box_record_mismatch_is_caught():
     assert row["match"]["sym"] is False and row["match"]["m2"] is True
 
 
+def _visrec():
+    """A vis-tagged launch_record where slot 12 holds a DIRECT sell + an AGGREGATOR (box-blind) new-wallet buy.
+    full view:   n_buys=1 (the new buyer) + n_sells=1 -> new buyer present -> sym 'N'
+    direct view: n_buys=0              + n_sells=1 -> more sells        -> sym 'S'  (what the box actually sees)."""
+    rows = [
+        [0.0,  10, "w0", -1.0,  1.0, 1e9, 100.0, True],      # buy (warm; w0 first-seen)
+        [0.4,  11, "w0", -1.0,  1.0, 1e9, 101.0, True],      # buy
+        [0.8,  12, "op",  1.0, -1.0, 1e9, 100.5, True],      # DIRECT sell (box sees it)
+        [0.85, 12, "newbie", -1.0, 1.0, 1e9, 101.0, False],  # AGGREGATOR new-wallet buy (box-blind)
+        [1.2,  13, "w0", -1.0,  1.0, 1e9, 102.0, True],      # buy
+        [1.6,  14, "w0", -1.0,  1.0, 1e9, 103.0, True],      # buy
+    ]
+    return {"create_ts": 0.0, "txs": rows}
+
+
+# fires on any net-sell slot (sym == S). On _visrec, slot 12 is sym S in the DIRECT view but sym N in FULL.
+GATE_S = {"hold": 2, "intercept": 0.0, "threshold": {"1": 5.0},
+          "predictors": [{"name": "sym == S  (sellers)", "coef": 10.0, "predicate": {"kind": "symbol", "symv": "S"}}]}
+
+
+def test_verify_replays_through_the_gate_visibility():
+    rec = _visrec()
+    g_direct = dict(GATE_S); g_direct["vis"] = "direct"
+    g_full = dict(GATE_S); g_full["vis"] = "full"
+    fire = [{"pool": "P", "slot": 12, "box": {}}]
+    od = fv.verify(fire, g_direct, have={"P": rec})
+    of = fv.verify(fire, g_full, have={"P": rec})
+    # the box's own (direct) view: the aggregator buy is hidden, slot 12 is sym S, the gate reproduces the fire
+    assert od["vis"] == "direct" and od["n_reproduced"] == 1 and od["rows"][0]["offline"]["sym"] == "S"
+    # a gate replayed on the FULL view scores sym N on that slot -> it fires on the WRONG slot (the old divergence)
+    assert of["vis"] == "full" and of["n_reproduced"] == 0 and of["rows"][0]["offline"]["sym"] == "N"
+
+
 def test_parse_fires_reads_jsonl_and_a_log_blob():
     jl = '{"pool": "AAA", "slot": 5, "sym": "N"}\n{"pool": "BBB", "slot": 9}'
     rows = fv.parse_fires(jl)

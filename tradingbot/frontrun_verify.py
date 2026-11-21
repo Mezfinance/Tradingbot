@@ -8,6 +8,11 @@ box fired on through the study's OWN ground-truth path (Helius history_from_star
 frontrun_live.SlotBank + precursor_gate) and checks the gate fires on the box's fire slot, with the same
 sym / m2 / eta the box logged.
 
+The replay uses the VISIBILITY the gate was fit on (`gate["vis"]`, default 'full'): a 'direct' gate is replayed
+through slot_flow(vis='direct') on vis-tagged recs, so the verifier reads the box's OWN view (top-level pumpswap
+only). A gate fit on 'full' but scored against the box's direct view fires on the wrong slots -- fit and verify
+on the same view (flurry-study --frontrun --gate-vis direct).
+
 Why this isolates the feed, not the brain: the precursor gate is price- and magnitude-free (every predictor is a
 symbol / motif / wallet-rank / sell-count), so a reserve-basis or vq mismatch CANNOT change which slots fire. Only
 the per-slot wallet set (fee payer), the buy/sell classification, and emitting a record for every slot (dead slots
@@ -74,7 +79,8 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3,
     """Replay one fired pool through the study's ground-truth path and score the box's gate on every slot.
     `rec` (a launch_record dict) short-circuits the fetch -- used by tests and when the box dumped its own series."""
     pool, slot, box = fire["pool"], int(fire["slot"]), fire.get("box") or {}
-    res = {"pool": pool, "slot": slot, "box": box}
+    gate_vis = gate.get("vis", "full")              # replay through the VIEW the gate was fit on = the box's own view
+    res = {"pool": pool, "slot": slot, "box": box, "vis": gate_vis}
     if rec is None:
         if helius is None:
             res["status"] = "no helius"
@@ -84,11 +90,11 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3,
             res["status"] = "mint unresolved"
             return res
         txs, _more, _err = helius.history_from_start(pool, span_s, fl.MAX_PAGES)
-        rec = he.launch_record(txs, pool, mint, window_s=span_s)
+        rec = he.launch_record(txs, pool, mint, window_s=span_s, with_vis=(gate_vis != "full"))
     saved = fl.USE_VQ
     try:
         fl.USE_VQ = False                           # the gate is price-free, so the basis cannot change a fire
-        flow = fl.slot_flow(rec)
+        flow = fl.slot_flow(rec, gate_vis)          # direct = only top-level pumpswap (what the box decodes)
     finally:
         fl.USE_VQ = saved
     if not flow:
@@ -135,12 +141,13 @@ def verify(fires: list[dict], gate: dict, helius=None, have: dict | None = None,
                        rec=(have or {}).get(f["pool"]), span_s=span_s) for f in fires]
     ok = [r for r in rows if r.get("status") == "ok"]
     repro = sum(1 for r in ok if r["reproduced"])
-    return {"tier": tier, "n_fires": len(fires), "n_checked": len(ok),
+    return {"tier": tier, "vis": gate.get("vis", "full"), "n_fires": len(fires), "n_checked": len(ok),
             "n_reproduced": repro, "n_diverged": len(ok) - repro, "rows": rows}
 
 
 def render(out: dict) -> str:
-    L = [f"FRONT-RUN FEED VERIFY  (tier {out['tier']}: top {out['tier']}%)",
+    L = [f"FRONT-RUN FEED VERIFY  (tier {out['tier']}: top {out['tier']}%,  gate vis '{out.get('vis', 'full')}'"
+         f"{' = the box view' if out.get('vis') == 'direct' else ''})",
          f"  fires {out['n_fires']}  checked {out['n_checked']}  "
          f"reproduced {out['n_reproduced']}  DIVERGED {out['n_diverged']}", ""]
     L.append(f"  {'pool':<20}{'slot':>12}{'in?':>5}{'fires?':>7}{'sym':>5}{'m2':>5}{'eta':>8}"

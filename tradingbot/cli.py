@@ -213,6 +213,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--vq", action="store_true", help="flurry-study: price on the effective (virtual_quote-aware) reserve basis, matching the live WS stream, instead of the raw vault ratio (which inflates early-life moves into basis artifacts). Needs --fetch to populate vq. Off by default so other modes stay reproducible; --frontrun forces it on.")
     parser.add_argument("--export-gate", metavar="PATH", help="flurry-study --frontrun: write the fitted precursor front-run gate (joint-logit intercept + non-move predictor coefficients + top-k%% eta thresholds) to a JSON the live box runner loads via tradingbot.precursor_gate.")
     parser.add_argument("--gate-hold", type=int, default=2, help="flurry-study --export-gate: slots to hold after entering front of N+1 (default 2, the paying cell).")
+    parser.add_argument("--gate-vis", choices=["full", "direct", "buyer_plus"], default="direct", help="flurry-study --frontrun: the ShredStream visibility to FIT the gate on. The live box decodes only TOP-LEVEL pumpswap swaps, so 'direct' (default) makes the exported gate fire on the box's own view (the vis-experiment showed direct carries ~89%% of the full edge); 'full' reproduces the historical full-flow study. frontrun-verify reads the gate's stamped vis to replay through the same view.")
     parser.add_argument("--vis-experiment", action="store_true", help="flurry-study: refit the front-run gate on each box-reproducible VISIBILITY (full / direct-only / buyer-plus) with the target always the real full-flow move, and compare the precursor gate's holdout edge -- does the box's ShredStream view (top-level pumpswap only; aggregator CPIs invisible) carry the study's edge? Forces --vq; needs --fetch to visibility-tag the rows.")
     parser.add_argument("--entry-window", type=int, nargs="?", const=10, default=None, metavar="W", help="flurry-study: patience study -- keep the safe 1-2 slot hold, but sweep WHICH entry slot (N+1..N+W, default W=10) to take it after a slot-N signal. A pull during the wait = no entry (no loss); reports per-offset EV, best-of-window ceiling, and a causal up-tick-ride rule vs a random-active-slot control, out of sample.")
     parser.add_argument("--fires", type=str, default=None, help="frontrun-verify: JSON/JSONL of box fires {pool, slot, token_mint?, sym?, m2?, eta?} or a raw box log to grep for 'GATE FIRE' lines")
@@ -887,17 +888,18 @@ def main(argv: list[str] | None = None) -> None:
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_vis_experiment(out))
             elif args.frontrun:   # front-run a >= move up-move: ceiling + lead-swept discovery + enter-on-signal net
                 _mv = args.move_pct / 100.0 if abs(args.move_pct - 1.0) > 1e-9 else _fl.FRONT_MOVE
-                out = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0, flurry_min=args.flurry_min)
+                out = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0,
+                                   flurry_min=args.flurry_min, vis=args.gate_vis)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_frontrun(out))
                 if args.export_gate:   # write the fitted precursor gate for the live box runner (precursor_gate.load)
                     _gate = _fl.export_gate(out, hold=args.gate_hold)
                     if _gate is None:
-                        print("  (no precursor predictor survived -- nothing to export)")
+                        print("  (no precursor predictor survived on the %s view -- nothing to export)" % args.gate_vis)
                     else:
                         with open(args.export_gate, "w") as _gh:
                             json.dump(_gate, _gh, indent=2)
-                        print("  gate -> %s  (%d predictors, thresholds %s, hold %d)"
-                              % (args.export_gate, len(_gate["predictors"]),
+                        print("  gate -> %s  (vis %s, %d predictors, thresholds %s, hold %d)"
+                              % (args.export_gate, _gate["vis"], len(_gate["predictors"]),
                                  ",".join(sorted(_gate["threshold"])), _gate["hold"]))
             else:
                 out = _fl.tail_report(_have, _metas, _tgt, args.cost_pct / 100.0, hold=args.horizon)
