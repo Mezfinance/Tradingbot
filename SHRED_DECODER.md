@@ -118,9 +118,30 @@ by top-level program id. Decode the routers that actually carry volume; leave th
 - **token→token through our pool**: neither mint is WSOL → ambiguous (both a buy and a sell on our
   pool within one route). Fall back to buyer_plus for these.
 
-## Layer 0 — raw UDP shreds → transactions
+## Layer 0 — shreds → transactions
 
-New requirement as of tomorrow. Pipeline:
+New requirement as of tomorrow. **Source: LocalShred Lite** (dedicatednodes), Amsterdam
+(`localshred-lite.nlams.dedicatednodes.io`). We run their Jito fork
+`dedicatednodes/shredstream-proxy` (`localshred-lite-proxy shredstream`, auth via `API_KEY` /
+`x-localshred-auth`, `--localshred-url http://…:9999`, plain HTTP). It handles the gRPC + auth and
+gives us **two taps**, and the fork vendors `solana-ledger 4.3.0` patched so "shred recovery" is
+public:
+
+- **gRPC entry service** (`--grpc-service-port`): the proxy itself deshreds + reconstructs entries and
+  streams `recovered` / `entries` / `txns` (+ decode-error counts) — the Jito entry-stream
+  equivalent. We consume `VersionedTransaction`s directly and **skip the whole FEC/RS/deshred build**,
+  going straight to layer 1. Co-located (same box) so the decode latency is small. **Try this first.**
+- **Raw UDP shreds** (`--dest-ip-ports 127.0.0.1:8001,…`): "same wire format a validator's TVU port
+  receives, **deduplicated upstream**, every shred of every slot." We deshred ourselves, reusing the
+  fork's now-public `solana-ledger 4.3.0` recovery. More control, maybe marginally faster (no gRPC),
+  but a real Rust build — only drop here if the entry service can't beat the N+1 deadline.
+
+Either tap is pre-execution (no `meta`, no vault deltas) and either hands layer 1 the same
+`VersionedTransaction`s, so **layer 1 (router-aware classify) is ours regardless** — the entry
+service gives transactions, not buy/sell direction. Upstream dedup means no shred-dedup for us.
+Amsterdam region → put the decoder, executor and Solana send path near Amsterdam for the N+1 budget.
+
+Pipeline for the raw-UDP path (not needed if the gRPC entry service is used):
 
 1. **Ingest** UDP shred packets from the provider (or a self-run receiver). Each is a data or coding
    shred with a common header (slot, fec_set_index, shred_index, variant) + Merkle fields
@@ -167,10 +188,11 @@ wait-for-shreds. Two consequences:
 
 ## Staged build plan
 
-1. **Offline first (no latency pressure).** Feed recorded raw shreds (capture a few minutes from the
-   new provider) through layers 0+1; compare the recovered per-slot buy/sell flow against the Helius
-   ground truth (`launch_record`/`slot_flow(vis="full")`) for the same pools — the same check
-   `frontrun_verify.py` does for box fires, but now on our own decode. This is the correctness gate.
+1. **Stand up the proxy + get transactions flowing.** Run `localshred-lite-proxy` with
+   `--grpc-service-port`; tap its reconstructed `txns` (no layer-0 build). Record a few minutes, run
+   layer 1 over them, and compare the recovered per-slot buy/sell flow against the Helius ground truth
+   (`launch_record`/`slot_flow(vis="full")`) for the same pools — the same check `frontrun_verify.py`
+   does for box fires, now on our own decode. This is the correctness gate, no latency pressure.
 2. **Router coverage.** Extend `front_stats` to bucket the aggregator slice by program id; write
    decoders for the routers that carry volume; everything else → buyer_plus.
 3. **Reconcile with the experiment.** The `--vis-experiment` tells us which visibility (`full` /
@@ -184,8 +206,10 @@ wait-for-shreds. Two consequences:
 
 ## Open items to confirm
 
-- **What the new feed emits** (raw UDP shreds vs partially reassembled) and its per-slot latency —
-  dictates how much of layer 0 we build vs the provider does.
+- **gRPC entry service vs raw UDP on LocalShred Lite**: confirm the `--grpc-service-port` entry
+  service yields full `VersionedTransaction`s and measure its per-slot completion latency (does it
+  beat N+1?). Only if it can't, confirm the raw-UDP framing (one datagram = one raw shred, no fork
+  wrapper) with a packet capture and build the deshredder on the fork's public `solana-ledger 4.3.0`.
 - **Discriminators** for `route`, `exact_out_route`, `shared_accounts_*_route` and the `*_v2` family,
   and the v2 account order (mints should stay at the same positions — verify). Pull from the Jupiter
   v6 Anchor IDL (`anchor idl fetch JUP6Lkb…` or the published IDL), not secondary pages.
@@ -199,3 +223,4 @@ wait-for-shreds. Two consequences:
 - Jupiter V6 program id, instruction set, account layouts: https://www.helius.dev/parsed-data/jupiter/aggregator-v6
 - `shared_accounts_route` discriminator `[193,32,155,51,65,214,156,129]`: https://docs.meteora.ag/developer-guides/zap/program/accounts
 - Jito ShredStream sunset + raw-UDP replacements: https://orbitflare.com/blog/developers/jito-shredstreams-last-slot , https://chainstack.com/how-to-improve-solana-rpc-latency-with-shredstream/ , https://docs.jito.wtf/lowlatencytxnfeed/
+- LocalShred Lite proxy (Jito fork, gRPC entry service + raw UDP, vendors `solana-ledger 4.3.0`): https://github.com/dedicatednodes/shredstream-proxy (README + `docs/localshred-lite-setup.md`)
