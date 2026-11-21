@@ -211,6 +211,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--max-hold", type=int, default=None, help="flurry-study: report the scalp at EVERY slot hold 1..N as its own column (flurry/motif/discovered-rule tables), to see continuation slot by slot. A hold >2 re-exposes to the reactive LP pull, so rugged%% rises -- read it as the hold/pull tradeoff, not a safe scalp.")
     parser.add_argument("--frontrun", action="store_true", help="flurry-study: front-run study -- can an indicator predict a >= --move-pct (default 30%%) up-move early enough to enter <=3 slots before it and exit 1-2 after? Perfect-foresight ceiling + lead-swept z-guarded indicator discovery + enter-on-signal net vs control. Forces --vq (effective reserve basis).")
     parser.add_argument("--vq", action="store_true", help="flurry-study: price on the effective (virtual_quote-aware) reserve basis, matching the live WS stream, instead of the raw vault ratio (which inflates early-life moves into basis artifacts). Needs --fetch to populate vq. Off by default so other modes stay reproducible; --frontrun forces it on.")
+    parser.add_argument("--export-gate", metavar="PATH", help="flurry-study --frontrun: write the fitted precursor front-run gate (joint-logit intercept + non-move predictor coefficients + top-k%% eta thresholds) to a JSON the live box runner loads via tradingbot.precursor_gate.")
+    parser.add_argument("--gate-hold", type=int, default=2, help="flurry-study --export-gate: slots to hold after entering front of N+1 (default 2, the paying cell).")
     parser.add_argument("--entry-window", type=int, nargs="?", const=10, default=None, metavar="W", help="flurry-study: patience study -- keep the safe 1-2 slot hold, but sweep WHICH entry slot (N+1..N+W, default W=10) to take it after a slot-N signal. A pull during the wait = no entry (no loss); reports per-offset EV, best-of-window ceiling, and a causal up-tick-ride rule vs a random-active-slot control, out of sample.")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
@@ -852,6 +854,16 @@ def main(argv: list[str] | None = None) -> None:
                 _mv = args.move_pct / 100.0 if abs(args.move_pct - 1.0) > 1e-9 else _fl.FRONT_MOVE
                 out = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0, flurry_min=args.flurry_min)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_frontrun(out))
+                if args.export_gate:   # write the fitted precursor gate for the live box runner (precursor_gate.load)
+                    _gate = _fl.export_gate(out, hold=args.gate_hold)
+                    if _gate is None:
+                        print("  (no precursor predictor survived -- nothing to export)")
+                    else:
+                        with open(args.export_gate, "w") as _gh:
+                            json.dump(_gate, _gh, indent=2)
+                        print("  gate -> %s  (%d predictors, thresholds %s, hold %d)"
+                              % (args.export_gate, len(_gate["predictors"]),
+                                 ",".join(sorted(_gate["threshold"])), _gate["hold"]))
             else:
                 out = _fl.tail_report(_have, _metas, _tgt, args.cost_pct / 100.0, hold=args.horizon)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_tail(out))

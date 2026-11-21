@@ -777,19 +777,20 @@ def _build_specs(train: list[dict]) -> list[dict]:
             thr = float(np.quantile(vals, q / 100.0))
             if thr <= float(vals.min()):
                 continue                                  # a threshold at the floor selects everything
-            specs.append({"rule": f"{fld} >= {thr:.3g} (q{q})", "kind": "numeric",
+            specs.append({"rule": f"{fld} >= {thr:.3g} (q{q})", "kind": "numeric", "field": fld, "thr": thr,
                           "fn": (lambda r, _f=fld, _t=thr: r["f"][_f] >= _t)})
     for fld in BOOL_FIELDS:
-        specs.append({"rule": f"{fld}", "kind": "bool", "fn": (lambda r, _f=fld: r["f"][_f] >= 1.0)})
+        specs.append({"rule": f"{fld}", "kind": "bool", "field": fld,
+                      "fn": (lambda r, _f=fld: r["f"][_f] >= 1.0)})
     syms = {r["sym"] for r in train}
     for x in sorted(syms):
-        specs.append({"rule": f"sym == {x}  ({SYM_DESC.get(x, x)})", "kind": "symbol",
+        specs.append({"rule": f"sym == {x}  ({SYM_DESC.get(x, x)})", "kind": "symbol", "symv": x,
                       "fn": (lambda r, _x=x: r["sym"] == _x)})
     for key, label in (("m2", "N-1..N"), ("m3", "N-2..N")):
         counts = Counter(r[key] for r in train)
         for mot, c in counts.items():
             if c >= DISC_MIN_SUPPORT and len(train) - c >= DISC_MIN_SUPPORT:
-                specs.append({"rule": f"{label} = {mot}", "kind": "motif",
+                specs.append({"rule": f"{label} = {mot}", "kind": "motif", "mkey": key, "mot": mot,
                               "fn": (lambda r, _k=key, _m=mot: r[_k] == _m)})
     return specs
 
@@ -2536,7 +2537,7 @@ def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS):
                     v = _scalp(slots, pull, rec["idx"], h, cost)
                     if v is not None:
                         rr[h].append(v)
-        rows.append({"pct": pct, "n": n_fire, "holds": {h: _agg(v) for h, v in rr.items()}})
+        rows.append({"pct": pct, "n": n_fire, "thr": thr, "holds": {h: _agg(v) for h, v in rr.items()}})
     # holdout-only random control so the comparison is out of sample too
     rng = random.Random(0)
     ctrl = {h: [] for h in holds}
@@ -2551,6 +2552,38 @@ def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS):
                 if v is not None:
                     ctrl[h].append(v)
     return {"rows": rows, "control": {h: _agg(v) for h, v in ctrl.items()}}
+
+
+def export_gate(out, hold: int = 2):
+    """Serialise the fitted precursor front-run gate to a small dict the live box runner loads through
+    tradingbot.precursor_gate: the joint-logistic intercept + non-move predictor coefficients (abs_move/move/
+    price_up already excluded by the precursor fit) and the eta threshold at each top-k%. The runner scores a
+    live _slot_bank record, fires when eta >= threshold[k], buys front of N+1, holds `hold`, sells N+hold.
+    Returns None when no precursor predictor survived (nothing to deploy)."""
+    lg = out.get("logit_precursor") or {}
+    gate = out.get("logit_gate_precursor") or {}
+    preds = lg.get("predictors") or []
+    rows = gate.get("rows") or []
+    if len(preds) < 2 or not rows:
+        return None
+    intercept = float(preds[0]["coef"])
+    meta = out.get("specmeta") or {}
+    predictors = [{"name": p["name"], "coef": float(p["coef"]), "predicate": meta.get(p["name"])}
+                  for p in preds[1:]]
+    threshold = {str(100 - r["pct"]): float(r["thr"]) for r in rows if "thr" in r}
+    return {
+        "kind": "frontrun_precursor",
+        "move": float(out.get("move", FRONT_MOVE)),
+        "lead": int(out.get("net_lead", FRONT_ENTRY_LEAD)),
+        "entry": "front of N+1 (immediately after the signal slot)",
+        "hold": int(hold),
+        "intercept": intercept,
+        "predictors": predictors,
+        "threshold": threshold,
+        "built": {"pools": int(out.get("pools", 0)), "events": int(out.get("events", 0)),
+                  "auc_hold": lg.get("auc_hold"), "move_pct": round(float(out.get("move", 0)) * 100, 2),
+                  "n_predictors": lg.get("n_predictors")},
+    }
 
 
 def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=FRONT_LEADS,
@@ -2608,6 +2641,8 @@ def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=
 
     specs = _build_specs(tr)
     specfn = {s["rule"]: s["fn"] for s in specs}
+    out["specmeta"] = {s["rule"]: {k: s.get(k) for k in ("kind", "field", "thr", "symv", "mkey", "mot")}
+                       for s in specs}                    # exact predicate params for export_gate (string is lossy)
     zc = max(3.0, math.sqrt(2.0 * math.log(max(len(specs) * len(leads), 2))))
     out["zc"] = zc
     profile, survivors = {}, {L: [] for L in leads}
