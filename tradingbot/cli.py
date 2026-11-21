@@ -213,6 +213,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--vq", action="store_true", help="flurry-study: price on the effective (virtual_quote-aware) reserve basis, matching the live WS stream, instead of the raw vault ratio (which inflates early-life moves into basis artifacts). Needs --fetch to populate vq. Off by default so other modes stay reproducible; --frontrun forces it on.")
     parser.add_argument("--export-gate", metavar="PATH", help="flurry-study --frontrun: write the fitted precursor front-run gate (joint-logit intercept + non-move predictor coefficients + top-k%% eta thresholds) to a JSON the live box runner loads via tradingbot.precursor_gate.")
     parser.add_argument("--gate-hold", type=int, default=2, help="flurry-study --export-gate: slots to hold after entering front of N+1 (default 2, the paying cell).")
+    parser.add_argument("--vis-experiment", action="store_true", help="flurry-study: refit the front-run gate on each box-reproducible VISIBILITY (full / direct-only / buyer-plus) with the target always the real full-flow move, and compare the precursor gate's holdout edge -- does the box's ShredStream view (top-level pumpswap only; aggregator CPIs invisible) carry the study's edge? Forces --vq; needs --fetch to visibility-tag the rows.")
     parser.add_argument("--entry-window", type=int, nargs="?", const=10, default=None, metavar="W", help="flurry-study: patience study -- keep the safe 1-2 slot hold, but sweep WHICH entry slot (N+1..N+W, default W=10) to take it after a slot-N signal. A pull during the wait = no entry (no loss); reports per-offset EV, best-of-window ceiling, and a causal up-tick-ride rule vs a random-active-slot control, out of sample.")
     parser.add_argument("--fires", type=str, default=None, help="frontrun-verify: JSON/JSONL of box fires {pool, slot, token_mint?, sym?, m2?, eta?} or a raw box log to grep for 'GATE FIRE' lines")
     parser.add_argument("--pairs", type=str, default=None, help="frontrun-verify: box fires by hand as 'pool:slot[:mint],pool:slot'")
@@ -802,7 +803,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "flurry-study":  # slot-level buy-flurry continuation for the reactive-backrun scalp (11-17)
         from tradingbot import flurry_study as _fl
-        if args.vq or args.frontrun:   # effective (vq-aware) reserve basis; frontrun needs it or the target is an artifact
+        if args.vq or args.frontrun or args.vis_experiment:   # effective (vq-aware) reserve basis; frontrun/experiment need it
             _fl.USE_VQ = True
         from tradingbot.journal import Journal as _FlJournal
         from tradingbot.watcher import WatchStore as _FlWS, watch_db_path as _fl_wdp
@@ -847,7 +848,7 @@ def main(argv: list[str] | None = None) -> None:
                 out = _fl.entry_window(_have, _metas, _tgt, args.cost_pct / 100.0, window=args.entry_window)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_entry_window(out))
             return
-        if args.tail or args.discover_econ or args.creation or args.slot0 or args.multibuy or args.frontrun:  # tail / econ-discovery / creation / slot-0 / multibuy / frontrun (all read flows the same way)
+        if args.tail or args.discover_econ or args.creation or args.slot0 or args.multibuy or args.frontrun or args.vis_experiment:  # all read flows the same way
             import time as _fl_time
             from tradingbot import pool_tracker as _fl_pt
             _ws = _FlWS(_fl_wdp(cfg))
@@ -864,7 +865,7 @@ def main(argv: list[str] | None = None) -> None:
                 _have = _flows_have
             else:
                 _have, _cr = _fl.fetch_flows(_ws, fl_helius, _metas, args.span_s,
-                                             int(args.max_credits or 0), prog)
+                                             int(args.max_credits or 0), prog, with_vis=args.vis_experiment)
             _tgt = _fl._tgt(args.target, args.flurry_min, args.horizon, args.move_pct)
             if args.multibuy:  # band flurries by buy count, enter the slot after, sweep the hold 1-10
                 out = _fl.multibuy_study(_have, _metas, args.cost_pct / 100.0)
@@ -879,6 +880,11 @@ def main(argv: list[str] | None = None) -> None:
                 out = _fl.discover_econ(_have, _metas, _tgt, args.cost_pct / 100.0)
                 out["target"] = _tgt
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_econ(out))
+            elif args.vis_experiment:   # does the box's ShredStream visibility carry the front-run edge?
+                _mv = args.move_pct / 100.0 if abs(args.move_pct - 1.0) > 1e-9 else _fl.FRONT_MOVE
+                out = _fl.vis_experiment(_have, _metas, move=_mv, cost=args.cost_pct / 100.0,
+                                         flurry_min=args.flurry_min, hold=args.gate_hold)
+                print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_vis_experiment(out))
             elif args.frontrun:   # front-run a >= move up-move: ceiling + lead-swept discovery + enter-on-signal net
                 _mv = args.move_pct / 100.0 if abs(args.move_pct - 1.0) > 1e-9 else _fl.FRONT_MOVE
                 out = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0, flurry_min=args.flurry_min)

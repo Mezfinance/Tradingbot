@@ -882,3 +882,97 @@ def test_frontrun_flat_market_has_no_events_and_no_survivor():
         assert fl.render_frontrun(out)
     finally:
         fl.USE_VQ = saved
+
+
+# -- visibility experiment ------------------------------------------------------------------------------------
+from tradingbot.data import helius as _he
+
+
+def _tx(slot, logs):
+    return {"blockTime": slot, "slot": slot, "meta": {"err": None, "logMessages": logs,
+            "preTokenBalances": [], "postTokenBalances": []},
+            "transaction": {"message": {"accountKeys": ["payer%d" % slot]}}}
+
+
+def test_launch_record_with_vis_tags_top_level_pumpswap():
+    direct = _tx(1, ["Program %s invoke [1]" % _he.PUMPSWAP_PROGRAM, "Program %s success" % _he.PUMPSWAP_PROGRAM])
+    agg = _tx(2, ["Program JUP6 invoke [1]", "Program %s invoke [2]" % _he.PUMPSWAP_PROGRAM, "Program JUP6 success"])
+    rec = _he.launch_record([direct, agg], "POOL", "MINT", window_s=180, with_vis=True)
+    assert rec["txs"][0][7] is True                      # top-level pumpswap -> box can decode it
+    assert rec["txs"][1][7] is False                     # pumpswap as a CPI under Jupiter -> invisible to the box
+    plain = _he.launch_record([direct, agg], "POOL", "MINT", window_s=180)   # default off: 7-element rows, unchanged
+    assert all(len(r) == 7 for r in plain["txs"])
+
+
+def test_slot_flow_full_matches_the_default():
+    rec = _rec()
+    assert fl.slot_flow(rec, "full") == fl.slot_flow(rec)
+
+
+def _front_vis(create_ts, signal=True, seed=0):
+    """Like _cre_front, but the organic new-wallet precursor buy is AGGREGATOR-routed (direct flag False) so the box
+    cannot see it, while the washbot/spike buys are direct (True). price path is identical across visibilities."""
+    import random as _r
+    rng = _r.Random("%s-%s" % (seed, create_ts))
+    sol, tok = 100.0, 100000.0
+    rows, sec, slot = [], 0.0, 0
+    up_frac = (1.40) ** 0.5 - 1.0
+
+    def buy(payer, frac, direct):
+        nonlocal sol, tok, sec, slot
+        nsol = sol + frac * sol
+        ntok = (sol * tok) / nsol
+        rows.append([sec, slot, payer, round(ntok - tok, 6), round(frac * sol, 9), round(ntok, 6), round(nsol, 9), direct])
+        sol, tok, sec, slot = nsol, ntok, sec + 0.4, slot + 1
+
+    for _ in range(5):
+        buy("w0", 0.002, True)
+    for e in range(25):
+        if signal:
+            buy("new%d_%d" % (create_ts, e), 0.01, False)   # precursor new wallet -- aggregator-routed, box-blind
+            buy("wb", up_frac, True)                          # the spike -- a direct washbot swap
+        else:
+            buy("wb", up_frac if rng.random() < 0.5 else 0.01, True)
+            buy("new%d_%d" % (create_ts, e), 0.01, False)
+        buy("w0", 0.002, True)
+        buy("w0", 0.002, True)
+    return {"create_ts": create_ts, "txs": rows}
+
+
+def test_slot_flow_direct_hides_the_aggregator_buyer_and_buyer_plus_recovers_it():
+    rec = _front_vis(0)
+    full = fl.slot_flow(rec, "full")
+    direct = fl.slot_flow(rec, "direct")
+    bplus = fl.slot_flow(rec, "buyer_plus")
+    # same slot set / price path across visibilities (price is read from every trade)
+    assert [s["slot"] for s in direct["slots"]] == [s["slot"] for s in full["slots"]]
+    assert [round(s["price"], 9) for s in direct["slots"]] == [round(s["price"], 9) for s in full["slots"]]
+    # a new-wallet (aggregator) buyer is in full and buyer_plus, never in direct
+    seen_full = {b for s in full["slots"] for b in s["buyers"]}
+    seen_direct = {b for s in direct["slots"] for b in s["buyers"]}
+    seen_bplus = {b for s in bplus["slots"] for b in s["buyers"]}
+    assert any(b.startswith("new") for b in seen_full)
+    assert not any(b.startswith("new") for b in seen_direct)        # box-blind to the aggregator buyer
+    assert any(b.startswith("new") for b in seen_bplus)             # recovered as a buyer (no magnitude)
+
+
+def test_vis_experiment_direct_loses_the_hidden_precursor_that_buyer_plus_keeps():
+    saved = fl.USE_VQ
+    try:
+        fl.USE_VQ = False
+        metas = [{"pool": "P%d" % i, "token_mint": "M%d" % i, "create_ts": float(i)} for i in range(6)]
+        have = {"P%d" % i: _front_vis(i) for i in range(6)}
+        # the target is the real full-flow move in every mode; only the features are restricted
+        surv = {}
+        for mode in ("full", "direct", "buyer_plus"):
+            out = fl.frontrun(have, metas, move=0.30, cost=0.01, vis=mode)
+            surv[mode] = [s["rule"] for L in out["leads"] for s in out["survivors"][L]]
+        assert any("sym == N" in r for r in surv["full"])           # the precursor is there with full sight
+        assert any("sym == N" in r for r in surv["buyer_plus"])     # and recovered when aggregator buyers are added
+        assert not any("sym == N" in r for r in surv["direct"])     # but invisible to the box's direct-only view
+        out = fl.vis_experiment(have, metas, move=0.30, cost=0.01)
+        assert out["usable_pools"] == 6 and out["tagged_pools"] == 6
+        assert set(out["results"]) == {"full", "direct", "buyer_plus"}
+        assert "VISIBILITY EXPERIMENT" in fl.render_vis_experiment(out)
+    finally:
+        fl.USE_VQ = saved

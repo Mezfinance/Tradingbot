@@ -132,6 +132,8 @@ def target_label(tgt: dict) -> str:
 
 # row indices from helius.launch_record txs: [sec, slot, payer, tokΔ, solΔ, tok_after, sol_after]
 _SLOT, _PAYER, _TOKD, _SOLD, _TOKA, _SOLA = 1, 2, 3, 4, 5, 6
+_VIS = 7   # optional 8th row element (helius.launch_record with_vis): True = top-level pumpswap swap the box can
+#          # decode from shreds; absent/False = an aggregator-routed CPI, direction invisible to the box.
 
 
 def classify(tok_change: float, sol_change: float) -> str:
@@ -153,10 +155,19 @@ def _pool_vq(raw: bytes) -> int:
     return int.from_bytes(raw[245:261], "little", signed=True) if raw and len(raw) >= 261 else 0
 
 
-def slot_flow(rec: dict) -> dict | None:
+def slot_flow(rec: dict, vis: str = "full") -> dict | None:
     """Rebuild the per-slot series from a launch_record dict. Returns None if there is no usable price path.
     `slots` is a sorted list of per-slot dicts {slot, n_buys, buy_sol, n_sells, sell_sol, price}; `price` is the
-    reserve ratio at the END of that slot. `pull_slot` is the first slot with an LP withdrawal (or None)."""
+    reserve ratio at the END of that slot. `pull_slot` is the first slot with an LP withdrawal (or None).
+
+    `vis` restricts which trades contribute to the per-slot BUYER/SELL aggregates, to reproduce what the live box
+    can actually see from ShredStream (the price path always uses every trade -- it is the real pool state):
+      "full"       -- every trade (the study baseline; byte-identical to before).
+      "direct"     -- only top-level pumpswap swaps (row[_VIS] True): the box's literal decoded view.
+      "buyer_plus" -- direct swaps as-is, plus each aggregator-routed trade counted as a buyer with its fee payer
+                      but no magnitude (the box sees the payer in the shred but not the CPI's direction/size),
+                      approximating recovery of the organic new-wallet signal.
+    Needs with_vis-tagged rows for the restricted modes; untagged rows read as not-direct."""
     txs = rec.get("txs") or []
     by_slot: dict[int, dict] = {}
     pull_slot = None
@@ -169,17 +180,22 @@ def slot_flow(rec: dict) -> dict | None:
         kind = classify(r[_TOKD] or 0.0, r[_SOLD] or 0.0)
         s = by_slot.setdefault(slot, {"slot": slot, "n_buys": 0, "buy_sol": 0.0, "n_sells": 0, "sell_sol": 0.0,
                                       "price": None, "buyers": [], "max_buy": 0.0})
-        if kind == "buy":
-            s["n_buys"] += 1
-            dsol = float(r[_SOLD] or 0.0)                 # SOL added to the pool
-            s["buy_sol"] += dsol
-            s["max_buy"] = max(s["max_buy"], dsol)
+        visible = vis == "full" or (len(r) > _VIS and bool(r[_VIS]))
+        if visible:
+            if kind == "buy":
+                s["n_buys"] += 1
+                dsol = float(r[_SOLD] or 0.0)                 # SOL added to the pool
+                s["buy_sol"] += dsol
+                s["max_buy"] = max(s["max_buy"], dsol)
+                s["buyers"].append(r[_PAYER])
+            elif kind == "sell":
+                s["n_sells"] += 1
+                s["sell_sol"] += -float(r[_SOLD] or 0.0)
+            elif kind == "pull" and pull_slot is None:
+                pull_slot = slot
+        elif vis == "buyer_plus" and kind in ("buy", "sell"):
+            s["n_buys"] += 1                                  # aggregator trade: payer visible, direction/size not
             s["buyers"].append(r[_PAYER])
-        elif kind == "sell":
-            s["n_sells"] += 1
-            s["sell_sol"] += -float(r[_SOLD] or 0.0)
-        elif kind == "pull" and pull_slot is None:
-            pull_slot = slot
         if tok_after and tok_after > 0:                   # price after this tx = end-of-slot price so far
             s["price"] = (float(sol_after) + vq_sol) / float(tok_after)
     slots = [by_slot[k] for k in sorted(by_slot)]
@@ -304,9 +320,18 @@ def flows_from_file(path: str) -> tuple[list[dict], dict]:
     return metas, have
 
 
-def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: int, progress=None) -> tuple[dict, int]:
+def _has_vis(rec: dict | None) -> bool:
+    """A cached flow is visibility-tagged iff its rows carry the 8th (top-level pumpswap) element."""
+    rows = (rec or {}).get("txs") or []
+    return bool(rows) and len(rows[0]) > _VIS
+
+
+def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: int, progress=None,
+                with_vis: bool = False) -> tuple[dict, int]:
     """Cache the first `span_s` of each pool's trading in watch.db `watch_flurry` (research key, stable hash order
-    so a credit cap leaves an even sample). Returns {pool: launch_record dict} and the research credits spent."""
+    so a credit cap leaves an even sample). Returns {pool: launch_record dict} and the research credits spent.
+    `with_vis` tags each row with its box visibility (top-level pumpswap vs aggregator CPI) and REFETCHES any cached
+    row that lacks the tag -- the one piece the cached launch_record does not store (it needs the raw tx logs)."""
     store.execute(SCHEMA)
     have: dict = {}
     for r in store.query("SELECT pool, data FROM watch_flurry", ()):
@@ -320,13 +345,18 @@ def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: in
     credits = 0
     for i, m in enumerate(order):
         pool = m["pool"]
-        if pool in have and (have[pool].get("txs") or have[pool].get("error")):
+        cached = have.get(pool)
+        done = cached and (cached.get("txs") or cached.get("error"))
+        tagged = done and (cached.get("error") or _has_vis(cached))   # error rows can't be re-tagged, leave them
+        if done and (not with_vis or tagged):
             continue
         if credits + MAX_PAGES * 10 > max_credits:
             break
         txs, _more, _err = helius.history_from_start(pool, span_s, MAX_PAGES)
         credits += MAX_PAGES * 10
-        rec = he.launch_record(txs, pool, m["token_mint"], window_s=span_s)
+        rec = he.launch_record(txs, pool, m["token_mint"], window_s=span_s, with_vis=with_vis)
+        if cached and cached.get("vq") is not None and "vq" not in rec:
+            rec["vq"] = cached["vq"]                                  # keep the vq basis across a vis refetch
         store.execute("INSERT OR REPLACE INTO watch_flurry(pool, data, ts) VALUES(?,?,?)",
                       (pool, json.dumps(rec), m.get("create_ts") or 0))
         have[pool] = rec
@@ -2602,7 +2632,7 @@ def export_gate(out, hold: int = 2):
 
 
 def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=FRONT_LEADS,
-             seed=0, flurry_min=DEFAULT_FLURRY_MIN):
+             seed=0, flurry_min=DEFAULT_FLURRY_MIN, vis="full"):
     """Can we predict a >= `move` up-move early enough to enter <=k slots before it and exit 1-2 after?
     (1) ceiling: enter T-k / exit T+j with perfect foresight; (2) indicator discovery, LEAD swept and reported
     (z-guarded time holdout, discover's discipline); (3) actionable enter-on-signal net vs a random-slot control.
@@ -2612,12 +2642,12 @@ def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=
     import math
     _saved_causal = CAUSAL_WALLET
     try:
-        return _frontrun(have, metas, move, cost, leads, seed, flurry_min)
+        return _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis)
     finally:
         globals()["CAUSAL_WALLET"] = _saved_causal
 
 
-def _frontrun(have, metas, move, cost, leads, seed, flurry_min):
+def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full"):
     import math
     globals()["CAUSAL_WALLET"] = True                        # live-valid features for the gate (see frontrun docstring)
     base_tgt = _tgt("price", flurry_min, 1, move * 100.0)     # for features/symbols only; target overwritten
@@ -2626,24 +2656,27 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min):
     n_events = n_slots = n_pools = 0
     for m in metas:
         rec = have.get(m["pool"])
-        flow = slot_flow(rec) if rec else None
+        flow = slot_flow(rec) if rec else None               # FULL: the real price path, ceiling, target, net
         if not flow:
             continue
+        feat = slot_flow(rec, vis) if vis != "full" else flow  # restricted: what the box can SEE to decide
+        if not feat or len(feat["slots"]) != len(flow["slots"]):
+            feat = flow                                      # price-driven slot set is identical; guard anyway
         n_pools += 1
         slots = flow["slots"]
         n_slots += len(slots)
-        pool_flows[m["pool"]] = flow
+        pool_flows[m["pool"]] = flow                         # scalp/net/gate price off FULL ground truth
         for key, rs in _front_ceiling(flow, move, cost).items():
             ceiling.setdefault(key, []).extend(rs)
-        events = _up_event_slots(slots, move)
+        events = _up_event_slots(slots, move)                # the real up-moves we aim to be positioned before
         n_events += len(events)
-        recs = _slot_bank(flow, ct.get(m["pool"], 0), base_tgt)
+        recs = _slot_bank(feat, ct.get(m["pool"], 0), base_tgt)   # features from the restricted view
         for idx, r in enumerate(recs):
-            r["target_by_lead"] = {L: _front_label(slots[idx]["slot"], events, L) for L in leads}
+            r["target_by_lead"] = {L: _front_label(feat["slots"][idx]["slot"], events, L) for L in leads}
             r["pool"], r["idx"] = m["pool"], idx
         all_recs.extend(recs)
 
-    out = {"mode": "frontrun", "move": move, "cost": cost, "leads": list(leads), "use_vq": USE_VQ,
+    out = {"mode": "frontrun", "move": move, "cost": cost, "leads": list(leads), "use_vq": USE_VQ, "vis": vis,
            "pools": n_pools, "slots": n_slots, "events": n_events,
            "event_rate": (n_events / n_slots if n_slots else 0.0),
            "ceiling": {f"{k}-{j}": _agg(v) for (k, j), v in sorted(ceiling.items())},
@@ -2894,4 +2927,106 @@ def render_frontrun(out):
 
     L.append("")
     L.append("  Mid-to-mid on untouched pools (hypothesis only, per the invariant); the live arbiter is a real reactive NET entry.")
+    return "\n".join(L)
+
+
+# -- visibility experiment: does the box's actual ShredStream view carry the front-run edge? --------------------
+# The study fit the gate on FULL flows (every trade, direction from pool vault deltas). The live box decodes only
+# TOP-LEVEL pumpswap swaps from shreds (~40% of trades -- mostly the washbot); ~60% are aggregator-routed CPIs whose
+# direction is invisible. So the box fires on a different, washbot-only slot composition than the study, and the
+# feed verifier found every box fire diverges. This refits the SAME gate on three visibilities -- full (ceiling),
+# direct (what the box literally decodes), buyer_plus (direct + aggregator buyers, approximating the organic signal)
+# -- with the TARGET always the real full-flow up-move, and compares the precursor gate's holdout edge. Whichever of
+# direct / buyer_plus keeps the edge is deployable from shreds; if only full has it, ShredStream cannot match the
+# study and the approach is dropped. Mid-to-mid, untouched pools -> hypothesis; a live NET probe is the arbiter.
+
+VIS_MODES = ("full", "direct", "buyer_plus")
+
+
+def _gate_best(gate: dict, hold: int = 2, min_n: int = 30):
+    """Best precursor-gate cell (highest hold-`hold` mean at n >= min_n) across the top-k%% rows, with the control.
+    Returns (best_cell_or_None, control_mean). A tail edge is judged on the mean, per the owner's standing rule."""
+    rows = (gate or {}).get("rows") or []
+    ctrl = ((gate or {}).get("control") or {}).get(hold) or {}
+    best = None
+    for r in rows:
+        a = (r.get("holds") or {}).get(hold) or {}
+        if a.get("n", 0) >= min_n and a.get("mean") is not None:
+            if best is None or a["mean"] > best["mean"]:
+                best = {"pct": r["pct"], "n": a["n"], "mean": a["mean"],
+                        "median": a.get("median"), "win": a.get("win_pct")}
+    return best, (ctrl.get("mean") if ctrl else None)
+
+
+def vis_experiment(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0,
+                   flurry_min=DEFAULT_FLURRY_MIN, hold=2):
+    """Run the front-run fit on each box-reproducible visibility and compare the precursor gate's holdout edge."""
+    usable = [m for m in metas if slot_flow(have.get(m["pool"]) or {}) is not None]
+    tagged = sum(1 for m in usable if _has_vis(have.get(m["pool"])))
+    res = {}
+    for mode in VIS_MODES:
+        out = frontrun(have, usable, move=move, cost=cost, flurry_min=flurry_min, vis=mode)
+        best, ctrl = _gate_best(out.get("logit_gate_precursor"), hold=hold)
+        res[mode] = {"pools": out.get("pools"), "slots": out.get("slots"), "events": out.get("events"),
+                     "event_rate": out.get("event_rate"), "gate_rows": (out.get("logit_gate_precursor") or {}).get("rows"),
+                     "best": best, "control": ctrl,
+                     "survivors": len((out.get("survivors") or {}).get(out.get("net_lead"), []))}
+    return {"mode": "vis-experiment", "move": move, "cost": cost, "hold": hold,
+            "usable_pools": len(usable), "tagged_pools": tagged, "results": res}
+
+
+def render_vis_experiment(out):
+    L = ["FRONT-RUN VISIBILITY EXPERIMENT  (does the box's ShredStream view carry the edge?)",
+         "  >= %.0f%% up-move, cost %.2f%%, gate hold %d slots;  usable pools %d, visibility-tagged %d"
+         % (out["move"] * 100, out["cost"] * 100, out["hold"], out["usable_pools"], out["tagged_pools"])]
+    if out["tagged_pools"] < out["usable_pools"]:
+        L.append("  WARNING: %d usable pools are NOT visibility-tagged (old cache) -- rerun with --fetch so the"
+                 % (out["usable_pools"] - out["tagged_pools"]))
+        L.append("           restricted modes see real direct/aggregator splits; untagged rows read as not-direct.")
+    L.append("")
+    L.append("  %-11s %8s %8s %10s   %-28s %8s %8s" %
+             ("visibility", "pools", "events", "evt-rate", "best precursor-gate cell (hold)", "control", "edge"))
+    labels = {"full": "full (all)", "direct": "direct-only", "buyer_plus": "buyer-plus"}
+    for mode in VIS_MODES:
+        r = out["results"].get(mode) or {}
+        b, ctrl = r.get("best"), r.get("control")
+        if b:
+            cell = "top%d%%  n%-4d %+6.1f%%  md%+5.1f win%2.0f" % (
+                100 - b["pct"], b["n"], b["mean"] * 100,
+                (b["median"] or 0) * 100, b["win"] or 0)
+            edge = (b["mean"] - ctrl) * 100 if ctrl is not None else None
+        else:
+            cell, edge = "(no cell n>=30)", None
+        L.append("  %-11s %8s %8s %9.2f%%   %-28s %7s %7s" % (
+            labels[mode], r.get("pools", "-"), r.get("events", "-"),
+            (r.get("event_rate") or 0) * 100, cell,
+            ("%+.1f%%" % (ctrl * 100)) if ctrl is not None else "-",
+            ("%+.1f" % edge) if edge is not None else "-"))
+    L.append("")
+    full = (out["results"].get("full") or {}).get("best")
+    direct = (out["results"].get("direct") or {}).get("best")
+    bplus = (out["results"].get("buyer_plus") or {}).get("best")
+
+    def _edge(mode):
+        r = out["results"].get(mode) or {}
+        b, c = r.get("best"), r.get("control")
+        return (b["mean"] - c) if (b and c is not None) else None
+
+    ef, ed, eb = _edge("full"), _edge("direct"), _edge("buyer_plus")
+    L.append("  => The target is the REAL full-flow move in every column; only the FEATURES are restricted to what")
+    L.append("     the box can see. So a column with a positive edge is deployable from shreds as-is.")
+    if ef is not None and ef > 0:
+        keep = [m for m, e in (("direct", ed), ("buyer_plus", eb)) if e is not None and e > 0 and e >= 0.5 * ef]
+        if keep:
+            L.append("     The edge SURVIVES on %s (>= half the full-view edge) -- the box's view carries it; build/keep ShredStream."
+                     % " and ".join(keep))
+        elif (ed is not None and ed > 0) or (eb is not None and eb > 0):
+            L.append("     The edge survives only WEAKLY on the restricted view (< half full) -- marginal; a live NET probe decides.")
+        else:
+            L.append("     The edge COLLAPSES on both restricted views -- it needs the aggregator (organic) trades the box can't")
+            L.append("     see from shreds, so ShredStream cannot match the study. Drop the front-run unless the feed is widened.")
+    else:
+        L.append("     No full-view edge at this move/hold either -- nothing to transfer; this is a null result, not a feed gap.")
+    L.append("")
+    L.append("  Mid-to-mid, untouched pools (hypothesis per the invariant); the live arbiter is a real reactive NET entry.")
     return "\n".join(L)

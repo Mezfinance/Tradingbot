@@ -567,11 +567,22 @@ def _vault(tx: dict, pool: str, mint: str, side: str) -> float:
     return 0.0
 
 
+def _top_level_pumpswap(tx: dict) -> bool:
+    """True if this tx called the pumpswap program at the OUTER (top) level -- a direct swap the box can decode
+    from raw ShredStream. An aggregator (Jupiter) routes pumpswap as a CPI (`invoke [2+]`), which the shreds carry
+    but the box cannot decode (no inner instructions), so the buy/sell direction is invisible there. Read from the
+    log depth bracket (`invoke [1]` = top level), which needs no address-lookup-table resolution."""
+    tag = "Program %s invoke [1]" % PUMPSWAP_PROGRAM
+    return any(line.startswith(tag) for line in (tx.get("meta") or {}).get("logMessages") or [])
+
+
 def launch_record(txs: list[dict], pool: str, base_mint: str, window_s: float = 180,
-                  exhausted: bool | None = None) -> dict:
+                  exhausted: bool | None = None, with_vis: bool = False) -> dict:
     """A pool's first `window_s` seconds from its oldest-first transactions: one row per successful tx,
     [seconds after creation, slot, fee payer, pool's token change, pool's SOL change, tokens after, SOL after].
-    Positive token change with negative SOL change = someone sold to the pool; the reverse = a buy."""
+    Positive token change with negative SOL change = someone sold to the pool; the reverse = a buy.
+    `with_vis` appends an 8th element per row: True iff the trade is a top-level (box-decodable) pumpswap swap --
+    the box's actual ShredStream visibility, for the visibility-restricted refit experiment."""
     if not txs:
         return {"error": "no transactions"}
     t0 = txs[0].get("blockTime") or 0
@@ -587,8 +598,11 @@ def launch_record(txs: list[dict], pool: str, base_mint: str, window_s: float = 
         b0, b1 = _vault(tx, pool, base_mint, "preTokenBalances"), _vault(tx, pool, base_mint, "postTokenBalances")
         q0, q1 = _vault(tx, pool, SOL_MINT, "preTokenBalances"), _vault(tx, pool, SOL_MINT, "postTokenBalances")
         keys = _keys(tx)
-        rows.append([bt - t0, tx.get("slot"), keys[0] if keys else None, round(b1 - b0, 6), round(q1 - q0, 9),
-                     round(b1, 6), round(q1, 9)])
+        row = [bt - t0, tx.get("slot"), keys[0] if keys else None, round(b1 - b0, 6), round(q1 - q0, 9),
+               round(b1, 6), round(q1, 9)]
+        if with_vis:
+            row.append(_top_level_pumpswap(tx))
+        rows.append(row)
     seed = next((r for r in rows if r[4] > 0 and r[6] == r[4]), None)  # the tx that funded the empty SOL vault
     creator = seed[2] if seed else (_keys(txs[0]) or [None])[0]
     return {"create_ts": t0, "creator": creator, "seed_sol": seed[6] if seed else None, "window_s": window_s,
