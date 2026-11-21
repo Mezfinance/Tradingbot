@@ -2491,6 +2491,14 @@ def _front_logit(tr, ho, specfn, rules, lead):
 
 
 FRONT_GATE_PCTS = (80, 90, 95, 98, 99)   # fire the joint logit only on its top (100-pct)% of scores
+FRONT_MOVE_FIELDS = {"abs_move", "move", "price_up"}   # the price move IN slot N -> backrun, not a precursor
+
+
+def _is_move_rule(rule):
+    """True if a discovered rule keys on the move IN slot N (abs_move/move/price_up) -- that is BACKRUNNING a move
+    already landed, not front-running the next one. Motif/symbol rules (wallet state) are precursors -> False."""
+    field = rule.split(" >=")[0].strip() if " >=" in rule else rule.strip()
+    return field in FRONT_MOVE_FIELDS
 
 
 def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS):
@@ -2660,6 +2668,11 @@ def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=
     out["net"] = net
     out["logit"] = _front_logit(tr, ho, specfn, [s["rule"] for s in survivors.get(lead_net, [])], lead_net)
     out["logit_gate"] = _front_logit_gate(ho, pool_flows, specfn, out["logit"], cost)
+    # precursor-only gate: drop the move-itself rules (abs_move/move/price_up = backrun) and refit on the wallet
+    # setup, so the gate fires BEFORE the move = a genuine front-run test, not a continuation/backrun one.
+    pre_rules = [s["rule"] for s in survivors.get(lead_net, []) if not _is_move_rule(s["rule"])]
+    out["logit_precursor"] = _front_logit(tr, ho, specfn, pre_rules, lead_net)
+    out["logit_gate_precursor"] = _front_logit_gate(ho, pool_flows, specfn, out["logit_precursor"], cost)
     return out
 
 
@@ -2755,11 +2768,16 @@ def render_frontrun(out):
     else:
         L.append("  MULTIVARIATE LOGISTIC: no surviving indicators at the deployed lead to fit")
 
-    gate = out.get("logit_gate") or {}
-    L.append("")
-    if gate.get("rows"):
-        L.append("  LOGIT-GATE ENTER-ON-SIGNAL (out of sample on holdout pools) -- fire only when the JOINT logit")
-        L.append("  score is in its top k%; precision test vs the single-rule net. Buy front of N+1, hold H, minus cost.")
+    def gate_block(gate, title, front_run):
+        if not (gate or {}).get("rows"):
+            L.append("")
+            L.append("  %s: no fitted joint logit to gate on" % title)
+            return
+        L.append("")
+        L.append("  %s (out of sample on holdout pools) -- fire only when the JOINT logit" % title)
+        kind = "excludes abs_move/move/price_up -> fires on the wallet SETUP before the move = a true front-run" \
+            if front_run else "includes abs_move = continuation/backrun contaminant"
+        L.append("  score is in its top k%% (%s). Buy front of N+1, hold H, minus cost." % kind)
         L.append("  %-24s%s" % ("", "".join("%28s" % ("hold %d" % h) for h in FRONT_HOLDS)))
         gc = gate.get("control", {})
         L.append("  %-24s%s" % ("control (holdout random)",
@@ -2775,12 +2793,18 @@ def render_frontrun(out):
                     edge = a["mean"] - c.get("mean", 0)
                     if paid is None or edge > paid[0]:
                         paid = (edge, row["pct"], h, a)
-        L.append("  => LOGIT-GATE %s" % (
-            "top %d%% / hold %d PAYS out of sample: net %+.1f%% (median %+.1f%%, win %.0f%%, n%d) -- the high-precision joint gate flips it; validate LIVE (1-slot NET probe) before any ShredStream build"
-            % (100 - paid[1], paid[2], paid[3]["mean"] * 100, paid[3]["median"] * 100, paid[3]["win_pct"], paid[3]["n"]) if paid
-            else "even the high-precision joint gate has no positive-median cell -- precision is not the lever, the base-rate wall holds, drop ShredStream"))
-    else:
-        L.append("  LOGIT-GATE ENTER-ON-SIGNAL: no fitted joint logit to gate on")
+        tag = "GATE" if not front_run else "FRONT-RUN GATE"
+        if paid:
+            L.append("  => %s top %d%% / hold %d PAYS out of sample: net %+.1f%% (median %+.1f%%, win %.0f%%, n%d) -- validate LIVE (1-slot NET probe) before any ShredStream build"
+                     % (tag, 100 - paid[1], paid[2], paid[3]["mean"] * 100, paid[3]["median"] * 100,
+                        paid[3]["win_pct"], paid[3]["n"]))
+        elif front_run:
+            L.append("  => %s no positive-median precursor cell -- the wallet setup does NOT front-run at the entry; the only edge was abs_move continuation (backrun), which fills kill -> drop ShredStream" % tag)
+        else:
+            L.append("  => %s no positive-median cell -- precision is not the lever, the base-rate wall holds" % tag)
+
+    gate_block(out.get("logit_gate"), "LOGIT-GATE ENTER-ON-SIGNAL (all predictors)", False)
+    gate_block(out.get("logit_gate_precursor"), "FRONT-RUN GATE (precursors only)", True)
 
     L.append("")
     L.append("  Mid-to-mid on untouched pools (hypothesis only, per the invariant); the live arbiter is a real reactive NET entry.")

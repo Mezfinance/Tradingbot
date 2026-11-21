@@ -846,6 +846,9 @@ def test_frontrun_finds_the_precursor_and_it_pays():
         assert gate["rows"] and "control" in gate
         assert all(r["n"] >= 0 and set(r["holds"]) == set(fl.FRONT_HOLDS) for r in gate["rows"])
         assert gate["rows"][-1]["n"] <= gate["rows"][0]["n"]         # a stricter top-k% fires on fewer slots
+        pre = out["logit_precursor"]                                 # the precursor-only (front-run) logit excludes move rules
+        assert not any(fl._is_move_rule(p["name"]) for p in pre["predictors"][1:])
+        assert "rows" in out["logit_gate_precursor"]
         assert fl.render_frontrun(out)
     finally:
         fl.USE_VQ = saved
