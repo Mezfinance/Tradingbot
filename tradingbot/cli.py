@@ -865,8 +865,11 @@ def main(argv: list[str] | None = None) -> None:
             if _flows_have is not None:
                 _have = _flows_have
             else:
+                # a restricted-visibility gate fit (frontrun --gate-vis direct/buyer_plus) needs the per-trade
+                # direct/aggregator tag, same as the vis-experiment -- else slot_flow(vis=) reads an empty view.
+                _with_vis = args.vis_experiment or (args.frontrun and args.gate_vis != "full")
                 _have, _cr = _fl.fetch_flows(_ws, fl_helius, _metas, args.span_s,
-                                             int(args.max_credits or 0), prog, with_vis=args.vis_experiment)
+                                             int(args.max_credits or 0), prog, with_vis=_with_vis)
             _tgt = _fl._tgt(args.target, args.flurry_min, args.horizon, args.move_pct)
             if args.multibuy:  # band flurries by buy count, enter the slot after, sweep the hold 1-10
                 out = _fl.multibuy_study(_have, _metas, args.cost_pct / 100.0)
