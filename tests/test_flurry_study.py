@@ -836,9 +836,29 @@ def test_frontrun_finds_the_precursor_and_it_pays():
         # it fires on the precursor slot and the spike lands in the hold -> beats the random-slot control
         assert any(top["holds"][h]["n"] >= 50 and top["holds"][h]["mean"] > out["control"][h]["mean"]
                    for h in fl.FRONT_HOLDS)
+        lg = out["logit"]                                            # the multivariate "regression with confidence"
+        assert lg["predictors"] and lg["predictors"][0]["name"] == "intercept"
+        nrow = next(p for p in lg["predictors"] if "sym == N" in p["name"])
+        assert nrow["coef"] > 0                                      # precursor points the right way in the joint fit
+        assert all(0.0 <= p["p"] <= 1.0 and fl.np.isfinite(p["z"]) for p in lg["predictors"])
+        assert lg["auc_hold"] is not None and lg["auc_hold"] > 0.5   # the joint model predicts the up-move out of sample
         assert fl.render_frontrun(out)
     finally:
         fl.USE_VQ = saved
+
+
+def test_logit_fit_recovers_a_positive_coefficient_with_finite_se():
+    rng = fl.np.random.default_rng(0)
+    n = 2000
+    x = (rng.random(n) < 0.5).astype(float)
+    p = 1.0 / (1.0 + fl.np.exp(-(-1.5 + 2.5 * x)))                     # y strongly driven by x
+    y = (rng.random(n) < p).astype(float)
+    X = fl.np.column_stack([fl.np.ones(n), x])
+    beta, se, _mu = fl._logit_fit(X, y)
+    assert beta[1] > 1.5 and se[1] > 0 and fl.np.isfinite(se[1])       # recovers the planted slope
+    z = beta[1] / se[1]
+    pv = fl._wald_p(z)
+    assert z > 3 and 0.0 <= pv <= 1.0 and pv < 0.01
 
 
 def test_frontrun_flat_market_has_no_events_and_no_survivor():
@@ -851,6 +871,7 @@ def test_frontrun_flat_market_has_no_events_and_no_survivor():
         assert out["events"] == 0                                   # nothing to front-run
         assert not out["ceiling"]                                   # no perfect-foresight cell either
         assert all(not out["survivors"][L] for L in out["leads"])   # and no indicator fabricated
+        assert not out["logit"].get("predictors")                   # nothing to fit the logistic on
         assert fl.render_frontrun(out)
     finally:
         fl.USE_VQ = saved

@@ -2402,6 +2402,94 @@ def _front_label(sn, events, lead):
     return 0.0
 
 
+def _ll(y, mu):
+    mu = np.clip(mu, 1e-9, 1.0 - 1e-9)
+    return float(np.sum(y * np.log(mu) + (1.0 - y) * np.log(1.0 - mu)))
+
+
+def _wald_p(z):
+    import math
+    return 2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(z) / math.sqrt(2.0))))
+
+
+def _logit_fit(X, y, ridge=1e-4, iters=60):
+    """IRLS logistic with a tiny L2 ridge (intercept unpenalised) so a separated or collinear predictor still
+    yields a finite covariance. Returns (beta, se, fitted mu); se from the ridged observed information."""
+    _n, p = X.shape
+    beta = np.zeros(p)
+    pen = ridge * np.eye(p)
+    pen[0, 0] = 0.0
+    for _ in range(iters):
+        mu = 1.0 / (1.0 + np.exp(-np.clip(X @ beta, -30, 30)))
+        w = np.clip(mu * (1.0 - mu), 1e-6, None)
+        grad = X.T @ (y - mu) - pen @ beta
+        H = X.T @ (X * w[:, None]) + pen
+        try:
+            step = np.linalg.solve(H, grad)
+        except np.linalg.LinAlgError:
+            step = np.linalg.lstsq(H, grad, rcond=None)[0]
+        beta = beta + step
+        if np.max(np.abs(step)) < 1e-8:
+            break
+    mu = 1.0 / (1.0 + np.exp(-np.clip(X @ beta, -30, 30)))
+    w = np.clip(mu * (1.0 - mu), 1e-6, None)
+    H = X.T @ (X * w[:, None]) + pen
+    try:
+        cov = np.linalg.inv(H)
+    except np.linalg.LinAlgError:
+        cov = np.linalg.pinv(H)
+    se = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+    return beta, se, mu
+
+
+def _front_logit(tr, ho, specfn, rules, lead):
+    """Multivariate logistic on the surviving indicators: joint coefficients + Wald z/p for the up-move within
+    `lead` slots, controlling for the correlation between indicators (a univariate lead that looks strong can
+    add nothing once another is in the model). Fit on TRAIN; generalization read as the holdout AUC. This is the
+    'regression with confidence' -- discover gives per-rule univariate z, the logistic gives the joint fit."""
+    seen, uniq = set(), []
+    for r in rules:                                        # dedupe, keep z-order, only rules we can evaluate
+        if r in specfn and r not in seen:
+            seen.add(r)
+            uniq.append(r)
+    if not uniq or not tr:
+        return {"predictors": [], "n": 0}
+    fns = [specfn[r] for r in uniq]
+
+    def design(recs):
+        X = np.ones((len(recs), len(uniq) + 1), float)
+        for j, fn in enumerate(fns):
+            X[:, j + 1] = np.fromiter((1.0 if fn(r) else 0.0 for r in recs), float, len(recs))
+        return X
+
+    Xtr = design(tr)
+    ytr = np.array([r["target_by_lead"][lead] for r in tr], float)
+    keep = [j for j in range(1, Xtr.shape[1]) if 0 < Xtr[:, j].sum() < len(tr)]   # drop constants (unidentified)
+    cols = [0] + keep
+    kept = [uniq[j - 1] for j in keep]
+    Xtr = Xtr[:, cols]
+    beta, se, mutr = _logit_fit(Xtr, ytr)
+    z = np.where(se > 0, beta / se, 0.0)
+    npred = max(len(kept), 1)
+    preds = []
+    for i, name in enumerate(["intercept"] + kept):
+        zi = float(z[i])
+        pi = _wald_p(zi)
+        preds.append({"name": name, "coef": float(beta[i]), "se": float(se[i]), "z": zi, "p": pi,
+                      "sig": bool(abs(zi) >= 1.96), "sig_bonf": bool(i > 0 and pi < 0.05 / npred)})
+    auc = None
+    if ho:
+        Xho = design(ho)[:, cols]
+        yho = np.array([r["target_by_lead"][lead] for r in ho], float)
+        if 0 < yho.sum() < len(yho):
+            auc = _rank_auc(Xho @ beta, yho)
+    p0 = float(ytr.mean())
+    ll0 = _ll(ytr, np.full(len(ytr), p0)) if 0 < p0 < 1 else 0.0
+    r2 = (1.0 - _ll(ytr, mutr) / ll0) if ll0 < 0 else 0.0
+    return {"lead": lead, "predictors": preds, "n": len(tr), "events": int(ytr.sum()),
+            "auc_hold": auc, "pseudo_r2": r2, "n_predictors": len(kept)}
+
+
 def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=FRONT_LEADS,
              seed=0, flurry_min=DEFAULT_FLURRY_MIN):
     """Can we predict a >= `move` up-move early enough to enter <=k slots before it and exit 1-2 after?
@@ -2515,6 +2603,7 @@ def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=
         net.append({"rule": p["rule"], "z": p["z"], "lift": p["lift"],
                     "holds": {h: _agg(v) for h, v in rr.items()}})
     out["net"] = net
+    out["logit"] = _front_logit(tr, ho, specfn, [s["rule"] for s in survivors.get(lead_net, [])], lead_net)
     return out
 
 
@@ -2589,6 +2678,27 @@ def render_frontrun(out):
                               % (paid[1][:40], paid[2], paid[3]["mean"] * 100, paid[3]["median"] * 100,
                                  paid[3]["win_pct"], out["control"].get(paid[2], {}).get("mean", 0) * 100) if paid
                               else "no surviving indicator's enter-on-signal beats the control on mean AND median -- the lead doesn't pay at the entry"))
+
+    lg = out.get("logit") or {}
+    L.append("")
+    if lg.get("predictors"):
+        L.append("  MULTIVARIATE LOGISTIC (lead %d) -- joint coefficients + Wald z/p; does each indicator add signal CONTROLLING for the others?"
+                 % lg.get("lead", out["net_lead"]))
+        L.append("  fit on %d train slots (%d up-moves); holdout AUC %s; pseudo-R2 %.3f"
+                 % (lg["n"], lg["events"],
+                    ("%.3f" % lg["auc_hold"]) if lg.get("auc_hold") is not None else "n/a", lg.get("pseudo_r2", 0.0)))
+        L.append("  %-40s%9s%8s%8s%9s  %s" % ("predictor", "coef", "se", "z", "p", "keep"))
+        for pr in lg["predictors"]:
+            flag = "BONF" if pr.get("sig_bonf") else ("*" if pr["sig"] else "")
+            L.append("  %-40s%+9.2f%8.2f%+8.1f%9.3f  %s"
+                     % (pr["name"][:40], pr["coef"], pr["se"], pr["z"], pr["p"], flag))
+        joint = [pr["name"] for pr in lg["predictors"] if pr.get("sig_bonf")]
+        L.append("  => LOGIT %s" % ("independent signal (Bonferroni): %s -- the joint predictor to fold into the live front-run rule"
+                                    % ", ".join(s[:24] for s in joint) if joint
+                                    else "no indicator stays significant under Bonferroni once the others are controlled -- the univariate leads are largely one signal"))
+    else:
+        L.append("  MULTIVARIATE LOGISTIC: no surviving indicators at the deployed lead to fit")
+
     L.append("")
     L.append("  Mid-to-mid on untouched pools (hypothesis only, per the invariant); the live arbiter is a real reactive NET entry.")
     return "\n".join(L)
