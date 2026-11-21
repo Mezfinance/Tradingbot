@@ -96,6 +96,7 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3,
         return res
     bank = live.SlotBank(flurry_min)
     thr = (gate.get("threshold") or {}).get(str(tier))
+    hold = int(gate.get("hold", 2))
     fired, at = [], None
     for s in flow["slots"]:
         r = bank.push(s)
@@ -104,7 +105,14 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3,
         if hit:
             fired.append(s["slot"])
         if s["slot"] == slot:
-            at = {"sym": r["sym"], "m2": r["m2"], "m3": r["m3"], "eta": round(e, 4), "fires": hit}
+            # abs_move AT the signal slot = the backrun discriminator: ~0 => a genuine precursor fire (the move
+            # is ahead, in N+1..N+hold); large => the fire overlaps a move already landed (backrun contamination).
+            entry = s.get("price") or fl._price_at(flow["slots"], slot)
+            exitp = fl._price_at(flow["slots"], slot + hold)
+            fwd = (exitp / entry - 1.0) if (entry and exitp) else None
+            at = {"sym": r["sym"], "m2": r["m2"], "m3": r["m3"], "eta": round(e, 4), "fires": hit,
+                  "abs_move": round(float(r["f"].get("abs_move", 0.0)), 4),
+                  "fwd_move": (round(fwd, 4) if fwd is not None else None)}
     res["status"] = "ok"
     res["n_slots"] = len(flow["slots"])
     res["in_flow"] = at is not None
@@ -135,7 +143,8 @@ def render(out: dict) -> str:
     L = [f"FRONT-RUN FEED VERIFY  (tier {out['tier']}: top {out['tier']}%)",
          f"  fires {out['n_fires']}  checked {out['n_checked']}  "
          f"reproduced {out['n_reproduced']}  DIVERGED {out['n_diverged']}", ""]
-    L.append(f"  {'pool':<20}{'slot':>12}{'in?':>5}{'fires?':>7}{'sym':>5}{'m2':>5}{'eta':>8}  match")
+    L.append(f"  {'pool':<20}{'slot':>12}{'in?':>5}{'fires?':>7}{'sym':>5}{'m2':>5}{'eta':>8}"
+             f"{'absmv@N':>9}{'fwd':>8}  kind  match")
     for r in out["rows"]:
         if r.get("status") != "ok":
             L.append(f"  {r['pool'][:20]:<20}{r['slot']:>12}  -- {r.get('status')}")
@@ -143,10 +152,15 @@ def render(out: dict) -> str:
         o = r["offline"] or {}
         mm = r.get("match")
         ms = "" if mm is None else ("ok" if all(mm.values()) else "MISMATCH " + ",".join(k for k, v in mm.items() if not v))
-        flag = "" if r["reproduced"] else "  <-- box fired but ground truth does NOT"
+        flag = "  <-- box fired but ground truth does NOT" if not r["reproduced"] else ""
+        am = o.get("abs_move")
+        fw = o.get("fwd_move")
+        # abs_move at N near 0 = clean precursor (front-run); large = overlaps a landed move (backrun territory)
+        kind = "?" if am is None else ("precursor" if am < 0.01 else "backrun?")
         L.append(f"  {r['pool'][:20]:<20}{r['slot']:>12}{('y' if r['in_flow'] else 'n'):>5}"
                  f"{('y' if o.get('fires') else 'n'):>7}{str(o.get('sym','')):>5}{str(o.get('m2','')):>5}"
-                 f"{(o.get('eta') if o.get('eta') is not None else 0):>8.3f}  {ms}{flag}")
+                 f"{(o.get('eta') if o.get('eta') is not None else 0):>8.3f}"
+                 f"{(am if am is not None else 0):>9.4f}{(fw if fw is not None else 0):>+8.3f}  {kind:<10}{ms}{flag}")
     if out["n_diverged"]:
         L += ["", "  DIVERGED fires = the box's live slot aggregation did not reproduce on chain ground truth.",
               "  Check, in order: the per-slot buyer wallet (fee payer = keys[0]); buy vs sell classification;",
