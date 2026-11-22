@@ -215,6 +215,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--gate-hold", type=int, default=2, help="flurry-study --export-gate: slots to hold after entering front of N+1 (default 2, the paying cell).")
     parser.add_argument("--capture", metavar="PATH", help="localshred-merge: the --capture feature JSONL from run_localshred.py --capture (our decode's per-slot features of each fresh pool)")
     parser.add_argument("--out", metavar="PATH", help="localshred-merge: write the merged --flows JSONL (our features + the Helius price path) here, for flurry-study --frontrun --flows")
+    parser.add_argument("--min-cap-slots", type=int, default=6, help="localshred-merge: skip captured pools with fewer slots than this before the Helius fetch (thin pools rarely yield >=3 Helius-priced slots, so they'd be fetched then dropped -- wasting credits)")
+    parser.add_argument("--min-cap-swaps", type=int, default=12, help="localshred-merge: skip captured pools with fewer total buy+sell events than this")
     parser.add_argument("--include-failed", action="store_true", help="flurry-study --frontrun: failed-inclusive refit A/B -- fit/eval the gate on decision features that COUNT reverted txs (what the live shred feed sees; no status in shreds) vs the success-only training view (vault deltas), on the SAME pools. Tests whether the front-run edge survives and whether re-fitting train=serve fixes the live over-firing. Refetches a superset.")
     parser.add_argument("--gate-vis", choices=["full", "direct", "buyer_plus"], default="direct", help="flurry-study --frontrun: the ShredStream visibility to FIT the gate on. The live box decodes only TOP-LEVEL pumpswap swaps, so 'direct' (default) makes the exported gate fire on the box's own view (the vis-experiment showed direct carries ~89%% of the full edge); 'full' reproduces the historical full-flow study. frontrun-verify reads the gate's stamped vis to replay through the same view.")
     parser.add_argument("--vis-experiment", action="store_true", help="flurry-study: refit the front-run gate on each box-reproducible VISIBILITY (full / direct-only / buyer-plus) with the target always the real full-flow move, and compare the precursor gate's holdout edge -- does the box's ShredStream view (top-level pumpswap only; aggregator CPIs invisible) carry the study's edge? Forces --vq; needs --fetch to visibility-tag the rows.")
@@ -820,7 +822,8 @@ def main(argv: list[str] | None = None) -> None:
             _cap_rows = [json.loads(x) for x in _cf if x.strip()]
         _lm_prog = lambda i, n, c: print(f"merge {i}/{n}, {c} credits", flush=True)
         _rows, _cr = _lm.merge_capture_flows(_cap_rows, _lm_helius, span_s=args.span_s,
-                                             max_credits=int(args.max_credits or 20_000), progress=_lm_prog)
+                                             max_credits=int(args.max_credits or 20_000), progress=_lm_prog,
+                                             min_cap_slots=args.min_cap_slots, min_cap_swaps=args.min_cap_swaps)
         with open(args.out, "w") as _of:
             for _r in _rows:
                 _of.write(json.dumps(_r) + "\n")

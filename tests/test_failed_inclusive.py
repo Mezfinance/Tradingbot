@@ -144,7 +144,7 @@ def test_merge_capture_flows_overlays_our_counts_on_helius_price(monkeypatch):
         def history_from_start(self, pool, span, pages):
             return ([], True, True)
 
-    rows, credits = fs.merge_capture_flows(cap, _H(), span_s=180, max_credits=10000)
+    rows, credits = fs.merge_capture_flows(cap, _H(), span_s=180, max_credits=10000, min_cap_slots=0, min_cap_swaps=0)
     assert len(rows) == 1 and rows[0]["pool"] == "P" and rows[0]["create_ts"] == 100.0
     txs = rows[0]["rec"]["txs"]
     s11 = [t for t in txs if t[1] == 11]
@@ -174,5 +174,25 @@ def test_merge_drops_pump_graduations(monkeypatch):
         def history_from_start(self, *a):
             return ([], True, True)
 
-    rows, _ = fs.merge_capture_flows(cap, _H(), span_s=180, max_credits=10000)
+    rows, _ = fs.merge_capture_flows(cap, _H(), span_s=180, max_credits=10000, min_cap_slots=0, min_cap_swaps=0)
     assert [r["pool"] for r in rows] == ["H"]          # graduation G (pump mint) dropped
+
+
+def test_merge_activity_prefilter_skips_thin_pools_before_fetching(monkeypatch):
+    # a thin pool (3 slots, 3 swaps) is skipped BEFORE the Helius fetch; an active one is fetched + kept.
+    thin_slots = [[0, 10, 1, 0, ["a"]], [1, 11, 1, 0, ["b"]], [2, 12, 1, 0, ["c"]]]
+    active_slots = [[i * 0.1, 10 + i, 2, 1, ["x", "y"]] for i in range(8)]   # 8 slots, 24 swaps
+    cap = [{"pool": "THIN", "token_mint": "Axyz", "create_ts": 1.0, "slots": thin_slots},
+           {"pool": "ACT", "token_mint": "Bxyz", "create_ts": 1.0, "slots": active_slots}]
+    fetched = []
+
+    class _H:
+        def history_from_start(self, pool, *a):
+            fetched.append(pool)
+            return ([], True, True)
+
+    monkeypatch.setattr(fs.he, "launch_record", lambda *a, **k: {"txs": [
+        [i * 0.1, 10 + i, "z", -5, 1, 90.0 - i, 6.0 + i] for i in range(8)]})
+    rows, _ = fs.merge_capture_flows(cap, _H(), span_s=180, max_credits=10000, min_cap_slots=6, min_cap_swaps=12)
+    assert fetched == ["ACT"]                    # THIN never cost a Helius call
+    assert [r["pool"] for r in rows] == ["ACT"]

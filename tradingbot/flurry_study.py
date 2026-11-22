@@ -324,7 +324,8 @@ def flows_from_file(path: str) -> tuple[list[dict], dict]:
     return metas, have
 
 
-def merge_capture_flows(cap_rows, helius, span_s: float = DEFAULT_SPAN_S, max_credits: int = 20_000, progress=None):
+def merge_capture_flows(cap_rows, helius, span_s: float = DEFAULT_SPAN_S, max_credits: int = 20_000, progress=None,
+                        min_cap_slots: int = 6, min_cap_swaps: int = 12):
     """Turn run_localshred --capture feature recs (our decode's per-slot buy/sell/buyers) into flurry-study --flows
     recs by backfilling the PRICE path from Helius -- the pool's real move, which defines the >=30% target. So the
     study fits the gate on OUR features with an accurate, feed-independent target. One rec per pool:
@@ -341,6 +342,10 @@ def merge_capture_flows(cap_rows, helius, span_s: float = DEFAULT_SPAN_S, max_cr
         if not pool or not mint or len(cap_slots) < 3:
             continue
         if mint.endswith("pump"):                          # drop pump.fun graduations: the study is hand-made only
+            continue
+        # thin pools rarely have >=3 Helius-priced slots (our count includes failed sniper txs Helius never priced),
+        # so they get fetched then dropped -- wasting credits. Skip them BEFORE the Helius call.
+        if len(cap_slots) < min_cap_slots or sum(s[2] + s[3] for s in cap_slots) < min_cap_swaps:
             continue
         if helius is None or credits + MAX_PAGES * 10 > max_credits:
             break
@@ -368,7 +373,7 @@ def merge_capture_flows(cap_rows, helius, span_s: float = DEFAULT_SPAN_S, max_cr
                     rows.append([sec, slot, b, -1e-9, 1e-9, toka, sola, True])      # our buy (payer kept for 'N')
                 for _ in range(int(o["n_sells"])):
                     rows.append([sec, slot, None, 1e-9, -1e-9, toka, sola, True])    # our sell (count only)
-        if len(rows) < 3:
+        if len(rows) < 3 or slot_flow({"txs": rows}) is None:   # emit only recs that yield a usable flow (>=3 priced slots)
             continue
         ct = cr.get("create_ts") or 0
         out.append({"pool": pool, "token_mint": mint, "create_ts": ct, "rec": {"create_ts": ct, "txs": rows}})
