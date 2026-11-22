@@ -34,6 +34,38 @@ precursor gate. The layer-1 spec below is kept for the record but is shelved as 
 positive-skew tail (win ~10-14%, median −1.0), per the invariant. The next real gate is a **live
 reactive NET probe** (up-side exit-fill risk), not a build.
 
+## RESULT (2026-11-22): the current reassembled feed is INCOMPLETE — box-exact proves it's not LUT
+
+The live box's `frontmeasure` fires still diverge from the Helius ground truth after the buy/sell
+orientation fix (`front_finalize` tib flip): a 40-fire `frontrun-verify` reproduced only 8, with 30
+`MISMATCH m2` (the *previous* slot's symbol differs; the current `S` matches). The 2026-11-21
+hypothesis was that the residual is the box's `drop_lut` (~3.9% of direct swaps: LUT-pooled direct
+pumpswap swaps the box can't resolve but the study's log-bracket `direct` tag keeps). The decisive
+test — `frontrun-verify --box-exact`, which makes the ground truth ALSO drop LUT-pooled direct swaps
+(`helius._box_visible` / `vis_box_exact`) — came back **DIVERGED 30 / 38, reproduced 8**: replicating
+the LUT drop recovered nothing (plain ~33% reproduced, box-exact ~21% on a larger sample, no change).
+
+So **the m2 residual is NOT `drop_lut`; it is deeper — trades lost upstream in the reassembled feed,
+invisible to `drop_parse`** (a shred that never arrives is never parsed-or-dropped). The tell is a
+completeness signature: 7 of 8 reproductions are `BS` (dominant-buy → net-sellers, eta −3.082); the
+box reliably catches the DOMINANT wallet (large, hard to drop) but loses the smaller outsider/new-
+wallet trades, so every non-dominant prior slot mis-classifies. That is exactly the wallet-setup
+population the motif gate keys on.
+
+**Consequence:** no box-side fix on the current feed closes this — not per-trade tib (a no-op; `tib`
+is a pool constant and `front_pending` already replays pre-seed slots), not a LUT resolver (box-exact
+shows LUT isn't the gap). The **complete-tx feed (LocalShred) is the only lever left.** And the test
+does NOT need the Amsterdam production box: completeness is feed CONTENT, not latency, so it runs from
+the existing Nuremberg box against the already-active LocalShred Lite account (see the Nuremberg
+measurement runbook). Clean verify → completeness confirmed, edge provable, then buy Amsterdam for
+latency; dirty → it wasn't completeness, stop, €0 spent. **Honest residual:** box-exact proves
+not-LUT and (with every cheaper cause ruled out — tib no-op, pre-seed handled, CPI matched by
+vis='direct', LUT replicated, `drop_parse`=0, `frontrun_live.SlotBank` parity-tested) points to shred
+incompleteness, but does not alone separate "missing trades" (LocalShred fixes) from a box-side
+aggregate difference (it would not). Only a per-slot trade-level diff — the box's vs the study's trade
+set for a mismatch pool — would, and that needs a box logging change on the retiring feed; the
+LocalShred verify is the cheaper definitive answer.
+
 ## Verdict: feasible, and simpler than feared
 
 The de-risking insight from the Jupiter v6 account layout (confirmed below): **we do not parse the
@@ -228,6 +260,54 @@ key was replaced. Everything right but nothing forwards = key suspended (the das
 shreds (we deshred ourselves; top-level pumpswap decode is enough), OR the repo's `--grpc-service-port` entry
 service (reconstructed `txns`, no deshred build) — try the entry service first.
 
+## Nuremberg measurement runbook (close the box-exact gap, €0, no new box)
+
+Goal: show the LocalShred feed reproduces the study where the current reassembled feed does NOT (the
+2026-11-22 box-exact DIVERGED). Runs on the EXISTING Nuremberg trading box; the Amsterdam production
+box waits on a clean result. Background every long command and read it with a separate `cat` (exec
+rule). The API key is on the dashboard, never in the repo.
+
+1. **Proxy up (entry-service tap).** On the Nuremberg box, build and run the fork per "operational
+   setup" above, but add `--grpc-service-port` so it reconstructs transactions in-proxy:
+   ```
+   localshred-lite-proxy shredstream \
+     --localshred-url http://localshred-lite.nlams.dedicatednodes.io:9999 \
+     --api-key $API_KEY --dest-ip-ports 127.0.0.1:8001 --grpc-service-port 9898 --src-bind-port 20000
+   ```
+   `sudo ufw allow 20000/udp` from the two senders (`45.154.33.229`, `45.154.33.129`). Healthy =
+   Received + forwarded counts climbing every 15 s AND the gRPC entry service listening on :9898.
+
+2. **Consumer (to build — the one new piece).** A small co-located python program:
+   a. **gRPC client** of the entry service (:9898) → yields `(slot, VersionedTransaction)`. Proto:
+      confirm the service/message names from the fork (`proto/` in `dedicatednodes/shredstream-proxy`,
+      or its `docs/localshred-lite-setup.md`); generate stubs with `grpcio-tools`. [OPEN ITEM]
+   b. **Direct top-level pumpswap decode** of each tx (mirror `pumpswap_direct` / the box's
+      `front_swap`): program id `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`, 8-byte discriminators
+      `sell` `[51,230,133,164,1,127,131,173]` / `buy_exact_quote_in` `[198,46,21,82,180,217,232,112]`
+      / `buy_base_out`; orientation `token_is_base = base_mint(acct 3) != WSOL`; buyer = fee payer
+      `keys[0]`; SOL size from the instruction data. Parsing the `VersionedTransaction` message needs
+      `solders` (or `solana-py`). [DEPENDENCY — confirm before adding]
+   c. **Per-slot aggregate** in the `frontrun_live.SlotBank` shape: `{slot, price (reserve ratio,
+      carry-forward if no trade), n_buys, buy_sol, max_buy, n_sells, sell_sol, buyers:[payer,…]}`.
+   d. **Drive it:** `runner = frontrun_live.Runner(precursor_gate.load("gate.json"), tier="1")`; for
+      each closing slot `runner.on_slot(agg)`, and on a FireSignal append
+      `{pool, slot, eta, sym, m2, tier, token_mint}` to a jsonl — the SAME shape the box writes to
+      `front-fires.jsonl`. `frontrun_live` + `precursor_gate` are already in the repo and
+      parity-tested; only (a)–(c) are new.
+
+3. **Verify (the answer).** Ship the jsonl to Fly (box → Mac → `fly ssh sftp` put to
+   `/data/ls-fires.jsonl`) and run the same feed-agnostic verifier:
+   ```
+   fly machine exec 863746ae7e73e8 "sh -lc 'nohup python -m tradingbot frontrun-verify \
+     --fires /data/ls-fires.jsonl --gate /data/gate.json --tier 1 --fetch --pages 20 \
+     > /tmp/v_ls.txt 2>&1 & echo started'" -a supermeme
+   ```
+   then a separate `cat /tmp/v_ls.txt`. Read `reproduced` / `DIVERGED` against the box's 8 / 30: a
+   clean reproduce = the complete feed closes the gap = edge provable on LocalShred (then buy
+   Amsterdam for latency); still-diverged = it wasn't completeness (a box aggregate difference, or
+   LocalShred itself drops trades) — stop and diff the consumer's decode against the study on a shared
+   pool. Decode at leisure; no latency pressure on this gate.
+
 ## Latency — the gating constraint
 
 Front-running needs slot N's flow **decided** in time to land a buy at the **front of N+1** (~400 ms
@@ -251,6 +331,7 @@ wait-for-shreds. Two consequences:
    layer 1 over them, and compare the recovered per-slot buy/sell flow against the Helius ground truth
    (`launch_record`/`slot_flow(vis="full")`) for the same pools — the same check `frontrun_verify.py`
    does for box fires, now on our own decode. This is the correctness gate, no latency pressure.
+   Concrete steps and the box-exact target: the **Nuremberg measurement runbook** above.
 2. **Router coverage.** Extend `front_stats` to bucket the aggregator slice by program id; write
    decoders for the routers that carry volume; everything else → buyer_plus.
 3. **Reconcile with the experiment.** The `--vis-experiment` tells us which visibility (`full` /
