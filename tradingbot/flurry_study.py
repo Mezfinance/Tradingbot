@@ -134,6 +134,8 @@ def target_label(tgt: dict) -> str:
 _SLOT, _PAYER, _TOKD, _SOLD, _TOKA, _SOLA = 1, 2, 3, 4, 5, 6
 _VIS = 7   # optional 8th row element (helius.launch_record with_vis): True = top-level pumpswap swap the box can
 #          # decode from shreds; absent/False = an aggregator-routed CPI, direction invisible to the box.
+_FAILED = 8  # optional 9th row element (helius.launch_record include_failed): True = a REVERTED swap. The live
+#            # shred feed counts these (no status in shreds); the training view (vault deltas) never saw them.
 
 
 def classify(tok_change: float, sol_change: float) -> str:
@@ -155,7 +157,7 @@ def _pool_vq(raw: bytes) -> int:
     return int.from_bytes(raw[245:261], "little", signed=True) if raw and len(raw) >= 261 else 0
 
 
-def slot_flow(rec: dict, vis: str = "full") -> dict | None:
+def slot_flow(rec: dict, vis: str = "full", include_failed: bool = False) -> dict | None:
     """Rebuild the per-slot series from a launch_record dict. Returns None if there is no usable price path.
     `slots` is a sorted list of per-slot dicts {slot, n_buys, buy_sol, n_sells, sell_sol, price}; `price` is the
     reserve ratio at the END of that slot. `pull_slot` is the first slot with an LP withdrawal (or None).
@@ -176,6 +178,8 @@ def slot_flow(rec: dict, vis: str = "full") -> dict | None:
         slot = r[_SLOT]
         if slot is None:
             continue
+        if (len(r) > _FAILED and bool(r[_FAILED])) and not include_failed:
+            continue                                       # a reverted swap: in the live feed but not training
         tok_after, sol_after = r[_TOKA], r[_SOLA]
         kind = classify(r[_TOKD] or 0.0, r[_SOLD] or 0.0)
         s = by_slot.setdefault(slot, {"slot": slot, "n_buys": 0, "buy_sol": 0.0, "n_sells": 0, "sell_sol": 0.0,
@@ -326,12 +330,21 @@ def _has_vis(rec: dict | None) -> bool:
     return bool(rows) and len(rows[0]) > _VIS
 
 
+def _has_failed(rec: dict | None) -> bool:
+    """A cached flow is failed-inclusive iff it was built with include_failed (so it carries the reverted swaps
+    the live shred feed sees). A failed-inclusive rec also carries the vis tag (include_failed implies it)."""
+    return bool((rec or {}).get("failed_tagged"))
+
+
 def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: int, progress=None,
-                with_vis: bool = False) -> tuple[dict, int]:
+                with_vis: bool = False, include_failed: bool = False) -> tuple[dict, int]:
     """Cache the first `span_s` of each pool's trading in watch.db `watch_flurry` (research key, stable hash order
     so a credit cap leaves an even sample). Returns {pool: launch_record dict} and the research credits spent.
     `with_vis` tags each row with its box visibility (top-level pumpswap vs aggregator CPI) and REFETCHES any cached
-    row that lacks the tag -- the one piece the cached launch_record does not store (it needs the raw tx logs)."""
+    row that lacks the tag -- the one piece the cached launch_record does not store (it needs the raw tx logs).
+    `include_failed` likewise refetches rows lacking the reverted swaps (the failed-inclusive refit test): it caches
+    a SUPERSET (success + failed-flagged rows) that slot_flow(include_failed=False/True) reads either way, so the
+    success-only and failed-inclusive views come from one fetch on identical pools. include_failed implies with_vis."""
     store.execute(SCHEMA)
     have: dict = {}
     for r in store.query("SELECT pool, data FROM watch_flurry", ()):
@@ -346,7 +359,7 @@ def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: in
         c = have.get(m["pool"])
         # when tagging, re-tag already-cached flows FIRST (cheap, focuses the budget on the flow set) before
         # spending it discovering brand-new pools; otherwise the hash order spreads it across every candidate.
-        retag = with_vis and c and c.get("txs") and not _has_vis(c)
+        retag = c and c.get("txs") and ((with_vis and not _has_vis(c)) or (include_failed and not _has_failed(c)))
         return (0 if retag else 1, hashlib.sha1(("fl:" + m["pool"]).encode()).hexdigest())
     order = sorted(metas, key=_order_key)
     credits = 0
@@ -354,14 +367,17 @@ def fetch_flows(store, helius, metas: list[dict], span_s: float, max_credits: in
         pool = m["pool"]
         cached = have.get(pool)
         done = cached and (cached.get("txs") or cached.get("error"))
-        tagged = done and (cached.get("error") or _has_vis(cached))   # error rows can't be re-tagged, leave them
-        if done and (not with_vis or tagged):
+        # a cached row satisfies the request iff it carries every tag asked for (error rows can't be tagged, leave them)
+        tagged = done and (cached.get("error") or
+                           ((not with_vis or _has_vis(cached)) and (not include_failed or _has_failed(cached))))
+        if done and tagged:
             continue
         if credits + MAX_PAGES * 10 > max_credits:
             break
         txs, _more, _err = helius.history_from_start(pool, span_s, MAX_PAGES)
         credits += MAX_PAGES * 10
-        rec = he.launch_record(txs, pool, m["token_mint"], window_s=span_s, with_vis=with_vis)
+        rec = he.launch_record(txs, pool, m["token_mint"], window_s=span_s, with_vis=with_vis,
+                               include_failed=include_failed)
         if cached and cached.get("vq") is not None and "vq" not in rec:
             rec["vq"] = cached["vq"]                                  # keep the vq basis across a vis refetch
         store.execute("INSERT OR REPLACE INTO watch_flurry(pool, data, ts) VALUES(?,?,?)",

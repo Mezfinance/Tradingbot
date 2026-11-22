@@ -66,3 +66,27 @@ def test_launch_record_includes_failed_rows_with_direction():
     assert rows[1][8] is True and rows[1][3] < 0 and rows[1][4] > 0 and rows[1][5] == 0.0   # failed buy
     assert rows[2][8] is True and rows[2][3] > 0 and rows[2][4] < 0            # failed sell
     assert rows[1][2] == PAYER                                                # payer captured (the would-be buyer)
+
+
+# --- Step 2: slot_flow toggles the failed rows ---
+from tradingbot import flurry_study as fs   # noqa: E402
+
+
+def _row(sec, slot, payer, td, sd, toka, sola, failed):
+    return [sec, slot, payer, td, sd, toka, sola, True, failed]   # vis=True at 7, _FAILED at 8
+
+
+def test_slot_flow_includes_failed_only_when_asked():
+    rec = {"create_ts": 0, "failed_tagged": True, "txs": [
+        _row(1, 10, "A", -10, 1, 90, 6, False),
+        _row(2, 11, "B", -10, 1, 80, 7, False),
+        _row(2, 11, "C", -1e-9, 1e-9, 0, 0, True),    # a FAILED buy in the same slot (new wallet C)
+        _row(3, 12, "D", 5, -0.5, 85, 6.5, False),
+    ]}
+    s0 = fs.slot_flow(rec, include_failed=False)
+    s1 = fs.slot_flow(rec, include_failed=True)
+    a = next(s for s in s0["slots"] if s["slot"] == 11)
+    b = next(s for s in s1["slots"] if s["slot"] == 11)
+    assert a["n_buys"] == 1 and a["buyers"] == ["B"]              # success-only: C (failed) dropped
+    assert b["n_buys"] == 2 and b["buyers"] == ["B", "C"]         # failed-inclusive: C counted as a buyer
+    assert a["price"] == b["price"]                               # the failed row never moves the price
