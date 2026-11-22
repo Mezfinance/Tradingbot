@@ -44,3 +44,43 @@ def on_transaction(consumer, slot, tx):
     """Feed one parsed transaction at `slot` into the Consumer. Returns any fires it produced."""
     account_keys, instructions, fee_payer = tx_view(tx)
     return consumer.on_tx(slot, account_keys, instructions, fee_payer)
+
+
+def deserialize_entries(entries_bytes):
+    """Yield each VersionedTransaction from a LocalShred entry-service `Entry.entries` payload (bincode
+    `Vec<solana_entry::Entry>`). Needs solders (the `live` extra). Each `solana_entry::Entry` is
+    `{ num_hashes:u64, hash:[u8;32], transactions:Vec<VersionedTransaction> }`, bincode: a `Vec` is a u64
+    LE length prefix then its elements, and a transaction is serialized inline. We deserialize the tx at
+    the current offset and advance by its byte length -- `VersionedTransaction.from_bytes` tolerates
+    trailing bytes and `bytes(tx)` round-trips to the exact length (verified on solders 0.29, 2026-11-22),
+    so no hand-written bincode message parser is needed."""
+    from solders.transaction import VersionedTransaction   # box dep (pyproject `live` extra)
+    buf = bytes(entries_bytes)
+    off = 0
+
+    def u64():
+        nonlocal off
+        v = int.from_bytes(buf[off:off + 8], "little")
+        off += 8
+        return v
+
+    n_entries = u64()
+    for _ in range(n_entries):
+        u64()                 # num_hashes (unused)
+        off += 32             # hash
+        for _ in range(u64()):
+            tx = VersionedTransaction.from_bytes(buf[off:])
+            off += len(bytes(tx))
+            yield tx
+
+
+def consume_stream(stream, consumer):
+    """Drive the Consumer from a `ShredstreamProxy.SubscribeEntries` stream: each message has `.slot`
+    and `.entries` (bincode `Vec<Entry>`). Fires go through `consumer.on_fire`. The gRPC channel + the
+    grpcio-tools-generated stubs are the only box-local bit:
+        stub = ShredstreamProxyStub(grpc.insecure_channel("127.0.0.1:9898"))
+        consume_stream(stub.SubscribeEntries(SubscribeEntriesRequest()), consumer)
+    """
+    for msg in stream:
+        for tx in deserialize_entries(msg.entries):
+            on_transaction(consumer, msg.slot, tx)
