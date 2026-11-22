@@ -33,6 +33,25 @@ def test_sol_base_pool_flips_so_a_token_buy_is_the_sell_instruction():
     assert buy_ix.is_buy is False and buy_ix.token == "TOKEN"      # token SELL
 
 
+def test_buy_base_out_is_decoded_as_a_token_buy():
+    # pump_amm `buy` (buy_base_out) is the dominant buy path; a TOKEN/WSOL pool -> a token BUY.
+    buy = _classify_one(lc.BUY_BASE_OUT, "TOKEN", lc.WSOL)
+    assert buy.is_buy is True and buy.token == "TOKEN"
+    # and on a SOL-base pool it flips (token buy arrives as... still buy_base_out here, WSOL is base):
+    sol_base = _classify_one(lc.BUY_BASE_OUT, lc.WSOL, "TOKEN")
+    assert sol_base.is_buy is False and sol_base.token == "TOKEN"   # inst_buy True, token_is_base False -> sell
+
+
+def test_non_sol_paired_pool_is_ignored():
+    # a USDC/token pool (neither side WSOL) is not a SOL-paired pool the box tracks -> None.
+    usdc = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    keys = ["PAYER", "POOL", "USER", "GCONF", "TOKEN", usdc]
+    assert lc.classify_instruction(lc.PROGRAM, [1, 2, 3, 4, 5], lc.BUY_BASE_OUT + bytes(16), keys, "PAYER") is None
+    # two WSOL sides (degenerate) also rejected
+    keys2 = ["PAYER", "POOL", "USER", "GCONF", lc.WSOL, lc.WSOL]
+    assert lc.classify_instruction(lc.PROGRAM, [1, 2, 3, 4, 5], lc.SELL + bytes(16), keys2, "PAYER") is None
+
+
 def test_non_pumpswap_and_malformed_are_ignored():
     keys = ["PAYER", "POOL", "USER", "GCONF", "TOKEN", lc.WSOL]
     assert lc.classify_instruction("OtherProgram", [1, 2, 3, 4, 5], lc.SELL + bytes(16), keys, "PAYER") is None

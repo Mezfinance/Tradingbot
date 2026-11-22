@@ -38,14 +38,15 @@ except ImportError:                   # noqa: E722 -- box copy sits beside the t
 PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"   # pumpswap (== pumpswap_direct.PROGRAM / helius.PUMPSWAP_PROGRAM)
 WSOL = "So11111111111111111111111111111111111111112"
 
-SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])        # pumpswap_direct.SELL
-BUY_EXACT_QUOTE_IN = bytes([198, 46, 21, 82, 180, 217, 232, 112])  # pumpswap_direct.BUY_EXACT_QUOTE_IN
-# buy_base_out is a third buy discriminator the box's front_swap handles; its 8 bytes aren't in this
-# repo's executor (which only sends sell / buy_exact_quote_in). To match the box's direct view exactly,
-# add it here from pump-public-docs/idl/pump_amm.json. Until then this covers sell + buy_exact_quote_in,
-# the dominant direct paths; a buy_base_out swap is simply not counted (a small, known undercount, the
-# frontrun-verify run will surface it if it matters).
-BUY_DISCS = frozenset({BUY_EXACT_QUOTE_IN})
+SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])        # pump_amm `sell` (== pumpswap_direct.SELL)
+BUY_EXACT_QUOTE_IN = bytes([198, 46, 21, 82, 180, 217, 232, 112])  # pump_amm `buy_exact_quote_in`
+BUY_BASE_OUT = bytes([102, 6, 61, 18, 1, 218, 235, 234])   # pump_amm `buy` (buy_base_out) = anchor global:buy
+# The box's front_swap decodes these THREE (sell + both buys). buy_base_out is the DOMINANT buy path;
+# omitting it undercounts buys so nearly every slot reads as net-sellers (sym 'S' -> a .S/BS flood with no
+# new-wallet 'N' motifs -- the 2026-11-22 live symptom). The rarer variants buy_exact_in /
+# sell_exact_quote_out the box does NOT decode, so they stay out too, keeping this an exact parity of the
+# box's direct view (so frontrun-verify's only variable is the feed, not the discriminator set).
+BUY_DISCS = frozenset({BUY_EXACT_QUOTE_IN, BUY_BASE_OUT})
 
 DEFAULT_FLURRY_MIN = frontrun_live.DEFAULT_FLURRY_MIN
 
@@ -81,7 +82,11 @@ def classify_instruction(program_id: str, accts, data, account_keys, fee_payer) 
         quote_mint = account_keys[accts[4]]
     except (IndexError, TypeError, KeyError):
         return None
-    token_is_base = base_mint != WSOL
+    base_is_sol = base_mint == WSOL
+    quote_is_sol = quote_mint == WSOL
+    if base_is_sol == quote_is_sol:              # need EXACTLY one WSOL side: a SOL-paired pool (box filter)
+        return None                              # excludes USDC-paired and other non-SOL pools
+    token_is_base = not base_is_sol              # the token is the non-WSOL mint
     token_buy = (inst_buy == token_is_base)      # the box flip: a SOL-base pool's token BUY is the `sell` ix
     token = base_mint if token_is_base else quote_mint
     return Swap(pool=pool, token=token, is_buy=token_buy, payer=fee_payer)
