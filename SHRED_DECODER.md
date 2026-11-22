@@ -176,8 +176,11 @@ public:
 
 - **gRPC entry service** (`--grpc-service-port`): the proxy itself deshreds + reconstructs entries and
   streams `recovered` / `entries` / `txns` (+ decode-error counts) — the Jito entry-stream
-  equivalent. We consume `VersionedTransaction`s directly and **skip the whole FEC/RS/deshred build**,
-  going straight to layer 1. Co-located (same box) so the decode latency is small. **Try this first.**
+  equivalent. We **skip the whole FEC/RS/deshred build** (the hard layer-0 part). Correction (proto
+  read 2026-11-22): the stream is `Entry{ uint64 slot, bytes entries }` where `entries` is bincode
+  `Vec<solana_entry::Entry>`, **not** ready `VersionedTransaction`s — so we still bincode-deserialize
+  the batch and pull each `Entry.transactions` before layer 1. Co-located (same box) so the decode
+  latency is small. **Try this first.**
 - **Raw UDP shreds** (`--dest-ip-ports 127.0.0.1:8001,…`): "same wire format a validator's TVU port
   receives, **deduplicated upstream**, every shred of every slot." We deshred ourselves, reusing the
   fork's now-public `solana-ledger 4.3.0` recovery. More control, maybe marginally faster (no gRPC),
@@ -277,23 +280,48 @@ rule). The API key is on the dashboard, never in the repo.
    `sudo ufw allow 20000/udp` from the two senders (`45.154.33.229`, `45.154.33.129`). Healthy =
    Received + forwarded counts climbing every 15 s AND the gRPC entry service listening on :9898.
 
-2. **Consumer (to build — the one new piece).** A small co-located python program:
-   a. **gRPC client** of the entry service (:9898) → yields `(slot, VersionedTransaction)`. Proto:
-      confirm the service/message names from the fork (`proto/` in `dedicatednodes/shredstream-proxy`,
-      or its `docs/localshred-lite-setup.md`); generate stubs with `grpcio-tools`. [OPEN ITEM]
-   b. **Direct top-level pumpswap decode** of each tx (mirror `pumpswap_direct` / the box's
-      `front_swap`): program id `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`, 8-byte discriminators
-      `sell` `[51,230,133,164,1,127,131,173]` / `buy_exact_quote_in` `[198,46,21,82,180,217,232,112]`
-      / `buy_base_out`; orientation `token_is_base = base_mint(acct 3) != WSOL`; buyer = fee payer
-      `keys[0]`; SOL size from the instruction data. Parsing the `VersionedTransaction` message needs
-      `solders` (or `solana-py`). [DEPENDENCY — confirm before adding]
-   c. **Per-slot aggregate** in the `frontrun_live.SlotBank` shape: `{slot, price (reserve ratio,
-      carry-forward if no trade), n_buys, buy_sol, max_buy, n_sells, sell_sol, buyers:[payer,…]}`.
-   d. **Drive it:** `runner = frontrun_live.Runner(precursor_gate.load("gate.json"), tier="1")`; for
-      each closing slot `runner.on_slot(agg)`, and on a FireSignal append
-      `{pool, slot, eta, sym, m2, tier, token_mint}` to a jsonl — the SAME shape the box writes to
-      `front-fires.jsonl`. `frontrun_live` + `precursor_gate` are already in the repo and
-      parity-tested; only (a)–(c) are new.
+2. **Consumer — decode core BUILT (`tradingbot/localshred_consumer.py` + `tradingbot/localshred_tap.py`,
+   tested); only the box-run I/O loop remains.** The core is the box's direct decode moved into the repo:
+   - `localshred_consumer.decode_tx(account_keys, instructions, fee_payer)` decodes top-level direct
+     pumpswap swaps — program id `pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA`, discriminators `sell`
+     `[51,230,133,164,1,127,131,173]` / `buy_exact_quote_in` `[198,46,21,82,180,217,232,112]`
+     (`buy_base_out` still TODO from `pump_amm.json`) — with the box orientation flip
+     `token_buy = (inst_buy == token_is_base)`, `token_is_base = base_mint(acct 3) != WSOL`, buyer =
+     fee payer `keys[0]`.
+   - `localshred_consumer.Consumer` routes one `frontrun_live.Runner` per pool, accumulates each pool's
+     active slot (`n_buys`/`n_sells`/`buyers`; price/SOL fed 0.0 — the gate is price/magnitude-free),
+     finalizes the slot when the pool next trades, and on a fire calls `on_fire` with the box-jsonl
+     fields; `localshred_consumer.jsonl_writer(path)` appends the `front-fires.jsonl` shape.
+   - `localshred_tap.tx_view(tx)` / `on_transaction(consumer, slot, tx)` map a parsed
+     `VersionedTransaction` (solders, duck-typed in tests) into the `decode_tx` view. LUT-indexed pool
+     accounts are unresolved → skipped, same blindness as the box (fine: box-exact proved the gap is
+     NOT LUT; add a LUT resolver only if the LocalShred verify's residual is then the ~3.9% LUT swaps).
+
+   **Entry-service contract (pinned, `dedicatednodes/shredstream-proxy` `jito_protos/protos/`, 2026-11-22):**
+   `service ShredstreamProxy { rpc SubscribeEntries(SubscribeEntriesRequest) returns (stream Entry); }`,
+   `message Entry { uint64 slot = 1; bytes entries = 2; }`. **Correction to "consume VersionedTransactions
+   directly":** `entries` is **bincode `Vec<solana_entry::Entry>`**, not ready txns — the proxy does
+   RS-recovery + deshred + reassembly (layer-0 steps 1–4, the hard part), but we still deserialize the
+   batch (step 5) and pull each `Entry.transactions: Vec<VersionedTransaction>` (step 6). Auth: the
+   `x-localshred-auth` header = `API_KEY` (env; `--api-key-header` to override). Request has no fields.
+   Stubs: `python -m grpc_tools.protoc -I jito_protos/protos --python_out=. --grpc_python_out=. shared.proto shredstream.proto` → `ShredstreamProxyStub`.
+
+   **Remaining box-run loop (validated on the box — needs `grpcio` + `solders`, and solders' deserialize
+   behaviour, which can't be unit-tested off the live feed):**
+   ```python
+   import localshred_consumer as lc, localshred_tap as tap
+   from solders.transaction import VersionedTransaction
+   stub = ShredstreamProxyStub(grpc.insecure_channel("127.0.0.1:9898"))   # same box
+   c = lc.Consumer(lc.load_gate("gate.json"), tier="1", on_fire=lc.jsonl_writer("ls-fires.jsonl"))
+   for e in stub.SubscribeEntries(SubscribeEntriesRequest()):             # e.slot, e.entries (bincode Vec<Entry>)
+       for tx in deserialize_entries(e.entries):                         # bincode Vec<Entry> -> VersionedTransactions
+           tap.on_transaction(c, e.slot, tx)
+   ```
+   `deserialize_entries` = bincode `Vec<Entry>` (u64 len prefix; each `Entry` = `u64 num_hashes` + `[u8;32]
+   hash` + `Vec<VersionedTransaction>`), yielding each tx. Slice each tx via `VersionedTransaction.from_bytes`
+   then advance by `len(bytes(tx))` **if** solders tolerates trailing bytes — the one thing to confirm on
+   the box (else compute the message length by parsing the bincode message header). `frontrun_live` +
+   `precursor_gate` + the decode core are parity-tested; only this gRPC + bincode layer is box-local.
 
 3. **Verify (the answer).** Ship the jsonl to Fly (box → Mac → `fly ssh sftp` put to
    `/data/ls-fires.jsonl`) and run the same feed-agnostic verifier:
