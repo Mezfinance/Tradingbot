@@ -115,6 +115,39 @@ def test_on_fire_gets_pool_token_and_slot():
                     "tier": "1", "token_mint": "TOKX"}
 
 
+class _AlwaysFire:
+    """A runner that fires on every slot -- isolates the Consumer's freshness gate from the real gate."""
+    def on_slot(self, rec):
+        return {"signal_slot": rec["slot"], "entry_slot": rec["slot"] + 1, "exit_slot": rec["slot"] + 2,
+                "hold": 2, "tier": "1", "eta": -3.0, "sym": "S", "m2": "BS"}
+
+
+def test_freshness_gate_fires_only_on_fresh_pools_after_warmup():
+    fires = []
+    c = lc.Consumer(gate={}, on_fire=fires.append, runner_factory=lambda: _AlwaysFire(),
+                    fresh_window_slots=10)
+    # OLD: present from the first slot (start_slot=100), so it's mid-life -> never eligible.
+    c.on_swap(100, "OLD", "T", False, "a")
+    c.on_swap(105, "OLD", "T", False, "a")   # flush OLD@100: first_slot-start = 0 < 10 (warm-up) -> suppressed
+    c.on_swap(118, "OLD", "T", False, "a")   # flush OLD@105: still < 10 -> suppressed
+    # NEW: first seen at 115, after the 10-slot warm-up (115-100=15) -> eligible for its first 10 slots.
+    c.on_swap(115, "NEW", "U", False, "b")
+    c.on_swap(118, "NEW", "U", False, "b")   # flush NEW@115: age 0 <= 10 -> FIRES
+    c.on_swap(130, "NEW", "U", False, "b")   # flush NEW@118: age 3 <= 10 -> FIRES
+    c.on_swap(145, "NEW", "U", False, "b")   # flush NEW@130: age 15 > 10 -> suppressed (outside fresh window)
+    c.flush_all()                            # OLD@118 suppressed, NEW@145 age 30 suppressed
+    assert [f["pool"] for f in fires] == ["NEW", "NEW"]
+    assert sorted(f["signal_slot"] for f in fires) == [115, 118]
+
+
+def test_freshness_gate_off_by_default_fires_on_everything():
+    fires = []
+    c = lc.Consumer(gate={}, on_fire=fires.append, runner_factory=lambda: _AlwaysFire())  # window 0 = off
+    c.on_swap(100, "OLD", "T", False, "a")
+    c.on_swap(105, "OLD", "T", False, "a")   # flush OLD@100 -> fires (no freshness gate)
+    assert len(fires) == 1 and fires[0]["pool"] == "OLD"
+
+
 def test_end_to_end_through_a_real_precursor_gate():
     # A minimal real gate: fire (eta >= 0.5) exactly when sym == 'S'. Proves decode -> aggregate ->
     # frontrun_live.Runner -> precursor_gate compose and emit a box-shaped fire.

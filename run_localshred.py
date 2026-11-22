@@ -38,6 +38,9 @@ def main():
     ap.add_argument("--out", default="ls-fires.jsonl", help="append each fire here, box shape")
     ap.add_argument("--addr", default="127.0.0.1:9898", help="proxy --grpc-service-port endpoint")
     ap.add_argument("--tier", default="1", help="gate tier: '1' top one percent, '2' top two percent")
+    ap.add_argument("--fresh-window-slots", type=int, default=450,
+                    help="freshness gate: fire only on pools first seen after a warm-up of this many "
+                         "slots and within this many slots of that (~450 = ~180s); 0 disables it")
     args = ap.parse_args()
 
     # Box-only deps: imported here so the file stays safe to have in the repo / import-scan.
@@ -61,12 +64,15 @@ def main():
         line = lc.fire_line(sig)
         print(f"[fire #{n['fires']}] {line}", flush=True)
 
-    consumer = lc.Consumer(gate, tier=args.tier, on_fire=on_fire)
+    consumer = lc.Consumer(gate, tier=args.tier, on_fire=on_fire,
+                           fresh_window_slots=args.fresh_window_slots)
 
     channel = grpc.insecure_channel(args.addr)
     stub = pbg.ShredstreamProxyStub(channel)
+    warm = "off" if args.fresh_window_slots <= 0 else f"{args.fresh_window_slots} slots (~{args.fresh_window_slots*0.4:.0f}s warm-up, no fires until then)"
     print(
-        f"[localshred] subscribing addr={args.addr} gate={args.gate} tier={args.tier} out={args.out}",
+        f"[localshred] subscribing addr={args.addr} gate={args.gate} tier={args.tier} "
+        f"fresh_window={warm} out={args.out}",
         flush=True,
     )
     try:

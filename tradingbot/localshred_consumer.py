@@ -104,7 +104,7 @@ def decode_tx(account_keys, instructions, fee_payer=None):
 
 
 class _PoolState:
-    __slots__ = ("slot", "token", "n_buys", "n_sells", "buyers", "runner")
+    __slots__ = ("slot", "token", "n_buys", "n_sells", "buyers", "runner", "first_slot")
 
     def __init__(self, runner):
         self.slot = None
@@ -113,6 +113,7 @@ class _PoolState:
         self.n_sells = 0
         self.buyers = []
         self.runner = runner
+        self.first_slot = None        # first slot we saw any swap for this pool (~creation for a fresh pool)
 
 
 class Consumer:
@@ -122,41 +123,67 @@ class Consumer:
     attached. `runner_factory` is for tests; by default it builds a real Runner from the gate."""
 
     def __init__(self, gate, tier: str = "1", flurry_min: int = DEFAULT_FLURRY_MIN,
-                 on_fire: Optional[Callable[[dict], None]] = None, runner_factory=None):
+                 on_fire: Optional[Callable[[dict], None]] = None, runner_factory=None,
+                 fresh_window_slots: int = 0):
         self.gate = gate
         self.tier = str(tier)
         self.flurry_min = flurry_min
         self.on_fire = on_fire
         self._make_runner = runner_factory or (lambda: frontrun_live.Runner(gate, self.tier, flurry_min))
         self.pools: dict = {}
+        # Freshness gate (the box's front_elig / pool_fresh equivalent). The precursor gate is fit only on
+        # FRESH launch pools (first ~180s from creation); scoring mid-life pools is out-of-distribution and
+        # floods on SB/BS/BB churn (the 2026-11-21 box bug), AND a mid-life fire diverges in frontrun-verify
+        # for the wrong reason (our per-pool history starts mid-life, the Helius ground truth from creation).
+        # So fire only on a pool that FIRST appeared after a warm-up of fresh_window_slots (confidence we
+        # caught it from its start, not mid-life) and within fresh_window_slots of that first appearance.
+        # 0 disables it (the raw core, for tests/replay); run_localshred.py sets ~450 (~180s at 0.4s/slot).
+        self.fresh_window_slots = int(fresh_window_slots)
+        self._start_slot = None
 
     def _slot_rec(self, st: _PoolState) -> dict:
         # price/sol fields are 0.0: the precursor gate is price- and magnitude-free (sym/m2/m3 only).
         return {"slot": st.slot, "price": 0.0, "n_buys": st.n_buys, "buy_sol": 0.0, "max_buy": 0.0,
                 "n_sells": st.n_sells, "sell_sol": 0.0, "buyers": list(st.buyers), "net_sol": 0.0}
 
+    def _fresh_ok(self, signal_slot: int, st: _PoolState) -> bool:
+        """True when a fire on `signal_slot` is on a genuinely fresh pool (see __init__). Window 0 = off."""
+        w = self.fresh_window_slots
+        if w <= 0:
+            return True
+        if self._start_slot is None or st.first_slot is None:
+            return False
+        if (st.first_slot - self._start_slot) < w:        # pool first seen during warm-up -> maybe mid-life
+            return False
+        return (signal_slot - st.first_slot) <= w          # and the fire is within the fresh window
+
     def _flush(self, pool: str, st: _PoolState) -> Optional[dict]:
         if st.slot is None:
             return None
-        sig = st.runner.on_slot(self._slot_rec(st))
+        signal_slot = st.slot
+        sig = st.runner.on_slot(self._slot_rec(st))        # advance the bank (keep tracking) even if suppressed
         st.slot = None
         st.n_buys = 0
         st.n_sells = 0
         st.buyers = []
-        if sig:
-            sig = dict(sig)
-            sig["pool"] = pool
-            sig["slot"] = sig["signal_slot"]
-            if st.token:
-                sig["token_mint"] = st.token
-            if self.on_fire:
-                self.on_fire(sig)
+        if not sig or not self._fresh_ok(signal_slot, st):
+            return None
+        sig = dict(sig)
+        sig["pool"] = pool
+        sig["slot"] = sig["signal_slot"]
+        if st.token:
+            sig["token_mint"] = st.token
+        if self.on_fire:
+            self.on_fire(sig)
         return sig
 
     def on_swap(self, slot: int, pool: str, token: Optional[str], is_buy: bool, payer) -> Optional[dict]:
+        if self._start_slot is None:
+            self._start_slot = slot
         st = self.pools.get(pool)
         if st is None:
             st = _PoolState(self._make_runner())
+            st.first_slot = slot
             self.pools[pool] = st
         fired = None
         if st.slot is not None and slot != st.slot:      # pool advanced -> close the active slot it held
