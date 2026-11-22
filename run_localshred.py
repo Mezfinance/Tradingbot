@@ -37,7 +37,7 @@ def main():
     ap.add_argument("--gate", required=True, help="precursor gate JSON (the direct-view fit)")
     ap.add_argument("--out", default="ls-fires.jsonl", help="append each fire here, box shape")
     ap.add_argument("--addr", default="127.0.0.1:9898", help="proxy --grpc-service-port endpoint")
-    ap.add_argument("--tier", default="1", help="gate tier (top-1% = '1', top-2% = '2')")
+    ap.add_argument("--tier", default="1", help="gate tier: '1' top one percent, '2' top two percent")
     args = ap.parse_args()
 
     # Box-only deps: imported here so the file stays safe to have in the repo / import-scan.
