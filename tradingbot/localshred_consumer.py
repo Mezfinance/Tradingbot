@@ -265,6 +265,23 @@ def load_gate(path: str):
     return precursor_gate.load(path)
 
 
+def fire_consumer(gate_path: str, fires_path: str, fresh_window_slots: int = 450,
+                  tier: str = "1", flurry_min: int = DEFAULT_FLURRY_MIN) -> "Consumer":
+    """Build a Consumer in FIRE mode: load the precursor gate from `gate_path` and append each fire (the box
+    front-fires.jsonl shape, {pool, slot, eta, sym, m2, tier, token_mint}) to `fires_path`. Feed it the SAME
+    transaction stream capture mode uses -- `localshred_tap.consume_stream(stream, consumer)` on the box.
+
+    This is the live counterpart of CaptureSink: capture fit the gate on our own feed, fire runs that gate.
+    `fresh_window_slots` ~450 (~180s at 0.4s/slot) matches the capture/fresh window so it fires only on fresh
+    launch pools (the gate's population); 0 disables the freshness gate (tests/replay). The lazy per-pool flush
+    (a pool's slot finalizes when it next trades) is fine for MEASUREMENT (the fire is logged with its correct
+    signal_slot); a real-money N+1 entry needs the box-side global-slot sweep (see Consumer.flush_all)."""
+    gate = load_gate(gate_path)
+    return Consumer(gate, tier=tier, flurry_min=flurry_min,
+                    on_fire=jsonl_writer(fires_path),
+                    fresh_window_slots=fresh_window_slots, handmade_only=True)
+
+
 class CaptureSink:
     """Collects the per-slot feature aggregates (Consumer.on_capture) of FRESH pools and emits one feature rec
     per pool: {pool, token_mint, create_ts, slots:[[sec, slot, n_buys, n_sells, buyers], ...]}. These are OUR

@@ -251,3 +251,21 @@ def test_consumer_skips_pump_graduations_by_default():
     c.on_swap(10, "HM", "ABCxyz", True, "a")          # a hand-made pool (non-pump) -> processed
     c.on_swap(11, "HM", "ABCxyz", True, "b")
     assert recs == ["HM"]
+
+
+def test_fire_consumer_wires_the_gate_and_a_fires_writer(tmp_path):
+    import json
+    gate_path = tmp_path / "gate.json"
+    gate_path.write_text(json.dumps({
+        "intercept": -10.0, "predictors": [{"coef": 20.0, "name": "sym == N"}],
+        "threshold": {"1": 0.0}, "hold": 2, "vis": "direct"}))
+    fires_path = tmp_path / "fires.jsonl"
+    c = lc.fire_consumer(str(gate_path), str(fires_path), fresh_window_slots=0, tier="1")
+    assert c.on_fire is not None and c.handmade_only is True and c.fresh_window_slots == 0
+    assert "_terms" in c.gate                                   # gate loaded + compiled
+    # the wired on_fire writer appends exactly the box front-fires.jsonl record
+    c.on_fire({"pool": "P", "signal_slot": 7, "eta": 1.2, "sym": "N", "m2": ".N",
+               "tier": "1", "token_mint": "Mxyz"})
+    rec = json.loads(fires_path.read_text().strip())
+    assert rec == {"pool": "P", "slot": 7, "eta": 1.2, "sym": "N", "m2": ".N",
+                   "tier": "1", "token_mint": "Mxyz"}
