@@ -204,6 +204,26 @@ def test_merge_drops_pump_graduations():
     assert [r["pool"] for r in rows] == ["H"]          # graduation G (pump mint) dropped before any fetch
 
 
+def test_merge_dedups_duplicate_pool_captures_keeping_the_richest():
+    # the capture can emit a pool across several windows; the merge must fetch each pool ONCE (richest window).
+    cap = [
+        {"pool": "P", "token_mint": "Axyz", "create_ts": 1.0,
+         "slots": [[0, 10, 1, 0, ["a"]], [1, 11, 1, 0, ["b"]], [2, 12, 1, 0, ["c"]]]},            # thin copy
+        {"pool": "P", "token_mint": "Axyz", "create_ts": 1.0,
+         "slots": [[i * 0.1, 10 + i, 2, 1, ["x", "y"]] for i in range(8)]},                        # rich copy
+    ]
+    fetched = []
+
+    class _H:
+        def history_window(self, pool, from_ts, span, pages):
+            fetched.append(pool)
+            return ([_wtx(10 + i, 90.0 - i, 6.0 + i, mint="Axyz", pool=pool) for i in range(8)], True)
+
+    rows, _ = fs.merge_capture_flows(cap, _H(), span_s=180, max_credits=10000, min_cap_slots=6, min_cap_swaps=12)
+    assert fetched == ["P"]                       # fetched once, not twice
+    assert len(rows) == 1                          # the rich copy survived the activity filter
+
+
 def test_merge_activity_prefilter_skips_thin_pools_before_fetching():
     # a thin pool (3 slots, 3 swaps) is skipped BEFORE the Helius fetch; an active one is fetched + kept.
     thin_slots = [[0, 10, 1, 0, ["a"]], [1, 11, 1, 0, ["b"]], [2, 12, 1, 0, ["c"]]]

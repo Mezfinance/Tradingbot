@@ -339,6 +339,15 @@ def merge_capture_flows(cap_rows, helius, span_s: float = DEFAULT_SPAN_S, max_cr
     The Helius fetch is ALIGNED to our captured window (history_window from create_ts), not history_from_start:
     a hand-made pool's trading (what we capture) can start minutes after the setup tx creation anchors on, so a
     creation-window price path shares no slots with ours."""
+    # Collapse duplicate captures of the same pool (the capture can emit a pool across several windows); keep the
+    # RICHEST (most slots) so one Helius fetch covers the best window -- otherwise we pay per duplicate and
+    # flows_from_file later keeps only one per pool anyway (the small run fetched 166 recs = 42 unique pools, 4x waste).
+    best: dict = {}
+    for cr in cap_rows:
+        p = cr.get("pool")
+        if p and (p not in best or len(cr.get("slots") or []) > len(best[p].get("slots") or [])):
+            best[p] = cr
+    cap_rows = list(best.values())
     out, credits = [], 0
     for i, cr in enumerate(cap_rows):
         pool, mint = cr.get("pool"), cr.get("token_mint")
@@ -2935,14 +2944,23 @@ def render_frontrun(out):
     L.append("  CEILING -- perfect foresight (enter T-k / exit T+j): is there money if we time it exactly")
     L.append("  k=before j=after   n mean/median win rug%")
     best = None
+    max_n = max_mean = 0
     for key in sorted(out["ceiling"]):
         a = out["ceiling"][key]
         L.append("  T-%s  exit T+%s      %s" % (key[0], key[-1], cell(a)))
+        max_n = max(max_n, a.get("n", 0))
+        max_mean = max(max_mean, a.get("mean", -9))
         if a.get("n", 0) >= 50 and a.get("mean", -9) > 0 and (best is None or a["mean"] > best[1]):
             best = (key, a["mean"], a)
-    L.append("  => CEILING %s" % ("+EV at T-%s/exit+%s (%.1f%% mean) -- a real front-run exists IF an indicator finds T"
-                                   % (best[0][0], best[0][-1], best[1] * 100) if best
-                                   else "NO +EV cell even with perfect foresight -> the move itself doesn't pay; drop"))
+    if best:
+        verdict = ("+EV at T-%s/exit+%s (%.1f%% mean) -- a real front-run exists IF an indicator finds T"
+                   % (best[0][0], best[0][-1], best[1] * 100))
+    elif max_n < 50:
+        verdict = ("TOO FEW up-move events to judge (best cell n=%d < 50%s) -- underpowered, NOT a negative; need a bigger sample"
+                   % (max_n, ", cells +EV so far at +%.0f%% mean" % (max_mean * 100) if max_mean > 0 else ""))
+    else:
+        verdict = "NO +EV cell even with perfect foresight -> the move itself doesn't pay; drop"
+    L.append("  => CEILING %s" % verdict)
 
     leads = out["leads"]
     prof = out["profile"]
