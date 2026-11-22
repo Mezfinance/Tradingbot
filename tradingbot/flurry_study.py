@@ -334,7 +334,11 @@ def merge_capture_flows(cap_rows, helius, span_s: float = DEFAULT_SPAN_S, max_cr
     A slot WE saw carries our counts; a slot only Helius saw (we missed it live) is a price-anchor row with no count
     -- exactly what the gate sees on our feed. Our swaps are all top-level pumpswap (direct), so every row is
     vis-tagged True (so --gate-vis direct and full both count them). Magnitudes are sentinel (the gate is
-    magnitude-free); the price per slot is the Helius end-of-slot reserves (carried forward over gaps)."""
+    magnitude-free); the price per slot is the Helius end-of-slot reserves (carried forward over gaps).
+
+    The Helius fetch is ALIGNED to our captured window (history_window from create_ts), not history_from_start:
+    a hand-made pool's trading (what we capture) can start minutes after the setup tx creation anchors on, so a
+    creation-window price path shares no slots with ours."""
     out, credits = [], 0
     for i, cr in enumerate(cap_rows):
         pool, mint = cr.get("pool"), cr.get("token_mint")
@@ -349,13 +353,20 @@ def merge_capture_flows(cap_rows, helius, span_s: float = DEFAULT_SPAN_S, max_cr
             continue
         if helius is None or credits + MAX_PAGES * 10 > max_credits:
             break
-        txs, _m, _ok = helius.history_from_start(pool, span_s, MAX_PAGES)
+        # Align the Helius price fetch to OUR captured TRADING window (create_ts = when we first saw it trade),
+        # not to the pool's creation. For a hand-made pool trading can start well after the setup tx that
+        # history_from_start anchors on, so creation-window prices don't overlap our slots (they sit minutes apart).
+        ct = cr.get("create_ts") or 0
+        txs, _ok = helius.history_window(pool, ct - 30, span_s + 60, MAX_PAGES)
         credits += MAX_PAGES * 10
-        hrows = (he.launch_record(txs, pool, mint, window_s=span_s) or {}).get("txs") or []
         price_by_slot = {}
-        for r in hrows:
-            if r[_TOKA] and r[_TOKA] > 0:
-                price_by_slot[r[_SLOT]] = (r[_TOKA], r[_SOLA])      # last tx of a slot wins = end-of-slot reserves
+        for tx in txs:
+            if (tx.get("meta") or {}).get("err") is not None:       # success txs only (price must be a real fill)
+                continue
+            toka = he._vault(tx, pool, mint, "postTokenBalances")
+            if toka and toka > 0:
+                sola = he._vault(tx, pool, he.SOL_MINT, "postTokenBalances")
+                price_by_slot[tx.get("slot")] = (toka, sola)        # last tx of a slot wins = end-of-slot reserves
         our = {s[1]: {"sec": s[0], "buyers": s[4], "n_sells": s[3]} for s in cap_slots}
         rows, last = [], None
         for slot in sorted(set(price_by_slot) | set(our)):
@@ -375,7 +386,6 @@ def merge_capture_flows(cap_rows, helius, span_s: float = DEFAULT_SPAN_S, max_cr
                     rows.append([sec, slot, None, 1e-9, -1e-9, toka, sola, True])    # our sell (count only)
         if len(rows) < 3 or slot_flow({"txs": rows}) is None:   # emit only recs that yield a usable flow (>=3 priced slots)
             continue
-        ct = cr.get("create_ts") or 0
         out.append({"pool": pool, "token_mint": mint, "create_ts": ct, "rec": {"create_ts": ct, "txs": rows}})
         if progress:
             progress(i + 1, len(cap_rows), credits)

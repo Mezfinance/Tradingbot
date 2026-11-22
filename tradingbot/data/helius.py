@@ -403,6 +403,30 @@ class Helius:
         times = [tx.get("blockTime") for tx in res.get("data") or [] if tx.get("blockTime")]
         return float(min(times)) if times else None
 
+    def history_window(self, address: str, from_ts: float, span_s: float,
+                       max_pages: int = 6) -> tuple[list[dict], bool]:
+        """Oldest-first full transactions whose blockTime is in [from_ts, from_ts+span_s].
+        For aligning a price path to a captured TRADING window, which for a hand-made pool can start well
+        after the pool's creation tx (what history_from_start anchors on). Returns (txs, ok)."""
+        txs: list[dict] = []
+        token = None
+        until = from_ts + span_s
+        for _ in range(max_pages):
+            opts = {"transactionDetails": "full", "sortOrder": "asc", "limit": 100,
+                    "maxSupportedTransactionVersion": TX_VERSION, "encoding": "jsonParsed",
+                    "filters": {"blockTime": {"gte": int(from_ts)}}}
+            if token:
+                opts["paginationToken"] = token
+            res = self._rpc("getTransactionsForAddress", [address, opts], HISTORY_CREDITS_PER_100)
+            if res is None:
+                return txs, False
+            page = res.get("data") or []
+            txs += [t for t in page if (t.get("blockTime") or 0) <= until]
+            token = res.get("paginationToken")
+            if not page or not token or (page[-1].get("blockTime") or 0) > until:
+                return txs, True
+        return txs, True
+
     def history(self, address: str, limit: int = 100) -> list[dict]:
         """Oldest-first full transactions touching `address`."""
         res = self._rpc("getTransactionsForAddress",

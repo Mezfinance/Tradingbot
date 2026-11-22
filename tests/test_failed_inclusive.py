@@ -126,23 +126,49 @@ def test_frontrun_include_failed_runs_both_views_and_compares():
 
 
 # --- merge: our capture features + Helius price -> --flows recs ---
-def test_merge_capture_flows_overlays_our_counts_on_helius_price(monkeypatch):
+def test_history_window_filters_by_blocktime_and_paginates():
+    h = helius.Helius(api_key="k")
+    pages = [
+        {"data": [{"slot": 10, "blockTime": 95}, {"slot": 11, "blockTime": 110}], "paginationToken": "t1"},
+        {"data": [{"slot": 12, "blockTime": 150}, {"slot": 13, "blockTime": 310}], "paginationToken": "t2"},
+    ]
+    calls = []
+
+    def fake_rpc(method, params, credits):
+        bt = params[1].get("filters", {}).get("blockTime", {})
+        calls.append(bt)
+        gte = bt.get("gte", 0)
+        p = pages[len(calls) - 1] if len(calls) <= len(pages) else {"data": [], "paginationToken": None}
+        return {"data": [t for t in p["data"] if t["blockTime"] >= gte],   # server honours gte (lower bound)
+                "paginationToken": p.get("paginationToken")}
+
+    h._rpc = fake_rpc
+    txs, ok = h.history_window("P", from_ts=100, span_s=180, max_pages=6)   # window [100, 280]
+    assert ok is True
+    assert [t["slot"] for t in txs] == [11, 12]        # 95 (server-dropped, gte) and 310 (>280, trimmed) gone
+    assert calls[0] == {"gte": 100}                    # gte filter sent
+    assert len(calls) == 2                             # stopped once a tx passed the window end (310 > 280)
+
+
+def _wtx(slot, toka, sola, mint="M", pool="P", err=None):
+    """A Helius jsonParsed tx carrying the pool's end-of-slot reserves (what history_window returns)."""
+    return {"slot": slot, "blockTime": 100 + slot, "meta": {"err": err, "postTokenBalances": [
+        {"owner": pool, "mint": mint, "uiTokenAmount": {"uiAmount": toka}},
+        {"owner": pool, "mint": fs.he.SOL_MINT, "uiTokenAmount": {"uiAmount": sola}}]}}
+
+
+def test_merge_capture_flows_overlays_our_counts_on_helius_price():
     cap = [{"pool": "P", "token_mint": "M", "create_ts": 100.0, "slots": [
         [0.0, 10, 1, 0, ["a"]],
         [1.0, 11, 2, 1, ["b", "c"]],
         [2.0, 12, 0, 1, []],
     ]}]
-    helius_rows = {"txs": [
-        [0.0, 10, "x", -5, 1, 95.0, 6.0],
-        [1.0, 11, "y", -5, 1, 90.0, 7.0],
-        [2.0, 12, "z", 5, -1, 95.0, 6.5],
-        [3.0, 13, "w", -5, 2, 80.0, 9.0],   # a slot our feed MISSED -> price anchor, no our count
-    ]}
-    monkeypatch.setattr(fs.he, "launch_record", lambda *a, **k: helius_rows)
+    win_txs = [_wtx(10, 95.0, 6.0), _wtx(11, 90.0, 7.0), _wtx(12, 95.0, 6.5),
+               _wtx(13, 80.0, 9.0)]            # a slot our feed MISSED -> price anchor, no our count
 
     class _H:
-        def history_from_start(self, pool, span, pages):
-            return ([], True, True)
+        def history_window(self, pool, from_ts, span, pages):
+            return (win_txs, True)
 
     rows, credits = fs.merge_capture_flows(cap, _H(), span_s=180, max_credits=10000, min_cap_slots=0, min_cap_swaps=0)
     assert len(rows) == 1 and rows[0]["pool"] == "P" and rows[0]["create_ts"] == 100.0
@@ -160,25 +186,25 @@ def test_merge_capture_flows_overlays_our_counts_on_helius_price(monkeypatch):
     assert abs(s11f["price"] - 7.0 / 90.0) < 1e-9          # the Helius reserves, not our sentinel
 
 
-def test_merge_drops_pump_graduations(monkeypatch):
+def test_merge_drops_pump_graduations():
     cap = [
         {"pool": "G", "token_mint": "ABCpump", "create_ts": 1.0,
          "slots": [[0, 10, 1, 0, ["a"]], [1, 11, 1, 0, ["b"]], [2, 12, 1, 0, ["c"]]]},
         {"pool": "H", "token_mint": "ABCxyz", "create_ts": 1.0,
          "slots": [[0, 10, 1, 0, ["a"]], [1, 11, 1, 0, ["b"]], [2, 12, 1, 0, ["c"]]]},
     ]
-    monkeypatch.setattr(fs.he, "launch_record", lambda *a, **k: {"txs": [
-        [0, 10, "x", -5, 1, 95.0, 6.0], [1, 11, "y", -5, 1, 90.0, 7.0], [2, 12, "z", -5, 1, 85.0, 8.0]]})
 
     class _H:
-        def history_from_start(self, *a):
-            return ([], True, True)
+        def history_window(self, pool, from_ts, span, pages):
+            return ([_wtx(10, 95.0, 6.0, mint="ABCxyz", pool=pool),
+                     _wtx(11, 90.0, 7.0, mint="ABCxyz", pool=pool),
+                     _wtx(12, 85.0, 8.0, mint="ABCxyz", pool=pool)], True)
 
     rows, _ = fs.merge_capture_flows(cap, _H(), span_s=180, max_credits=10000, min_cap_slots=0, min_cap_swaps=0)
-    assert [r["pool"] for r in rows] == ["H"]          # graduation G (pump mint) dropped
+    assert [r["pool"] for r in rows] == ["H"]          # graduation G (pump mint) dropped before any fetch
 
 
-def test_merge_activity_prefilter_skips_thin_pools_before_fetching(monkeypatch):
+def test_merge_activity_prefilter_skips_thin_pools_before_fetching():
     # a thin pool (3 slots, 3 swaps) is skipped BEFORE the Helius fetch; an active one is fetched + kept.
     thin_slots = [[0, 10, 1, 0, ["a"]], [1, 11, 1, 0, ["b"]], [2, 12, 1, 0, ["c"]]]
     active_slots = [[i * 0.1, 10 + i, 2, 1, ["x", "y"]] for i in range(8)]   # 8 slots, 24 swaps
@@ -187,12 +213,10 @@ def test_merge_activity_prefilter_skips_thin_pools_before_fetching(monkeypatch):
     fetched = []
 
     class _H:
-        def history_from_start(self, pool, *a):
+        def history_window(self, pool, from_ts, span, pages):
             fetched.append(pool)
-            return ([], True, True)
+            return ([_wtx(10 + i, 90.0 - i, 6.0 + i, mint="Bxyz", pool=pool) for i in range(8)], True)
 
-    monkeypatch.setattr(fs.he, "launch_record", lambda *a, **k: {"txs": [
-        [i * 0.1, 10 + i, "z", -5, 1, 90.0 - i, 6.0 + i] for i in range(8)]})
     rows, _ = fs.merge_capture_flows(cap, _H(), span_s=180, max_credits=10000, min_cap_slots=6, min_cap_swaps=12)
     assert fetched == ["ACT"]                    # THIN never cost a Helius call
     assert [r["pool"] for r in rows] == ["ACT"]
