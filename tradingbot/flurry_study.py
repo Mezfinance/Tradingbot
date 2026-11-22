@@ -340,6 +340,8 @@ def merge_capture_flows(cap_rows, helius, span_s: float = DEFAULT_SPAN_S, max_cr
         cap_slots = cr.get("slots") or []
         if not pool or not mint or len(cap_slots) < 3:
             continue
+        if mint.endswith("pump"):                          # drop pump.fun graduations: the study is hand-made only
+            continue
         if helius is None or credits + MAX_PAGES * 10 > max_credits:
             break
         txs, _m, _ok = helius.history_from_start(pool, span_s, MAX_PAGES)

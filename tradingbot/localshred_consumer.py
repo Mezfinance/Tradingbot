@@ -39,6 +39,14 @@ except ImportError:                   # noqa: E722 -- box copy sits beside the t
 PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"   # pumpswap (== pumpswap_direct.PROGRAM / helius.PUMPSWAP_PROGRAM)
 WSOL = "So11111111111111111111111111111111111111112"
 
+
+def is_handmade(token: Optional[str]) -> bool:
+    """A hand-made pumpswap pool: a token mint NOT ending in 'pump'. pump.fun tokens end in 'pump' and their
+    graduations are pumpswap pools too, but the study and the box's launch_live scorer are hand-made ONLY (the
+    creator holds the LP and can pull it), so the consumer matches that population -- scoring graduations the gate
+    was never fit on is out-of-distribution (and part of the live over-firing)."""
+    return bool(token) and not token.endswith("pump")
+
 SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])        # pump_amm `sell` (== pumpswap_direct.SELL)
 BUY_EXACT_QUOTE_IN = bytes([198, 46, 21, 82, 180, 217, 232, 112])  # pump_amm `buy_exact_quote_in`
 BUY_BASE_OUT = bytes([102, 6, 61, 18, 1, 218, 235, 234])   # pump_amm `buy` (buy_base_out) = anchor global:buy
@@ -130,11 +138,15 @@ class Consumer:
 
     def __init__(self, gate, tier: str = "1", flurry_min: int = DEFAULT_FLURRY_MIN,
                  on_fire: Optional[Callable[[dict], None]] = None, runner_factory=None,
-                 fresh_window_slots: int = 0, on_capture: Optional[Callable] = None):
+                 fresh_window_slots: int = 0, on_capture: Optional[Callable] = None,
+                 handmade_only: bool = True):
         self.gate = gate
         self.tier = str(tier)
         self.flurry_min = flurry_min
         self.on_fire = on_fire
+        # Process ONLY hand-made pools (token mint not ending 'pump'), matching the study / launch_live scorer;
+        # pump.fun graduations are out-of-distribution for the gate (and part of the over-firing). Off -> every pool.
+        self.handmade_only = handmade_only
         # on_capture(pool, token, slot_rec) is called for EVERY finalized slot (not just fires): the per-slot
         # feature aggregate our decode produces. --capture mode writes these to fit the study on our own feed.
         self.on_capture = on_capture
@@ -192,6 +204,8 @@ class Consumer:
     def on_swap(self, slot: int, pool: str, token: Optional[str], is_buy: bool, payer) -> Optional[dict]:
         if self._start_slot is None:
             self._start_slot = slot
+        if self.handmade_only and not is_handmade(token):
+            return None                                  # skip pump.fun graduations: the gate is hand-made only
         st = self.pools.get(pool)
         if st is None:
             st = _PoolState(self._make_runner())

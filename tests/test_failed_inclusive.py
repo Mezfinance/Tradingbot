@@ -158,3 +158,21 @@ def test_merge_capture_flows_overlays_our_counts_on_helius_price(monkeypatch):
     s11f = next(s for s in flow["slots"] if s["slot"] == 11)
     assert s11f["n_buys"] == 2 and s11f["buyers"] == ["b", "c"] and s11f["n_sells"] == 1
     assert abs(s11f["price"] - 7.0 / 90.0) < 1e-9          # the Helius reserves, not our sentinel
+
+
+def test_merge_drops_pump_graduations(monkeypatch):
+    cap = [
+        {"pool": "G", "token_mint": "ABCpump", "create_ts": 1.0,
+         "slots": [[0, 10, 1, 0, ["a"]], [1, 11, 1, 0, ["b"]], [2, 12, 1, 0, ["c"]]]},
+        {"pool": "H", "token_mint": "ABCxyz", "create_ts": 1.0,
+         "slots": [[0, 10, 1, 0, ["a"]], [1, 11, 1, 0, ["b"]], [2, 12, 1, 0, ["c"]]]},
+    ]
+    monkeypatch.setattr(fs.he, "launch_record", lambda *a, **k: {"txs": [
+        [0, 10, "x", -5, 1, 95.0, 6.0], [1, 11, "y", -5, 1, 90.0, 7.0], [2, 12, "z", -5, 1, 85.0, 8.0]]})
+
+    class _H:
+        def history_from_start(self, *a):
+            return ([], True, True)
+
+    rows, _ = fs.merge_capture_flows(cap, _H(), span_s=180, max_credits=10000)
+    assert [r["pool"] for r in rows] == ["H"]          # graduation G (pump mint) dropped

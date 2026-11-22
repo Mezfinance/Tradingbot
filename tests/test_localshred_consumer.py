@@ -232,3 +232,22 @@ def test_consumer_on_capture_fires_per_finalized_slot():
     c.on_swap(10, "P", "TOK", False, "s")
     c.on_swap(11, "P", "TOK", True, "b")               # advance -> flush slot 10 -> capture
     assert recs == [("P", "TOK", 10, 1, 1)]
+
+
+# --- hand-made filter (pump.fun graduations are out of the study's population) ---
+def test_is_handmade_flags_pump_mints():
+    assert lc.is_handmade("ABCxyz") is True
+    assert lc.is_handmade("SoMeMintpump") is False
+    assert lc.is_handmade(None) is False and lc.is_handmade("") is False
+
+
+def test_consumer_skips_pump_graduations_by_default():
+    recs = []
+    c = lc.Consumer(gate={}, runner_factory=lambda: _RecRunner(),
+                    on_capture=lambda p, t, r: recs.append(p))
+    c.on_swap(10, "GRAD", "ABCpump", True, "a")       # a graduation (pump mint) -> skipped
+    c.on_swap(11, "GRAD", "ABCpump", True, "b")
+    assert recs == [] and "GRAD" not in c.pools
+    c.on_swap(10, "HM", "ABCxyz", True, "a")          # a hand-made pool (non-pump) -> processed
+    c.on_swap(11, "HM", "ABCxyz", True, "b")
+    assert recs == ["HM"]
