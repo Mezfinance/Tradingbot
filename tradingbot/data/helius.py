@@ -46,6 +46,14 @@ MIN_INTERVAL_S = 0.15
 RETRIES_429 = 4
 RPC_CREDITS = 1
 SOL_MINT = "So11111111111111111111111111111111111111112"
+
+# pump_amm swap instruction discriminators (anchor global:<name>, first 8 bytes); mirror
+# localshred_consumer / pumpswap_direct. swap_direction uses them to read a FAILED tx's direction from its
+# instruction -- a failed tx moves no vaults, so launch_record's vault-delta path can't see it.
+_SWAP_SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])                   # sell
+_SWAP_BUYS = frozenset({bytes([198, 46, 21, 82, 180, 217, 232, 112]),        # buy_exact_quote_in
+                        bytes([102, 6, 61, 18, 1, 218, 235, 234])})          # buy (buy_base_out)
+_FAILED_SENTINEL = 1e-9   # magnitude for a failed tx's vault-delta sign (direction only; the gate is magnitude-free)
 # Program log lines of a liquidity withdrawal (pumpswap `Withdraw`, Meteora/Raydium remove-liquidity variants).
 WITHDRAW_RE = re.compile(r"Instruction: (Withdraw|RemoveLiquidity|RemoveAllLiquidity|RemoveBalanceLiquidity|"
                          r"remove_liquidity|withdraw)\b")
@@ -594,9 +602,48 @@ def _box_visible(tx: dict, pool: str) -> bool:
     return _top_level_pumpswap(tx) and not _lut_sourced(tx, pool)
 
 
+def _b58decode(s: str) -> bytes:
+    n = 0
+    for c in s:
+        n = n * 58 + B58.index(c)
+    body = n.to_bytes((n.bit_length() + 7) // 8, "big") if n else b""
+    return b"\0" * (len(s) - len(s.lstrip("1"))) + body
+
+
+def swap_direction(tx: dict) -> bool | None:
+    """Token buy/sell direction of a tx's top-level pumpswap swap, read from the INSTRUCTION -- so it works for a
+    FAILED tx, which has no vault delta for launch_record to read. True = token buy, False = token sell, None = not
+    a decodable top-level SOL-paired pumpswap swap. Mirrors localshred_consumer.classify_instruction's orientation
+    flip, reading jsonParsed instruction pubkeys directly (base/quote at instruction accounts 3/4)."""
+    msg = (tx.get("transaction") or {}).get("message") or {}
+    for ix in msg.get("instructions") or []:
+        if ix.get("programId") != PUMPSWAP_PROGRAM:
+            continue
+        accts = ix.get("accounts") or []
+        if len(accts) < 5:
+            continue
+        try:
+            disc = _b58decode(ix.get("data") or "")[:8]
+        except ValueError:
+            continue
+        if disc == _SWAP_SELL:
+            inst_buy = False
+        elif disc in _SWAP_BUYS:
+            inst_buy = True
+        else:
+            continue
+        base, quote = accts[3], accts[4]
+        base_sol, quote_sol = base == SOL_MINT, quote == SOL_MINT
+        if base_sol == quote_sol:                 # need exactly one WSOL side (a SOL-paired pool)
+            continue
+        token_is_base = not base_sol
+        return inst_buy == token_is_base          # the box flip: a SOL-base pool's token BUY is the `sell` ix
+    return None
+
+
 def launch_record(txs: list[dict], pool: str, base_mint: str, window_s: float = 180,
                   exhausted: bool | None = None, with_vis: bool = False,
-                  vis_box_exact: bool = False) -> dict:
+                  vis_box_exact: bool = False, include_failed: bool = False) -> dict:
     """A pool's first `window_s` seconds from its oldest-first transactions: one row per successful tx,
     [seconds after creation, slot, fee payer, pool's token change, pool's SOL change, tokens after, SOL after].
     Positive token change with negative SOL change = someone sold to the pool; the reverse = a buy.
@@ -608,6 +655,7 @@ def launch_record(txs: list[dict], pool: str, base_mint: str, window_s: float = 
         return {"error": "no transactions"}
     t0 = txs[0].get("blockTime") or 0
     rows, failed, complete = [], 0, (len(txs) < 100 if exhausted is None else exhausted)
+    tag_vis = with_vis or include_failed
     for tx in txs:
         bt = tx.get("blockTime") or 0
         if bt > t0 + window_s:
@@ -615,19 +663,30 @@ def launch_record(txs: list[dict], pool: str, base_mint: str, window_s: float = 
             break
         if (tx.get("meta") or {}).get("err") is not None:
             failed += 1
+            if include_failed:                        # emit a direction-only row for a reverted swap (no delta)
+                d = swap_direction(tx)
+                if d is not None:
+                    keys = _keys(tx)
+                    td, sd = (-_FAILED_SENTINEL, _FAILED_SENTINEL) if d else (_FAILED_SENTINEL, -_FAILED_SENTINEL)
+                    frow = [bt - t0, tx.get("slot"), keys[0] if keys else None, td, sd, 0.0, 0.0]
+                    frow.append(_box_visible(tx, pool) if vis_box_exact else _top_level_pumpswap(tx))
+                    frow.append(True)                 # _FAILED flag: a reverted tx (price unchanged, 0/0 after)
+                    rows.append(frow)
             continue
         b0, b1 = _vault(tx, pool, base_mint, "preTokenBalances"), _vault(tx, pool, base_mint, "postTokenBalances")
         q0, q1 = _vault(tx, pool, SOL_MINT, "preTokenBalances"), _vault(tx, pool, SOL_MINT, "postTokenBalances")
         keys = _keys(tx)
         row = [bt - t0, tx.get("slot"), keys[0] if keys else None, round(b1 - b0, 6), round(q1 - q0, 9),
                round(b1, 6), round(q1, 9)]
-        if with_vis:
+        if tag_vis:
             row.append(_box_visible(tx, pool) if vis_box_exact else _top_level_pumpswap(tx))
+        if include_failed:
+            row.append(False)                         # _FAILED flag: a successful tx
         rows.append(row)
     seed = next((r for r in rows if r[4] > 0 and r[6] == r[4]), None)  # the tx that funded the empty SOL vault
     creator = seed[2] if seed else (_keys(txs[0]) or [None])[0]
     return {"create_ts": t0, "creator": creator, "seed_sol": seed[6] if seed else None, "window_s": window_s,
-            "txs": rows,
+            "txs": rows, "failed_tagged": include_failed,
             "failed": failed, "complete": complete, "fetched": len(txs)}
 
 
