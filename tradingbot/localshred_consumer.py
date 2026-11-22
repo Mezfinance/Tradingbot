@@ -27,6 +27,7 @@ view `decode_tx` takes. This module is the decode + aggregate + decision CORE, u
 either, so the adapters are a thin, box-local layer over a tested core.
 """
 import json
+import time
 from typing import Callable, NamedTuple, Optional
 
 try:                                  # in-package and standalone-on-the-box both work
@@ -129,11 +130,14 @@ class Consumer:
 
     def __init__(self, gate, tier: str = "1", flurry_min: int = DEFAULT_FLURRY_MIN,
                  on_fire: Optional[Callable[[dict], None]] = None, runner_factory=None,
-                 fresh_window_slots: int = 0):
+                 fresh_window_slots: int = 0, on_capture: Optional[Callable] = None):
         self.gate = gate
         self.tier = str(tier)
         self.flurry_min = flurry_min
         self.on_fire = on_fire
+        # on_capture(pool, token, slot_rec) is called for EVERY finalized slot (not just fires): the per-slot
+        # feature aggregate our decode produces. --capture mode writes these to fit the study on our own feed.
+        self.on_capture = on_capture
         self._make_runner = runner_factory or (lambda: frontrun_live.Runner(gate, self.tier, flurry_min))
         self.pools: dict = {}
         # Freshness gate (the box's front_elig / pool_fresh equivalent). The precursor gate is fit only on
@@ -166,7 +170,10 @@ class Consumer:
         if st.slot is None:
             return None
         signal_slot = st.slot
-        sig = st.runner.on_slot(self._slot_rec(st))        # advance the bank (keep tracking) even if suppressed
+        rec = self._slot_rec(st)
+        if self.on_capture:
+            self.on_capture(pool, st.token, rec)           # record the per-slot feature aggregate (for --capture)
+        sig = st.runner.on_slot(rec)                        # advance the bank (keep tracking) even if suppressed
         st.slot = None
         st.n_buys = 0
         st.n_sells = 0
@@ -242,3 +249,49 @@ def jsonl_writer(path: str) -> Callable[[dict], None]:
 
 def load_gate(path: str):
     return precursor_gate.load(path)
+
+
+class CaptureSink:
+    """Collects the per-slot feature aggregates (Consumer.on_capture) of FRESH pools and emits one feature rec
+    per pool: {pool, token_mint, create_ts, slots:[[sec, slot, n_buys, n_sells, buyers], ...]}. These are OUR
+    decode's features; localshred-merge backfills the price path from Helius -> flurry-study --flows fits the gate
+    on our own feed (train = serve). A pool first seen during the warm-up is skipped (it may be mid-life, so its
+    history doesn't start at creation); each pool is trimmed to its first `span_s` and emitted when it ages out."""
+
+    def __init__(self, write: Callable[[dict], None], span_s: float = 180.0, warm_s: float = 180.0,
+                 min_slots: int = 3, clock: Optional[Callable[[], float]] = None,
+                 wall: Optional[Callable[[], float]] = None):
+        self.write = write
+        self.span_s = span_s
+        self.warm_s = warm_s
+        self.min_slots = min_slots
+        self._clock = clock or time.monotonic
+        self._wall = wall or time.time
+        self.start = self._clock()
+        self.pools: dict = {}
+        self.written = 0
+
+    def on_capture(self, pool: str, token: Optional[str], rec: dict) -> None:
+        now = self._clock()
+        p = self.pools.get(pool)
+        if p is None:
+            if now - self.start < self.warm_s:              # warm-up: skip pools first seen early (maybe mid-life)
+                return
+            p = self.pools[pool] = {"first": now, "create_ts": self._wall(), "token": token, "slots": []}
+        if token and not p["token"]:
+            p["token"] = token
+        if now - p["first"] <= self.span_s:
+            p["slots"].append([round(now - p["first"], 2), rec["slot"],
+                               rec["n_buys"], rec["n_sells"], list(rec["buyers"])])
+        for done in [k for k, q in self.pools.items() if now - q["first"] > self.span_s + 5]:
+            self._emit(done, self.pools.pop(done))
+
+    def _emit(self, pool: str, p: dict) -> None:
+        if len(p["slots"]) < self.min_slots or not p["token"]:
+            return
+        self.write({"pool": pool, "token_mint": p["token"], "create_ts": p["create_ts"], "slots": p["slots"]})
+        self.written += 1
+
+    def close(self) -> None:
+        for pool in list(self.pools):
+            self._emit(pool, self.pools.pop(pool))

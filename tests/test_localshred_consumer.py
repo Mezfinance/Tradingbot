@@ -184,3 +184,51 @@ def test_end_to_end_through_a_real_precursor_gate():
     assert len(fires) == 1
     assert fires[0]["pool"] == "P" and fires[0]["sym"] == "S" and fires[0]["signal_slot"] == 10
     assert fires[0]["entry_slot"] == 11 and fires[0]["tier"] == "1"
+
+
+# --- capture mode (fit the study on our own feed) ---
+class _Clock:
+    def __init__(self, t=1000.0):
+        self.t = t
+    def __call__(self):
+        return self.t
+
+
+def test_capture_sink_skips_warmup_and_emits_fresh_pools():
+    out = []
+    clk = _Clock(1000.0)
+    cap = lc.CaptureSink(out.append, span_s=10, warm_s=5, min_slots=3, clock=clk, wall=lambda: 42.0)
+    clk.t = 1002.0                                     # inside the warm-up (start 1000, warm until 1005)
+    cap.on_capture("EARLY", "T", {"slot": 1, "n_buys": 1, "n_sells": 0, "buyers": ["a"]})
+    assert "EARLY" not in cap.pools                    # skipped (maybe mid-life)
+    clk.t = 1006.0                                      # after warm-up: a genuinely fresh pool
+    for s in range(3):
+        cap.on_capture("FRESH", "TOK", {"slot": 10 + s, "n_buys": 2, "n_sells": 1, "buyers": ["x", "y"]})
+    assert len(cap.pools["FRESH"]["slots"]) == 3
+    clk.t = 1022.0                                      # FRESH ages past span+5 -> emitted on the next capture
+    cap.on_capture("OTHER", "T2", {"slot": 99, "n_buys": 1, "n_sells": 0, "buyers": ["z"]})
+    assert len(out) == 1
+    r = out[0]
+    assert r["pool"] == "FRESH" and r["token_mint"] == "TOK" and r["create_ts"] == 42.0
+    assert len(r["slots"]) == 3
+    assert r["slots"][0][1] == 10 and r["slots"][0][2] == 2 and r["slots"][0][3] == 1 and r["slots"][0][4] == ["x", "y"]
+
+
+def test_capture_sink_drops_pools_with_too_few_slots():
+    out = []
+    clk = _Clock(1000.0)
+    cap = lc.CaptureSink(out.append, span_s=10, warm_s=0, min_slots=3, clock=clk, wall=lambda: 1.0)
+    clk.t = 1001.0
+    cap.on_capture("P", "T", {"slot": 1, "n_buys": 1, "n_sells": 0, "buyers": ["a"]})
+    cap.close()
+    assert out == []                                   # 1 slot < min_slots -> not emitted
+
+
+def test_consumer_on_capture_fires_per_finalized_slot():
+    recs = []
+    c = lc.Consumer(gate={}, runner_factory=lambda: _RecRunner(),
+                    on_capture=lambda pool, tok, r: recs.append((pool, tok, r["slot"], r["n_buys"], r["n_sells"])))
+    c.on_swap(10, "P", "TOK", True, "a")
+    c.on_swap(10, "P", "TOK", False, "s")
+    c.on_swap(11, "P", "TOK", True, "b")               # advance -> flush slot 10 -> capture
+    assert recs == [("P", "TOK", 10, 1, 1)]

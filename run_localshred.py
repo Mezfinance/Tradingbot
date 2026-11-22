@@ -28,12 +28,13 @@ Then ship ls-fires.jsonl to Fly and `frontrun-verify` it against the box-exact 8
 """
 
 import argparse
+import json
 import os
 import sys
 
 
 def main():
-    ap = argparse.ArgumentParser(description="LocalShred entry service -> precursor-gate fires")
+    ap = argparse.ArgumentParser(description="LocalShred entry service -> precursor-gate fires / feature capture")
     ap.add_argument("--gate", required=True, help="precursor gate JSON (the direct-view fit)")
     ap.add_argument("--out", default="ls-fires.jsonl", help="append each fire here, box shape")
     ap.add_argument("--addr", default="127.0.0.1:9898", help="proxy --grpc-service-port endpoint")
@@ -41,6 +42,12 @@ def main():
     ap.add_argument("--fresh-window-slots", type=int, default=450,
                     help="freshness gate: fire only on pools first seen after a warm-up of this many "
                          "slots and within this many slots of that (~450 = ~180s); 0 disables it")
+    ap.add_argument("--capture", metavar="PATH", default=None,
+                    help="also capture our decode's per-slot features of every FRESH pool to PATH (JSONL), to fit "
+                         "the study on our own feed: run a day, then localshred-merge + flurry-study --frontrun --flows")
+    ap.add_argument("--span-s", type=float, default=180.0, help="--capture: seconds of each pool's life to record")
+    ap.add_argument("--warmup-s", type=float, default=180.0,
+                    help="--capture: skip pools first seen in this warm-up (they may be mid-life)")
     args = ap.parse_args()
 
     # Box-only deps: imported here so the file stays safe to have in the repo / import-scan.
@@ -64,15 +71,32 @@ def main():
         line = lc.fire_line(sig)
         print(f"[fire #{n['fires']}] {line}", flush=True)
 
+    cap = None
+    capf = None
+    if args.capture:
+        capf = open(args.capture, "a")
+        cw = {"n": 0}
+
+        def _cap_write(rec):
+            capf.write(json.dumps(rec) + "\n")
+            capf.flush()
+            cw["n"] += 1
+            if cw["n"] % 50 == 0:
+                print(f"[capture] {cw['n']} pools written -> {args.capture}", flush=True)
+
+        cap = lc.CaptureSink(_cap_write, span_s=args.span_s, warm_s=args.warmup_s)
+
     consumer = lc.Consumer(gate, tier=args.tier, on_fire=on_fire,
-                           fresh_window_slots=args.fresh_window_slots)
+                           fresh_window_slots=args.fresh_window_slots,
+                           on_capture=cap.on_capture if cap else None)
 
     channel = grpc.insecure_channel(args.addr)
     stub = pbg.ShredstreamProxyStub(channel)
     warm = "off" if args.fresh_window_slots <= 0 else f"{args.fresh_window_slots} slots (~{args.fresh_window_slots*0.4:.0f}s warm-up, no fires until then)"
+    capnote = f" capture={args.capture} (span {args.span_s:.0f}s, warm {args.warmup_s:.0f}s)" if args.capture else ""
     print(
         f"[localshred] subscribing addr={args.addr} gate={args.gate} tier={args.tier} "
-        f"fresh_window={warm} out={args.out}",
+        f"fresh_window={warm} out={args.out}{capnote}",
         flush=True,
     )
     try:
@@ -82,6 +106,11 @@ def main():
         pass
     finally:
         consumer.flush_all()
+        if cap:
+            cap.close()
+            print(f"[capture] {cap.written} pools total -> {args.capture}", flush=True)
+            if capf:
+                capf.close()
         print(f"[localshred] stopped after {n['fires']} fires", flush=True)
     return 0
 
