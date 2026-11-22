@@ -123,3 +123,38 @@ def test_frontrun_include_failed_runs_both_views_and_compares():
     assert o_f["pools"] == o_s["pools"]                   # failed toggles only the decision features, not the pools
     r = fs.render_frontrun_failed_compare(o_s, o_f)
     assert "FAILED-INCLUSIVE REFIT TEST" in r and "VERDICT" in r
+
+
+# --- merge: our capture features + Helius price -> --flows recs ---
+def test_merge_capture_flows_overlays_our_counts_on_helius_price(monkeypatch):
+    cap = [{"pool": "P", "token_mint": "M", "create_ts": 100.0, "slots": [
+        [0.0, 10, 1, 0, ["a"]],
+        [1.0, 11, 2, 1, ["b", "c"]],
+        [2.0, 12, 0, 1, []],
+    ]}]
+    helius_rows = {"txs": [
+        [0.0, 10, "x", -5, 1, 95.0, 6.0],
+        [1.0, 11, "y", -5, 1, 90.0, 7.0],
+        [2.0, 12, "z", 5, -1, 95.0, 6.5],
+        [3.0, 13, "w", -5, 2, 80.0, 9.0],   # a slot our feed MISSED -> price anchor, no our count
+    ]}
+    monkeypatch.setattr(fs.he, "launch_record", lambda *a, **k: helius_rows)
+
+    class _H:
+        def history_from_start(self, pool, span, pages):
+            return ([], True, True)
+
+    rows, credits = fs.merge_capture_flows(cap, _H(), span_s=180, max_credits=10000)
+    assert len(rows) == 1 and rows[0]["pool"] == "P" and rows[0]["create_ts"] == 100.0
+    txs = rows[0]["rec"]["txs"]
+    s11 = [t for t in txs if t[1] == 11]
+    assert len(s11) == 4                                    # anchor + 2 buys + 1 sell
+    anchor = next(t for t in s11 if t[3] == 0.0 and t[4] == 0.0)
+    assert anchor[5] == 90.0 and anchor[6] == 7.0 and anchor[7] is True
+    assert [t[2] for t in s11 if t[3] < 0] == ["b", "c"]   # our buyers kept, in order
+    s13 = [t for t in txs if t[1] == 13]
+    assert len(s13) == 1 and s13[0][3] == 0.0              # missed slot: anchor only, no our count
+    flow = fs.slot_flow(rows[0]["rec"], vis="direct")      # direct view counts our (vis-True) rows
+    s11f = next(s for s in flow["slots"] if s["slot"] == 11)
+    assert s11f["n_buys"] == 2 and s11f["buyers"] == ["b", "c"] and s11f["n_sells"] == 1
+    assert abs(s11f["price"] - 7.0 / 90.0) < 1e-9          # the Helius reserves, not our sentinel

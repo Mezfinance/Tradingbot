@@ -127,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify", "localshred-merge"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -213,6 +213,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--vq", action="store_true", help="flurry-study: price on the effective (virtual_quote-aware) reserve basis, matching the live WS stream, instead of the raw vault ratio (which inflates early-life moves into basis artifacts). Needs --fetch to populate vq. Off by default so other modes stay reproducible; --frontrun forces it on.")
     parser.add_argument("--export-gate", metavar="PATH", help="flurry-study --frontrun: write the fitted precursor front-run gate (joint-logit intercept + non-move predictor coefficients + top-k%% eta thresholds) to a JSON the live box runner loads via tradingbot.precursor_gate.")
     parser.add_argument("--gate-hold", type=int, default=2, help="flurry-study --export-gate: slots to hold after entering front of N+1 (default 2, the paying cell).")
+    parser.add_argument("--capture", metavar="PATH", help="localshred-merge: the --capture feature JSONL from run_localshred.py --capture (our decode's per-slot features of each fresh pool)")
+    parser.add_argument("--out", metavar="PATH", help="localshred-merge: write the merged --flows JSONL (our features + the Helius price path) here, for flurry-study --frontrun --flows")
     parser.add_argument("--include-failed", action="store_true", help="flurry-study --frontrun: failed-inclusive refit A/B -- fit/eval the gate on decision features that COUNT reverted txs (what the live shred feed sees; no status in shreds) vs the success-only training view (vault deltas), on the SAME pools. Tests whether the front-run edge survives and whether re-fitting train=serve fixes the live over-firing. Refetches a superset.")
     parser.add_argument("--gate-vis", choices=["full", "direct", "buyer_plus"], default="direct", help="flurry-study --frontrun: the ShredStream visibility to FIT the gate on. The live box decodes only TOP-LEVEL pumpswap swaps, so 'direct' (default) makes the exported gate fire on the box's own view (the vis-experiment showed direct carries ~89%% of the full edge); 'full' reproduces the historical full-flow study. frontrun-verify reads the gate's stamped vis to replay through the same view.")
     parser.add_argument("--vis-experiment", action="store_true", help="flurry-study: refit the front-run gate on each box-reproducible VISIBILITY (full / direct-only / buyer-plus) with the target always the real full-flow move, and compare the precursor gate's holdout edge -- does the box's ShredStream view (top-level pumpswap only; aggregator CPIs invisible) carry the study's edge? Forces --vq; needs --fetch to visibility-tag the rows.")
@@ -803,6 +805,26 @@ def main(argv: list[str] | None = None) -> None:
             _fvh.min_interval_s = 1 / max(args.rps, 0.1)
         _out = _fv.verify(_fires, _gate, helius=_fvh, tier=args.tier, flurry_min=args.flurry_min, span_s=args.span_s, max_pages=args.pages, box_exact=args.box_exact)
         print(json.dumps(_out, indent=2, default=str) if args.json else _fv.render(_out))
+        return
+
+    if args.command == "localshred-merge":  # our --capture features + Helius price -> flurry-study --flows recs
+        from tradingbot import flurry_study as _lm
+        import httpx as _lm_httpx
+        from tradingbot.data.helius import Helius as _LmHelius
+        if not args.capture or not args.out:
+            print("localshred-merge needs --capture <in.jsonl> --out <flows.jsonl>", file=sys.stderr)
+            return
+        _lm_helius = _LmHelius(client=_lm_httpx.Client(timeout=60))   # research (backup) key, never the live key
+        _lm_helius.min_interval_s = 1 / max(args.rps, 0.1)
+        with open(args.capture) as _cf:
+            _cap_rows = [json.loads(x) for x in _cf if x.strip()]
+        _lm_prog = lambda i, n, c: print(f"merge {i}/{n}, {c} credits", flush=True)
+        _rows, _cr = _lm.merge_capture_flows(_cap_rows, _lm_helius, span_s=args.span_s,
+                                             max_credits=int(args.max_credits or 20_000), progress=_lm_prog)
+        with open(args.out, "w") as _of:
+            for _r in _rows:
+                _of.write(json.dumps(_r) + "\n")
+        print(f"merged {len(_rows)} of {len(_cap_rows)} captured pools -> {args.out} ({_cr} research credits)")
         return
 
     if args.command == "flurry-study":  # slot-level buy-flurry continuation for the reactive-backrun scalp (11-17)

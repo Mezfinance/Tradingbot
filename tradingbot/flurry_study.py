@@ -324,6 +324,57 @@ def flows_from_file(path: str) -> tuple[list[dict], dict]:
     return metas, have
 
 
+def merge_capture_flows(cap_rows, helius, span_s: float = DEFAULT_SPAN_S, max_credits: int = 20_000, progress=None):
+    """Turn run_localshred --capture feature recs (our decode's per-slot buy/sell/buyers) into flurry-study --flows
+    recs by backfilling the PRICE path from Helius -- the pool's real move, which defines the >=30% target. So the
+    study fits the gate on OUR features with an accurate, feed-independent target. One rec per pool:
+    {pool, token_mint, create_ts, rec}. Returns (rows, credits_spent).
+
+    A slot WE saw carries our counts; a slot only Helius saw (we missed it live) is a price-anchor row with no count
+    -- exactly what the gate sees on our feed. Our swaps are all top-level pumpswap (direct), so every row is
+    vis-tagged True (so --gate-vis direct and full both count them). Magnitudes are sentinel (the gate is
+    magnitude-free); the price per slot is the Helius end-of-slot reserves (carried forward over gaps)."""
+    out, credits = [], 0
+    for i, cr in enumerate(cap_rows):
+        pool, mint = cr.get("pool"), cr.get("token_mint")
+        cap_slots = cr.get("slots") or []
+        if not pool or not mint or len(cap_slots) < 3:
+            continue
+        if helius is None or credits + MAX_PAGES * 10 > max_credits:
+            break
+        txs, _m, _ok = helius.history_from_start(pool, span_s, MAX_PAGES)
+        credits += MAX_PAGES * 10
+        hrows = (he.launch_record(txs, pool, mint, window_s=span_s) or {}).get("txs") or []
+        price_by_slot = {}
+        for r in hrows:
+            if r[_TOKA] and r[_TOKA] > 0:
+                price_by_slot[r[_SLOT]] = (r[_TOKA], r[_SOLA])      # last tx of a slot wins = end-of-slot reserves
+        our = {s[1]: {"sec": s[0], "buyers": s[4], "n_sells": s[3]} for s in cap_slots}
+        rows, last = [], None
+        for slot in sorted(set(price_by_slot) | set(our)):
+            if slot in price_by_slot:
+                last = price_by_slot[slot]
+            if last is None:
+                continue                                           # no price seen yet -> skip until the pool trades
+            toka, sola = last
+            o = our.get(slot)
+            sec = o["sec"] if o else 0.0
+            if slot in price_by_slot:
+                rows.append([sec, slot, None, 0.0, 0.0, toka, sola, True])         # price anchor (classify -> other)
+            if o:
+                for b in o["buyers"]:
+                    rows.append([sec, slot, b, -1e-9, 1e-9, toka, sola, True])      # our buy (payer kept for 'N')
+                for _ in range(int(o["n_sells"])):
+                    rows.append([sec, slot, None, 1e-9, -1e-9, toka, sola, True])    # our sell (count only)
+        if len(rows) < 3:
+            continue
+        ct = cr.get("create_ts") or 0
+        out.append({"pool": pool, "token_mint": mint, "create_ts": ct, "rec": {"create_ts": ct, "txs": rows}})
+        if progress:
+            progress(i + 1, len(cap_rows), credits)
+    return out, credits
+
+
 def _has_vis(rec: dict | None) -> bool:
     """A cached flow is visibility-tagged iff its rows carry the 8th (top-level pumpswap) element."""
     rows = (rec or {}).get("txs") or []
