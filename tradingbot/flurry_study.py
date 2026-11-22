@@ -2661,22 +2661,24 @@ def export_gate(out, hold: int = 2):
 
 
 def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=FRONT_LEADS,
-             seed=0, flurry_min=DEFAULT_FLURRY_MIN, vis="full"):
+             seed=0, flurry_min=DEFAULT_FLURRY_MIN, vis="full", include_failed=False):
     """Can we predict a >= `move` up-move early enough to enter <=k slots before it and exit 1-2 after?
     (1) ceiling: enter T-k / exit T+j with perfect foresight; (2) indicator discovery, LEAD swept and reported
     (z-guarded time holdout, discover's discipline); (3) actionable enter-on-signal net vs a random-slot control.
     Needs USE_VQ (effective reserves), else the target is a raw-ratio artifact. Observational -> hypothesis only.
     Forces CAUSAL_WALLET: the wallet-rank features are online (no look-ahead), so the fitted/exported gate fires
-    on the same slots live as in the backtest -- otherwise sym==B / dominant_bought would use hindsight."""
+    on the same slots live as in the backtest -- otherwise sym==B / dominant_bought would use hindsight.
+    `include_failed` feeds the DECISION features (not the price path) the reverted swaps the live shred feed counts
+    but the training view (vault deltas) never saw -- the failed-inclusive refit test (train = serve)."""
     import math
     _saved_causal = CAUSAL_WALLET
     try:
-        return _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis)
+        return _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis, include_failed)
     finally:
         globals()["CAUSAL_WALLET"] = _saved_causal
 
 
-def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full"):
+def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", include_failed=False):
     import math
     globals()["CAUSAL_WALLET"] = True                        # live-valid features for the gate (see frontrun docstring)
     base_tgt = _tgt("price", flurry_min, 1, move * 100.0)     # for features/symbols only; target overwritten
@@ -2688,7 +2690,16 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full"):
         flow = slot_flow(rec) if rec else None               # FULL: the real price path, ceiling, target, net
         if not flow:
             continue
-        feat = slot_flow(rec, vis) if vis != "full" else flow  # restricted: what the box can SEE to decide
+        if include_failed:                                   # decision features see reverted swaps (live feed);
+            fr = slot_flow(rec, vis, include_failed=True)     # price/target/net stay success-only ground truth.
+            if fr:
+                raw = {s["slot"]: s for s in fr["slots"]}      # align to flow's slots (drop failed-only slots) so
+                feat = {"slots": [raw.get(s["slot"], s) for s in flow["slots"]],   # the idx<->flow mapping holds
+                        "pull_slot": flow["pull_slot"]}
+            else:
+                feat = slot_flow(rec, vis) or flow
+        else:
+            feat = slot_flow(rec, vis) if vis != "full" else flow  # restricted: what the box can SEE to decide
         if not feat or len(feat["slots"]) != len(flow["slots"]):
             feat = flow                                      # price-driven slot set is identical; guard anyway
         n_pools += 1
@@ -2706,6 +2717,7 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full"):
         all_recs.extend(recs)
 
     out = {"mode": "frontrun", "move": move, "cost": cost, "leads": list(leads), "use_vq": USE_VQ, "vis": vis,
+           "include_failed": include_failed,
            "pools": n_pools, "slots": n_slots, "events": n_events,
            "event_rate": (n_events / n_slots if n_slots else 0.0),
            "ceiling": {f"{k}-{j}": _agg(v) for (k, j), v in sorted(ceiling.items())},
@@ -2798,6 +2810,40 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full"):
     out["logit_precursor"] = _front_logit(tr, ho, specfn, pre_rules, lead_net)
     out["logit_gate_precursor"] = _front_logit_gate(ho, pool_flows, specfn, out["logit_precursor"], cost)
     return out
+
+
+def render_frontrun_failed_compare(out_s, out_f):
+    """The failed-inclusive refit A/B: success-only (training view) vs failed-inclusive (what the live box sees).
+    The headline is whether the precursor signal still clears the holdout z-guard once reverted txs pollute the
+    per-slot features -- i.e. whether re-fitting the live gate on failed-inclusive features (train = serve) keeps
+    the edge, or the edge was an artifact of the clean on-chain view the shred feed cannot reproduce."""
+    def _pre(o):
+        lead = o.get("net_lead")
+        return [s for s in ((o.get("survivors") or {}).get(lead) or []) if not _is_move_rule(s["rule"])]
+    ps, pf = _pre(out_s), _pre(out_f)
+    topz = lambda xs: max((abs(s["z"]) for s in xs), default=0.0)
+    L = ["=" * 78,
+         "FAILED-INCLUSIVE REFIT TEST -- does the front-run edge survive counting reverted txs?",
+         "The live shred feed counts FAILED txs (no status in shreds); the training view (vault",
+         "deltas) never did. Decision features toggle it; price/target/net stay success-only.",
+         "=" * 78, "",
+         "################  SUCCESS-ONLY  (the view the gate was fit on)  ################",
+         render_frontrun(out_s), "",
+         "################  FAILED-INCLUSIVE  (what the live box actually sees)  ################",
+         render_frontrun(out_f), "",
+         "=> VERDICT (failed-inclusive refit)",
+         "   precursor survivors (holdout z-guard)   success-only: %d (top |z| %.1f)   failed-inclusive: %d (top |z| %.1f)"
+         % (len(ps), topz(ps), len(pf), topz(pf))]
+    if len(pf) == 0 and len(ps) > 0:
+        L += ["   EDGE DIES with failed txs: the precursor signal is an artifact of the clean on-chain view the",
+              "   shred feed cannot reproduce -> the shred front-run is a dead end on this feed. STOP."]
+    elif len(pf) >= max(1, len(ps) // 2):
+        L += ["   EDGE SURVIVES failed-inclusive: re-fit the LIVE gate with --include-failed (train = serve) and the",
+              "   over-firing is fixed with the edge intact. Confirm via the FRONT-RUN GATE net blocks above."]
+    else:
+        L += ["   WEAKENED: fewer precursors survive. Read the FRONT-RUN GATE net above to judge whether the",
+              "   surviving edge is worth deploying on the failed-inclusive (live) view."]
+    return "\n".join(L)
 
 
 def render_frontrun(out):

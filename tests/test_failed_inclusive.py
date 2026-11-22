@@ -90,3 +90,36 @@ def test_slot_flow_includes_failed_only_when_asked():
     assert a["n_buys"] == 1 and a["buyers"] == ["B"]              # success-only: C (failed) dropped
     assert b["n_buys"] == 2 and b["buyers"] == ["B", "C"]         # failed-inclusive: C counted as a buyer
     assert a["price"] == b["price"]                               # the failed row never moves the price
+
+
+# --- Step 3: frontrun runs both views and render_frontrun_failed_compare works ---
+def _causal_rows_tagged(cycles=45):
+    """_rec_causal's shape (new wallet -> bot pump -> quiet) with vis(7)=True, _FAILED(8)=False on every row."""
+    res, rows, sec, slot = [1e9, 100.0], [], 0.0, 10
+    for c in range(cycles):
+        res[0] -= 1000.0; res[1] += 0.2
+        rows.append([sec, slot, f"out{c}", -1000.0, 0.2, res[0], res[1], True, False]); sec += 0.05
+        for _ in range(5):
+            res[0] -= 5000.0; res[1] += 3.0
+            rows.append([sec, slot + 1, "bot", -5000.0, 3.0, res[0], res[1], True, False]); sec += 0.05
+        for q in range(2, 6):
+            res[0] -= 10.0; res[1] += 0.02
+            rows.append([sec, slot + q, "bot", -10.0, 0.02, res[0], res[1], True, False]); sec += 0.05
+        slot += 6
+    return rows
+
+
+def test_frontrun_include_failed_runs_both_views_and_compares():
+    rows = _causal_rows_tagged()
+    for r in rows[::7]:                                   # inject FAILED buys from fresh "ghost" wallets
+        rows.append([r[0] + 0.01, r[1], f"ghost{r[1]}", -1e-9, 1e-9, 0.0, 0.0, True, True])
+    rec = {"txs": rows, "failed_tagged": True, "create_ts": 0}
+    pools = [f"P{i}" for i in range(80)]
+    have = {p: rec for p in pools}
+    metas = [{"pool": p, "token_mint": "M", "create_ts": float(i)} for i, p in enumerate(pools)]
+    o_s = fs.frontrun(have, metas, include_failed=False)
+    o_f = fs.frontrun(have, metas, include_failed=True)
+    assert o_s["include_failed"] is False and o_f["include_failed"] is True
+    assert o_f["pools"] == o_s["pools"]                   # failed toggles only the decision features, not the pools
+    r = fs.render_frontrun_failed_compare(o_s, o_f)
+    assert "FAILED-INCLUSIVE REFIT TEST" in r and "VERDICT" in r

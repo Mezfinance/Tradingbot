@@ -213,6 +213,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--vq", action="store_true", help="flurry-study: price on the effective (virtual_quote-aware) reserve basis, matching the live WS stream, instead of the raw vault ratio (which inflates early-life moves into basis artifacts). Needs --fetch to populate vq. Off by default so other modes stay reproducible; --frontrun forces it on.")
     parser.add_argument("--export-gate", metavar="PATH", help="flurry-study --frontrun: write the fitted precursor front-run gate (joint-logit intercept + non-move predictor coefficients + top-k%% eta thresholds) to a JSON the live box runner loads via tradingbot.precursor_gate.")
     parser.add_argument("--gate-hold", type=int, default=2, help="flurry-study --export-gate: slots to hold after entering front of N+1 (default 2, the paying cell).")
+    parser.add_argument("--include-failed", action="store_true", help="flurry-study --frontrun: failed-inclusive refit A/B -- fit/eval the gate on decision features that COUNT reverted txs (what the live shred feed sees; no status in shreds) vs the success-only training view (vault deltas), on the SAME pools. Tests whether the front-run edge survives and whether re-fitting train=serve fixes the live over-firing. Refetches a superset.")
     parser.add_argument("--gate-vis", choices=["full", "direct", "buyer_plus"], default="direct", help="flurry-study --frontrun: the ShredStream visibility to FIT the gate on. The live box decodes only TOP-LEVEL pumpswap swaps, so 'direct' (default) makes the exported gate fire on the box's own view (the vis-experiment showed direct carries ~89%% of the full edge); 'full' reproduces the historical full-flow study. frontrun-verify reads the gate's stamped vis to replay through the same view.")
     parser.add_argument("--vis-experiment", action="store_true", help="flurry-study: refit the front-run gate on each box-reproducible VISIBILITY (full / direct-only / buyer-plus) with the target always the real full-flow move, and compare the precursor gate's holdout edge -- does the box's ShredStream view (top-level pumpswap only; aggregator CPIs invisible) carry the study's edge? Forces --vq; needs --fetch to visibility-tag the rows.")
     parser.add_argument("--entry-window", type=int, nargs="?", const=10, default=None, metavar="W", help="flurry-study: patience study -- keep the safe 1-2 slot hold, but sweep WHICH entry slot (N+1..N+W, default W=10) to take it after a slot-N signal. A pull during the wait = no entry (no loss); reports per-offset EV, best-of-window ceiling, and a causal up-tick-ride rule vs a random-active-slot control, out of sample.")
@@ -869,9 +870,11 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 # a restricted-visibility gate fit (frontrun --gate-vis direct/buyer_plus) needs the per-trade
                 # direct/aggregator tag, same as the vis-experiment -- else slot_flow(vis=) reads an empty view.
-                _with_vis = args.vis_experiment or (args.frontrun and args.gate_vis != "full")
+                _incl_failed = bool(args.frontrun and args.include_failed)
+                _with_vis = args.vis_experiment or (args.frontrun and args.gate_vis != "full") or _incl_failed
                 _have, _cr = _fl.fetch_flows(_ws, fl_helius, _metas, args.span_s,
-                                             int(args.max_credits or 0), prog, with_vis=_with_vis)
+                                             int(args.max_credits or 0), prog, with_vis=_with_vis,
+                                             include_failed=_incl_failed)
             _tgt = _fl._tgt(args.target, args.flurry_min, args.horizon, args.move_pct)
             if args.multibuy:  # band flurries by buy count, enter the slot after, sweep the hold 1-10
                 out = _fl.multibuy_study(_have, _metas, args.cost_pct / 100.0)
@@ -893,6 +896,14 @@ def main(argv: list[str] | None = None) -> None:
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_vis_experiment(out))
             elif args.frontrun:   # front-run a >= move up-move: ceiling + lead-swept discovery + enter-on-signal net
                 _mv = args.move_pct / 100.0 if abs(args.move_pct - 1.0) > 1e-9 else _fl.FRONT_MOVE
+                if args.include_failed:   # failed-inclusive refit A/B: success-only vs failed-inclusive (same pools)
+                    _o_s = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0,
+                                        flurry_min=args.flurry_min, vis=args.gate_vis, include_failed=False)
+                    _o_f = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0,
+                                        flurry_min=args.flurry_min, vis=args.gate_vis, include_failed=True)
+                    print(json.dumps({"success_only": _o_s, "failed_inclusive": _o_f}, indent=2, default=str)
+                          if args.json else _fl.render_frontrun_failed_compare(_o_s, _o_f))
+                    return
                 out = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0,
                                    flurry_min=args.flurry_min, vis=args.gate_vis)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_frontrun(out))
