@@ -2689,7 +2689,9 @@ def _front_logit(tr, ho, specfn, rules, lead):
 
 
 FRONT_GATE_PCTS = (80, 90, 95, 98, 99)   # fire the joint logit only on its top (100-pct)% of scores
-FRONT_MOVE_FIELDS = {"abs_move", "move", "price_up"}   # the price move IN slot N -> backrun, not a precursor
+FRONT_MOVE_FIELDS = {"abs_move", "move", "price_up", "prev_abs_move", "prev_move"}   # ANY move feature (this slot OR the
+#   rebased prior slot) means buying INTO an up-move -- the backrun/momentum dance live fills kill. The precursor gate
+#   fires on the wallet SETUP only, never on a move, so none of these can drive a fire.
 
 
 def _is_move_rule(rule):

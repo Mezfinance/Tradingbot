@@ -80,6 +80,8 @@ class SlotBank:
             "prev_buy_sol": (self.prev_f["buy_sol"] if self.prev_f else 0.0),
             "prev_new_buyers": (self.prev_f["new_buyers"] if self.prev_f else 0.0),
             "prev_net_sol": (self.prev_f["net_sol"] if self.prev_f else 0.0),
+            "prev_abs_move": (self.prev_f["abs_move"] if self.prev_f else 0.0),
+            "prev_move": (self.prev_f["move"] if self.prev_f else 0.0),
         }
         if nbuys >= self.flurry_min:
             sym = "F"

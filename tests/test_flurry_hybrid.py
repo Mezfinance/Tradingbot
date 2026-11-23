@@ -51,3 +51,12 @@ def test_hybrid_mode_switch_and_prev_abs_move_is_in_the_rule_bank():
         assert fl._bank_for(rec, flow, 0.0, tgt)[2]["m2"] == "BN"
     finally:
         fl.HYBRID = saved
+
+
+def test_move_features_are_excluded_from_the_precursor_gate():
+    # ANY move feature -- this slot OR the rebased prior slot -- is backrun/momentum (buying into a move), which
+    # live fills kill. None may drive a precursor fire.
+    for rule in ("abs_move >= 0.02 (q90)", "move >= 0.01 (q90)", "price_up",
+                 "prev_abs_move >= 0.0157 (q90)", "prev_move >= 0.0093 (q90)"):
+        assert fl._is_move_rule(rule), rule
+    assert not fl._is_move_rule("N-1..N = BN")      # a wallet-setup motif is a precursor
