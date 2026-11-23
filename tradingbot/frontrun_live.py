@@ -191,6 +191,51 @@ class HybridRunner:
                 "sym": rec["sym"], "m2": rec["m2"]}
 
 
+class HybridConsumer:
+    """Per-pool orchestration of HybridRunners for the box: route the two live feeds to the right pool's runner.
+    The box drives it with two entry points:
+      * on_helius_slot(pool, slot_agg) -- when the Helius transactionSubscribe FullSlotAggregator emits a complete
+        slot (the rebase). Deliver these as they arrive.
+      * on_shred_slot(pool, slot_agg) -- when the SHRED stream closes a slot (the direct current-slot aggregate).
+        Scores it and, on a fire, stamps the pool and forwards the FireSignal. The box should DELAY this call ~1
+        slot (~500 ms) so the Helius WS has rebased the prior slots first (HybridRunner's timing contract).
+    on_pool(pool) fires the first time a pool is seen, so the box opens that pool's transactionSubscribe.
+    Fresh / hand-made filtering stays on the shred Consumer upstream -- only its finalized slots for fresh
+    hand-made pools should be routed here."""
+
+    def __init__(self, gate: dict, tier: str = "1", flurry_min: int = DEFAULT_FLURRY_MIN,
+                 on_fire=None, on_pool=None):
+        self.gate = gate if "_terms" in gate else precursor_gate.compile_gate(gate)
+        self.tier = str(tier)
+        self.flurry_min = flurry_min
+        self.on_fire = on_fire
+        self.on_pool = on_pool
+        self.runners: dict = {}
+
+    def _runner(self, pool: str) -> "HybridRunner":
+        r = self.runners.get(pool)
+        if r is None:
+            r = HybridRunner(self.gate, self.tier, self.flurry_min)
+            self.runners[pool] = r
+            if self.on_pool:
+                self.on_pool(pool)                           # box opens transactionSubscribe(accountInclude=[pool])
+        return r
+
+    def on_helius_slot(self, pool: str, slot_agg: dict) -> None:
+        self._runner(pool).on_full_slot(slot_agg)
+
+    def on_shred_slot(self, pool: str, slot_agg: dict):
+        sig = self._runner(pool).on_direct_slot(slot_agg)
+        if sig is not None:
+            sig["pool"] = pool
+            if self.on_fire:
+                self.on_fire(sig)
+        return sig
+
+    def drop(self, pool: str) -> None:
+        self.runners.pop(pool, None)                         # pool aged out of the fresh window
+
+
 def net_return(entry_fill: float, exit_fill: float, cost: float = 0.01) -> float:
     """NET return of a filled front-run: exit_fill / entry_fill - 1 - cost (round-trip cost, default 1%). The box
     passes its REAL fill prices (entry at the front of N+1, exit at N+hold) so the live number is fills, not the

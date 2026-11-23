@@ -77,3 +77,23 @@ def test_hybrid_runner_fires_on_exactly_the_study_gate_slots():
     live_fires = [sig["signal_slot"] for s in fl.slot_flow(rec, "direct")["slots"]
                   if (sig := runner.on_direct_slot(s))]
     assert live_fires == study_fires and len(study_fires) >= 1
+
+
+def test_hybrid_consumer_routes_feeds_per_pool_and_fires():
+    rec = _rec()
+    gate = pg.compile_gate({"intercept": -1.0, "predictors": [{"coef": 5.0, "name": "sym == N"}],
+                            "threshold": {"1": 0.0}, "hold": 2})
+    pools_seen, fires = [], []
+    con = live.HybridConsumer(gate, "1", on_fire=fires.append, on_pool=pools_seen.append)
+    # rebase first (Helius), then score (shred) -- the box's ordering
+    for s in fl.slot_flow(rec, "full")["slots"]:
+        con.on_helius_slot("POOL", s)
+    for s in fl.slot_flow(rec, "direct")["slots"]:
+        con.on_shred_slot("POOL", s)
+    assert pools_seen == ["POOL"]                 # on_pool fired once, on first sight
+    assert fires and all(f["pool"] == "POOL" for f in fires)
+    # parity: the consumer fires on exactly the study's gate slots
+    study = fl._hybrid_bank(rec, 0.0, fl._tgt("price", 3, 2, 1.0))
+    direct_slots = [s["slot"] for s in fl.slot_flow(rec, "direct")["slots"]]
+    want = [direct_slots[i] for i, r in enumerate(study) if pg.fires(r, gate, "1")]
+    assert [f["signal_slot"] for f in fires] == want
