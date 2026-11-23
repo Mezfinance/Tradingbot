@@ -60,3 +60,21 @@ def test_move_features_are_excluded_from_the_precursor_gate():
                  "prev_abs_move >= 0.0157 (q90)", "prev_move >= 0.0093 (q90)"):
         assert fl._is_move_rule(rule), rule
     assert not fl._is_move_rule("N-1..N = BN")      # a wallet-setup motif is a precursor
+
+
+def test_forced_precursors_injects_the_organic_buyer_rules():
+    specfn = {
+        "sym == N  (a brand-new wallet bought in N)": None,
+        "sym == .  (a dead slot)": None,
+        "N-1..N = .N": None,
+        "N-1..N = N.": None,
+        "N-1..N = BS": None,                 # a washbot motif, not forced
+        "abs_move >= 0.02 (q90)": None,      # a move rule, never forced
+        "prev_abs_move >= 0.0157 (q90)": None,
+    }
+    forced = fl._forced_precursors(specfn, already={"N-1..N = BS"})
+    assert "sym == N  (a brand-new wallet bought in N)" in forced
+    assert "sym == .  (a dead slot)" in forced
+    assert "N-1..N = .N" in forced and "N-1..N = N." in forced
+    assert "N-1..N = BS" not in forced          # already kept
+    assert all("move" not in r for r in forced) # no move rule forced

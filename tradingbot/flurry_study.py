@@ -2701,6 +2701,28 @@ def _is_move_rule(rule):
     return field in FRONT_MOVE_FIELDS
 
 
+# The new-wallet / quiet->new-wallet precursors: a brand-new wallet arriving (N), or a quiet slot leading into one
+# (sym '.', or the motifs .N / ..N). These are the ORGANIC buyer the washbot reacts to -- the real front-run trigger
+# the discover runs named repeatedly -- but the joint logit prunes them as collinear with the washbot-wallet motifs.
+# They are forced into the deployable precursor gate so it always carries the organic-buyer signal.
+FRONT_FORCE = ("sym == N", "sym == .", "N-1..N = .N", "N-2..N = ..N", "N-1..N = N.")
+
+
+def _forced_precursors(specfn, already):
+    """specfn rules matching a FRONT_FORCE precursor not already kept (and not a move rule). Forced into the gate
+    even if discover's z-guard / the joint logit dropped them. A forced rule constant on train is dropped by
+    _front_logit anyway, so this only ever ADDS a predictor that actually fires."""
+    out = []
+    for rule in specfn:
+        if rule in already or _is_move_rule(rule):
+            continue
+        head = rule.split("  ")[0].strip()                 # drop the "  (symbol description)" suffix
+        if rule in FRONT_FORCE or head in FRONT_FORCE:
+            out.append(rule)
+            already.add(rule)
+    return out
+
+
 def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS):
     """The decisive precision test: score every HOLDOUT slot with the fitted joint logit (out of sample -- it was
     fit on train), then enter-on-signal only when that score is in its top k%. A single rule fires too broadly
@@ -2943,6 +2965,8 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
     # precursor-only gate: drop the move-itself rules (abs_move/move/price_up = backrun) and refit on the wallet
     # setup, so the gate fires BEFORE the move = a genuine front-run test, not a continuation/backrun one.
     pre_rules = [s["rule"] for s in survivors.get(lead_net, []) if not _is_move_rule(s["rule"])]
+    pre_rules += _forced_precursors(specfn, set(pre_rules))   # force the organic-buyer precursors (N / quiet / .N) in
+    out["forced_precursors"] = [r for r in pre_rules if r not in {s["rule"] for s in survivors.get(lead_net, [])}]
     out["logit_precursor"] = _front_logit(tr, ho, specfn, pre_rules, lead_net)
     out["logit_gate_precursor"] = _front_logit_gate(ho, pool_flows, specfn, out["logit_precursor"], cost)
     return out
