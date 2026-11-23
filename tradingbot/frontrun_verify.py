@@ -44,9 +44,10 @@ def parse_fires(text: str) -> list[dict]:
     if text.startswith("[") or text.lstrip().startswith("{"):
         rows = json.loads(text) if text.startswith("[") else [json.loads(x) for x in text.splitlines() if x.strip()]
         for r in rows:
-            if r.get("pool") and r.get("slot") is not None:
+            sl = r.get("slot", r.get("signal_slot"))     # the live box writes 'signal_slot'; verify uses 'slot'
+            if r.get("pool") and sl is not None:
                 box = {k: r[k] for k in ("sym", "m2", "m3", "eta") if k in r}
-                out.append({"pool": r["pool"], "slot": int(r["slot"]), "mint": r.get("token_mint"), "box": box})
+                out.append({"pool": r["pool"], "slot": int(sl), "mint": r.get("token_mint"), "box": box})
         return out
     for m in _FIRE_RE.finditer(text):               # fall back to parsing a plain log blob
         out.append({"pool": m.group(1), "slot": int(m.group(2)), "mint": None, "box": {}})
