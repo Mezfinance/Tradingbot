@@ -139,11 +139,16 @@ class Consumer:
     def __init__(self, gate, tier: str = "1", flurry_min: int = DEFAULT_FLURRY_MIN,
                  on_fire: Optional[Callable[[dict], None]] = None, runner_factory=None,
                  fresh_window_slots: int = 0, on_capture: Optional[Callable] = None,
-                 handmade_only: bool = True):
+                 handmade_only: bool = True, on_pool: Optional[Callable] = None, reserves=None):
         self.gate = gate
         self.tier = str(tier)
         self.flurry_min = flurry_min
         self.on_fire = on_fire
+        # on_pool(pool) fires once, the first time a (hand-made) pool is seen -> the box subscribes its vaults on
+        # the WS reserve feed. `reserves` is a reserve_tracker.ReserveTracker: when set, each fire is stamped with
+        # the box's current {sol, tok, reserve_slot} view (for the NET's revert cost + the SOL-drift validity).
+        self.on_pool = on_pool
+        self.reserves = reserves
         # Process ONLY hand-made pools (token mint not ending 'pump'), matching the study / launch_live scorer;
         # pump.fun graduations are out-of-distribution for the gate (and part of the over-firing). Off -> every pool.
         self.handmade_only = handmade_only
@@ -197,6 +202,8 @@ class Consumer:
         sig["slot"] = sig["signal_slot"]
         if st.token:
             sig["token_mint"] = st.token
+        if self.reserves is not None:
+            sig.update(self.reserves.stamp(pool))            # {sol, tok, reserve_slot} at the fire (box WS view)
         if self.on_fire:
             self.on_fire(sig)
         return sig
@@ -211,6 +218,8 @@ class Consumer:
             st = _PoolState(self._make_runner())
             st.first_slot = slot
             self.pools[pool] = st
+            if self.on_pool:
+                self.on_pool(pool)                           # first sight -> box subscribes this pool's vaults
         fired = None
         if st.slot is not None and slot != st.slot:      # pool advanced -> close the active slot it held
             fired = self._flush(pool, st)
@@ -250,6 +259,9 @@ def fire_line(sig: dict) -> dict:
            "eta": sig.get("eta"), "sym": sig.get("sym"), "m2": sig.get("m2"), "tier": sig.get("tier")}
     if sig.get("token_mint"):
         rec["token_mint"] = sig["token_mint"]
+    for k in ("sol", "tok", "reserve_slot"):                 # box WS reserve stamp, when the feed is wired
+        if sig.get(k) is not None:
+            rec[k] = sig[k]
     return rec
 
 
