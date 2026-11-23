@@ -69,3 +69,14 @@ def test_aggregator_feeds_a_hybrid_full_bank_in_slot_order():
         agg.push(hw.swap_from_tx(tx, POOL, MINT))
     agg.flush()
     assert len(got) == 2 and all("sym" in r and "m2" in r for r in got)
+
+
+def test_inline_helpers_are_pinned_to_helius():
+    # the box runs helius_feature_ws flat (no tradingbot package), so it inlines helius._vault/_keys/SOL_MINT;
+    # pin them to the originals so they can never drift.
+    assert hw.SOL_MINT == he.SOL_MINT
+    tx = _tx(42, "PAYER", 1000, 980, 100, 102)
+    for side in ("preTokenBalances", "postTokenBalances"):
+        assert hw._vault(tx, POOL, MINT, side) == he._vault(tx, POOL, MINT, side)
+        assert hw._vault(tx, POOL, he.SOL_MINT, side) == he._vault(tx, POOL, he.SOL_MINT, side)
+    assert hw._keys(tx) == he._keys(tx)

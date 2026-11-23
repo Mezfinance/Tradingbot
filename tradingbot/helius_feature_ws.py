@@ -16,7 +16,21 @@ buy_sol, max_buy, n_sells, sell_sol, buyers, price), so the full SlotBank's reco
 The WS I/O loop + the notification->tx shaping are box-side (run_localshred.py), validated on the box; this decode
 + aggregation is pure and tested here.
 """
-from .data import helius as he
+# Inlined copies of helius._vault / _keys / SOL_MINT so this module runs on the box's FLAT layout (no tradingbot
+# package there). Pinned to the helius originals by tests/test_helius_feature_ws.py so they cannot drift.
+SOL_MINT = "So11111111111111111111111111111111111111112"
+
+
+def _vault(tx: dict, pool: str, mint: str, side: str) -> float:
+    for b in (tx.get("meta") or {}).get(side) or []:
+        if b.get("owner") == pool and b.get("mint") == mint:
+            return float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+    return 0.0
+
+
+def _keys(tx: dict) -> list:
+    keys = ((tx.get("transaction") or {}).get("message") or {}).get("accountKeys") or []
+    return [k["pubkey"] if isinstance(k, dict) else k for k in keys]
 
 
 def swap_from_tx(tx: dict, pool: str, token_mint: str) -> dict | None:
@@ -25,14 +39,14 @@ def swap_from_tx(tx: dict, pool: str, token_mint: str) -> dict | None:
     exactly as helius.launch_record. A buy = tokens leave the pool (tok_delta < 0) and SOL enters (sol_delta > 0)."""
     if (tx.get("meta") or {}).get("err") is not None:
         return None                                      # reverted: slot_flow's full view excludes failed txs
-    b0 = he._vault(tx, pool, token_mint, "preTokenBalances")
-    b1 = he._vault(tx, pool, token_mint, "postTokenBalances")
-    q0 = he._vault(tx, pool, he.SOL_MINT, "preTokenBalances")
-    q1 = he._vault(tx, pool, he.SOL_MINT, "postTokenBalances")
+    b0 = _vault(tx, pool, token_mint, "preTokenBalances")
+    b1 = _vault(tx, pool, token_mint, "postTokenBalances")
+    q0 = _vault(tx, pool, SOL_MINT, "preTokenBalances")
+    q1 = _vault(tx, pool, SOL_MINT, "postTokenBalances")
     tok_delta, sol_delta = b1 - b0, q1 - q0
     if tok_delta == 0 and sol_delta == 0:
         return None                                      # not a swap that touched this pool
-    keys = he._keys(tx)
+    keys = _keys(tx)
     return {"slot": tx.get("slot"), "payer": (keys[0] if keys else None),
             "tok_delta": round(tok_delta, 6), "sol_delta": round(sol_delta, 9),
             "tok_after": round(b1, 6), "sol_after": round(q1, 9)}
