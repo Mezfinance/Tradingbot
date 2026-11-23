@@ -127,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify", "frontrun-fill", "localshred-merge"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify", "frontrun-fill", "localshred-merge", "shred-completeness"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -852,6 +852,28 @@ def main(argv: list[str] | None = None) -> None:
             for _r in _rows:
                 _of.write(json.dumps(_r) + "\n")
         print(f"merged {len(_rows)} of {len(_cap_rows)} captured pools -> {args.out} ({_cr} research credits)")
+        return
+
+    if args.command == "shred-completeness":  # the box's LocalShred capture vs Helius truth: what we have vs miss
+        from tradingbot import shred_completeness as _sc
+        import httpx as _sc_httpx
+        from tradingbot.data.helius import Helius as _ScHelius
+        _cap_path = args.capture or "/root/ls/ourfeed.jsonl"
+        try:
+            _sc_rows = _sc.load_capture(_cap_path)
+        except FileNotFoundError:
+            print(f"shred-completeness: no capture at {_cap_path} "
+                  f"(pass --capture <file>; the box writes it to /root/ls/ourfeed.jsonl)", file=sys.stderr)
+            sys.exit(2)
+        if not _sc_rows:
+            print(f"shred-completeness: {_cap_path} has no capture records", file=sys.stderr)
+            sys.exit(2)
+        _sc_helius = _ScHelius(client=_sc_httpx.Client(timeout=60))   # research (backup) key, never the live key
+        _sc_helius.min_interval_s = 1 / max(args.rps, 0.1)
+        _sc_prog = lambda i, n, c: print(f"compare {i}/{n}, {c} credits", file=sys.stderr, flush=True)
+        _sc_out = _sc.study(_sc_rows, _sc_helius, max_credits=int(args.max_credits or 40_000),
+                            span_s=args.span_s, max_pools=args.max_pools, progress=_sc_prog)
+        print(json.dumps(_sc_out, indent=2) if args.json else _sc.render(_sc_out))
         return
 
     if args.command == "flurry-study":  # slot-level buy-flurry continuation for the reactive-backrun scalp (11-17)
