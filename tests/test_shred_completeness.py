@@ -137,6 +137,25 @@ def test_load_capture_dedups_to_the_richest(tmp_path):
     assert len(rows) == 1 and len(rows[0]["slots"]) == 2
 
 
+def test_row_layout_matches_flurry_study():
+    # the comparator inlines these to stay numpy-free for the box; pin them to flurry_study so a layout
+    # change there (the launch_record row shape) is caught rather than silently diverging.
+    from tradingbot import flurry_study as fs
+    assert (sc._SLOT, sc._PAYER, sc._TOKD, sc._SOLD, sc._VIS) == (fs._SLOT, fs._PAYER, fs._TOKD, fs._SOLD, fs._VIS)
+    assert sc.MAX_PAGES == fs.MAX_PAGES
+    assert sc._classify(-10, 1) == fs.classify(-10, 1) == "buy"
+    assert sc._classify(10, -1) == fs.classify(10, -1) == "sell"
+
+
+def test_comparator_imports_no_numpy():
+    import subprocess, sys
+    # a fresh interpreter: importing the comparator must not pull numpy (the box venv is numpy-free).
+    r = subprocess.run([sys.executable, "-c",
+                        "import sys, tradingbot.shred_completeness; "
+                        "sys.exit(1 if 'numpy' in sys.modules else 0)"])
+    assert r.returncode == 0
+
+
 def test_freshness_reports_age_and_span():
     rows = [{"pool": "p1", "create_ts": 1000, "slots": []},
             {"pool": "p2", "create_ts": 4600, "slots": []}]

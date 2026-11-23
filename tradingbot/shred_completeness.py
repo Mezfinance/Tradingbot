@@ -37,8 +37,22 @@ import json
 import time
 from typing import Callable, Optional
 
-from . import flurry_study as fs
 from .data import helius as he
+
+# Row layout + classify, INLINED from flurry_study so the comparator imports no numpy -- it must run on the
+# box, whose venv (run_hybrid.py's) is deliberately numpy-free, and importing flurry_study pulls numpy. These
+# mirror flurry_study exactly (pinned by tests/test_shred_completeness.py::test_row_layout_matches_flurry_study):
+# a launch_record row is [sec, slot, payer, tokΔ, solΔ, tokA, solA, vis?].
+_SLOT, _PAYER, _TOKD, _SOLD, _VIS = 1, 2, 3, 4, 7
+MAX_PAGES = 6
+
+
+def _classify(tok_change: float, sol_change: float) -> str:
+    if tok_change < 0 and sol_change > 0:
+        return "buy"        # tokens leave the pool, SOL enters
+    if tok_change > 0 and sol_change < 0:
+        return "sell"       # tokens enter, SOL leaves
+    return "other"          # pull / add / other -- not a buyer-or-seller trade
 
 
 def load_capture(path: str) -> list[dict]:
@@ -82,17 +96,17 @@ def _slot_counts(rec_vis: dict, mode: str) -> dict:
     every trade; ``mode='direct'`` only rows whose 8th element (``with_vis``: top-level pumpswap) is truthy."""
     out: dict = {}
     for r in rec_vis.get("txs") or []:
-        if mode == "direct" and not (len(r) > fs._VIS and bool(r[fs._VIS])):
+        if mode == "direct" and not (len(r) > _VIS and bool(r[_VIS])):
             continue
-        kind = fs.classify(r[fs._TOKD] or 0.0, r[fs._SOLD] or 0.0)
+        kind = _classify(r[_TOKD] or 0.0, r[_SOLD] or 0.0)
         if kind not in ("buy", "sell"):
             continue
-        sl = int(r[fs._SLOT])
+        sl = int(r[_SLOT])
         d = out.setdefault(sl, {"n_buys": 0, "n_sells": 0, "buyers": set()})
         if kind == "buy":
             d["n_buys"] += 1
-            if r[fs._PAYER]:
-                d["buyers"].add(r[fs._PAYER])
+            if r[_PAYER]:
+                d["buyers"].add(r[_PAYER])
         else:
             d["n_sells"] += 1
     return out
@@ -175,14 +189,14 @@ def study(cap_rows: list[dict], helius, max_credits: int = 40_000, span_s: float
     agg = {k: 0 for k in ("all", "direct", "box_visible", "capture", "routed", "lut", "absent",
                            "chain_buyers", "box_buyers", "cap_hit_chain", "cap_hit_box")}
     rows, credits, compared, no_chain = [], 0, 0, 0
-    per_page = fs.MAX_PAGES * 10
+    per_page = MAX_PAGES * 10
     for i, cr in enumerate(pools):
         if compared >= max_pools:
             break
         if helius is None or credits + per_page > max_credits:
             break
         ct = cr.get("create_ts") or 0
-        txs, _ok = helius.history_window(cr["pool"], ct - 30, span_s + 60, fs.MAX_PAGES)
+        txs, _ok = helius.history_window(cr["pool"], ct - 30, span_s + 60, MAX_PAGES)
         credits += per_page
         res = compare_pool(cr, txs)
         if res is None:
