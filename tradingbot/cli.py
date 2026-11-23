@@ -127,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify", "frontrun-fill", "localshred-merge", "shred-completeness"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify", "frontrun-fill", "localshred-merge", "shred-completeness", "symbol-flip"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -874,6 +874,33 @@ def main(argv: list[str] | None = None) -> None:
         _sc_out = _sc.study(_sc_rows, _sc_helius, max_credits=int(args.max_credits or 40_000),
                             span_s=args.span_s, max_pools=args.max_pools, progress=_sc_prog)
         print(json.dumps(_sc_out, indent=2) if args.json else _sc.render(_sc_out))
+        return
+
+    if args.command == "symbol-flip":  # the gate-level number: does the pre-LUT box fire where the direct view does? (11-23)
+        from tradingbot import symbol_flip as _sf
+        from tradingbot import precursor_gate as _sf_pg
+        import httpx as _sf_httpx
+        from tradingbot.data.helius import Helius as _SfHelius
+        if not args.gate:
+            print("symbol-flip: pass --gate <gate.json> (the hybrid gate, flurry-study --export-gate)", file=sys.stderr)
+            sys.exit(2)
+        _sf_gate = _sf_pg.load(args.gate)
+        _cap_path = args.capture or "/root/ls/ourfeed.jsonl"
+        try:
+            _sf_rows = _sf.load_capture(_cap_path)
+        except FileNotFoundError:
+            print(f"symbol-flip: no capture at {_cap_path} (pass --capture <file>)", file=sys.stderr)
+            sys.exit(2)
+        if not _sf_rows:
+            print(f"symbol-flip: {_cap_path} has no capture records", file=sys.stderr)
+            sys.exit(2)
+        _sf_helius = _SfHelius(client=_sf_httpx.Client(timeout=60))   # research (backup) key, never the live key
+        _sf_helius.min_interval_s = 1 / max(args.rps, 0.1)
+        _sf_prog = lambda i, n, c: print(f"flip {i}/{n}, {c} credits", file=sys.stderr, flush=True)
+        _sf_out = _sf.study(_sf_rows, _sf_helius, _sf_gate, tier=str(args.tier),
+                            max_credits=int(args.max_credits or 40_000), span_s=args.span_s,
+                            max_pools=args.max_pools, progress=_sf_prog)
+        print(json.dumps(_sf_out, indent=2) if args.json else _sf.render(_sf_out))
         return
 
     if args.command == "flurry-study":  # slot-level buy-flurry continuation for the reactive-backrun scalp (11-17)
