@@ -230,7 +230,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--sol-usd", type=float, default=83.0, help="frontrun-fill: SOL price in USD for sizing the trade (default 83)")
     parser.add_argument("--hold", type=int, default=2, help="frontrun-fill: slots to hold (sell at N+k+hold); default 2 = exit N+2, dodges the >=2-slot reactive pull")
     parser.add_argument("--box-exact", action="store_true", help="frontrun-verify: build the ground truth with the box's LUT drop replicated (a direct swap whose pool account is LUT-loaded is dropped, as the box does). If MISMATCH rows vanish under this, the cause is the box's drop_lut (resolve LUTs / LocalShred); if they survive, the gap is deeper than LUT.")
-    parser.add_argument("--hybrid", action="store_true", help="frontrun-verify: build the ground truth as the hybrid bank (CURRENT slot from the DIRECT shred view, PRIOR slots rebased to the FULL Helius view) instead of a single-vis SlotBank -- verifies a hybrid-gate box run against the exact offline hybrid the gate was fit on. Auto-on when the gate JSON stamps \"hybrid\": true.")
+    # frontrun-verify --hybrid reuses the --hybrid flag defined above (flurry-study); both are store_true -> args.hybrid.
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
     parser.add_argument("--apply", action="store_true", help="canary-sweep: close the empty accounts (default: list)")
