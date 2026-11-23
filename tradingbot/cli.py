@@ -127,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify", "localshred-merge"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify", "frontrun-fill", "localshred-merge"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -226,6 +226,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--gate", type=str, default=None, help="frontrun-verify: the exported gate JSON (flurry-study --export-gate)")
     parser.add_argument("--tier", type=str, default="1", help="frontrun-verify: gate tier to check (1 = top 1%%, 2 = top 2%%)")
     parser.add_argument("--pages", type=int, default=None, help="frontrun-verify: history pages to fetch per pool (100 txs each; raise for busy pools so a late fired slot is fetched rather than falsely truncated; default 6)")
+    parser.add_argument("--sol-usd", type=float, default=83.0, help="frontrun-fill: SOL price in USD for sizing the trade (default 83)")
+    parser.add_argument("--hold", type=int, default=2, help="frontrun-fill: slots to hold (sell at N+k+hold); default 2 = exit N+2, dodges the >=2-slot reactive pull")
     parser.add_argument("--box-exact", action="store_true", help="frontrun-verify: build the ground truth with the box's LUT drop replicated (a direct swap whose pool account is LUT-loaded is dropped, as the box does). If MISMATCH rows vanish under this, the cause is the box's drop_lut (resolve LUTs / LocalShred); if they survive, the gap is deeper than LUT.")
     parser.add_argument("--usd", type=float, default=2.0, help="canary-smoke: USD to buy and sell back")
     parser.add_argument("--pool", help="canary-smoke on the direct route: the token's pumpswap pool (else looked up)")
@@ -807,6 +809,26 @@ def main(argv: list[str] | None = None) -> None:
             _fvh.min_interval_s = 1 / max(args.rps, 0.1)
         _out = _fv.verify(_fires, _gate, helius=_fvh, tier=args.tier, flurry_min=args.flurry_min, span_s=args.span_s, max_pages=args.pages, box_exact=args.box_exact)
         print(json.dumps(_out, indent=2, default=str) if args.json else _fv.render(_out))
+        return
+
+    if args.command == "frontrun-fill":  # realistic NET of the live fires, settled on Helius true reserves
+        from tradingbot import frontrun_fill as _ff
+        if not args.fires:
+            print("frontrun-fill needs --fires <path>", file=sys.stderr)
+            return
+        _ffires = _ff.load_fires(args.fires)
+        _hold = args.hold
+        if args.gate:
+            with open(args.gate) as _gh:
+                _hold = int(json.load(_gh).get("hold", args.hold))
+        _ffh = None
+        if args.fetch:
+            import httpx as _ff_httpx
+            from tradingbot.data.helius import Helius as _FfHelius
+            _ffh = _FfHelius(client=_ff_httpx.Client(timeout=60))  # research (backup) key, never the live key
+            _ffh.min_interval_s = 1 / max(args.rps, 0.1)
+        _out = _ff.measure(_ffires, gate_hold=_hold, sol_usd=args.sol_usd, helius=_ffh, span_s=args.span_s, max_pages=args.pages)
+        print(json.dumps(_out, indent=2, default=str) if args.json else _ff.render(_out))
         return
 
     if args.command == "localshred-merge":  # our --capture features + Helius price -> flurry-study --flows recs
