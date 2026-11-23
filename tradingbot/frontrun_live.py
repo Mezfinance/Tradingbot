@@ -126,6 +126,71 @@ class Runner:
                 "sym": rec["sym"], "m2": rec["m2"]}
 
 
+class HybridRunner:
+    """The box's live HYBRID architecture, EXACTLY mirroring flurry_study._hybrid_bank (parity-pinned by
+    tests/test_hybrid_live.py). Two feeds, one gate:
+
+      * the SHRED stream scores the CURRENT slot -- fed to on_direct_slot(slot_agg): the direct bank gives the
+        slot's own symbol + wallet features (its own abs_move/move/price_up are zeroed, since shreds carry no
+        reserves, so there is no live current-slot price);
+      * the Helius WS stream rebases the HISTORY -- every COMPLETE slot it delivers is fed to on_full_slot(slot_agg):
+        the full bank gives that slot's real (Helius) symbol + features, which become the motif history (N-1, N-2)
+        and the lagged prev_* for scoring later slots.
+
+    So scoring a shred slot N = direct(N) current features + full(N-1, N-2) rebased history, exactly as the study
+    (which forces CAUSAL_WALLET on -- the online banks here are causal by construction, so they match).
+    TIMING CONTRACT: before on_direct_slot(N), the box must have delivered via on_full_slot every FULL slot < N
+    that exists (Helius at `processed` is ~1 slot behind, so by the time the shred closes N the WS has N-1). If the
+    WS has not yet delivered a prior slot, the history for that position reads as a dead '.' -- the box should wait
+    the few ms for the WS to catch up to N-1 so the live record matches the study's."""
+
+    def __init__(self, gate: dict, tier: str = "1", flurry_min: int = DEFAULT_FLURRY_MIN):
+        self.gate = gate if "_terms" in gate else precursor_gate.compile_gate(gate)
+        self.tier = str(tier)
+        self.hold = int(gate.get("hold", 2))
+        self.direct = SlotBank(flurry_min)                  # SHRED feed -> current slot
+        self.full = SlotBank(flurry_min)                    # Helius WS feed -> rebased history
+        self.full_sym: dict = {}
+        self.full_f: dict = {}
+        self.full_order: list = []
+        self.last_rec: dict = {}
+
+    def on_full_slot(self, slot_agg: dict) -> None:
+        """A COMPLETE slot from the Helius WS: advance the full bank and store its symbol + features (the rebase)."""
+        slot = slot_agg["slot"]
+        r = self.full.push(slot_agg)
+        self.full_sym[slot] = r["sym"]
+        self.full_f[slot] = r["f"]
+        self.full_order.append(slot)
+
+    def hybrid_rec(self, slot: int, direct_rec: dict) -> dict:
+        """Combine the shred current slot with the Helius-rebased history -- flurry_study._hybrid_bank, online."""
+        f = dict(direct_rec["f"])
+        f["abs_move"] = 0.0; f["move"] = 0.0; f["price_up"] = 0.0   # no live current-slot price from shreds
+        prior = [s for s in self.full_order if s < slot]
+        psl = prior[-1] if prior else None
+        p2sl = prior[-2] if len(prior) >= 2 else None
+        pf = self.full_f.get(psl) or {}
+        f["prev_buys"] = pf.get("n_buys", 0.0); f["prev_buy_sol"] = pf.get("buy_sol", 0.0)
+        f["prev_new_buyers"] = pf.get("new_buyers", 0.0); f["prev_net_sol"] = pf.get("net_sol", 0.0)
+        f["prev_abs_move"] = pf.get("abs_move", 0.0); f["prev_move"] = pf.get("move", 0.0)
+        sym = direct_rec["sym"]
+        return {"f": f, "sym": sym, "m2": self.full_sym.get(psl, ".") + sym,
+                "m3": self.full_sym.get(p2sl, ".") + self.full_sym.get(psl, ".") + sym}
+
+    def on_direct_slot(self, slot_agg: dict):
+        """A closed slot from the SHRED stream: score direct(N) current + full(N-1,N-2) rebased history. Returns a
+        FireSignal when the gate fires, else None. The scored record is on self.last_rec for the parity verifier."""
+        slot = slot_agg["slot"]
+        rec = self.hybrid_rec(slot, self.direct.push(slot_agg))
+        self.last_rec = rec
+        if not precursor_gate.fires(rec, self.gate, self.tier):
+            return None
+        return {"signal_slot": slot, "entry_slot": slot + 1, "exit_slot": slot + self.hold,
+                "hold": self.hold, "tier": self.tier, "eta": precursor_gate.eta(rec, self.gate),
+                "sym": rec["sym"], "m2": rec["m2"]}
+
+
 def net_return(entry_fill: float, exit_fill: float, cost: float = 0.01) -> float:
     """NET return of a filled front-run: exit_fill / entry_fill - 1 - cost (round-trip cost, default 1%). The box
     passes its REAL fill prices (entry at the front of N+1, exit at N+hold) so the live number is fills, not the
