@@ -181,7 +181,36 @@ def verify(fires: list[dict], gate: dict, helius=None, have: dict | None = None,
     trunc = sum(1 for r in rows if r.get("status") == "truncated")
     return {"tier": tier, "vis": gate.get("vis", "full"), "box_exact": box_exact, "hybrid": hybrid,
             "n_fires": len(fires), "n_checked": len(ok), "n_reproduced": repro, "n_diverged": len(ok) - repro,
-            "n_truncated": trunc, "rows": rows}
+            "n_truncated": trunc, "dist": _distance(ok), "rows": rows}
+
+
+def _distance(ok: list[dict]) -> dict:
+    """How far off the live box is from the offline ground truth, quantified. repro_rate is the headline: the
+    share of box fires the offline hybrid also fires on. The misses split by CAUSE: a box fire on a slot the
+    offline gate would NOT fire (present_nofire -> the features crossed threshold live but not offline: usually a
+    rebased prior symbol differing, i.e. timing/decode) vs a box fire on a slot the offline flow does not even
+    hold (absent -> the live aggregated a slot chain history does not show). Symbol-agreement rates and the mean
+    |eta gap| say how close the scoring is even when it does fire."""
+    n = len(ok)
+    repro = sum(1 for r in ok if r["reproduced"])
+    present_nofire = sum(1 for r in ok if r["in_flow"] and not r["reproduced"])
+    absent = sum(1 for r in ok if not r["in_flow"])
+    sym_ck = sym_ok = m2_ck = m2_ok = 0
+    deta: list[float] = []
+    for r in ok:
+        mm = r.get("match") or {}
+        if "sym" in mm:
+            sym_ck += 1; sym_ok += bool(mm["sym"])
+        if "m2" in mm:
+            m2_ck += 1; m2_ok += bool(mm["m2"])
+        o, b = r.get("offline") or {}, r.get("box") or {}
+        if o.get("eta") is not None and "eta" in b:
+            deta.append(abs(float(b["eta"]) - float(o["eta"])))
+    return {"checked": n, "reproduced": repro, "repro_rate": (repro / n if n else None),
+            "present_but_offline_nofire": present_nofire, "slot_absent_offline": absent,
+            "sym_checked": sym_ck, "sym_match": sym_ok, "sym_rate": (sym_ok / sym_ck if sym_ck else None),
+            "m2_checked": m2_ck, "m2_match": m2_ok, "m2_rate": (m2_ok / m2_ck if m2_ck else None),
+            "mean_abs_eta_gap": (sum(deta) / len(deta) if deta else None)}
 
 
 def render(out: dict) -> str:
@@ -192,6 +221,22 @@ def render(out: dict) -> str:
          f"  fires {out['n_fires']}  checked {out['n_checked']}  "
          f"reproduced {out['n_reproduced']}  DIVERGED {out['n_diverged']}"
          + (f"  truncated {out['n_truncated']}" if out.get('n_truncated') else ""), ""]
+    d = out.get("dist") or {}
+    if d.get("checked"):
+        pct = lambda x: "n/a" if x is None else f"{x * 100:.0f}%"
+        L += [f"  HOW FAR OFF  (checked {d['checked']})",
+              f"    reproduced          {d['reproduced']}/{d['checked']}  ({pct(d.get('repro_rate'))})"
+              "   <- share of box fires the offline hybrid also fires on",
+              f"    of the misses:      {d['present_but_offline_nofire']} fired where offline would NOT "
+              "(features/timing: prior symbol differs)",
+              f"                        {d['slot_absent_offline']} fired on a slot absent from offline "
+              "(shred decode / feed)",
+              f"    current sym agree   {d['sym_match']}/{d['sym_checked']}  ({pct(d.get('sym_rate'))})"
+              "   <- shred decode fidelity",
+              f"    prior sym (m2) agree {d['m2_match']}/{d['m2_checked']}  ({pct(d.get('m2_rate'))})"
+              "  <- Helius rebase fidelity",
+              f"    mean |eta gap|      {'n/a' if d.get('mean_abs_eta_gap') is None else format(d['mean_abs_eta_gap'], '.3f')}"
+              "   <- scoring closeness when it does fire", ""]
     L.append(f"  {'pool':<20}{'slot':>12}{'in?':>5}{'fires?':>7}{'sym':>5}{'m2':>5}{'eta':>8}"
              f"{'absmv@N':>9}{'fwd':>8}  kind  match")
     for r in out["rows"]:
