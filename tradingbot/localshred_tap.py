@@ -8,12 +8,18 @@ against the account-key list), so it is unit-tested; it needs no grpc and no sol
 `tx.message.account_keys`, `tx.message.instructions`, and each instruction's `program_id_index` /
 `accounts` / `data`).
 
-LUT note: for a v0 message `account_keys` is the STATIC keys only; address-table-lookup accounts are
-unresolved, so a swap whose pool account is LUT-indexed has an out-of-range index and is skipped by
-`decode_tx` (classify returns None). That is the same LUT-blindness the box has, and it is fine for the
-first LocalShred verify: the box-exact result (2026-11-22) showed the gap is NOT the ~3.9% LUT drop but
-deeper feed incompleteness, so LocalShred's value is a COMPLETE trade stream upstream of LUT -- a
-LUT resolver is only worth adding if the LocalShred verify's residual is then the LUT swaps.
+LUT resolution (the "fuller decode", 2026-11-23): for a v0 message `account_keys` is the STATIC keys only;
+address-table-lookup accounts sit after them, in Solana's order (all tables' WRITABLE entries, then all
+tables' READONLY entries). Without the table contents a swap whose pool/mint is LUT-indexed has an
+out-of-range index and is skipped (classify returns None) -- the box's historical ~3.9% `drop_lut`. Pass a
+`resolve(table_pubkey) -> list[str] | None` (the box caches each lookup-table account's address list; the
+offline completeness tool fetches it from Helius) and `tx_view` rebuilds the full resolved account list so
+those swaps decode. Resolution is all-or-nothing per tx: if ANY referenced table is unresolved we fall back
+to the static-only keys (a partial resolve would shift every later table's absolute index and corrupt the
+read), so `resolve=None` (or a miss) reproduces the exact old LUT-blind behaviour -- the default, byte-for-byte.
+Why bother now that 2026-11-23 showed routing is 0.2% and the gap is deeper feed incompleteness: a clean
+completeness read needs LUT swaps IN, so a "missing" trade is genuine shred-feed loss, not a resolver we chose
+not to run. Routed (CPI) swaps still never appear here -- a compiled message carries no inner instructions.
 
 The box-run I/O loop (gRPC `ShredstreamProxy.SubscribeEntries` stream + bincode `Vec<Entry>` deserialize
 + solders `VersionedTransaction` parse -> these functions) is the Nuremberg measurement runbook in
@@ -22,13 +28,40 @@ correctness depends on solders' deserialize behaviour and the live feed.
 """
 
 
-def tx_view(tx):
+def resolve_account_keys(msg, resolve):
+    """Full resolved account-key list for a (possibly v0) message: static keys + LUT writable + LUT readonly,
+    in Solana's canonical order. `resolve(table_pubkey) -> list[str] | None` gives a lookup table's address
+    list. Returns (keys, resolved_lut) where resolved_lut is True only if EVERY referenced table resolved
+    (and every index was in range); otherwise (static_keys, False) -- never a partial/corrupt resolve.
+    A legacy message (no address_table_lookups) returns (static_keys, True)."""
+    static = [str(k) for k in msg.account_keys]
+    lookups = getattr(msg, "address_table_lookups", None) or []
+    if not lookups:
+        return static, True
+    if resolve is None:
+        return static, False
+    writable, readonly = [], []
+    for lk in lookups:
+        table = resolve(str(lk.account_key))
+        if not table:
+            return static, False                       # unresolved table -> can't place later tables -> bail
+        try:
+            writable.extend(table[int(i)] for i in lk.writable_indexes)
+            readonly.extend(table[int(i)] for i in lk.readonly_indexes)
+        except (IndexError, TypeError):
+            return static, False                       # table shorter than an index expects -> bail
+    return static + writable + readonly, True
+
+
+def tx_view(tx, resolve=None):
     """One parsed transaction -> (account_keys: list[str], instructions: list[(program_id, accts, data)],
     fee_payer: str|None). Top-level instructions only (the box's direct view excludes CPIs, which a
     compiled message does not contain anyway -- inner instructions live in meta, which the entry stream
-    does not carry). An instruction whose program-id index is out of range (LUT-only) is skipped."""
+    does not carry). With `resolve` (a LUT lookup) the account list is the full resolved set so LUT-indexed
+    swaps decode; without it (the default), v0 LUT accounts are unresolved and such instructions are skipped,
+    reproducing the box's LUT-blind view exactly. An instruction with an out-of-range index is skipped."""
     msg = tx.message
-    account_keys = [str(k) for k in msg.account_keys]
+    account_keys, _ = resolve_account_keys(msg, resolve)
     n = len(account_keys)
     fee_payer = account_keys[0] if account_keys else None
     out = []
@@ -36,13 +69,17 @@ def tx_view(tx):
         pid_idx = int(ix.program_id_index)
         if pid_idx < 0 or pid_idx >= n:
             continue
-        out.append((account_keys[pid_idx], [int(a) for a in ix.accounts], bytes(ix.data)))
+        accts = [int(a) for a in ix.accounts]
+        if any(a < 0 or a >= n for a in accts):        # an unresolved-LUT account index -> skip (old behaviour)
+            continue
+        out.append((account_keys[pid_idx], accts, bytes(ix.data)))
     return account_keys, out, fee_payer
 
 
-def on_transaction(consumer, slot, tx):
-    """Feed one parsed transaction at `slot` into the Consumer. Returns any fires it produced."""
-    account_keys, instructions, fee_payer = tx_view(tx)
+def on_transaction(consumer, slot, tx, resolve=None):
+    """Feed one parsed transaction at `slot` into the Consumer. Returns any fires it produced.
+    `resolve` (optional LUT lookup) enables the fuller LUT-resolved decode; default = LUT-blind."""
+    account_keys, instructions, fee_payer = tx_view(tx, resolve)
     return consumer.on_tx(slot, account_keys, instructions, fee_payer)
 
 

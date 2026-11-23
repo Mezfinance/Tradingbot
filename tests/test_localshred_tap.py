@@ -58,6 +58,90 @@ def test_on_transaction_decodes_and_routes_into_the_consumer():
     assert rec[0]["slot"] == 42 and rec[0]["n_buys"] == 1 and rec[0]["buyers"] == ["PAYER"]
 
 
+# --- LUT resolution (the fuller decode): v0 message with address_table_lookups ---
+
+class _Lk:
+    def __init__(self, account_key, writable_indexes, readonly_indexes):
+        self.account_key = account_key
+        self.writable_indexes = writable_indexes
+        self.readonly_indexes = readonly_indexes
+
+
+class _MsgV0:
+    def __init__(self, account_keys, instructions, lookups):
+        self.account_keys = account_keys
+        self.instructions = instructions
+        self.address_table_lookups = lookups
+
+
+class _TxV0:
+    def __init__(self, account_keys, instructions, lookups):
+        self.message = _MsgV0(account_keys, instructions, lookups)
+
+
+def test_lut_indexed_swap_is_skipped_without_a_resolver():
+    # pool/user/gconf/base/quote all live in a LUT (indices 2..6 are past the 2 static keys).
+    keys = ["PAYER", lc.PROGRAM]
+    lk = _Lk("TABLE", [0, 1], [2, 3, 4])
+    ix = _Ix(1, [2, 3, 4, 5, 6], lc.SELL + bytes(16))
+    account_keys, instructions, _ = tap.tx_view(_TxV0(keys, [ix], [lk]))   # resolve=None (default)
+    assert account_keys == keys and instructions == []                     # LUT-blind: skipped, no crash
+
+
+def test_lut_resolver_recovers_the_swap():
+    keys = ["PAYER", lc.PROGRAM]
+    lk = _Lk("TABLE", [0, 1], [2, 3, 4])                                   # writable: pool,user; readonly: gconf,base,quote
+    table = ["POOL", "USER", "GCONF", "TOKEN", lc.WSOL]
+    ix = _Ix(1, [2, 3, 4, 5, 6], lc.SELL + bytes(16))
+
+    def resolve(t):
+        return table if t == "TABLE" else None
+
+    account_keys, instructions, fee_payer = tap.tx_view(_TxV0(keys, [ix], [lk]), resolve)
+    assert account_keys == ["PAYER", lc.PROGRAM, "POOL", "USER", "GCONF", "TOKEN", lc.WSOL]
+    assert instructions == [(lc.PROGRAM, [2, 3, 4, 5, 6], lc.SELL + bytes(16))]
+    swaps = lc.decode_tx(account_keys, instructions, fee_payer)
+    assert len(swaps) == 1
+    assert swaps[0].pool == "POOL" and swaps[0].token == "TOKEN" and swaps[0].payer == "PAYER"
+    assert swaps[0].is_buy is False                                        # SELL of a token-base pool
+
+
+def test_lut_order_is_static_then_all_writable_then_all_readonly():
+    lk1 = _Lk("T1", [0], [1])
+    lk2 = _Lk("T2", [0], [1])
+
+    def resolve(t):
+        return {"T1": ["W1", "R1"], "T2": ["W2", "R2"]}.get(t)
+
+    keys, ok = tap.resolve_account_keys(_MsgV0(["S0"], [], [lk1, lk2]), resolve)
+    assert ok is True
+    assert keys == ["S0", "W1", "W2", "R1", "R2"]                          # Solana order: writable before readonly
+
+
+def test_partial_lut_resolution_falls_back_to_static():
+    lk1, lk2 = _Lk("T1", [0], []), _Lk("T2", [0], [])
+
+    def resolve(t):
+        return ["X"] if t == "T1" else None                               # T2 unresolved
+
+    keys, ok = tap.resolve_account_keys(_MsgV0(["S0"], [], [lk1, lk2]), resolve)
+    assert ok is False and keys == ["S0"]                                 # no partial resolve -> no index corruption
+
+
+def test_lut_index_out_of_table_range_falls_back():
+    lk = _Lk("T", [5], [])                                                # index 5 but the table has 1 entry
+    keys, ok = tap.resolve_account_keys(_MsgV0(["S0"], [], [lk]), lambda t: ["only"])
+    assert ok is False and keys == ["S0"]
+
+
+def test_resolver_unused_on_a_legacy_message():
+    keys = ["PAYER", lc.PROGRAM, "POOL", "USER", "GCONF", "TOKEN", lc.WSOL]
+    ix = _Ix(1, [2, 3, 4, 5, 6], lc.SELL + bytes(16))
+    # a legacy _Tx has no address_table_lookups -> resolve is irrelevant, full static keys
+    account_keys, instructions, _ = tap.tx_view(_Tx(keys, [ix]), resolve=lambda t: ["junk"])
+    assert account_keys == keys and instructions == [(lc.PROGRAM, [2, 3, 4, 5, 6], lc.SELL + bytes(16))]
+
+
 # --- box-path tests that use real solders objects (skip where solders isn't installed) ---
 
 def _le(n):
