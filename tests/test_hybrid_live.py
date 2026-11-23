@@ -97,3 +97,22 @@ def test_hybrid_consumer_routes_feeds_per_pool_and_fires():
     direct_slots = [s["slot"] for s in fl.slot_flow(rec, "direct")["slots"]]
     want = [direct_slots[i] for i, r in enumerate(study) if pg.fires(r, gate, "1")]
     assert [f["signal_slot"] for f in fires] == want
+
+
+def test_hybrid_consumer_freshness_gate_suppresses_mid_life_pools():
+    gate = pg.compile_gate({"intercept": -1.0, "predictors": [{"coef": 9.0, "name": "sym == N"}],
+                            "threshold": {"1": 0.0}, "hold": 2})
+    fires = []
+    con = live.HybridConsumer(gate, "1", on_fire=fires.append, fresh_window_slots=5)
+    # a pool first seen at the very first slot (during the warm-up) never fires, even on an N slot
+    con.on_shred_slot("OLD", {"slot": 100, "price": 0.0, "n_buys": 1, "buy_sol": 1.0, "max_buy": 1.0,
+                              "n_sells": 0, "sell_sol": 0.0, "buyers": ["NEW"], "net_sol": 1.0})
+    assert fires == []
+    # a pool first seen well after the warm-up, firing within the window, is allowed
+    con2 = live.HybridConsumer(gate, "1", on_fire=fires.append, fresh_window_slots=5)
+    for s in range(100, 110):                       # advance the global start past the warm-up
+        con2.on_shred_slot("WARM", {"slot": s, "price": 0.0, "n_buys": 0, "buy_sol": 0.0, "max_buy": 0.0,
+                                    "n_sells": 1, "sell_sol": 1.0, "buyers": [], "net_sol": -1.0})
+    con2.on_shred_slot("FRESH", {"slot": 108, "price": 0.0, "n_buys": 1, "buy_sol": 1.0, "max_buy": 1.0,
+                                 "n_sells": 0, "sell_sol": 0.0, "buyers": ["NEWBUYER"], "net_sol": 1.0})
+    assert fires and fires[-1]["pool"] == "FRESH"

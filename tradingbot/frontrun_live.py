@@ -204,12 +204,18 @@ class HybridConsumer:
     hand-made pools should be routed here."""
 
     def __init__(self, gate: dict, tier: str = "1", flurry_min: int = DEFAULT_FLURRY_MIN,
-                 on_fire=None, on_pool=None):
+                 on_fire=None, on_pool=None, fresh_window_slots: int = 0):
         self.gate = gate if "_terms" in gate else precursor_gate.compile_gate(gate)
         self.tier = str(tier)
         self.flurry_min = flurry_min
         self.on_fire = on_fire
         self.on_pool = on_pool
+        # Fire only on FRESH pools (as the study's universe is): the pool was first seen after a warm-up of
+        # fresh_window_slots (confidence we caught it from its start) and the fire is within that window of first
+        # sight. 0 = off (tests / replay). Mirrors localshred_consumer.Consumer._fresh_ok on the SHRED first-sight.
+        self.fresh_window_slots = int(fresh_window_slots)
+        self._start_slot = None
+        self._first: dict = {}
         self.runners: dict = {}
 
     def _runner(self, pool: str) -> "HybridRunner":
@@ -221,15 +227,31 @@ class HybridConsumer:
                 self.on_pool(pool)                           # box opens transactionSubscribe(accountInclude=[pool])
         return r
 
+    def _fresh_ok(self, pool: str, slot: int) -> bool:
+        w = self.fresh_window_slots
+        if w <= 0:
+            return True
+        first = self._first.get(pool)
+        if self._start_slot is None or first is None:
+            return False
+        if (first - self._start_slot) < w:                   # pool first seen during warm-up -> maybe mid-life
+            return False
+        return (slot - first) <= w
+
     def on_helius_slot(self, pool: str, slot_agg: dict) -> None:
         self._runner(pool).on_full_slot(slot_agg)
 
     def on_shred_slot(self, pool: str, slot_agg: dict):
-        sig = self._runner(pool).on_direct_slot(slot_agg)
-        if sig is not None:
-            sig["pool"] = pool
-            if self.on_fire:
-                self.on_fire(sig)
+        slot = slot_agg["slot"]
+        if self._start_slot is None:
+            self._start_slot = slot
+        self._first.setdefault(pool, slot)                   # first sight of the pool on the SHRED feed
+        sig = self._runner(pool).on_direct_slot(slot_agg)    # advance the bank even if suppressed (keep tracking)
+        if sig is None or not self._fresh_ok(pool, slot):
+            return None
+        sig["pool"] = pool
+        if self.on_fire:
+            self.on_fire(sig)
         return sig
 
     def drop(self, pool: str) -> None:
