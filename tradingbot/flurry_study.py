@@ -820,6 +820,7 @@ NUMERIC_FIELDS = [
     "n_buys", "buy_sol", "max_buy", "net_sol", "n_sells", "sell_sol", "distinct_buyers", "new_buyers",
     "mean_buy", "abs_move", "slots_since_flurry", "age_slots",
     "prev_buys", "prev_buy_sol", "prev_new_buyers", "prev_net_sol",
+    "prev_abs_move", "prev_move",
 ]
 BOOL_FIELDS = ["outside_buy", "dominant_bought", "new_present", "sell_present", "price_up"]
 THRESH_Q = (50, 75, 90)   # quantiles (of the train slice) each numeric is cut at
@@ -885,6 +886,7 @@ def _slot_bank(flow: dict, create_ts: float, tgt: dict) -> list[dict]:
             "prev_buys": (prev["n_buys"] if prev else 0.0), "prev_buy_sol": (prev["buy_sol"] if prev else 0.0),
             "prev_new_buyers": (prev["new_buyers"] if prev else 0.0),
             "prev_net_sol": (prev["net_sol"] if prev else 0.0),
+            "prev_abs_move": (prev["abs_move"] if prev else 0.0), "prev_move": (prev["move"] if prev else 0.0),
         }
         if s["n_buys"] >= flurry_min:
             sym = "F"
@@ -907,6 +909,56 @@ def _slot_bank(flow: dict, create_ts: float, tgt: dict) -> list[dict]:
         if s["n_buys"] >= flurry_min:
             last_flurry = slot
     return recs
+
+
+HYBRID = False   # box live architecture: score the CURRENT slot from the DIRECT (shred) view, rebase history to FULL (Helius)
+
+
+def _hybrid_bank(rec, create_ts, tgt):
+    """The box's live architecture as a study: shreds score the CURRENT slot (DIRECT view -- what the box decodes
+    live, incomplete, and with NO price, since shreds carry no reserves), and the moment the Helius WS sees a slot
+    it is rebased to the FULL view. So for a direct (shred-visible) slot N: N's own symbol + wallet features come
+    from DIRECT, N's own abs_move/move/price_up are zeroed (not live-available at the fire), and the motif history
+    (N-1, N-2) plus the lagged prev_* features -- including the rebased prior-slot abs_move (prev_abs_move) -- come
+    from the FULL (Helius) view, which is complete and available by the time N fires. Fires on direct slots; the
+    target (did an up-move follow) is the FULL truth."""
+    full_flow = slot_flow(rec, "full")
+    direct_flow = slot_flow(rec, "direct")
+    if not full_flow or not direct_flow:
+        return []
+    full_recs = _slot_bank(full_flow, create_ts, tgt)
+    fs = full_flow["slots"]
+    fsym = {fs[i]["slot"]: full_recs[i]["sym"] for i in range(len(full_recs))}
+    ff = {fs[i]["slot"]: full_recs[i]["f"] for i in range(len(full_recs))}
+    ftgt = {fs[i]["slot"]: full_recs[i]["target"] for i in range(len(full_recs))}
+    order = [s["slot"] for s in fs]
+    pos = {sl: i for i, sl in enumerate(order)}
+    direct_recs = _slot_bank(direct_flow, create_ts, tgt)
+    out = []
+    for i, s in enumerate(direct_flow["slots"]):
+        slot = s["slot"]
+        f = dict(direct_recs[i]["f"])
+        f["abs_move"], f["move"], f["price_up"] = 0.0, 0.0, 0.0   # current slot: no live price from shreds
+        p = pos.get(slot)
+        psl = order[p - 1] if (p is not None and p >= 1) else None
+        p2sl = order[p - 2] if (p is not None and p >= 2) else None
+        pf = ff.get(psl) or {}
+        f["prev_buys"] = pf.get("n_buys", 0.0); f["prev_buy_sol"] = pf.get("buy_sol", 0.0)
+        f["prev_new_buyers"] = pf.get("new_buyers", 0.0); f["prev_net_sol"] = pf.get("net_sol", 0.0)
+        f["prev_abs_move"] = pf.get("abs_move", 0.0); f["prev_move"] = pf.get("move", 0.0)
+        sym = direct_recs[i]["sym"]
+        out.append({"f": f, "sym": sym, "m2": fsym.get(psl, ".") + sym,
+                    "m3": fsym.get(p2sl, ".") + fsym.get(psl, ".") + sym,
+                    "target": ftgt.get(slot, direct_recs[i]["target"]), "create_ts": create_ts})
+    return out
+
+
+def _bank_for(rec, flow, create_ts, tgt):
+    """The per-slot bank for the current mode: HYBRID (shred current slot + Helius-rebased history) or the full
+    bank. `flow` is the already-computed full flow (reused when not hybrid)."""
+    if HYBRID:
+        return _hybrid_bank(rec, create_ts, tgt)
+    return _slot_bank(flow, create_ts, tgt)
 
 
 def _build_specs(train: list[dict]) -> list[dict]:
@@ -988,7 +1040,7 @@ def discover(journal, store, cfg=None, helius=None, hours: float = 720.0, span_s
         if not flow:
             continue
         n_flows += 1
-        recs.extend(_slot_bank(flow, m["create_ts"] or 0.0, tgt))
+        recs.extend(_bank_for(rec, flow, m["create_ts"] or 0.0, tgt))
     out = {"hours": hours, "span_s": span_s, "flurry_min": flurry_min, "probed_only": probed_only, "target": tgt,
            "credits": credits, "n_pools": len(metas), "n_flows": n_flows, "n_slots": len(recs),
            "survivors": [], "tested": 0, "base_train": 0.0, "base_hold": 0.0, "split": "none", "zc": 0.0}
@@ -2777,7 +2829,11 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
                 feat = slot_flow(rec, vis) or flow
         else:
             feat = slot_flow(rec, vis) if vis != "full" else flow  # restricted: what the box can SEE to decide
-        if not feat or len(feat["slots"]) != len(flow["slots"]):
+        if HYBRID:
+            feat = slot_flow(rec, "direct")                  # current slot = shred view; _hybrid_bank rebases history
+            if not feat:
+                continue
+        elif not feat or len(feat["slots"]) != len(flow["slots"]):
             feat = flow                                      # price-driven slot set is identical; guard anyway
         n_pools += 1
         slots = flow["slots"]
@@ -2787,7 +2843,8 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
             ceiling.setdefault(key, []).extend(rs)
         events = _up_event_slots(slots, move)                # the real up-moves we aim to be positioned before
         n_events += len(events)
-        recs = _slot_bank(feat, ct.get(m["pool"], 0), base_tgt)   # features from the restricted view
+        recs = (_hybrid_bank(rec, ct.get(m["pool"], 0), base_tgt) if HYBRID
+                else _slot_bank(feat, ct.get(m["pool"], 0), base_tgt))   # features from the restricted/hybrid view
         for idx, r in enumerate(recs):
             r["target_by_lead"] = {L: _front_label(feat["slots"][idx]["slot"], events, L) for L in leads}
             r["pool"], r["idx"] = m["pool"], idx

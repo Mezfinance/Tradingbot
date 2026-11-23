@@ -200,6 +200,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--horizon", type=int, default=2, help="flurry-study: price target -- the up-move may land within the next this-many slots")
     parser.add_argument("--scalp", action="store_true", help="flurry-study: run the after-the-flurry continuation table instead of the lead-lag characterization")
     parser.add_argument("--discover", action="store_true", help="flurry-study: data-driven discovery (auto rule bank + motifs, holdout-confirmed) instead of the named-event characterization")
+    parser.add_argument("--hybrid", action="store_true", help="flurry-study --discover / --frontrun: the box's live architecture -- score the CURRENT slot from the DIRECT (shred) view (its own abs_move/move zeroed, not live-available), rebase the motif history + lagged prev_* (incl. prev_abs_move) to the FULL (Helius) view. Tests whether a rebased prior-slot abs_move predictor holds once history is Helius-accurate but the current slot is shred-fresh.")
     parser.add_argument("--combos", action="store_true", help="flurry-study --discover: also beam-search CONJUNCTIONS of filters (AND them together), kept only where the stacked rule clears a stricter family-wise z guard AND is sharper out of sample than any of its single filters -- does stacking filters surface a cleaner edge")
     parser.add_argument("--tail", action="store_true", help="flurry-study: tail-concentration breakdown of the discovered survivors (is the edge a broad tail or a few pools)")
     parser.add_argument("--discover-econ", action="store_true", help="flurry-study: economics-ranked discovery -- SELECT rules by the scalp P&L they'd have made (significant vs the control on mean OR median, holdout-confirmed, family-wise guarded), not by lift. Surfaces rules whose lift was unremarkable but whose median/mean%% pays, labelled broad vs tail with move direction; runs both sides (momentum + reversion) so the up-side fat tail can be distrusted while the down-side tail is read as the fills-favoured bounce.")
@@ -854,6 +855,7 @@ def main(argv: list[str] | None = None) -> None:
 
     if args.command == "flurry-study":  # slot-level buy-flurry continuation for the reactive-backrun scalp (11-17)
         from tradingbot import flurry_study as _fl
+        _fl.HYBRID = bool(getattr(args, "hybrid", False))   # box live arch: shred current slot + Helius-rebased history
         if args.vq or args.frontrun or args.vis_experiment:   # effective (vq-aware) reserve basis; frontrun/experiment need it
             _fl.USE_VQ = True
         from tradingbot.journal import Journal as _FlJournal
