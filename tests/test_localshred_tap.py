@@ -142,6 +142,84 @@ def test_resolver_unused_on_a_legacy_message():
     assert account_keys == keys and instructions == [(lc.PROGRAM, [2, 3, 4, 5, 6], lc.SELL + bytes(16))]
 
 
+# --- LUT resolver: fetch + cache the table contents a shred cannot carry ---
+
+def test_parse_lookup_table_reads_packed_pubkeys_after_the_56_byte_meta():
+    # meta (56 bytes) then two 32-byte pubkeys: all-zero -> "1"*32, then 0..01 -> "1"*31 + "2".
+    data = bytes(56) + bytes(32) + (bytes(31) + bytes([1]))
+    addrs = tap.parse_lookup_table(data)
+    assert addrs == ["1" * 32, "1" * 31 + "2"]
+    assert tap.parse_lookup_table(bytes(40)) == []          # shorter than the meta -> no addresses
+    assert tap.parse_lookup_table(None) == []
+
+
+def test_lut_resolver_fetches_once_and_caches():
+    table = bytes(56) + bytes(32)                           # one address: "1"*32
+    calls = []
+
+    def fetch(t):
+        calls.append(t)
+        return table if t == "T" else None
+
+    lr = tap.LutResolver(fetch)
+    assert lr.resolve("T") == ["1" * 32]
+    assert lr.resolve("T") == ["1" * 32]                    # served from cache
+    assert calls == ["T"]                                   # fetched once
+    assert lr.resolve("MISS") is None                       # not a LUT -> cached None
+    assert lr.resolve("MISS") is None
+    assert calls == ["T", "MISS"]                           # the None miss is cached, not refetched
+
+
+def test_lut_resolver_cached_path_records_pending_and_warms():
+    table = bytes(56) + bytes(32)
+    lr = tap.LutResolver(lambda t: table)
+    assert lr.resolve_cached("T") is None                   # live hot path never blocks on a miss
+    assert lr.pending == {"T"}
+    lr.warm("T")                                            # background fetch
+    assert lr.resolve_cached("T") == ["1" * 32] and lr.pending == set()
+
+
+def test_resolver_recovers_a_lut_swap_end_to_end_through_tx_view():
+    # the pool/user/gconf/base/quote live in a table; the resolver fetches its parsed address list.
+    import importlib
+    # build a real ALT data blob whose parsed addresses are the five accounts, via a fetch that returns them.
+    table_addrs = ["POOL", "USER", "GCONF", "TOKEN", lc.WSOL]
+    lr = tap.LutResolver(lambda t: ("blob" if t == "TABLE" else None))
+    # patch parse to map our blob -> the address list (the parse itself is covered above)
+    orig = tap.parse_lookup_table
+    tap.parse_lookup_table = lambda d: table_addrs if d == "blob" else []
+    try:
+        keys = ["PAYER", lc.PROGRAM]
+        lk = _Lk("TABLE", [0, 1], [2, 3, 4])
+        ix = _Ix(1, [2, 3, 4, 5, 6], lc.SELL + bytes(16))
+        account_keys, instructions, fee_payer = tap.tx_view(_TxV0(keys, [ix], [lk]), lr.resolve)
+        assert account_keys == ["PAYER", lc.PROGRAM, "POOL", "USER", "GCONF", "TOKEN", lc.WSOL]
+        swaps = lc.decode_tx(account_keys, instructions, fee_payer)
+        assert len(swaps) == 1 and swaps[0].pool == "POOL" and swaps[0].token == "TOKEN"
+    finally:
+        tap.parse_lookup_table = orig
+
+
+def test_consume_stream_threads_resolve_into_on_transaction():
+    seen = []
+
+    class _Tap:
+        pass
+
+    # a stand-in stream of one message with one "tx"; deserialize_entries + on_transaction are monkeypatched
+    orig_des, orig_on = tap.deserialize_entries, tap.on_transaction
+    tap.deserialize_entries = lambda entries: ["TX"]
+    tap.on_transaction = lambda consumer, slot, tx, resolve=None: seen.append((slot, tx, resolve))
+    try:
+        class _Msg:
+            slot = 7
+            entries = b""
+        tap.consume_stream([_Msg()], consumer=object(), resolve="RES")
+        assert seen == [(7, "TX", "RES")]
+    finally:
+        tap.deserialize_entries, tap.on_transaction = orig_des, orig_on
+
+
 # --- box-path tests that use real solders objects (skip where solders isn't installed) ---
 
 def _le(n):

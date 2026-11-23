@@ -53,6 +53,71 @@ def resolve_account_keys(msg, resolve):
     return static + writable + readonly, True
 
 
+# --- Address Lookup Table resolution (fetch + cache the table contents a shred cannot carry) ---------------
+
+ALT_PROGRAM = "AddressLookupTab1e1111111111111111111111111"   # Solana address-lookup-table program
+_ALT_META = 56   # LOOKUP_TABLE_META_SIZE: an initialized table's addresses start here, 32 bytes each
+_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def _b58encode(raw: bytes) -> str:
+    n = int.from_bytes(raw, "big")
+    out = ""
+    while n > 0:
+        n, r = divmod(n, 58)
+        out = _B58[r] + out
+    pad = 0
+    for b in raw:
+        if b == 0:
+            pad += 1
+        else:
+            break
+    return "1" * pad + out
+
+
+def parse_lookup_table(data) -> list:
+    """The address list of an initialized Address Lookup Table account, from its raw data bytes: the meta is a
+    fixed 56 bytes, then packed 32-byte pubkeys. [] if the data is missing or too short (resolve_account_keys
+    treats [] the same as an unresolved table and bails to the static keys, so a malformed table is harmless)."""
+    if not data or len(data) < _ALT_META:
+        return []
+    body = bytes(data)[_ALT_META:]
+    return [_b58encode(body[i * 32:(i + 1) * 32]) for i in range(len(body) // 32)]
+
+
+class LutResolver:
+    """resolve(table_pubkey) -> list[str] | None for tx_view, backed by a `fetch(table) -> raw account data |
+    None` (the box builds `fetch` from its Helius/RPC getMultipleAccounts; return the account's data bytes only
+    when its owner is ALT_PROGRAM, else None). A LUT is append-only, so an address at an index never changes and
+    caching the list is safe. Two resolve paths:
+      resolve        -- fetch inline on a cache miss; for the OFFLINE --capture decode, where a round-trip per new
+                        table is fine and every LUT-indexed direct swap should decode.
+      resolve_cached -- cache-only (returns None + records the table in `pending`); for the LIVE hot path, so a
+                        new table never blocks a slot. The box warms `pending` out-of-band with warm(table), and
+                        the table resolves on its next sighting (an operator reuses its table across many swaps).
+    A miss (fetch None, not a LUT, or an empty table) is cached as None so it is not refetched every tx."""
+
+    def __init__(self, fetch):
+        self._fetch = fetch
+        self._cache: dict = {}        # table pubkey -> list[str] | None
+        self.pending: set = set()     # tables seen on a cache miss (live: warm these in the background)
+
+    def resolve(self, table):
+        if table not in self._cache:
+            self._cache[table] = parse_lookup_table(self._fetch(table)) or None
+        return self._cache[table]
+
+    def resolve_cached(self, table):
+        if table in self._cache:
+            return self._cache[table]
+        self.pending.add(table)
+        return None
+
+    def warm(self, table):
+        self._cache[table] = parse_lookup_table(self._fetch(table)) or None
+        self.pending.discard(table)
+
+
 def tx_view(tx, resolve=None):
     """One parsed transaction -> (account_keys: list[str], instructions: list[(program_id, accts, data)],
     fee_payer: str|None). Top-level instructions only (the box's direct view excludes CPIs, which a
@@ -111,13 +176,16 @@ def deserialize_entries(entries_bytes):
             yield tx
 
 
-def consume_stream(stream, consumer):
+def consume_stream(stream, consumer, resolve=None):
     """Drive the Consumer from a `ShredstreamProxy.SubscribeEntries` stream: each message has `.slot`
-    and `.entries` (bincode `Vec<Entry>`). Fires go through `consumer.on_fire`. The gRPC channel + the
-    grpcio-tools-generated stubs are the only box-local bit:
+    and `.entries` (bincode `Vec<Entry>`). Fires go through `consumer.on_fire`. Pass `resolve` (a
+    LutResolver's `resolve` for --capture, `resolve_cached` for the live hot path) to decode LUT-indexed
+    direct swaps instead of dropping them. The gRPC channel + the grpcio-tools-generated stubs are the only
+    box-local bit:
         stub = ShredstreamProxyStub(grpc.insecure_channel("127.0.0.1:9898"))
-        consume_stream(stub.SubscribeEntries(SubscribeEntriesRequest()), consumer)
+        lut = LutResolver(fetch)   # fetch(table) -> ALT account data via the box's Helius getMultipleAccounts
+        consume_stream(stub.SubscribeEntries(SubscribeEntriesRequest()), consumer, resolve=lut.resolve)
     """
     for msg in stream:
         for tx in deserialize_entries(msg.entries):
-            on_transaction(consumer, msg.slot, tx)
+            on_transaction(consumer, msg.slot, tx, resolve)
