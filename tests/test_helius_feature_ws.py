@@ -71,6 +71,42 @@ def test_aggregator_feeds_a_hybrid_full_bank_in_slot_order():
     assert len(got) == 2 and all("sym" in r and "m2" in r for r in got)
 
 
+def _notif(slot, payer, tok_pre, tok_post, sol_pre, sol_post, err=None):
+    """A Helius transactionSubscribe params.result, shaped exactly as the live feed sends it (box capture,
+    11-23): the tx is nested under result.transaction.transaction.message, meta under result.transaction.meta,
+    accountKeys as jsonParsed {pubkey,...} dicts."""
+    bal = lambda owner, mint, amt: {"owner": owner, "mint": mint, "uiTokenAmount": {"uiAmount": amt}}
+    keys = [{"pubkey": payer, "signer": True}, {"pubkey": "prog"}, {"pubkey": "x"}]
+    return {"slot": slot, "signature": "sig", "transactionIndex": 0,
+            "transaction": {
+                "transaction": {"signatures": ["sig"], "message": {"accountKeys": keys, "instructions": []}},
+                "meta": {"err": err,
+                         "preTokenBalances": [bal(POOL, MINT, tok_pre), bal(POOL, he.SOL_MINT, sol_pre)],
+                         "postTokenBalances": [bal(POOL, MINT, tok_post), bal(POOL, he.SOL_MINT, sol_post)]},
+                "version": 1}}
+
+
+def test_normalize_notification_unwraps_the_real_helius_shape():
+    # the bug the 11-23 run hit: payer came back None because the box mapped result.transaction (the wrapper) as
+    # the tx, so _keys looked for wrapper.message (absent). normalize_notification pulls the real nesting.
+    flat = hw.normalize_notification(_notif(10, "BUYER", 1000, 980, 100, 102))
+    assert flat["slot"] == 10
+    sw = hw.swap_from_tx(flat, POOL, MINT)
+    assert sw["payer"] == "BUYER"                      # jsonParsed dict accountKeys -> pubkey, not None
+    assert sw["tok_delta"] == -20 and sw["sol_delta"] == 2   # a buy, from the pool vault deltas
+    # a reverted notification (meta.err set) yields no swap
+    assert hw.swap_from_tx(hw.normalize_notification(_notif(11, "C", 980, 970, 102, 104, err={"x": 1})), POOL, MINT) is None
+    # the end-to-end box path: raw notification -> normalize -> aggregate -> a full-bank record with a sym
+    from tradingbot import frontrun_live as live
+    bank = live.SlotBank()
+    got = []
+    agg = hw.FullSlotAggregator(lambda s: got.append(bank.push(s)))
+    agg.push(hw.swap_from_tx(hw.normalize_notification(_notif(10, "A", 1000, 980, 100, 102)), POOL, MINT))
+    agg.push(hw.swap_from_tx(hw.normalize_notification(_notif(11, "D", 980, 970, 102, 104)), POOL, MINT))
+    agg.flush()
+    assert len(got) == 2 and all(r.get("sym") for r in got)
+
+
 def test_inline_helpers_are_pinned_to_helius():
     # the box runs helius_feature_ws flat (no tradingbot package), so it inlines helius._vault/_keys/SOL_MINT;
     # pin them to the originals so they can never drift.

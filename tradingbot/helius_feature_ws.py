@@ -33,6 +33,19 @@ def _keys(tx: dict) -> list:
     return [k["pubkey"] if isinstance(k, dict) else k for k in keys]
 
 
+def normalize_notification(result: dict) -> dict:
+    """A Helius transactionSubscribe `params.result` -> the flat {slot, transaction:{message}, meta} shape
+    swap_from_tx expects. The real notification (confirmed on the box, 11-23) nests one level deeper:
+    result = {slot, signature, transaction: {transaction: {signatures, message:{accountKeys}}, meta, version}}.
+    The subscription MUST send maxSupportedTransactionVersion >= 1, else Helius returns an error stub with no
+    body (slot/signature/error only) and this yields an empty tx. jsonParsed accountKeys are {pubkey,...} dicts,
+    which _keys already handles."""
+    inner = result.get("transaction") or {}
+    return {"slot": result.get("slot"),
+            "transaction": inner.get("transaction") or {},   # {signatures, message}
+            "meta": inner.get("meta") or {}}
+
+
 def swap_from_tx(tx: dict, pool: str, token_mint: str) -> dict | None:
     """One Helius tx (shaped {slot, transaction, meta}) -> a swap dict for the full bank, or None (reverted, or no
     change to THIS pool's vaults). buyer = fee payer (keys[0]); the pool's token / SOL vault deltas give direction,

@@ -213,6 +213,9 @@ class HybridConsumer:
         # Fire only on FRESH pools (as the study's universe is): the pool was first seen after a warm-up of
         # fresh_window_slots (confidence we caught it from its start) and the fire is within that window of first
         # sight. 0 = off (tests / replay). Mirrors localshred_consumer.Consumer._fresh_ok on the SHRED first-sight.
+        # No per-pool dedup: the gate fires on EVERY qualifying slot (a setup seen twice fires twice), so the live
+        # rate is read raw against the study's ~1000 fires / 12 h on ~200 winners (top-1% logit) -- a fresh washbot
+        # genuinely setting up twice IS two signals.
         self.fresh_window_slots = int(fresh_window_slots)
         self._start_slot = None
         self._first: dict = {}

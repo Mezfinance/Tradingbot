@@ -99,6 +99,23 @@ def test_hybrid_consumer_routes_feeds_per_pool_and_fires():
     assert [f["signal_slot"] for f in fires] == want
 
 
+def test_hybrid_consumer_fires_on_every_qualifying_slot_no_dedup():
+    # a setup seen twice fires twice -- no per-pool dedup. The live rate is read raw against the study's ~1000/12h.
+    rec = _rec()
+    gate = pg.compile_gate({"intercept": -1.0, "predictors": [{"coef": 5.0, "name": "sym == N"}],
+                            "threshold": {"1": 0.0}, "hold": 2})
+    study = fl._hybrid_bank(rec, 0.0, fl._tgt("price", 3, 2, 1.0))
+    n_fires = sum(1 for r in study if pg.fires(r, gate, "1"))
+    assert n_fires >= 2                                       # the planted flow fires on more than one slot
+    fired = []
+    con = live.HybridConsumer(gate, "1", on_fire=fired.append)
+    for s in fl.slot_flow(rec, "full")["slots"]:
+        con.on_helius_slot("POOL", s)
+    for s in fl.slot_flow(rec, "direct")["slots"]:
+        con.on_shred_slot("POOL", s)
+    assert len(fired) == n_fires                              # every qualifying slot fired, repeats included
+
+
 def test_hybrid_consumer_freshness_gate_suppresses_mid_life_pools():
     gate = pg.compile_gate({"intercept": -1.0, "predictors": [{"coef": 9.0, "name": "sym == N"}],
                             "threshold": {"1": 0.0}, "hold": 2})
