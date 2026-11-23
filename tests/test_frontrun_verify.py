@@ -88,6 +88,30 @@ def test_verify_replays_through_the_gate_visibility():
     assert of["vis"] == "full" and of["n_reproduced"] == 0 and of["rows"][0]["offline"]["sym"] == "N"
 
 
+def test_hybrid_verify_scores_current_from_direct_and_differs_from_full():
+    # HYBRID ground truth: the CURRENT slot from the DIRECT shred view, PRIOR slots rebased to FULL. On _visrec
+    # slot 12 is sym S in direct (the box's view) but sym N in full, so a hybrid verify of a sym-S gate reproduces
+    # the fire (like the box), while a pure-full gate scores N there and does NOT -- proving hybrid uses direct
+    # for the current slot, not the full view.
+    rec = _visrec()
+    fire = [{"pool": "P", "slot": 12, "box": {"sym": "S"}}]
+    oh = fv.verify(fire, dict(GATE_S), have={"P": rec}, hybrid=True)
+    of = fv.verify(fire, {**GATE_S, "vis": "full"}, have={"P": rec})
+    assert oh["hybrid"] is True
+    assert oh["n_reproduced"] == 1 and oh["rows"][0]["offline"]["sym"] == "S"
+    assert all(oh["rows"][0]["match"].values())                       # box sym S agrees with the hybrid ground truth
+    assert of["n_reproduced"] == 0 and of["rows"][0]["offline"]["sym"] == "N"   # pure full fires on the wrong slot
+    # the current-slot abs_move is zeroed in hybrid (shreds carry no price), by design
+    assert oh["rows"][0]["offline"]["abs_move"] == 0.0
+
+
+def test_hybrid_auto_detected_from_the_gate_flag():
+    rec = _visrec()
+    g = {**GATE_S, "hybrid": True}                                    # a hybrid-exported gate stamps its own flag
+    out = fv.verify([{"pool": "P", "slot": 12, "box": {}}], g, have={"P": rec})
+    assert out["hybrid"] is True and out["rows"][0]["offline"]["sym"] == "S"
+
+
 def test_parse_fires_reads_jsonl_and_a_log_blob():
     jl = '{"pool": "AAA", "slot": 5, "sym": "N"}\n{"pool": "BBB", "slot": 9}'
     rows = fv.parse_fires(jl)

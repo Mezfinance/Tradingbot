@@ -88,12 +88,15 @@ def _is_truncated(fired_slot: int, flow: dict, reached: bool) -> bool:
 
 def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, helius=None,
                rec: dict | None = None, span_s: float = 180.0, max_pages: int | None = None,
-               box_exact: bool = False) -> dict:
+               box_exact: bool = False, hybrid: bool = False) -> dict:
     """Replay one fired pool through the study's ground-truth path and score the box's gate on every slot.
     `rec` (a launch_record dict) short-circuits the fetch -- used by tests and when the box dumped its own series.
     `box_exact` builds the ground truth with the box's LUT drop replicated (launch_record vis_box_exact), so a
     `direct` gate is verified against EXACTLY what the box can see -- a MISMATCH that survives box_exact is a
-    deeper gap than LUT (shred loss); one that vanishes is the drop_lut completeness gap."""
+    deeper gap than LUT (shred loss); one that vanishes is the drop_lut completeness gap.
+    `hybrid` builds the ground truth as flurry_study._hybrid_bank (the box's live architecture: the CURRENT slot
+    scored from the DIRECT shred view, the prior slots rebased to the FULL Helius view) instead of a single-vis
+    SlotBank -- so a hybrid-gate box fire is verified against the exact offline hybrid the gate was fit on."""
     pool, slot, box = fire["pool"], int(fire["slot"]), fire.get("box") or {}
     gate_vis = gate.get("vis", "full")              # replay through the VIEW the gate was fit on = the box's own view
     res = {"pool": pool, "slot": slot, "box": box, "vis": gate_vis}
@@ -107,23 +110,30 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
             res["status"] = "mint unresolved"
             return res
         txs, reached, _err = helius.history_from_start(pool, span_s, max_pages or fl.MAX_PAGES)
-        rec = he.launch_record(txs, pool, mint, window_s=span_s, with_vis=(gate_vis != "full"),
+        rec = he.launch_record(txs, pool, mint, window_s=span_s, with_vis=(hybrid or gate_vis != "full"),
                                vis_box_exact=box_exact)
-    saved = fl.USE_VQ
+    saved_vq, saved_c = fl.USE_VQ, fl.CAUSAL_WALLET
     try:
         fl.USE_VQ = False                           # the gate is price-free, so the basis cannot change a fire
-        flow = fl.slot_flow(rec, gate_vis)          # direct = only top-level pumpswap (what the box decodes)
+        if hybrid:
+            fl.CAUSAL_WALLET = True                 # the frontrun gate is fit on causal (online) wallet ranks
+            flow = fl.slot_flow(rec, "direct")      # fires land on direct (shred) slots; prices feed the fwd move
+            recs = fl._hybrid_bank(rec, 0.0, fl._tgt(flurry_min=flurry_min))  # direct current + full rebased prior
+        else:
+            flow = fl.slot_flow(rec, gate_vis)      # direct = only top-level pumpswap (what the box decodes)
+            recs = None
     finally:
-        fl.USE_VQ = saved
-    if not flow:
+        fl.USE_VQ, fl.CAUSAL_WALLET = saved_vq, saved_c
+    if not flow or (hybrid and not recs):
         res["status"] = "no flow (pool had < 3 priced slots in history)"
         return res
-    bank = live.SlotBank(flurry_min)
+    slots = flow["slots"]
+    bank = None if hybrid else live.SlotBank(flurry_min)
     thr = (gate.get("threshold") or {}).get(str(tier))
     hold = int(gate.get("hold", 2))
     fired, at = [], None
-    for s in flow["slots"]:
-        r = bank.push(s)
+    for i, s in enumerate(slots):
+        r = recs[i] if hybrid else bank.push(s)     # hybrid recs align to the direct-flow slots (same slot_flow)
         e = pg.eta(r, gate)
         hit = thr is not None and e >= float(thr)
         if hit:
@@ -131,8 +141,9 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
         if s["slot"] == slot:
             # abs_move AT the signal slot = the backrun discriminator: ~0 => a genuine precursor fire (the move
             # is ahead, in N+1..N+hold); large => the fire overlaps a move already landed (backrun contamination).
-            entry = s.get("price") or fl._price_at(flow["slots"], slot)
-            exitp = fl._price_at(flow["slots"], slot + hold)
+            # In hybrid the current-slot abs_move is zeroed (shreds carry no price), so it is always ~0 by design.
+            entry = s.get("price") or fl._price_at(slots, slot)
+            exitp = fl._price_at(slots, slot + hold)
             fwd = (exitp / entry - 1.0) if (entry and exitp) else None
             at = {"sym": r["sym"], "m2": r["m2"], "m3": r["m3"], "eta": round(e, 4), "fires": hit,
                   "abs_move": round(float(r["f"].get("abs_move", 0.0)), 4),
@@ -156,24 +167,26 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
 
 def verify(fires: list[dict], gate: dict, helius=None, have: dict | None = None,
            tier: str = "1", flurry_min: int = 3, span_s: float = 180.0, max_pages: int | None = None,
-           box_exact: bool = False) -> dict:
+           box_exact: bool = False, hybrid: bool = False) -> dict:
     """Verify every fire. `have` (pool -> launch_record dict) injects ground-truth recs without Helius (tests)."""
+    hybrid = hybrid or bool(gate.get("hybrid"))     # a hybrid-exported gate may stamp its own flag
     if "_terms" not in gate:
         pg.compile_gate(gate)
     rows = [verify_one(f, gate, tier, flurry_min, helius=helius,
                        rec=(have or {}).get(f["pool"]), span_s=span_s, max_pages=max_pages,
-                       box_exact=box_exact) for f in fires]
+                       box_exact=box_exact, hybrid=hybrid) for f in fires]
     ok = [r for r in rows if r.get("status") == "ok"]
     repro = sum(1 for r in ok if r["reproduced"])
     trunc = sum(1 for r in rows if r.get("status") == "truncated")
-    return {"tier": tier, "vis": gate.get("vis", "full"), "box_exact": box_exact, "n_fires": len(fires),
-            "n_checked": len(ok), "n_reproduced": repro, "n_diverged": len(ok) - repro,
+    return {"tier": tier, "vis": gate.get("vis", "full"), "box_exact": box_exact, "hybrid": hybrid,
+            "n_fires": len(fires), "n_checked": len(ok), "n_reproduced": repro, "n_diverged": len(ok) - repro,
             "n_truncated": trunc, "rows": rows}
 
 
 def render(out: dict) -> str:
-    L = [f"FRONT-RUN FEED VERIFY  (tier {out['tier']}: top {out['tier']}%,  gate vis '{out.get('vis', 'full')}'"
-         f"{' = the box view' if out.get('vis') == 'direct' else ''}"
+    _mode = ("HYBRID: direct current slot + Helius-rebased prior" if out.get("hybrid")
+             else "gate vis '%s'%s" % (out.get("vis", "full"), " = the box view" if out.get("vis") == "direct" else ""))
+    L = [f"FRONT-RUN FEED VERIFY  (tier {out['tier']}: top {out['tier']}%,  {_mode}"
          f"{',  BOX-EXACT: ground truth drops LUT swaps too' if out.get('box_exact') else ''})",
          f"  fires {out['n_fires']}  checked {out['n_checked']}  "
          f"reproduced {out['n_reproduced']}  DIVERGED {out['n_diverged']}"
@@ -200,7 +213,14 @@ def render(out: dict) -> str:
         L += ["", f"  {out['n_truncated']} fires were FETCH-TRUNCATED (busy pool, history capped before the slot) --",
               "  not divergences; raise --pages to fetch them. They are excluded from reproduced/DIVERGED."]
     if out["n_diverged"]:
-        if out.get("box_exact"):
+        if out.get("hybrid"):
+            L += ["", "  DIVERGED under HYBRID = the box's live hybrid (shred current slot + Helius-rebased prior)",
+                  "  did not reproduce the offline _hybrid_bank on the same pool history. A MISMATCH on the PRIOR",
+                  "  symbol (m2/m3) points at the rebase landing late (the full slot arrived after the direct fire",
+                  "  -> prev '.'; raise --shred-delay-s or buffer); a MISMATCH on the current sym points at the shred",
+                  "  decode (per-slot buyer keys[0] / buy-sell classification). box fired but ground truth does NOT",
+                  "  = the live rebase surfaced a precursor the offline hybrid did not."]
+        elif out.get("box_exact"):
             L += ["", "  DIVERGED under BOX-EXACT = the gap SURVIVES replicating the box's LUT drop, so it is NOT",
                   "  drop_lut completeness -- it is deeper (shreds lost upstream, invisible to drop_parse). No",
                   "  LUT resolver on the current feed fixes this; the complete-tx decode (LocalShred) is the answer."]
