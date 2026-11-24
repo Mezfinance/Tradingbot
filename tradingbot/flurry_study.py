@@ -304,23 +304,35 @@ def metas_from_pools(path: str) -> list[dict]:
 
 
 def flows_from_file(path: str) -> tuple[list[dict], dict]:
-    """Load launch_record recs reconstructed live by the box surf.py (MODE=surf): a JSON list or JSONL of
-    {pool, token_mint, create_ts, rec}, where rec is a helius.launch_record-shaped dict {create_ts, txs:[...]}.
-    Returns (metas, have) so study/discover/characterize run their LITERAL code on live-captured slot flows,
-    bypassing Helius. create_ts = the pool's first-seen wall-clock, so discover's time split is a true
-    prospective live walk-forward (early-session pools train, later-session pools test). Route #1 (live)."""
+    """Load live box-reconstructed flows (no Helius history reconstruction). A JSON list or JSONL, one row per pool,
+    in either of two shapes:
+      * launch_record rec (box surf.py MODE=surf): {pool, token_mint, create_ts, rec} with rec a
+        helius.launch_record-shaped {create_ts, txs:[...]} -- one complete decode.
+      * two-feed capture (box run_hybrid capture mode): {pool, token_mint, create_ts, shred, confirmed, frontier,
+        pull_slot} -- the box's OWN shred decode (per-slot buy/sell/buyers, NO price) and Helius-WS CONFIRMED decode
+        (same, WITH price), plus the confirmation frontier per decision. This is the train=serve front-run input:
+        the gate is fit on exactly what the box serves live (shred-fresh current slot + confirmed-lagged history).
+    Returns (metas, have); have[pool] is the rec or the capture dict (_frontrun detects a capture by its
+    'confirmed'/'shred' keys). create_ts = the pool's first-seen wall-clock, so the time split is a true prospective
+    live walk-forward (early-session pools train, later-session pools test). Route #1 (live)."""
     with open(path) as fh:
         text = fh.read().strip()
     rows = json.loads(text) if text.startswith("[") else [json.loads(x) for x in text.splitlines() if x.strip()]
     metas, have, seen = [], {}, set()
     for r in rows:
-        pool, mint, rec = r.get("pool"), r.get("token_mint"), r.get("rec")
-        if not pool or not mint or not rec or pool in seen:
+        pool, mint = r.get("pool"), r.get("token_mint")
+        if not pool or not mint or pool in seen:
+            continue
+        rec = r.get("rec")
+        is_cap = ("confirmed" in r) or ("shred" in r)
+        if not rec and not is_cap:
             continue
         seen.add(pool)
-        ct = r.get("create_ts") or rec.get("create_ts") or 0
+        ct = r.get("create_ts") or (rec.get("create_ts") if isinstance(rec, dict) else 0) or 0
         metas.append({"pool": pool, "token_mint": mint, "create_ts": ct})
-        have[pool] = rec
+        have[pool] = ({"shred": r.get("shred") or [], "confirmed": r.get("confirmed") or [],
+                       "frontier": r.get("frontier") or [], "pull_slot": r.get("pull_slot")}
+                      if is_cap else rec)
     return metas, have
 
 
@@ -914,18 +926,31 @@ def _slot_bank(flow: dict, create_ts: float, tgt: dict) -> list[dict]:
 HYBRID = False   # box live architecture: score the CURRENT slot from the DIRECT (shred) view, rebase history to FULL (Helius)
 
 
-def _hybrid_bank(rec, create_ts, tgt):
-    """The box's live architecture as a study: shreds score the CURRENT slot (DIRECT view -- what the box decodes
-    live, incomplete, and with NO price, since shreds carry no reserves), and the moment the Helius WS sees a slot
-    it is rebased to the FULL view. So for a direct (shred-visible) slot N: N's own symbol + wallet features come
-    from DIRECT, N's own abs_move/move/price_up are zeroed (not live-available at the fire), and the motif history
-    (N-1, N-2) plus the lagged prev_* features -- including the rebased prior-slot abs_move (prev_abs_move) -- come
-    from the FULL (Helius) view, which is complete and available by the time N fires. Fires on direct slots; the
-    target (did an up-move follow) is the FULL truth."""
-    full_flow = slot_flow(rec, "full")
-    direct_flow = slot_flow(rec, "direct")
-    if not full_flow or not direct_flow:
-        return []
+def _flow_from_series(rows, priced):
+    """Build a slot_flow-shaped dict from a box-captured per-slot series (no Helius, no tx reconstruction). Each row
+    is [slot, n_buys, buy_sol, max_buy, n_sells, sell_sol, buyers] (+ price when priced). A price-free (shred)
+    series gets a constant placeholder price (1.0) so _slot_bank runs; the current slot's price-derived features are
+    zeroed by the hybrid builder anyway. Slots sorted; net_sol = buy_sol - sell_sol."""
+    slots = []
+    for r in rows or []:
+        slot = int(r[0]); nb = float(r[1]); bs = float(r[2]); mb = float(r[3])
+        ns = float(r[4]); ss = float(r[5])
+        buyers = list(r[6] or []) if len(r) > 6 else []
+        price = float(r[7]) if (priced and len(r) > 7 and r[7]) else 1.0
+        slots.append({"slot": slot, "n_buys": nb, "buy_sol": bs, "max_buy": mb,
+                      "n_sells": ns, "sell_sol": ss, "net_sol": bs - ss,
+                      "buyers": buyers, "price": price})
+    slots.sort(key=lambda s: s["slot"])
+    return {"slots": slots, "pull_slot": None}
+
+
+def _hybrid_from_flows(full_flow, direct_flow, create_ts, tgt, prior_fn=None):
+    """Shared rebasing for the hybrid bank. The CURRENT slot's symbol + wallet features come from direct_flow (the
+    shred view; its abs_move/move/price_up are zeroed -- no live price from shreds), and the motif history (m2/m3)
+    plus the count prev_* features come from full_flow (the confirmed view). prior_fn(slot, order) -> (psl, p2sl)
+    chooses the prior slots; the default is the two full-flow slots immediately before N (offline, treats all prior
+    as confirmed). The capture path passes a frontier-capped prior_fn so the prior never uses a slot the box had not
+    yet confirmed at decision N. prev_abs_move/prev_move are carried but the gate excludes them (FRONT_MOVE_FIELDS)."""
     full_recs = _slot_bank(full_flow, create_ts, tgt)
     fs = full_flow["slots"]
     fsym = {fs[i]["slot"]: full_recs[i]["sym"] for i in range(len(full_recs))}
@@ -933,15 +958,19 @@ def _hybrid_bank(rec, create_ts, tgt):
     ftgt = {fs[i]["slot"]: full_recs[i]["target"] for i in range(len(full_recs))}
     order = [s["slot"] for s in fs]
     pos = {sl: i for i, sl in enumerate(order)}
+    if prior_fn is None:
+        def prior_fn(slot, _order):
+            p = pos.get(slot)
+            psl = _order[p - 1] if (p is not None and p >= 1) else None
+            p2sl = _order[p - 2] if (p is not None and p >= 2) else None
+            return psl, p2sl
     direct_recs = _slot_bank(direct_flow, create_ts, tgt)
     out = []
     for i, s in enumerate(direct_flow["slots"]):
         slot = s["slot"]
         f = dict(direct_recs[i]["f"])
         f["abs_move"], f["move"], f["price_up"] = 0.0, 0.0, 0.0   # current slot: no live price from shreds
-        p = pos.get(slot)
-        psl = order[p - 1] if (p is not None and p >= 1) else None
-        p2sl = order[p - 2] if (p is not None and p >= 2) else None
+        psl, p2sl = prior_fn(slot, order)
         pf = ff.get(psl) or {}
         f["prev_buys"] = pf.get("n_buys", 0.0); f["prev_buy_sol"] = pf.get("buy_sol", 0.0)
         f["prev_new_buyers"] = pf.get("new_buyers", 0.0); f["prev_net_sol"] = pf.get("net_sol", 0.0)
@@ -951,6 +980,43 @@ def _hybrid_bank(rec, create_ts, tgt):
                     "m3": fsym.get(p2sl, ".") + fsym.get(psl, ".") + sym,
                     "target": ftgt.get(slot, direct_recs[i]["target"]), "create_ts": create_ts})
     return out
+
+
+def _hybrid_bank(rec, create_ts, tgt):
+    """The box's live architecture as a study, OFFLINE approximation: shreds score the CURRENT slot (DIRECT view --
+    what the box decodes live, incomplete, and with NO price, since shreds carry no reserves), and the history is
+    rebased to the FULL (Helius) view. Derives both views by vis-filtering one launch_record rec, and treats ALL
+    prior slots as confirmed -- the optimism the box's real lag does not have. For a train=serve study use the box's
+    two real feeds via _hybrid_bank_from_capture; this stays for the scorer/Helius-history path."""
+    full_flow = slot_flow(rec, "full")
+    direct_flow = slot_flow(rec, "direct")
+    if not full_flow or not direct_flow:
+        return []
+    return _hybrid_from_flows(full_flow, direct_flow, create_ts, tgt)
+
+
+def _hybrid_bank_from_capture(cap, create_ts, tgt):
+    """Train=serve hybrid bank from the box's TWO real feeds (no Helius history reconstruction): the CURRENT slot
+    from the SHRED decode (price-free) and the prior m2/m3 + count prev_* features from the Helius-WS CONFIRMED
+    decode, capped at the captured confirmation frontier per decision so the prior never uses a slot the box had not
+    yet confirmed at the N->N+1 boundary. frontier[N] defaults to N-1 (the stated lag-1 shape) when not recorded, so
+    the capture's own frontier -- not an assumption -- decides whether the prior is N-1 or N-k."""
+    full_flow = _flow_from_series(cap.get("confirmed") or [], priced=True)
+    full_flow["pull_slot"] = cap.get("pull_slot")
+    direct_flow = _flow_from_series(cap.get("shred") or [], priced=False)
+    if not full_flow["slots"] or not direct_flow["slots"]:
+        return []
+    frontier = {int(a): int(b) for a, b in (cap.get("frontier") or [])}
+    conf = [s["slot"] for s in full_flow["slots"]]           # sorted confirmed (full-flow) active slot ids
+
+    def prior_fn(slot, _order):
+        ft = frontier.get(slot, slot - 1)                   # confirmed-through at decision N (default: lag 1)
+        avail = [c for c in conf if c < slot and c <= ft]    # confirmed active slots the box actually had at N
+        psl = avail[-1] if avail else None
+        p2sl = avail[-2] if len(avail) >= 2 else None
+        return psl, p2sl
+
+    return _hybrid_from_flows(full_flow, direct_flow, create_ts, tgt, prior_fn=prior_fn)
 
 
 def _bank_for(rec, flow, create_ts, tgt):
@@ -2840,25 +2906,33 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
     n_events = n_slots = n_pools = 0
     for m in metas:
         rec = have.get(m["pool"])
-        flow = slot_flow(rec) if rec else None               # FULL: the real price path, ceiling, target, net
-        if not flow:
-            continue
-        if include_failed:                                   # decision features see reverted swaps (live feed);
-            fr = slot_flow(rec, vis, include_failed=True)     # price/target/net stay success-only ground truth.
-            if fr:
-                raw = {s["slot"]: s for s in fr["slots"]}      # align to flow's slots (drop failed-only slots) so
-                feat = {"slots": [raw.get(s["slot"], s) for s in flow["slots"]],   # the idx<->flow mapping holds
-                        "pull_slot": flow["pull_slot"]}
-            else:
-                feat = slot_flow(rec, vis) or flow
-        else:
-            feat = slot_flow(rec, vis) if vis != "full" else flow  # restricted: what the box can SEE to decide
-        if HYBRID:
-            feat = slot_flow(rec, "direct")                  # current slot = shred view; _hybrid_bank rebases history
-            if not feat:
+        cap = rec if (isinstance(rec, dict) and ("confirmed" in rec or "shred" in rec)) else None
+        if cap is not None:                                  # box two-feed capture (train=serve): no Helius reconstruction
+            flow = _flow_from_series(cap.get("confirmed") or [], priced=True)   # FULL: confirmed price path -> ceiling/target/net
+            flow["pull_slot"] = cap.get("pull_slot")
+            feat = _flow_from_series(cap.get("shred") or [], priced=False)      # decision (shred) slot ids
+            if not flow["slots"] or not feat["slots"]:
                 continue
-        elif not feat or len(feat["slots"]) != len(flow["slots"]):
-            feat = flow                                      # price-driven slot set is identical; guard anyway
+        else:
+            flow = slot_flow(rec) if rec else None               # FULL: the real price path, ceiling, target, net
+            if not flow:
+                continue
+            if include_failed:                                   # decision features see reverted swaps (live feed);
+                fr = slot_flow(rec, vis, include_failed=True)     # price/target/net stay success-only ground truth.
+                if fr:
+                    raw = {s["slot"]: s for s in fr["slots"]}      # align to flow's slots (drop failed-only slots) so
+                    feat = {"slots": [raw.get(s["slot"], s) for s in flow["slots"]],   # the idx<->flow mapping holds
+                            "pull_slot": flow["pull_slot"]}
+                else:
+                    feat = slot_flow(rec, vis) or flow
+            else:
+                feat = slot_flow(rec, vis) if vis != "full" else flow  # restricted: what the box can SEE to decide
+            if HYBRID:
+                feat = slot_flow(rec, "direct")                  # current slot = shred view; _hybrid_bank rebases history
+                if not feat:
+                    continue
+            elif not feat or len(feat["slots"]) != len(flow["slots"]):
+                feat = flow                                      # price-driven slot set is identical; guard anyway
         n_pools += 1
         slots = flow["slots"]
         n_slots += len(slots)
@@ -2867,8 +2941,11 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
             ceiling.setdefault(key, []).extend(rs)
         events = _up_event_slots(slots, move)                # the real up-moves we aim to be positioned before
         n_events += len(events)
-        recs = (_hybrid_bank(rec, ct.get(m["pool"], 0), base_tgt) if HYBRID
-                else _slot_bank(feat, ct.get(m["pool"], 0), base_tgt))   # features from the restricted/hybrid view
+        if cap is not None:
+            recs = _hybrid_bank_from_capture(cap, ct.get(m["pool"], 0), base_tgt)   # shred current + confirmed prior (frontier-capped)
+        else:
+            recs = (_hybrid_bank(rec, ct.get(m["pool"], 0), base_tgt) if HYBRID
+                    else _slot_bank(feat, ct.get(m["pool"], 0), base_tgt))   # features from the restricted/hybrid view
         for idx, r in enumerate(recs):
             r["target_by_lead"] = {L: _front_label(feat["slots"][idx]["slot"], events, L) for L in leads}
             r["pool"], r["idx"] = m["pool"], idx
