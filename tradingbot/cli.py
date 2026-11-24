@@ -213,6 +213,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--frontrun", action="store_true", help="flurry-study: front-run study -- can an indicator predict a >= --move-pct (default 30%%) up-move early enough to enter <=3 slots before it and exit 1-2 after? Perfect-foresight ceiling + lead-swept z-guarded indicator discovery + enter-on-signal net vs control. Forces --vq (effective reserve basis).")
     parser.add_argument("--vq", action="store_true", help="flurry-study: price on the effective (virtual_quote-aware) reserve basis, matching the live WS stream, instead of the raw vault ratio (which inflates early-life moves into basis artifacts). Needs --fetch to populate vq. Off by default so other modes stay reproducible; --frontrun forces it on.")
     parser.add_argument("--export-gate", metavar="PATH", help="flurry-study --frontrun: write the fitted precursor front-run gate (joint-logit intercept + non-move predictor coefficients + top-k%% eta thresholds) to a JSON the live box runner loads via tradingbot.precursor_gate.")
+    parser.add_argument("--no-throttle", action="store_true", help="flurry-study --frontrun: run the discovery + logit gate UNTHROTTLED -- drop the family-wise z correction (z guard 1.96, no 3.0 floor) so every individually-significant rule survives into the logit gate, move features included. Lets it discover everything naturally; decide the exclusions from the evidence.")
     parser.add_argument("--gate-hold", type=int, default=2, help="flurry-study --export-gate: slots to hold after entering front of N+1 (default 2, the paying cell).")
     parser.add_argument("--capture", metavar="PATH", help="localshred-merge: the --capture feature JSONL from run_localshred.py --capture (our decode's per-slot features of each fresh pool)")
     parser.add_argument("--out", metavar="PATH", help="localshred-merge: write the merged --flows JSONL (our features + the Helius price path) here, for flurry-study --frontrun --flows")
@@ -997,14 +998,16 @@ def main(argv: list[str] | None = None) -> None:
                 _mv = args.move_pct / 100.0 if abs(args.move_pct - 1.0) > 1e-9 else _fl.FRONT_MOVE
                 if args.include_failed:   # failed-inclusive refit A/B: success-only vs failed-inclusive (same pools)
                     _o_s = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0,
-                                        flurry_min=args.flurry_min, vis=args.gate_vis, include_failed=False)
+                                        flurry_min=args.flurry_min, vis=args.gate_vis, include_failed=False,
+                                        no_throttle=args.no_throttle)
                     _o_f = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0,
-                                        flurry_min=args.flurry_min, vis=args.gate_vis, include_failed=True)
+                                        flurry_min=args.flurry_min, vis=args.gate_vis, include_failed=True,
+                                        no_throttle=args.no_throttle)
                     print(json.dumps({"success_only": _o_s, "failed_inclusive": _o_f}, indent=2, default=str)
                           if args.json else _fl.render_frontrun_failed_compare(_o_s, _o_f))
                     return
                 out = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0,
-                                   flurry_min=args.flurry_min, vis=args.gate_vis)
+                                   flurry_min=args.flurry_min, vis=args.gate_vis, no_throttle=args.no_throttle)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_frontrun(out))
                 if args.export_gate:   # write the fitted precursor gate for the live box runner (precursor_gate.load)
                     _gate = _fl.export_gate(out, hold=args.gate_hold)

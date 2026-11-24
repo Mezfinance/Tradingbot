@@ -854,6 +854,24 @@ def test_frontrun_finds_the_precursor_and_it_pays():
         fl.USE_VQ = saved
 
 
+def test_frontrun_no_throttle_drops_the_family_wise_z_guard():
+    saved = fl.USE_VQ
+    try:
+        fl.USE_VQ = False
+        metas = [{"pool": "P%d" % i, "token_mint": "M%d" % i, "create_ts": float(i)} for i in range(6)]
+        have = {"P%d" % i: _cre_front(i) for i in range(6)}
+        base = fl.frontrun(have, metas, move=0.30, cost=0.01)
+        loose = fl.frontrun(have, metas, move=0.30, cost=0.01, no_throttle=True)
+        assert base["zc"] > 1.96 and loose["zc"] == 1.96 and loose["no_throttle"]
+        # a looser guard keeps at least as many survivors at the deployed lead -> more feed the logit gate
+        nb = len(base["survivors"][fl.FRONT_ENTRY_LEAD])
+        nl = len(loose["survivors"][fl.FRONT_ENTRY_LEAD])
+        assert nl >= nb
+        assert "[UNTHROTTLED" in fl.render_frontrun(loose)
+    finally:
+        fl.USE_VQ = saved
+
+
 def test_logit_fit_recovers_a_positive_coefficient_with_finite_se():
     rng = fl.np.random.default_rng(0)
     n = 2000

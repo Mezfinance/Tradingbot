@@ -2898,7 +2898,7 @@ def export_gate(out, hold: int = 2):
 
 
 def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=FRONT_LEADS,
-             seed=0, flurry_min=DEFAULT_FLURRY_MIN, vis="full", include_failed=False):
+             seed=0, flurry_min=DEFAULT_FLURRY_MIN, vis="full", include_failed=False, no_throttle=False):
     """Can we predict a >= `move` up-move early enough to enter <=k slots before it and exit 1-2 after?
     (1) ceiling: enter T-k / exit T+j with perfect foresight; (2) indicator discovery, LEAD swept and reported
     (z-guarded time holdout, discover's discipline); (3) actionable enter-on-signal net vs a random-slot control.
@@ -2910,12 +2910,12 @@ def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=
     import math
     _saved_causal = CAUSAL_WALLET
     try:
-        return _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis, include_failed)
+        return _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis, include_failed, no_throttle)
     finally:
         globals()["CAUSAL_WALLET"] = _saved_causal
 
 
-def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", include_failed=False):
+def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", include_failed=False, no_throttle=False):
     import math
     globals()["CAUSAL_WALLET"] = True                        # live-valid features for the gate (see frontrun docstring)
     base_tgt = _tgt("price", flurry_min, 1, move * 100.0)     # for features/symbols only; target overwritten
@@ -3001,7 +3001,11 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
     out["specmeta"] = {s["rule"]: {k: s.get(k) for k in ("kind", "field", "thr", "symv", "mkey", "mot")}
                        for s in specs}                    # exact predicate params for export_gate (string is lossy)
     zc = max(3.0, math.sqrt(2.0 * math.log(max(len(specs) * len(leads), 2))))
+    if no_throttle:          # unthrottled: plain per-rule significance, no family-wise correction, no 3.0 floor --
+        zc = 1.96            # let discovery keep EVERY individually-significant rule (move features included) and
+        #                      build the logit gate from all of them; decide the exclusions from the evidence.
     out["zc"] = zc
+    out["no_throttle"] = no_throttle
     profile, survivors = {}, {L: [] for L in leads}
     for L in leads:
         ttr = np.array([r["target_by_lead"][L] for r in tr], float)
@@ -3106,8 +3110,9 @@ def render_frontrun_failed_compare(out_s, out_f):
 
 
 def render_frontrun(out):
-    L = ["FRONT-RUN STUDY  (position BEFORE a >= %.0f%% up-move; enter front of T..%d before T, exit 1-%d after)"
-         % (out["move"] * 100, FRONT_K[-1] - 1, FRONT_J[-1])]
+    L = ["FRONT-RUN STUDY  (position BEFORE a >= %.0f%% up-move; enter front of T..%d before T, exit 1-%d after)%s"
+         % (out["move"] * 100, FRONT_K[-1] - 1, FRONT_J[-1],
+            "  [UNTHROTTLED: z guard 1.96, no family-wise correction]" if out.get("no_throttle") else "")]
     L.append("  pools %d  active slots %d  up-move events %d (%.2f%% of slots)  cost %.2f%%  vq basis %s"
              % (out["pools"], out["slots"], out["events"], out["event_rate"] * 100, out["cost"] * 100,
                 "ON" if out.get("use_vq") else "OFF (raw ratio -- numbers are basis artifacts!)"))
