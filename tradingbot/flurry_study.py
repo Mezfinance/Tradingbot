@@ -2611,15 +2611,18 @@ def render(out: dict) -> str:
 
 # --- front-run study (11-21): position BEFORE a >= FRONT_MOVE up-move, so the spike is the gain, not the entry.
 # The up-side fill artifact (11-19: react = buy the spike top, sell the reversion trough) is sidestepped by being
-# IN before the spike. The only hard constraint is the trade window (enter <=k slots before T, exit 1-2 after);
-# the indicator LEAD (how far before T it fires) is swept and REPORTED, not fixed. Runs on the vq (effective)
-# basis -- set USE_VQ True (the CLI --frontrun does) or the >= 0.3 target fires on raw-ratio basis artifacts.
+# IN before the spike. The only hard constraint is the trade window (enter <=k slots before T / front of T, exit
+# 1-4 after); the indicator LEAD (how far before T it fires) is swept and REPORTED, not fixed. Runs on the vq
+# (effective) basis -- set USE_VQ True (the CLI --frontrun does) or the >= 0.3 target fires on raw-ratio artifacts.
 FRONT_MOVE = 0.30            # the single-slot up-move (effective basis) we want to be positioned before
 FRONT_LEADS = (1, 2, 3, 5, 8)   # indicator LEAD windows (raw slots ahead), swept -- each rule's profile is reported
-FRONT_K = (1, 2, 3)         # ceiling: enter this many slots BEFORE the up-move slot T
-FRONT_J = (1, 2)            # ceiling: exit this many slots AFTER T
+FRONT_K = (1, 2, 3)         # ceiling: enter at the close of slot T-k. Prices are slot-END, so k=1 = front of the
+#   move slot T (in before the spike), k=2 = 1 slot before, k=3 = 2 slots before. k=0 would buy T's close (AFTER
+#   the move = a backrun), so it is deliberately not here.
+FRONT_J = (1, 2, 3, 4)      # ceiling: exit this many slots AFTER T (the spec trade window: exit 1-4 after the move)
 FRONT_ENTRY_LEAD = 3        # the deployed enter-on-signal window: an up-move within this many slots ahead
-FRONT_HOLDS = (2, 3, 4, 5)  # enter-on-signal holds (raw slots) covering the lead + a 1-2 slot exit
+FRONT_HOLDS = (2, 3, 4, 5, 6)  # enter-on-signal holds (raw slots from entry): entry is front of N+1 and the move
+#   lands within the lead, so holds 2-6 span ~T+1..T+4 across the window (the spec's "exit 1-4 after the move")
 FRONT_CONTROL = 60          # random active slots per pool for the enter-on-signal control
 FRONT_NET_TOP = 6           # surviving indicators carried into the actionable-net scalp
 
@@ -3084,8 +3087,8 @@ def render_frontrun_failed_compare(out_s, out_f):
 
 
 def render_frontrun(out):
-    L = ["FRONT-RUN STUDY  (position BEFORE a >= %.0f%% up-move; enter <=%d before T, exit 1-2 after)"
-         % (out["move"] * 100, FRONT_K[-1])]
+    L = ["FRONT-RUN STUDY  (position BEFORE a >= %.0f%% up-move; enter front of T..%d before T, exit 1-%d after)"
+         % (out["move"] * 100, FRONT_K[-1] - 1, FRONT_J[-1])]
     L.append("  pools %d  active slots %d  up-move events %d (%.2f%% of slots)  cost %.2f%%  vq basis %s"
              % (out["pools"], out["slots"], out["events"], out["event_rate"] * 100, out["cost"] * 100,
                 "ON" if out.get("use_vq") else "OFF (raw ratio -- numbers are basis artifacts!)"))
