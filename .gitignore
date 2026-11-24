@@ -14,3 +14,11 @@ canary_rotation.json
 pool_paths.json
 provision.log
 deploy.log
+# capture / peek / snapshot artifacts downloaded into the checkout for scp (root-level only; research/*.gz stays tracked)
+/*.jsonl
+/*.jsonl.gz
+/*.log
+/peek*
+/snap*
+/ourfeed*
+/capture*

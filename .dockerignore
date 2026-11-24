@@ -8,3 +8,13 @@ __pycache__
 keypair.json
 .pytest_cache
 backups
+# capture / peek / snapshot data artifacts dropped in the checkout for scp -- never needed in the image, and they
+# bloat the build context (fly deploy uploads the whole dir). `*.gz`/`*.jsonl` match only ROOT-level files (Docker
+# globs don't cross `/`), so nested research/*.gz is unaffected.
+*.jsonl
+*.gz
+*.log
+ourfeed*
+capture*
+peek*
+snap*
