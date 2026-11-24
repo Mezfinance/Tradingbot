@@ -248,6 +248,17 @@ def _scalp(slots: list[dict], pull_slot, s_idx: int, hold: int, cost: float) -> 
     return max(-1.0, min(exit_price / entry - 1.0 - cost, RET_CAP))
 
 
+def _scalp_rec(slots: list[dict], cpos: dict, pull_slot, rec: dict, hold: int, cost: float) -> float | None:
+    """Scalp a decision rec on the FULL/confirmed price path, located by the decision slot NUMBER via `cpos`
+    ({slot: position} over `slots`). The decision (shred/direct) slot set is NOT positionally aligned with the
+    price path -- the capture's two feeds are independent, and hybrid's direct view is a subset of the full view --
+    so rec['idx'] (a decision-view position) must never index `slots`. None if that slot has no confirmed price."""
+    ci = cpos.get(rec["slot"])
+    if ci is None:
+        return None
+    return _scalp(slots, pull_slot, ci, hold, cost)
+
+
 def _agg(rets: list[float]) -> dict:
     rets = [r for r in rets if r is not None]
     if not rets:
@@ -2819,12 +2830,16 @@ def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS):
             if not flow:
                 continue
             slots, pull = flow["slots"], flow["pull_slot"]
+            cpos = {s["slot"]: i for i, s in enumerate(slots)}   # decision slot NUMBER -> confirmed-price position
             for rec in recs:
                 if rec["_eta"] < thr:
                     continue
+                ci = cpos.get(rec["slot"])
+                if ci is None:                                   # decision slot has no confirmed price -> unfillable
+                    continue
                 n_fire += 1
                 for h in holds:
-                    v = _scalp(slots, pull, rec["idx"], h, cost)
+                    v = _scalp(slots, pull, ci, h, cost)
                     if v is not None:
                         rr[h].append(v)
         rows.append({"pct": pct, "n": n_fire, "thr": thr, "holds": {h: _agg(v) for h, v in rr.items()}})
@@ -2950,8 +2965,11 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
             recs = (_hybrid_bank(rec, ct.get(m["pool"], 0), base_tgt) if HYBRID
                     else _slot_bank(feat, ct.get(m["pool"], 0), base_tgt))   # features from the restricted/hybrid view
         for idx, r in enumerate(recs):
-            r["target_by_lead"] = {L: _front_label(feat["slots"][idx]["slot"], events, L) for L in leads}
-            r["pool"], r["idx"] = m["pool"], idx
+            sn = feat["slots"][idx]["slot"]
+            r["target_by_lead"] = {L: _front_label(sn, events, L) for L in leads}
+            r["pool"], r["idx"], r["slot"] = m["pool"], idx, sn   # slot NUMBER: the net/gate scalp prices by it
+            #   because the decision (shred/direct) slot set is not positionally aligned with the confirmed/full
+            #   price path the scalp enters on (capture: independent feeds; hybrid: direct is a subset of full)
         all_recs.extend(recs)
 
     out = {"mode": "frontrun", "move": move, "cost": cost, "leads": list(leads), "use_vq": USE_VQ, "vis": vis,
@@ -3030,11 +3048,12 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
         rr = {h: [] for h in FRONT_HOLDS}
         for pool, flow in pool_flows.items():
             slots, pull = flow["slots"], flow["pull_slot"]
+            cpos = {s["slot"]: i for i, s in enumerate(slots)}   # decision slot NUMBER -> confirmed-price position
             for rec in recs_by_pool.get(pool, []):
                 if not fn(rec):
                     continue
                 for h in FRONT_HOLDS:
-                    r = _scalp(slots, pull, rec["idx"], h, cost)
+                    r = _scalp_rec(slots, cpos, pull, rec, h, cost)
                     if r is not None:
                         rr[h].append(r)
         net.append({"rule": p["rule"], "z": p["z"], "lift": p["lift"],

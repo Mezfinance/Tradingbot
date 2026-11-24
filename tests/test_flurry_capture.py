@@ -90,6 +90,40 @@ def test_flows_from_file_detects_a_capture_row(tmp_path):
     assert "txs" in have["REC"]                                     # launch_record rec (existing path)
 
 
+def test_scalp_rec_prices_by_slot_number_not_decision_position():
+    # the decision (shred) slot set is not positionally aligned with the confirmed price path, so the scalp must
+    # locate the entry by the slot NUMBER, never by rec['idx'] (a decision-view position).
+    slots = [{"slot": 5, "price": 1.0}, {"slot": 6, "price": 1.2}, {"slot": 7, "price": 1.1}]
+    cpos = {s["slot"]: i for i, s in enumerate(slots)}
+    rec = {"slot": 5, "idx": 99}                                     # idx is bogus on purpose -> must be ignored
+    assert fs._scalp_rec(slots, cpos, None, rec, 1, 0.0) == fs._scalp(slots, None, 0, 1, 0.0)  # enters at slot 5
+    # a decision slot absent from the confirmed price path (WS opened late) -> unfillable -> None, never IndexError
+    assert fs._scalp_rec(slots, cpos, None, {"slot": 1, "idx": 0}, 1, 0.0) is None
+
+
+def test_frontrun_capture_mismatched_feeds_reaches_the_net_without_indexerror():
+    # the regression: shred carries MORE active slots than confirmed (the Helius WS opens per-pool late), so a
+    # decision-view index used against the confirmed price path ran off the end (IndexError at line _scalp). Enough
+    # pools to pass the min-support gate (>= 2*DISC_MIN_SUPPORT recs) so the net + precursor gate scalp actually run.
+    def pool(pfx, bump_at):
+        shred, confirmed = [], []
+        price = 1.0
+        for k in range(1, 13):
+            price = price * 1.25 if k == bump_at else price * 1.001
+            buyers = ["%sn%d" % (pfx, k)] if k % 2 == 0 else ["%sR" % pfx]   # even: new wallet (N); odd: repeat (B/b)
+            shred.append(_shred(k, 1, buyers))
+            if k >= 3:                                              # confirmed opens LATE: slots 1,2 are shred-only
+                confirmed.append(_conf(k, 1, buyers, price))
+        return {"shred": shred, "confirmed": confirmed, "frontier": [], "pull_slot": None}
+
+    metas = [{"pool": "P%d" % i, "token_mint": "m%d" % i, "create_ts": float(i)} for i in range(8)]
+    have = {"P%d" % i: pool("P%d" % i, 6 + 2 * (i % 2)) for i in range(8)}   # bump at an even (N) slot
+    out = fs.frontrun(have, metas, move=0.2)                        # must NOT raise (the IndexError regression)
+    assert out["pools"] == 8 and out["events"] >= 1
+    assert isinstance(out["net"], list)
+    assert "rows" in out["logit_gate_precursor"]                    # the precursor-gate scalp ran over mismatched feeds
+
+
 def test_frontrun_runs_on_a_two_feed_capture_without_helius():
     # two pools, each with a +20% up-move so there are events to be positioned before; the study should run its
     # literal front-run code on the capture (ceiling + feature bank) and return cleanly, no Helius.
