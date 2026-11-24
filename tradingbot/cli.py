@@ -1001,15 +1001,16 @@ def main(argv: list[str] | None = None) -> None:
                 if args.include_failed:   # failed-inclusive refit A/B: success-only vs failed-inclusive (same pools)
                     _o_s = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0,
                                         flurry_min=args.flurry_min, vis=args.gate_vis, include_failed=False,
-                                        no_throttle=args.no_throttle)
+                                        no_throttle=args.no_throttle, tail=args.tail)
                     _o_f = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0,
                                         flurry_min=args.flurry_min, vis=args.gate_vis, include_failed=True,
-                                        no_throttle=args.no_throttle)
+                                        no_throttle=args.no_throttle, tail=args.tail)
                     print(json.dumps({"success_only": _o_s, "failed_inclusive": _o_f}, indent=2, default=str)
                           if args.json else _fl.render_frontrun_failed_compare(_o_s, _o_f))
                     return
                 out = _fl.frontrun(_have, _metas, move=_mv, cost=args.cost_pct / 100.0,
-                                   flurry_min=args.flurry_min, vis=args.gate_vis, no_throttle=args.no_throttle)
+                                   flurry_min=args.flurry_min, vis=args.gate_vis, no_throttle=args.no_throttle,
+                                   tail=args.tail)
                 print(json.dumps(out, indent=2, default=str) if args.json else _fl.render_frontrun(out))
                 if args.export_gate:   # write the fitted precursor gate for the live box runner (precursor_gate.load)
                     _gate = _fl.export_gate(out, hold=args.gate_hold)

@@ -2864,6 +2864,64 @@ def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS):
     return {"rows": rows, "control": {h: _agg(v) for h, v in ctrl.items()}}
 
 
+def front_gate_tail(ho, pool_flows, specfn, lg, cost, pcts=FRONT_GATE_PCTS, holds=FRONT_HOLDS):
+    """Tail-concentration of a gate cell: is the mean a BROAD edge (many distinct winning pools) or a few spikes?
+    For each (top-k%, hold) it re-scores the holdout with the fitted logit `lg`, fires the top-k%, and over the
+    fires reports: distinct winning POOLS vs winners (a broad tail has ~one winner per pool, not 10 wins in 2 pools),
+    the CAPPED mean vs the UNCAPPED (raw, no +300% ceiling) mean (raw >> capped = a reserve-ratio spike carries it),
+    and the top-5 / top-20 share of the summed positive (uncapped) return (high share = fragile)."""
+    preds = (lg or {}).get("predictors") or []
+    if len(preds) < 1 or not ho:
+        return {}
+    b0 = preds[0]["coef"]
+    terms = [(p["coef"], specfn[p["name"]]) for p in preds[1:] if p["name"] in specfn]
+    by_pool, scores = {}, []
+    for r in ho:
+        eta = b0 + sum(c for c, fn in terms if fn(r))
+        r["_eta_t"] = eta
+        scores.append(eta)
+        by_pool.setdefault(r["pool"], []).append(r)
+    sc = np.array(scores, float)
+    out = {}
+    for pct in pcts:
+        thr = float(np.quantile(sc, pct / 100.0))
+        for h in holds:
+            fires = []                                       # (pool, capped, raw)
+            for pool, recs in by_pool.items():
+                flow = pool_flows.get(pool)
+                if not flow:
+                    continue
+                slots, pull = flow["slots"], flow["pull_slot"]
+                cpos = {s["slot"]: i for i, s in enumerate(slots)}
+                for rec in recs:
+                    if rec["_eta_t"] < thr:
+                        continue
+                    ci = cpos.get(rec["slot"])
+                    if ci is None:
+                        continue
+                    rc = _raw_scalp(slots, pull, ci, h, cost)
+                    if rc is None:
+                        continue
+                    raw, capped = rc
+                    fires.append((pool, capped, raw))
+            if not fires:
+                continue
+            wins = [(p, c, r) for (p, c, r) in fires if c > 0]
+            pos = sorted((r for (_, _, r) in wins), reverse=True)   # uncapped positive returns, biggest first
+            tot = sum(pos)
+            out[(pct, h)] = {
+                "n": len(fires), "winners": len(wins),
+                "win_pools": len(set(p for (p, _, _) in wins)),
+                "fire_pools": len(set(p for (p, _, _) in fires)),
+                "capped_mean": sum(c for _, c, _ in fires) / len(fires),
+                "raw_mean": sum(r for _, _, r in fires) / len(fires),
+                "top5_share": (sum(pos[:5]) / tot if tot > 0 else 0.0),
+                "top20_share": (sum(pos[:20]) / tot if tot > 0 else 0.0),
+                "max_raw": (pos[0] if pos else 0.0),
+            }
+    return out
+
+
 def export_gate(out, hold: int = 2):
     """Serialise the fitted precursor front-run gate to a small dict the live box runner loads through
     tradingbot.precursor_gate: the joint-logistic intercept + non-move predictor coefficients (abs_move/move/
@@ -2903,7 +2961,7 @@ def export_gate(out, hold: int = 2):
 
 
 def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=FRONT_LEADS,
-             seed=0, flurry_min=DEFAULT_FLURRY_MIN, vis="full", include_failed=False, no_throttle=False):
+             seed=0, flurry_min=DEFAULT_FLURRY_MIN, vis="full", include_failed=False, no_throttle=False, tail=False):
     """Can we predict a >= `move` up-move early enough to enter <=k slots before it and exit 1-2 after?
     (1) ceiling: enter T-k / exit T+j with perfect foresight; (2) indicator discovery, LEAD swept and reported
     (z-guarded time holdout, discover's discipline); (3) actionable enter-on-signal net vs a random-slot control.
@@ -2915,12 +2973,12 @@ def frontrun(have, metas, move=FRONT_MOVE, cost=DEFAULT_COST_PCT / 100.0, leads=
     import math
     _saved_causal = CAUSAL_WALLET
     try:
-        return _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis, include_failed, no_throttle)
+        return _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis, include_failed, no_throttle, tail)
     finally:
         globals()["CAUSAL_WALLET"] = _saved_causal
 
 
-def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", include_failed=False, no_throttle=False):
+def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", include_failed=False, no_throttle=False, tail=False):
     import math
     globals()["CAUSAL_WALLET"] = True                        # live-valid features for the gate (see frontrun docstring)
     base_tgt = _tgt("price", flurry_min, 1, move * 100.0)     # for features/symbols only; target overwritten
@@ -3083,6 +3141,8 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
     out["forced_precursors"] = [r for r in pre_rules if r not in {s["rule"] for s in survivors.get(lead_net, [])}]
     out["logit_precursor"] = _front_logit(tr, ho, specfn, pre_rules, lead_net)
     out["logit_gate_precursor"] = _front_logit_gate(ho, pool_flows, specfn, out["logit_precursor"], cost)
+    if tail:                                                 # broad-vs-spikes concentration of the precursor gate cells
+        out["gate_tail"] = front_gate_tail(ho, pool_flows, specfn, out["logit_precursor"], cost)
     return out
 
 
@@ -3288,6 +3348,33 @@ def render_frontrun(out):
 
     backrun_edge = gate_block(out.get("logit_gate"), "LOGIT-GATE ENTER-ON-SIGNAL (all predictors)", False)
     gate_block(out.get("logit_gate_precursor"), "FRONT-RUN GATE (precursors only)", True, backrun=backrun_edge)
+
+    gt = out.get("gate_tail")
+    if gt:
+        L.append("")
+        L.append("  FRONT-RUN GATE TAIL CONCENTRATION (precursor gate) -- is the mean a BROAD edge or a few spikes?")
+        L.append("  %-16s %6s %7s %9s %10s %9s %9s %9s" %
+                 ("cut / hold", "fires", "winners", "win-pools", "cap/raw mean", "top5%", "top20%", "max"))
+        for (pct, h) in sorted(gt, key=lambda k: (k[0], k[1])):
+            if pct < 98:                                     # only the actionable tight cuts
+                continue
+            d = gt[(pct, h)]
+            L.append("  top %-4g h%-2d %6d %7d %9d %6.1f/%-5.1f%% %8.0f%% %8.0f%% %+8.0f%%" % (
+                100 - pct, h, d["n"], d["winners"], d["win_pools"],
+                d["capped_mean"] * 100, d["raw_mean"] * 100, d["top5_share"] * 100, d["top20_share"] * 100,
+                d["max_raw"] * 100))
+        # verdict on the deployable cell (top 0.5%, hold 3) if present, else the tightest available
+        key = (99.5, 3) if (99.5, 3) in gt else (sorted(gt, key=lambda k: (-k[0], k[1]))[0] if gt else None)
+        if key:
+            d = gt[key]
+            broad = (d["winners"] and d["win_pools"] >= 0.7 * d["winners"] and d["top5_share"] <= 0.5
+                     and d["raw_mean"] <= 2.0 * max(d["capped_mean"], 1e-9))
+            L.append("  => top %g%% / hold %d: %d winners across %d pools, top-5 take %.0f%% of the positive return, "
+                     "raw mean %.0f%% vs capped %.0f%% -- %s"
+                     % (100 - key[0], key[1], d["winners"], d["win_pools"], d["top5_share"] * 100,
+                        d["raw_mean"] * 100, d["capped_mean"] * 100,
+                        "BROAD (edge spread across many pools, not a few spikes)" if broad
+                        else "CONCENTRATED (a few pools / spikes carry it -- fragile, weight the live probe accordingly)"))
 
     L.append("")
     L.append("  Mid-to-mid on untouched pools (hypothesis only, per the invariant); the live arbiter is a real reactive NET entry.")

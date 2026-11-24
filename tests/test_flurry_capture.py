@@ -147,6 +147,36 @@ def test_ws_only_uses_the_confirmed_series_as_the_single_feed():
         fs.WS_ONLY = saved
 
 
+def test_frontrun_tail_concentration_is_computed_when_requested():
+    # --tail adds the broad-vs-spikes breakdown of the precursor gate: distinct winning pools, capped vs raw mean,
+    # top-5/20 share. Off by default; on, every cell's stats are well-formed.
+    saved = fs.WS_ONLY
+    try:
+        fs.WS_ONLY = True
+
+        def pool(pfx, bump):
+            confirmed, price = [], 1.0
+            for k in range(1, 13):
+                price = price * 1.25 if k == bump else price * 1.001
+                buyers = ["%sn%d" % (pfx, k)] if k % 2 == 0 else ["%sR" % pfx]   # even: new wallet; odd: repeat
+                confirmed.append(_conf(k, 1, buyers, price))
+            return {"shred": [], "confirmed": confirmed, "frontier": [], "pull_slot": None}
+
+        metas = [{"pool": "P%d" % i, "token_mint": "m%d" % i, "create_ts": float(i)} for i in range(8)]
+        have = {"P%d" % i: pool("P%d" % i, 6 + 2 * (i % 2)) for i in range(8)}
+        base = fs.frontrun(have, metas, move=0.2)
+        assert "gate_tail" not in base                       # off by default
+        out = fs.frontrun(have, metas, move=0.2, tail=True)
+        assert isinstance(out.get("gate_tail"), dict)
+        for (pct, h), d in out["gate_tail"].items():
+            assert d["win_pools"] <= d["winners"]            # distinct winning pools can't exceed winners
+            assert d["winners"] <= d["n"]
+            assert 0.0 <= d["top5_share"] <= 1.0 + 1e-9 and 0.0 <= d["top20_share"] <= 1.0 + 1e-9
+        assert (not out["gate_tail"]) or "TAIL CONCENTRATION" in fs.render_frontrun(out)
+    finally:
+        fs.WS_ONLY = saved
+
+
 def test_frontrun_runs_on_a_two_feed_capture_without_helius():
     # two pools, each with a +20% up-move so there are events to be positioned before; the study should run its
     # literal front-run code on the capture (ceiling + feature bank) and return cleanly, no Helius.
