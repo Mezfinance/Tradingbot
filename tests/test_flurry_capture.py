@@ -124,6 +124,29 @@ def test_frontrun_capture_mismatched_feeds_reaches_the_net_without_indexerror():
     assert "rows" in out["logit_gate_precursor"]                    # the precursor-gate scalp ran over mismatched feeds
 
 
+def test_ws_only_uses_the_confirmed_series_as_the_single_feed():
+    # WS-only: the Helius-WS ('confirmed') series is the sole complete+priced feed -- no shred, no hybrid. A pool
+    # with an EMPTY shred series (which two-feed mode would drop) must still be used from its confirmed series.
+    saved = fs.WS_ONLY
+    try:
+        fs.WS_ONLY = True
+
+        def pool(pfx, bump):
+            confirmed, price = [], 1.0
+            for k in range(1, 13):
+                price = price * 1.25 if k == bump else price * 1.001
+                confirmed.append(_conf(k, (3 if k == bump - 1 else 1), ["%sc%d" % (pfx, k)], price))
+            return {"shred": [], "confirmed": confirmed, "frontier": [], "pull_slot": None}   # shred EMPTY on purpose
+
+        metas = [{"pool": "P%d" % i, "token_mint": "m%d" % i, "create_ts": float(i)} for i in range(8)]
+        have = {"P%d" % i: pool("P%d" % i, 6 + 2 * (i % 2)) for i in range(8)}
+        out = fs.frontrun(have, metas, move=0.2)
+        assert out["ws_only"] and out["pools"] == 8 and out["events"] >= 1   # empty shred no longer drops the pool
+        assert "[WS-ONLY feed]" in fs.render_frontrun(out)
+    finally:
+        fs.WS_ONLY = saved
+
+
 def test_frontrun_runs_on_a_two_feed_capture_without_helius():
     # two pools, each with a +20% up-move so there are events to be positioned before; the study should run its
     # literal front-run code on the capture (ceiling + feature bank) and return cleanly, no Helius.

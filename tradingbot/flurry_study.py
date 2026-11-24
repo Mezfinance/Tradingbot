@@ -935,6 +935,9 @@ def _slot_bank(flow: dict, create_ts: float, tgt: dict) -> list[dict]:
 
 
 HYBRID = False   # box live architecture: score the CURRENT slot from the DIRECT (shred) view, rebase history to FULL (Helius)
+WS_ONLY = False  # WS-only capture: use the Helius-WS ('confirmed') per-slot series as the single complete+priced feed --
+#                  no shred, no hybrid rebase. The processed WS is same-slot + complete (proven), so shreds buy nothing
+#                  for an N+1 entry; this studies/serves the simpler one-feed architecture. Set from the CLI --ws-only.
 
 
 def _flow_from_series(rows, priced):
@@ -2925,12 +2928,17 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
     for m in metas:
         rec = have.get(m["pool"])
         cap = rec if (isinstance(rec, dict) and ("confirmed" in rec or "shred" in rec)) else None
-        if cap is not None:                                  # box two-feed capture (train=serve): no Helius reconstruction
-            flow = _flow_from_series(cap.get("confirmed") or [], priced=True)   # FULL: confirmed price path -> ceiling/target/net
+        if cap is not None:                                  # box capture (train=serve): no Helius reconstruction
+            flow = _flow_from_series(cap.get("confirmed") or [], priced=True)   # the Helius-WS complete price path
             flow["pull_slot"] = cap.get("pull_slot")
-            feat = _flow_from_series(cap.get("shred") or [], priced=False)      # decision (shred) slot ids
-            if not flow["slots"] or not feat["slots"]:
-                continue
+            if WS_ONLY:                                       # one complete+priced WS feed: decision == price path, no shred/hybrid
+                feat = flow
+                if not flow["slots"]:
+                    continue
+            else:
+                feat = _flow_from_series(cap.get("shred") or [], priced=False)  # two-feed hybrid: decision (shred) slot ids
+                if not flow["slots"] or not feat["slots"]:
+                    continue
         else:
             flow = slot_flow(rec) if rec else None               # FULL: the real price path, ceiling, target, net
             if not flow:
@@ -2959,11 +2967,12 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
             ceiling.setdefault(key, []).extend(rs)
         events = _up_event_slots(slots, move)                # the real up-moves we aim to be positioned before
         n_events += len(events)
-        if cap is not None:
+        if cap is not None and not WS_ONLY:
             recs = _hybrid_bank_from_capture(cap, ct.get(m["pool"], 0), base_tgt)   # shred current + confirmed prior (frontier-capped)
-        else:
-            recs = (_hybrid_bank(rec, ct.get(m["pool"], 0), base_tgt) if HYBRID
-                    else _slot_bank(feat, ct.get(m["pool"], 0), base_tgt))   # features from the restricted/hybrid view
+        elif cap is None and HYBRID:
+            recs = _hybrid_bank(rec, ct.get(m["pool"], 0), base_tgt)
+        else:                                                 # WS-only capture, or the plain single-feed path
+            recs = _slot_bank(feat, ct.get(m["pool"], 0), base_tgt)
         for idx, r in enumerate(recs):
             sn = feat["slots"][idx]["slot"]
             r["target_by_lead"] = {L: _front_label(sn, events, L) for L in leads}
@@ -2973,7 +2982,7 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
         all_recs.extend(recs)
 
     out = {"mode": "frontrun", "move": move, "cost": cost, "leads": list(leads), "use_vq": USE_VQ, "vis": vis,
-           "include_failed": include_failed,
+           "include_failed": include_failed, "ws_only": WS_ONLY,
            "pools": n_pools, "slots": n_slots, "events": n_events,
            "event_rate": (n_events / n_slots if n_slots else 0.0),
            "ceiling": {f"{k}-{j}": _agg(v) for (k, j), v in sorted(ceiling.items())},
@@ -3110,8 +3119,9 @@ def render_frontrun_failed_compare(out_s, out_f):
 
 
 def render_frontrun(out):
-    L = ["FRONT-RUN STUDY  (position BEFORE a >= %.0f%% up-move; enter front of T..%d before T, exit 1-%d after)%s"
+    L = ["FRONT-RUN STUDY  (position BEFORE a >= %.0f%% up-move; enter front of T..%d before T, exit 1-%d after)%s%s"
          % (out["move"] * 100, FRONT_K[-1] - 1, FRONT_J[-1],
+            "  [WS-ONLY feed]" if out.get("ws_only") else "",
             "  [UNTHROTTLED: z guard 1.96, no family-wise correction]" if out.get("no_throttle") else "")]
     L.append("  pools %d  active slots %d  up-move events %d (%.2f%% of slots)  cost %.2f%%  vq basis %s"
              % (out["pools"], out["slots"], out["events"], out["event_rate"] * 100, out["cost"] * 100,

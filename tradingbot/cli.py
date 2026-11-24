@@ -214,6 +214,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--vq", action="store_true", help="flurry-study: price on the effective (virtual_quote-aware) reserve basis, matching the live WS stream, instead of the raw vault ratio (which inflates early-life moves into basis artifacts). Needs --fetch to populate vq. Off by default so other modes stay reproducible; --frontrun forces it on.")
     parser.add_argument("--export-gate", metavar="PATH", help="flurry-study --frontrun: write the fitted precursor front-run gate (joint-logit intercept + non-move predictor coefficients + top-k%% eta thresholds) to a JSON the live box runner loads via tradingbot.precursor_gate.")
     parser.add_argument("--no-throttle", action="store_true", help="flurry-study --frontrun: run the discovery + logit gate UNTHROTTLED -- drop the family-wise z correction (z guard 1.96, no 3.0 floor) so every individually-significant rule survives into the logit gate, move features included. Lets it discover everything naturally; decide the exclusions from the evidence.")
+    parser.add_argument("--ws-only", action="store_true", help="flurry-study --frontrun --flows: study a capture using ONLY its Helius-WS ('confirmed') per-slot series as a single complete+priced feed -- no shred, no hybrid rebase, no frontier. The processed WS is same-slot + complete, so this is the one-feed architecture (drops ShredStream). Works on the existing two-feed captures (uses just the confirmed half) and on WS-only captures.")
     parser.add_argument("--gate-hold", type=int, default=2, help="flurry-study --export-gate: slots to hold after entering front of N+1 (default 2, the paying cell).")
     parser.add_argument("--capture", metavar="PATH", help="localshred-merge: the --capture feature JSONL from run_localshred.py --capture (our decode's per-slot features of each fresh pool)")
     parser.add_argument("--out", metavar="PATH", help="localshred-merge: write the merged --flows JSONL (our features + the Helius price path) here, for flurry-study --frontrun --flows")
@@ -907,6 +908,7 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "flurry-study":  # slot-level buy-flurry continuation for the reactive-backrun scalp (11-17)
         from tradingbot import flurry_study as _fl
         _fl.HYBRID = bool(getattr(args, "hybrid", False))   # box live arch: shred current slot + Helius-rebased history
+        _fl.WS_ONLY = bool(getattr(args, "ws_only", False))   # WS-only capture: the confirmed series is the single feed
         if args.vq or args.frontrun or args.vis_experiment:   # effective (vq-aware) reserve basis; frontrun/experiment need it
             _fl.USE_VQ = True
         from tradingbot.journal import Journal as _FlJournal
