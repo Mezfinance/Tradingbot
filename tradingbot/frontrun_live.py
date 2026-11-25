@@ -21,6 +21,8 @@ Box loop sketch (pseudocode):
         if sig:                                            # land a buy at the FRONT of sig["entry_slot"]=N+1, hold
             executor.front_run(sig)                        # to sig["exit_slot"]=N+hold, log swap_return + net_return
 """
+import json
+import time
 from collections import Counter
 
 try:                                  # in-package (tradingbot.frontrun_live) and standalone on the box both work
@@ -450,3 +452,79 @@ def net_return(entry_fill: float, exit_fill: float, cost: float = 0.01) -> float
     if not entry_fill:
         return 0.0
     return swap_return(entry_fill, exit_fill) - cost
+
+
+class PerTxCapture:
+    """Append the box's OWN per-tx WS decode to a JSONL capture the --mid-slot study reads DIRECTLY -- no Helius
+    history fetch, no localshred-merge, no reconstruction. This is the train=serve input for the mid-slot re-fit:
+    the capture IS the stream of raw swaps (helius_feature_ws.swap_from_tx shape) the live StreamingRunner is fed,
+    recorded at decision time, so a gate fit on it fires on the same per-tx partials live by construction.
+
+    One JSONL line per fresh hand-made pool, the plain-rec shape flows_from_file reads (route #1, 'surf MODE=surf'):
+        {"pool": p, "token_mint": m, "create_ts": ct,
+         "rec": {"create_ts": ct, "txs": [[sec, slot, payer, tok_delta, sol_delta, tok_after, sol_after], ...]}}
+    The txs rows match flurry_study's _SLOT.._SOLA layout (index 0 = sec since creation; wall-clock receipt time is
+    a fine proxy -- the study keys on the slot, not sec). swap_from_tx already drops reverted/no-change txs, so the
+    rows are success-only, exactly the full training view (slot_flow full) and exactly what the runner's
+    first-tx-only peek sees -- no _FAILED/_VIS element needed.
+
+    Box wiring (run_ws.py, next to the existing FullSlotAggregator capture; the WS sub-management stays untouched):
+        cap = PerTxCapture("/data/wscap_pertx.jsonl")
+        # on launch detection (the LP-mint sighting the scorer already uses):
+        cap.open_pool(pool, token_mint, create_ts)
+        # per WS transactionSubscribe notification for that pool:
+        cap.on_notification(result, pool, token_mint)      # normalize + swap_from_tx + append, returns the row/None
+        # when the pool ages out of the fresh window (or at teardown):
+        cap.close_pool(pool)                               # writes the pool's line; cap.flush() writes all open pools
+    """
+
+    def __init__(self, path: str, now=time.time):
+        self._path = path
+        self._now = now
+        self._pools: dict = {}   # pool -> {"mint": str, "create_ts": float, "rows": list}
+
+    def open_pool(self, pool: str, token_mint: str, create_ts) -> None:
+        if pool not in self._pools:
+            self._pools[pool] = {"mint": token_mint, "create_ts": float(create_ts or 0.0), "rows": []}
+
+    def on_tx(self, swap: dict, pool: str):
+        """Append one decoded swap (swap_from_tx output) to the pool's buffer. Returns the row, or None if the pool
+        is not open or the swap is empty/missing a slot."""
+        p = self._pools.get(pool)
+        if p is None or not swap or swap.get("slot") is None:
+            return None
+        sec = round(self._now() - p["create_ts"], 3)
+        row = [sec, swap["slot"], swap.get("payer"), swap.get("tok_delta"), swap.get("sol_delta"),
+               swap.get("tok_after"), swap.get("sol_after")]
+        p["rows"].append(row)
+        return row
+
+    def on_notification(self, result: dict, pool: str, token_mint: str):
+        """One Helius transactionSubscribe params.result -> decode + append. Lazy-imports helius_feature_ws so the
+        capture decode matches the live StreamingRunner's decode exactly. Returns the appended row, or None."""
+        try:                                              # in-package and box-standalone both work
+            from . import helius_feature_ws as hw
+        except ImportError:                               # noqa: E722
+            import helius_feature_ws as hw
+        swap = hw.swap_from_tx(hw.normalize_notification(result), pool, token_mint)
+        return self.on_tx(swap, pool) if swap else None
+
+    def close_pool(self, pool: str):
+        """Write the pool's JSONL line (append) and forget it. Returns the record written, or None if nothing was
+        buffered for the pool."""
+        p = self._pools.pop(pool, None)
+        if not p or not p["rows"]:
+            return None
+        rec = {"pool": pool, "token_mint": p["mint"], "create_ts": p["create_ts"],
+               "rec": {"create_ts": p["create_ts"], "txs": p["rows"]}}
+        with open(self._path, "a") as fh:
+            fh.write(json.dumps(rec) + "\n")
+        return rec
+
+    def flush(self) -> int:
+        """Write every open pool's line (teardown). Returns the number of pools written."""
+        n = 0
+        for pool in list(self._pools):
+            if self.close_pool(pool):
+                n += 1
+        return n

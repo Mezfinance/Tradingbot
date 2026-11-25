@@ -223,3 +223,46 @@ def test_streaming_runner_committed_history_matches_complete_slot_pushes():
     for k in bank.prev_f:
         assert abs(sr.bank.prev_f[k] - bank.prev_f[k]) < 1e-9, k
     assert sr.cur["slot"] == 2                                # slot 2 is still partial (not committed)
+
+
+# --- PerTxCapture: the box's own per-tx WS decode -> the --mid-slot study input, no Helius merge ---------------
+import json
+from tests.test_helius_feature_ws import _notif, POOL, MINT
+
+
+def test_pertx_capture_round_trips_through_the_loader_and_mid_slot_bank(tmp_path):
+    # the capture writes the plain-rec shape flows_from_file reads as route #1, and --mid-slot scores it directly.
+    path = str(tmp_path / "wscap.jsonl")
+    cap = live.PerTxCapture(path, now=lambda: 1005.0)       # fixed clock -> sec = 5.0 on every row
+    cap.open_pool("P", "M", 1000.0)
+    for slot, payer in [(1, "a"), (2, "b"), (3, "c"), (4, "d")]:   # each slot's first (only) tx is a new wallet
+        row = cap.on_tx(_swap(slot, payer), "P")
+        assert row[fl._SLOT] == slot and row[fl._PAYER] == payer   # the txs layout the study indexes
+        assert row[fl._TOKD] == -10.0 and row[fl._TOKA] == 100.0 and row[fl._SOLA] == 1.0 and row[0] == 5.0
+    rec = cap.close_pool("P")
+    assert rec["pool"] == "P" and rec["rec"]["txs"][0][fl._SLOT] == 1
+
+    metas, have = fl.flows_from_file(path)
+    assert metas == [{"pool": "P", "token_mint": "M", "create_ts": 1000.0}]
+    assert "confirmed" not in have["P"] and "shred" not in have["P"]   # read as a PLAIN rec, so _frontrun's cap is None
+    assert [r[fl._SLOT] for r in have["P"]["txs"]] == [1, 2, 3, 4]
+
+    saved = fl.MID_SLOT
+    try:
+        fl.MID_SLOT = True
+        flow = fl.slot_flow(have["P"])
+        recs = fl._mid_slot_bank(have["P"], 1000.0, fl._tgt("price", 3, 1, 30.0))
+        assert len(recs) == len(flow["slots"])              # one record per complete slot, aligned
+        assert all(r["sym"] == "N" for r in recs)           # every slot's first tx is a brand-new wallet
+    finally:
+        fl.MID_SLOT = saved
+
+
+def test_pertx_capture_on_notification_decodes_and_drops_reverts(tmp_path):
+    cap = live.PerTxCapture(str(tmp_path / "c.jsonl"), now=lambda: 2.0)
+    cap.open_pool(POOL, MINT, 0.0)
+    row = cap.on_notification(_notif(10, "BUYER", 1000, 980, 100, 102), POOL, MINT)   # tokens out, SOL in = a buy
+    assert row[fl._SLOT] == 10 and row[fl._PAYER] == "BUYER" and row[fl._TOKD] == -20.0 and row[fl._SOLD] == 2.0
+    assert cap.on_notification(_notif(11, "X", 980, 970, 102, 104, err={"e": 1}), POOL, MINT) is None  # reverted
+    assert cap.on_tx(_swap(12, "y"), "UNOPENED") is None    # an unopened pool is ignored
+    assert len(cap._pools[POOL]["rows"]) == 1               # only the successful buy was buffered
