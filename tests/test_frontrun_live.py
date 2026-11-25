@@ -154,3 +154,58 @@ def test_ws_only_consumer_fresh_window_gates_mid_life_and_late_fires():
     assert con.on_slot("FRESH", _agg(15)) is not None        # (15-10)=5<=5 -> fires
     assert con.on_slot("FRESH", _agg(16)) is None            # (16-10)=6>5 -> aged past the window
     assert [s["pool"] for s in fires] == ["FRESH", "FRESH"]
+
+
+# --- peek (non-mutating) + StreamingRunner: score the slot as its txs stream, fire DURING the slot ----
+
+def _swap(slot, payer):                  # a buy in the swap_from_tx shape (tokens out, SOL in); price 0.01/tx
+    return {"slot": slot, "payer": payer, "tok_delta": -10.0, "sol_delta": 0.1,
+            "tok_after": 100.0, "sol_after": 1.0}
+
+
+def test_peek_record_equals_push_and_does_not_mutate():
+    a = _agg(5)
+    bp, br = live.SlotBank(3), live.SlotBank(3)
+    peeked = bp.peek(a)
+    pushed = br.push(a)
+    assert peeked == pushed                                   # peek builds the same record push would
+    assert bp.first is None and not bp.seen and bp.prev_sym == "." and bp.prev_price is None  # state untouched
+    assert bp.push(a) == pushed                               # and a real push afterwards still matches
+
+
+def test_peeks_before_a_push_do_not_change_the_committed_record():
+    a, b = _agg(0), _agg(1)
+    b1, b2 = live.SlotBank(3), live.SlotBank(3)
+    b1.push(a); b2.push(a)
+    b1.peek(b); b1.peek(b)                                    # peek the next slot twice on b1
+    assert b1.push(b) == b2.push(b)                           # the committed record is identical to the un-peeked bank
+
+
+def test_streaming_runner_fires_once_per_slot_on_the_first_tripping_tx():
+    gate = _fire_gate()                                       # fires on sym == N (new wallet), hold 3
+    sr = live.StreamingRunner(gate, tier="0.5", flurry_min=3)
+    sig = sr.on_tx(_swap(100, "w_a"))                         # first tx of slot 100: new wallet -> sym N -> fires mid-slot
+    assert sig is not None and sig["signal_slot"] == 100 and sig["partial"] is True
+    assert sig["entry_slot"] == 101 and sig["exit_slot"] == 103 and sig["hold"] == 3 and sig["sym"] == "N"
+    assert sr.cur["slot"] == 100                              # slot 100 is still OPEN (partial), not yet committed
+    assert sr.on_tx(_swap(100, "w_b")) is None               # same slot -> at most one fire
+    sig2 = sr.on_tx(_swap(101, "w_c"))                        # a new slot commits 100 to history, can fire again
+    assert sig2 is not None and sig2["signal_slot"] == 101
+    assert sr.bank.prev_sym == "N"                            # slot 100 (buyers w_a,w_b, both new) committed as N
+
+
+def test_streaming_runner_committed_history_matches_complete_slot_pushes():
+    sr = live.StreamingRunner(_always_gate(), tier="0.5", flurry_min=3)
+    for t in (_swap(0, "a"), _swap(0, "b"), _swap(1, "c"), _swap(2, "a")):
+        sr.on_tx(t)                                           # slot 2's tx closes slot 1 -> 0 and 1 are committed
+    bank = live.SlotBank(3)
+    agg0 = {"slot": 0, "price": 0.01, "n_buys": 2, "buy_sol": 0.2, "max_buy": 0.1,
+            "n_sells": 0, "sell_sol": 0.0, "buyers": ["a", "b"], "net_sol": 0.2}
+    agg1 = {"slot": 1, "price": 0.01, "n_buys": 1, "buy_sol": 0.1, "max_buy": 0.1,
+            "n_sells": 0, "sell_sol": 0.0, "buyers": ["c"], "net_sol": 0.1}
+    bank.push(agg0); bank.push(agg1)
+    assert sr.bank.prev_sym == bank.prev_sym and sr.bank.prev2_sym == bank.prev2_sym
+    assert abs(sr.bank.prev_price - bank.prev_price) < 1e-12
+    for k in bank.prev_f:
+        assert abs(sr.bank.prev_f[k] - bank.prev_f[k]) < 1e-9, k
+    assert sr.cur["slot"] == 2                                # slot 2 is still partial (not committed)

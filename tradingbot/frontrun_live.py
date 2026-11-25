@@ -47,16 +47,15 @@ class SlotBank:
         self.prev_f = None
         self.prev_price = None
 
-    def push(self, s: dict) -> dict:
+    def _build(self, s: dict, commit: bool) -> dict:
         slot = s["slot"]
-        if self.first is None:
-            self.first = slot
+        first = self.first if self.first is not None else slot
         buyers = s.get("buyers") or []
         new_b = [b for b in buyers if b not in self.seen]
-        self.seen.update(buyers)
-        self.run_cnt.update(buyers)                         # include slot N's own buyers (visible as it closes)
-        top3 = {w for w, _ in self.run_cnt.most_common(3)}
-        top1 = self.run_cnt.most_common(1)[0][0] if self.run_cnt else None
+        rc = self.run_cnt if commit else self.run_cnt.copy()
+        rc.update(buyers)                                   # include slot N's own buyers (visible as it closes)
+        top3 = {w for w, _ in rc.most_common(3)}
+        top1 = rc.most_common(1)[0][0] if rc else None
         pprice = self.prev_price if self.prev_price is not None else s["price"]
         move = (s["price"] / pprice - 1.0) if pprice else 0.0
         since = float(min(slot - self.last_flurry, 50)) if self.last_flurry is not None else 50.0
@@ -72,7 +71,7 @@ class SlotBank:
             "net_sol": net_sol, "n_sells": n_sells, "sell_sol": sell_sol,
             "distinct_buyers": float(len(set(buyers))), "new_buyers": float(len(new_b)),
             "mean_buy": (buy_sol / nbuys if nbuys else 0.0), "abs_move": abs(move), "move": move,
-            "slots_since_flurry": since, "age_slots": float(min(slot - self.first, 1000)),
+            "slots_since_flurry": since, "age_slots": float(min(slot - first, 1000)),
             "outside_buy": outsider, "dominant_bought": dominant,
             "new_present": 1.0 if new_b else 0.0, "sell_present": 1.0 if n_sells > 0 else 0.0,
             "price_up": 1.0 if move > 0 else 0.0,
@@ -98,11 +97,24 @@ class SlotBank:
         else:
             sym = "."
         rec = {"f": f, "sym": sym, "m2": self.prev_sym + sym, "m3": self.prev2_sym + self.prev_sym + sym}
-        self.prev2_sym, self.prev_sym, self.prev_f = self.prev_sym, sym, f
-        self.prev_price = s["price"]
-        if nbuys >= self.flurry_min:
-            self.last_flurry = slot
+        if commit:
+            if self.first is None:
+                self.first = slot
+            self.seen.update(buyers)                         # run_cnt was already advanced in place (rc is self.run_cnt)
+            self.prev2_sym, self.prev_sym, self.prev_f = self.prev_sym, sym, f
+            self.prev_price = s["price"]
+            if nbuys >= self.flurry_min:
+                self.last_flurry = slot
         return rec
+
+    def push(self, s: dict) -> dict:
+        """Commit one COMPLETE active slot (in slot order) and return its record -- advances the running state."""
+        return self._build(s, True)
+
+    def peek(self, s: dict) -> dict:
+        """Record for a PARTIAL current slot WITHOUT advancing the state -- the streamed-tx scorer peeks the growing
+        current slot after each tx (history = the prior committed slots), then push()es it once the slot closes."""
+        return self._build(s, False)
 
 
 class Runner:
@@ -124,6 +136,81 @@ class Runner:
         return {"signal_slot": n, "entry_slot": n + 1, "exit_slot": n + self.hold,
                 "hold": self.hold, "tier": self.tier, "eta": precursor_gate.eta(rec, self.gate),
                 "sym": rec["sym"], "m2": rec["m2"]}
+
+
+class StreamingRunner:
+    """Score the gate on the STREAMING current slot -- after each transaction, not only once the slot closes.
+
+    A complete slot is only knowable after the NEXT slot starts (that is what "complete" means), so a complete-slot
+    decision (Runner.on_slot) can never be sent before N+1 begins -- it tops out at front-of-N+2. To land at the
+    FRONT of N+1 we must decide DURING N, on the slot as its transactions arrive. This runner keeps the prior slots
+    committed to the bank as COMPLETE (a tx in a new slot proves the old one closed) and the current slot PARTIAL;
+    after each swap it peeks (non-mutating) the gate on [prior complete history] + [current partial] and fires on
+    the first tx whose partial trips the gate (at most once per slot).
+
+    IMPORTANT -- this is the serve MECHANISM, not a validated signal yet. The exported gate is fit on the COMPLETE
+    slot's symbol/motif (Runner), so scoring a PARTIAL current slot here is train/serve skew: the current slot's
+    symbol is provisional until it closes (a '.' dead slot or a final 'S'/'F' is unknowable mid-stream), and any
+    predictor on the current slot can flip as more txs land. The gate must be RE-FIT to this mid-slot decision
+    point (flurry_study, decision = first partial that trips) before a fire here means money. Until then, run it in
+    MEASURE mode (how early, and on what partial, would the current gate fire) to size the re-fit.
+
+    Feed raw swaps (helius_feature_ws.swap_from_tx shape: slot, payer, tok_delta, sol_delta, tok_after, sol_after),
+    NOT FullSlotAggregator output -- this runner owns its own bank and commits slots itself from the tx stream, so
+    do not also feed its bank the aggregator's complete slots (double-commit). The box sets the real entry slot from
+    its own slot clock (the next CHAIN slot), since `signal_slot` here is the partial slot's number."""
+
+    def __init__(self, gate: dict, tier: str = "1", flurry_min: int = DEFAULT_FLURRY_MIN):
+        self.gate = gate if "_terms" in gate else precursor_gate.compile_gate(gate)
+        self.tier = str(tier)
+        self.hold = int(gate.get("hold", 2))
+        self.bank = SlotBank(flurry_min)
+        self.cur: dict | None = None        # the current slot's running partial aggregate
+        self.fired_slot = None
+
+    @staticmethod
+    def _blank(slot: int) -> dict:
+        return {"slot": slot, "n_buys": 0, "buy_sol": 0.0, "max_buy": 0.0, "n_sells": 0,
+                "sell_sol": 0.0, "buyers": [], "price": None}
+
+    def _add(self, swap: dict) -> None:
+        s = self.cur
+        tokd, sold = swap["tok_delta"], swap["sol_delta"]
+        if tokd < 0 and sold > 0:                           # buy: tokens out, SOL in
+            s["n_buys"] += 1
+            s["buy_sol"] += sold
+            s["max_buy"] = max(s["max_buy"], sold)
+            s["buyers"].append(swap["payer"])
+        elif tokd > 0 and sold < 0:                         # sell: tokens in, SOL out
+            s["n_sells"] += 1
+            s["sell_sol"] += -sold
+        if swap.get("tok_after"):                           # a pull/seed moves no wallet state but updates the price
+            s["price"] = swap["sol_after"] / swap["tok_after"]
+
+    def _priced(self, agg: dict) -> dict:
+        if agg["price"] is None:                            # no readable reserve yet: carry the last committed price
+            a = dict(agg)                                   # (as FullSlotAggregator._flush does) so move reads 0
+            a["price"] = self.bank.prev_price if self.bank.prev_price is not None else 0.0
+            return a
+        return agg
+
+    def on_tx(self, swap: dict):
+        """One streamed swap. Commits the prior slot to history when a new slot's first tx arrives, accumulates the
+        current slot, and returns a FireSignal when the growing partial first trips the gate (else None)."""
+        slot = swap["slot"]
+        if self.cur is not None and slot != self.cur["slot"]:
+            self.bank.push(self._priced(self.cur))          # the prior slot is complete now -> commit to history
+            self.cur = None
+        if self.cur is None:
+            self.cur = self._blank(slot)
+        self._add(swap)
+        rec = self.bank.peek(self._priced(self.cur))        # gate on prior-complete history + this partial slot
+        if self.fired_slot == slot or not precursor_gate.fires(rec, self.gate, self.tier):
+            return None
+        self.fired_slot = slot
+        return {"signal_slot": slot, "entry_slot": slot + 1, "exit_slot": slot + self.hold,
+                "hold": self.hold, "tier": self.tier, "eta": precursor_gate.eta(rec, self.gate),
+                "sym": rec["sym"], "m2": rec["m2"], "partial": True}
 
 
 class HybridRunner:
