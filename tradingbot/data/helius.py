@@ -336,6 +336,14 @@ class Helius:
         times = [s.get("blockTime") for s in res or [] if s.get("blockTime")]
         return float(min(times)) if times else None
 
+    def first_slot(self, address: str) -> int | None:
+        """Slot of the oldest of an address's last 1,000 signatures (1 credit): a pool's creation slot. Exact for a
+        pool with < 1,000 signatures (every fresh pool); for a busier one it is an UNDER-estimate of age (its real
+        creation is older), so a fresh/stale split built on it only ever errs toward calling a busy pool fresh."""
+        res = self._rpc("getSignaturesForAddress", [address, {"limit": 1000}], RPC_CREDITS)
+        slots = [s.get("slot") for s in res or [] if s.get("slot") is not None]
+        return int(min(slots)) if slots else None
+
     def lp_activity(self, lp_mint: str) -> dict | None:
         """An LP mint's successful signatures (1 credit, last 1,000): creation = the oldest; the LP only moves on
         create / deposit / withdraw, so the newest one after creation is when a full pull happened (if the supply

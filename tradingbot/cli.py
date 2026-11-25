@@ -127,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify", "frontrun-fill", "localshred-merge", "shred-completeness", "symbol-flip"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify", "frontrun-fill", "localshred-merge", "capture-fresh", "shred-completeness", "symbol-flip"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -220,6 +220,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--gate-hold", type=int, default=2, help="flurry-study --export-gate: slots to hold after entering front of N+1 (default 2, the paying cell).")
     parser.add_argument("--capture", metavar="PATH", help="localshred-merge: the --capture feature JSONL from run_localshred.py --capture (our decode's per-slot features of each fresh pool)")
     parser.add_argument("--out", metavar="PATH", help="localshred-merge: write the merged --flows JSONL (our features + the Helius price path) here, for flurry-study --frontrun --flows")
+    parser.add_argument("--fresh-slots", type=int, default=450, help="capture-fresh: keep a captured pool only if its first captured slot is within this many slots (~450 = ~180 s, the live pool_fresh window) of its creation slot -- i.e. born during the session, caught fresh")
     parser.add_argument("--min-cap-slots", type=int, default=6, help="localshred-merge: skip captured pools with fewer slots than this before the Helius fetch (thin pools rarely yield >=3 Helius-priced slots, so they'd be fetched then dropped -- wasting credits)")
     parser.add_argument("--min-cap-swaps", type=int, default=12, help="localshred-merge: skip captured pools with fewer total buy+sell events than this")
     parser.add_argument("--include-failed", action="store_true", help="flurry-study --frontrun: failed-inclusive refit A/B -- fit/eval the gate on decision features that COUNT reverted txs (what the live shred feed sees; no status in shreds) vs the success-only training view (vault deltas), on the SAME pools. Tests whether the front-run edge survives and whether re-fitting train=serve fixes the live over-firing. Refetches a superset.")
@@ -860,6 +861,29 @@ def main(argv: list[str] | None = None) -> None:
             for _r in _rows:
                 _of.write(json.dumps(_r) + "\n")
         print(f"merged {len(_rows)} of {len(_cap_rows)} captured pools -> {args.out} ({_cr} research credits)")
+        return
+
+    if args.command == "capture-fresh":  # keep only pools caught fresh (born during the capture) + stamp vq
+        from tradingbot import fresh_filter as _ff
+        import httpx as _ff_httpx
+        from tradingbot.data.helius import Helius as _FfHelius
+        if not args.capture or not args.out:
+            print("capture-fresh needs --capture <wscap_pertx.jsonl> --out <wscap_fresh.jsonl>", file=sys.stderr)
+            sys.exit(2)
+        with open(args.capture) as _ffc:
+            _ff_rows = [json.loads(x) for x in _ffc if x.strip()]
+        _ff_helius = _FfHelius(client=_ff_httpx.Client(timeout=60))   # research (backup) key, never the live key
+        _ff_helius.min_interval_s = 1 / max(args.rps, 0.1)
+        _ff_prog = lambda i, n, s: print(f"fresh {s['fresh']}/{i} of {n}, {s['credits']} credits",
+                                         file=sys.stderr, flush=True)
+        _ff_kept, _ff_stats = _ff.fresh_filter(_ff_rows, _ff_helius, fresh_slots=args.fresh_slots,
+                                               max_credits=int(args.max_credits or 0), progress=_ff_prog)
+        with open(args.out, "w") as _ffo:
+            for _r in _ff_kept:
+                _ffo.write(json.dumps(_r) + "\n")
+        print(f"kept {len(_ff_kept)} fresh of {_ff_stats['total']} pools -> {args.out} "
+              f"(stale {_ff_stats['stale']}, unreadable {_ff_stats['unreadable']}, "
+              f"{_ff_stats['credits']} research credits{', capped' if _ff_stats['capped'] else ''})")
         return
 
     if args.command == "shred-completeness":  # the box's LocalShred capture vs Helius truth: what we have vs miss
