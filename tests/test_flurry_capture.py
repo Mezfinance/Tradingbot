@@ -251,3 +251,28 @@ def test_slot_flow_drops_a_reserve_collapse_and_does_not_carry_its_price_forward
         assert all(s["price"] < 1.0 for s in on["slots"])                       # ...and its price never carried fwd
     finally:
         fs.DROP_ARTIFACTS = saved
+
+
+def test_filter_by_liq_keeps_only_pools_at_or_above_the_floor():
+    # peek5 carries no liquidity field, so filter_by_liq joins the scorer's recorded liq_usd. C has no record -> dropped.
+    liq = {"A": 9000.0, "B": 2000.0, "D": 50000.0}
+
+    def query(sql, params):
+        return [{"pool": p, "liq_usd": liq[p]} for p in params if p in liq]
+
+    metas = [{"pool": p, "token_mint": "m" + p, "create_ts": 1.0} for p in ("A", "B", "C", "D")]
+    have = {p: {"confirmed": [[1, 0, 0.0, 0.0, 0, 0.0, [], 1.0]]} for p in ("A", "B", "C", "D")}
+    kept, have2, stats = fs.filter_by_liq(query, metas, have, 5000.0)
+    assert [m["pool"] for m in kept] == ["A", "D"]          # >= 5000 only (B below, C unknown)
+    assert set(have2) == {"A", "D"}                         # have filtered to match the kept metas
+    assert stats == {"floor": 5000.0, "total": 4, "with_liq": 3, "kept": 2,
+                     "dropped_below": 1, "dropped_unknown": 1}
+
+
+def test_filter_by_liq_fails_open_when_the_table_is_missing():
+    def query(sql, params):
+        raise Exception("no such table: watch_launch_live")
+
+    metas = [{"pool": "A", "token_mint": "mA", "create_ts": 1.0}]
+    kept, have2, stats = fs.filter_by_liq(query, metas, {"A": {"confirmed": []}}, 5000.0)
+    assert kept == metas and have2 == {"A": {"confirmed": []}} and "error" in stats   # no filter applied

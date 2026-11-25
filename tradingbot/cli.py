@@ -216,6 +216,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--no-throttle", action="store_true", help="flurry-study --frontrun: run the discovery + logit gate UNTHROTTLED -- drop the family-wise z correction (z guard 1.96, no 3.0 floor) so every individually-significant rule survives into the logit gate, move features included. Lets it discover everything naturally; decide the exclusions from the evidence.")
     parser.add_argument("--ws-only", action="store_true", help="flurry-study --frontrun --flows: study a capture using ONLY its Helius-WS ('confirmed') per-slot series as a single complete+priced feed -- no shred, no hybrid rebase, no frontier. The processed WS is same-slot + complete, so this is the one-feed architecture (drops ShredStream). Works on the existing two-feed captures (uses just the confirmed half) and on WS-only captures.")
     parser.add_argument("--mid-slot", action="store_true", help="flurry-study --frontrun: the re-fit for front-of-N+1. A complete slot is only knowable once the NEXT slot starts, so a complete-slot gate tops out at front-of-N+2 (feed-lag 2-3). Fit the gate on the PARTIAL current slot at its FIRST tx (the earliest DURING-slot decision) + completed prior slots, predicting N+1 -- served by frontrun_live.StreamingRunner (first-tx-only), so train == serve. Read the holdout AUC + FRONT-RUN GATE net at the mid-slot decision point. Plain single full-feed path (not --ws-only/--hybrid).")
+    parser.add_argument("--min-liq-usd", type=float, default=0.0, help="flurry-study --frontrun (and the other flow modes): keep only capture pools whose scorer-recorded liquidity at second 4 (watch_launch_live.liq_usd) is >= this, matching the LIVE bot's model_book_min_liq_usd. A WS-only/LocalShred capture has no liquidity floor, so sub-$5k pools (where the raw reserve ratio is most inflated and genuine moves largest) otherwise swamp the ceiling. 0 = off. Pools with no scorer liq record are dropped. Use 5000 for the honest 'what we can bank' read.")
     parser.add_argument("--keep-artifacts", action="store_true", help="flurry-study --frontrun/--discover/--discover-econ: KEEP reserve-collapse artifact slots (a near-full buy empties the token side for one tx -> the reserve ratio/price explodes). Default drops them entirely (token reserve < 15%% of the pool median, or price-only: price > 1/0.15 x the pool median) so the discover/logit TARGET counts only genuine, tradeable up-moves -- a cap bounds an artifact's effect on the mean but still lets it count as an up-move, so only dropping it stops discovery honing on artifacts. Pass this to restore the old (capped-but-kept) behaviour for comparison.")
     parser.add_argument("--gate-hold", type=int, default=2, help="flurry-study --export-gate: slots to hold after entering front of N+1 (default 2, the paying cell).")
     parser.add_argument("--capture", metavar="PATH", help="localshred-merge: the --capture feature JSONL from run_localshred.py --capture (our decode's per-slot features of each fresh pool)")
@@ -1011,6 +1012,13 @@ def main(argv: list[str] | None = None) -> None:
                 _have, _cr = _fl.fetch_flows(_ws, fl_helius, _metas, args.span_s,
                                              int(args.max_credits or 0), prog, with_vis=_with_vis,
                                              include_failed=_incl_failed)
+            if args.min_liq_usd and args.min_liq_usd > 0:   # match the live bot's $5k floor (peek5 carries no liq field)
+                _metas, _have, _lqs = _fl.filter_by_liq(_ws.query, _metas, _have, args.min_liq_usd)
+                if _lqs.get("error"):
+                    print(f"liquidity floor ${args.min_liq_usd:,.0f}: no watch_launch_live join ({_lqs['error']}) -- NOT filtered", flush=True)
+                else:
+                    print(f"liquidity floor ${_lqs['floor']:,.0f}: kept {_lqs['kept']}/{_lqs['total']} pools "
+                          f"({_lqs['dropped_below']} below floor, {_lqs['dropped_unknown']} no scorer liq record)", flush=True)
             _tgt = _fl._tgt(args.target, args.flurry_min, args.horizon, args.move_pct)
             if args.multibuy:  # band flurries by buy count, enter the slot after, sweep the hold 1-10
                 out = _fl.multibuy_study(_have, _metas, args.cost_pct / 100.0)

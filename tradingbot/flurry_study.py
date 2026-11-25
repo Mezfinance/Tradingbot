@@ -399,6 +399,34 @@ def flows_from_file(path: str) -> tuple[list[dict], dict]:
     return metas, have
 
 
+def filter_by_liq(query, metas, have, floor):
+    """Keep only capture pools whose scorer-recorded liquidity at second 4 (watch_launch_live.liq_usd) is >= floor,
+    so the study measures the pool population the LIVE bot would actually trade (model_book_min_liq_usd = $5000). A
+    WS-only / LocalShred capture (peek5) carries no liquidity field and the fresh-window gate has no liquidity floor,
+    so sub-$5k pools -- where the raw reserve ratio is most inflated and genuine % moves are largest -- otherwise swamp
+    the ceiling. The floor is joined from the scorer table (free, local on /data). A pool with no liq record is DROPPED
+    (we cannot confirm it clears the floor; keeping it would re-admit exactly the thin pools we are excluding).
+    Returns (metas, have, stats)."""
+    pools = [m["pool"] for m in metas]
+    liq: dict[str, float] = {}
+    try:
+        for i in range(0, len(pools), 400):
+            chunk = pools[i:i + 400]
+            q = ("SELECT pool, liq_usd FROM watch_launch_live WHERE liq_usd IS NOT NULL AND pool IN (%s)"
+                 % ",".join("?" * len(chunk)))
+            for r in query(q, tuple(chunk)):
+                liq[r["pool"]] = r["liq_usd"]
+    except Exception as e:                                   # table/column missing (e.g. a test store) -> no filter
+        return metas, have, {"floor": floor, "error": str(e), "total": len(metas), "kept": len(metas)}
+    kept = [m for m in metas if (liq.get(m["pool"]) or 0) >= floor]
+    keptset = {m["pool"] for m in kept}
+    have2 = {p: v for p, v in have.items() if p in keptset} if have else have
+    stats = {"floor": floor, "total": len(metas), "with_liq": len(liq), "kept": len(kept),
+             "dropped_below": sum(1 for m in metas if m["pool"] in liq and liq[m["pool"]] < floor),
+             "dropped_unknown": sum(1 for m in metas if m["pool"] not in liq)}
+    return kept, have2, stats
+
+
 def merge_capture_flows(cap_rows, helius, span_s: float = DEFAULT_SPAN_S, max_credits: int = 20_000, progress=None,
                         min_cap_slots: int = 6, min_cap_swaps: int = 12):
     """Turn run_localshred --capture feature recs (our decode's per-slot buy/sell/buyers) into flurry-study --flows
