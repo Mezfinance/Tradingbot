@@ -111,3 +111,10 @@ class FullSlotAggregator:
 
     def flush(self) -> None:
         self._flush()
+
+    def flush_if_before(self, slot: int) -> None:
+        """Emit the open slot if it is older than `slot`. A global slot watermark (the max slot seen across ALL
+        pools) calls this to finalize a quiet pool's slot the instant the chain advances past it, instead of
+        waiting for THIS pool's next trade -- cutting the per-pool finalization lag to ~1 slot."""
+        if self.cur is not None and self.cur["slot"] < slot:
+            self._flush()
