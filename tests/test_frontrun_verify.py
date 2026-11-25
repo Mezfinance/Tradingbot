@@ -141,6 +141,42 @@ def test_injected_rec_is_never_truncated():
     assert out["rows"][0]["status"] == "ok" and out["rows"][0]["reproduced"] is False
 
 
+# -- ws-only: verify a box fire against the capture's OWN confirmed series (single feed, no rebase, no Helius) --
+
+def _capture_from_flow(seed, pool="P"):
+    """A box WS-only capture {pool, token_mint, create_ts, confirmed:[[slot,nb,buy_sol,max_buy,ns,sell_sol,[buyers],
+    price],...]} built from the planted flow's slots -- exactly the shape run_ws.py --capture writes and
+    flows_from_file reads. Scoring its confirmed series must reproduce scoring the flow (train=serve)."""
+    flow = fl.slot_flow(_cre_front(seed))
+    confirmed = [[s["slot"], s["n_buys"], s["buy_sol"], s["max_buy"], s["n_sells"], s["sell_sol"],
+                  list(s["buyers"]), s["price"]] for s in flow["slots"]]
+    return {"pool": pool, "token_mint": "M", "create_ts": 0.0,
+            "confirmed": confirmed, "shred": [], "frontier": [], "pull_slot": None}
+
+
+def test_ws_only_verify_scores_the_capture_single_feed_and_reproduces():
+    # a capture injected via have is auto-detected (confirmed key) and scored through _flow_from_series -> SlotBank,
+    # the SAME path the box serves and the --ws-only study fit -> the box fire reproduces, no Helius, no rebase.
+    slot, sym, m2 = _firing_slots(0)[0]
+    cap = _capture_from_flow(0)
+    out = fv.verify([{"pool": "P", "slot": slot, "box": {"sym": sym, "m2": m2}}], dict(GATE), have={"P": cap})
+    assert out["hybrid"] is False                      # a capture is never rebased
+    assert out["n_reproduced"] == 1 and out["n_diverged"] == 0
+    row = out["rows"][0]
+    assert row["vis"] == "ws-only" and row["in_flow"] and row["reproduced"]
+    assert all(row["match"].values())                  # box sym/m2 agree with the single-feed ground truth
+
+
+def test_ws_only_overrides_a_hybrid_stamped_gate():
+    # the gate that broke live was stamped hybrid, so verify rebased; ws_only must win and score the capture single-feed.
+    slot, _, _ = _firing_slots(0)[0]
+    cap = _capture_from_flow(0)
+    g = {**GATE, "hybrid": True}
+    out = fv.verify([{"pool": "P", "slot": slot, "box": {}}], g, have={"P": cap}, ws_only=True)
+    assert out["hybrid"] is False                      # ws-only beats the gate's hybrid flag -> no rebase
+    assert out["n_reproduced"] == 1 and out["rows"][0]["vis"] == "ws-only"
+
+
 # -- box-exact: replicate the live box's LUT drop in the ground truth, to tell a LUT gap from a deeper one --
 from tradingbot.data import helius as he
 

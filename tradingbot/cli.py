@@ -806,13 +806,17 @@ def main(argv: list[str] | None = None) -> None:
         else:
             print("frontrun-verify needs --fires <path> or --pairs 'pool:slot,...'", file=sys.stderr)
             return
+        _have = None
+        if getattr(args, "flows", None):            # ws-only train=serve: ground truth is the box's OWN capture
+            from tradingbot import flurry_study as _fv_fs
+            _, _have = _fv_fs.flows_from_file(args.flows)   # pool -> {confirmed,...}; verify scores it single-feed, no rebase
         _fvh = None
         if args.fetch:
             import httpx as _fv_httpx
             from tradingbot.data.helius import Helius as _FvHelius
             _fvh = _FvHelius(client=_fv_httpx.Client(timeout=60))  # research (backup) key, never the live key
             _fvh.min_interval_s = 1 / max(args.rps, 0.1)
-        _out = _fv.verify(_fires, _gate, helius=_fvh, tier=args.tier, flurry_min=args.flurry_min, span_s=args.span_s, max_pages=args.pages, box_exact=args.box_exact, hybrid=args.hybrid)
+        _out = _fv.verify(_fires, _gate, helius=_fvh, have=_have, tier=args.tier, flurry_min=args.flurry_min, span_s=args.span_s, max_pages=args.pages, box_exact=args.box_exact, hybrid=args.hybrid, ws_only=getattr(args, "ws_only", False))
         print(json.dumps(_out, indent=2, default=str) if args.json else _fv.render(_out))
         return
 

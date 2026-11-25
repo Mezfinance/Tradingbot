@@ -89,7 +89,7 @@ def _is_truncated(fired_slot: int, flow: dict, reached: bool) -> bool:
 
 def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, helius=None,
                rec: dict | None = None, span_s: float = 180.0, max_pages: int | None = None,
-               box_exact: bool = False, hybrid: bool = False) -> dict:
+               box_exact: bool = False, hybrid: bool = False, ws_only: bool = False) -> dict:
     """Replay one fired pool through the study's ground-truth path and score the box's gate on every slot.
     `rec` (a launch_record dict) short-circuits the fetch -- used by tests and when the box dumped its own series.
     `box_exact` builds the ground truth with the box's LUT drop replicated (launch_record vis_box_exact), so a
@@ -99,9 +99,12 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
     scored from the DIRECT shred view, the prior slots rebased to the FULL Helius view) instead of a single-vis
     SlotBank -- so a hybrid-gate box fire is verified against the exact offline hybrid the gate was fit on."""
     pool, slot, box = fire["pool"], int(fire["slot"]), fire.get("box") or {}
-    gate_vis = gate.get("vis", "full")              # replay through the VIEW the gate was fit on = the box's own view
+    is_cap = isinstance(rec, dict) and ("confirmed" in rec or "shred" in rec)   # a box capture, not a launch_record
+    ws = ws_only or is_cap                          # single complete feed, no rebase (the box's + study's own path)
+    hybrid = hybrid and not ws                      # ws-only never rebases, whatever the gate stamped
+    gate_vis = "ws-only" if ws else gate.get("vis", "full")   # replay through the view the gate was fit on
     res = {"pool": pool, "slot": slot, "box": box, "vis": gate_vis}
-    reached = True                                  # an injected rec is complete; only a real fetch can truncate
+    reached = True                                  # an injected rec/capture is complete; only a real fetch truncates
     if rec is None:
         if helius is None:
             res["status"] = "no helius"
@@ -111,12 +114,18 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
             res["status"] = "mint unresolved"
             return res
         txs, reached, _err = helius.history_from_start(pool, span_s, max_pages or fl.MAX_PAGES)
-        rec = he.launch_record(txs, pool, mint, window_s=span_s, with_vis=(hybrid or gate_vis != "full"),
+        rec = he.launch_record(txs, pool, mint, window_s=span_s, with_vis=(hybrid or (not ws and gate_vis != "full")),
                                vis_box_exact=box_exact)
-    saved_vq, saved_c = fl.USE_VQ, fl.CAUSAL_WALLET
+    saved_vq, saved_c, saved_da = fl.USE_VQ, fl.CAUSAL_WALLET, fl.DROP_ARTIFACTS
     try:
         fl.USE_VQ = False                           # the gate is price-free, so the basis cannot change a fire
-        if hybrid:
+        if ws:
+            fl.CAUSAL_WALLET = True                 # causal (online) wallet ranks, as the gate was fit
+            fl.DROP_ARTIFACTS = True                # score the capture EXACTLY as --frontrun fit it (reserve-collapse drop)
+            flow = (fl._flow_from_series(rec.get("confirmed") or [], priced=True) if is_cap
+                    else fl.slot_flow(rec, "full"))  # the single complete+priced feed the box serves -- no rebase
+            recs = None
+        elif hybrid:
             fl.CAUSAL_WALLET = True                 # the frontrun gate is fit on causal (online) wallet ranks
             flow = fl.slot_flow(rec, "direct")      # fires land on direct (shred) slots; prices feed the fwd move
             recs = fl._hybrid_bank(rec, 0.0, fl._tgt(flurry_min=flurry_min))  # direct current + full rebased prior
@@ -124,7 +133,7 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
             flow = fl.slot_flow(rec, gate_vis)      # direct = only top-level pumpswap (what the box decodes)
             recs = None
     finally:
-        fl.USE_VQ, fl.CAUSAL_WALLET = saved_vq, saved_c
+        fl.USE_VQ, fl.CAUSAL_WALLET, fl.DROP_ARTIFACTS = saved_vq, saved_c, saved_da
     if not flow or (hybrid and not recs):
         res["status"] = "no flow (pool had < 3 priced slots in history)"
         return res
@@ -168,14 +177,17 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
 
 def verify(fires: list[dict], gate: dict, helius=None, have: dict | None = None,
            tier: str = "1", flurry_min: int = 3, span_s: float = 180.0, max_pages: int | None = None,
-           box_exact: bool = False, hybrid: bool = False) -> dict:
-    """Verify every fire. `have` (pool -> launch_record dict) injects ground-truth recs without Helius (tests)."""
-    hybrid = hybrid or bool(gate.get("hybrid"))     # a hybrid-exported gate may stamp its own flag
+           box_exact: bool = False, hybrid: bool = False, ws_only: bool = False) -> dict:
+    """Verify every fire. `have` (pool -> launch_record OR box-capture dict) injects ground truth without Helius.
+    ws_only: score the capture's single complete+priced feed (confirmed series) through SlotBank with NO rebase --
+    the box's and study's own path, so a train=serve gate reproduces by construction (frontrun-verify is then an
+    integration check: did the live fires come from the captured feed, not a hybrid reconstruction)."""
+    hybrid = (hybrid or bool(gate.get("hybrid"))) and not ws_only   # ws-only never rebases, whatever the gate stamped
     if "_terms" not in gate:
         pg.compile_gate(gate)
     rows = [verify_one(f, gate, tier, flurry_min, helius=helius,
                        rec=(have or {}).get(f["pool"]), span_s=span_s, max_pages=max_pages,
-                       box_exact=box_exact, hybrid=hybrid) for f in fires]
+                       box_exact=box_exact, hybrid=hybrid, ws_only=ws_only) for f in fires]
     ok = [r for r in rows if r.get("status") == "ok"]
     repro = sum(1 for r in ok if r["reproduced"])
     trunc = sum(1 for r in rows if r.get("status") == "truncated")
