@@ -196,3 +196,58 @@ def test_frontrun_runs_on_a_two_feed_capture_without_helius():
     assert out["mode"] == "frontrun"
     assert out["pools"] == 2
     assert "ceiling" in out and out["events"] >= 1                  # the +20% bumps are real up-events
+
+
+# --- reserve-collapse artifact filter (DROP_ARTIFACTS): remove near-drain spikes ENTIRELY -----------
+
+def _rec(rows):                          # a launch_record: rows [sec, slot, payer, tokD, solD, tok_after, sol_after]
+    return {"txs": rows, "vq": 0}
+
+
+def test_drop_artifacts_reserve_branch_drops_a_token_reserve_collapse():
+    slots = [{"slot": 1, "tok": 1000.0, "price": 0.01}, {"slot": 2, "tok": 1000.0, "price": 0.01},
+             {"slot": 3, "tok": 50.0, "price": 2.0}, {"slot": 4, "tok": 1000.0, "price": 0.011}]
+    kept = fs._drop_artifacts(slots)                         # tok 50 < 0.15 x median(1000) -> dropped
+    assert [s["slot"] for s in kept] == [1, 2, 4]
+
+
+def test_drop_artifacts_price_branch_drops_the_spike_image_and_leaves_flat_untouched():
+    slots = [{"slot": 1, "price": 1.0}, {"slot": 2, "price": 1.02}, {"slot": 3, "price": 20.0},
+             {"slot": 4, "price": 1.03}]
+    kept = fs._drop_artifacts(slots)                         # 20 > median(~1.025)/0.15 ~ 6.8 -> dropped
+    assert [s["slot"] for s in kept] == [1, 2, 4]
+    flat = [{"slot": k, "price": 1.0} for k in range(5)]     # price-free (shred) series: all equal -> untouched
+    assert fs._drop_artifacts(flat) == flat
+
+
+def test_flow_from_series_drops_a_capture_price_spike_only_when_enabled():
+    rows = [[k, 1, 0.1, 0.1, 0, 0.0, [f"w{k}"], 1.0 + 0.01 * k] for k in range(4)]   # prices ~1.0..1.03
+    rows.append([4, 1, 5.0, 5.0, 0, 0.0, ["x"], 20.0])                                # a near-drain spike
+    saved = fs.DROP_ARTIFACTS
+    try:
+        fs.DROP_ARTIFACTS = False
+        assert any(abs(s["price"] - 20.0) < 1e-9 for s in fs._flow_from_series(rows, priced=True)["slots"])
+        fs.DROP_ARTIFACTS = True
+        on = fs._flow_from_series(rows, priced=True)["slots"]
+        assert all(s["price"] < 2.0 for s in on) and len(on) == 4   # spike gone, genuine slots kept
+        # a price-free capture series is never touched (all prices become the 1.0 placeholder)
+        free = fs._flow_from_series([[k, 1, 0.1, 0.1, 0, 0.0, [f"w{k}"]] for k in range(4)], priced=False)
+        assert len(free["slots"]) == 4
+    finally:
+        fs.DROP_ARTIFACTS = saved
+
+
+def test_slot_flow_drops_a_reserve_collapse_and_does_not_carry_its_price_forward():
+    rows = [[0, k, f"w{k}", -10.0, 1.0, 1000.0 - 10 * k, 10.0 + k] for k in range(1, 5)]   # 4 normal buys
+    rows.append([0, 5, "x", -940.0, 90.0, 50.0, 101.0])                                    # near-drain: tok 50
+    saved = fs.DROP_ARTIFACTS
+    try:
+        fs.DROP_ARTIFACTS = False
+        off = fs.slot_flow(_rec(rows))
+        assert any(s["slot"] == 5 and s["price"] > 1.0 for s in off["slots"])   # artifact kept, price explodes
+        fs.DROP_ARTIFACTS = True
+        on = fs.slot_flow(_rec(rows))
+        assert on is not None and all(s["slot"] != 5 for s in on["slots"])      # dropped entirely...
+        assert all(s["price"] < 1.0 for s in on["slots"])                       # ...and its price never carried fwd
+    finally:
+        fs.DROP_ARTIFACTS = saved

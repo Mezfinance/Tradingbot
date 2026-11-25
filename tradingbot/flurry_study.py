@@ -53,6 +53,49 @@ USE_VQ = False
 # than in the backtest. Off by default so every other mode stays byte-reproducible; frontrun forces it on so the
 # exported gate is live-valid (precursor_gate scores the same slots the study scored).
 CAUSAL_WALLET = False
+# When True, reserve-collapse artifact slots are removed from the study ENTIRELY (not capped): a near-full buy
+# empties the token side for one tx, so the reserve ratio (and the price derived from it) explodes. Such a slot is
+# not a tradeable move -- there is almost no token liquidity left to transact at that "price", and it springs back.
+# RET_CAP only bounds its EFFECT on the mean return; the discover/logit TARGET (_target_hit, built from the raw
+# price series) still reads the spike as a >=move%% up-move, so a cap cannot stop discovery honing on artifacts --
+# only dropping the slot can. Where the token reserve is known (Helius path, slot['tok']) the test is the reserve
+# itself; on a price-only capture it is the same collapse seen through price. Off by default so legacy modes stay
+# reproducible; the CLI turns it on for --frontrun/--discover (disable with --keep-artifacts).
+DROP_ARTIFACTS = False
+ARTIFACT_RESERVE_FRAC = 0.15  # artifact if token reserve < this x the pool's median reserve (price-only: price >
+#                             # 1/this x the pool's median price; sol ~const across the drain makes that the
+#                             # conservative image of the same collapse). 0.15 = a slot where ~85%+ of the token
+#                             # reserve vanished in one slot = near-drain, not a move you could trade.
+
+
+def _median(xs: list[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    if not n:
+        return 0.0
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2.0
+
+
+def _drop_artifacts(slots: list[dict]) -> list[dict]:
+    """Remove reserve-collapse artifact slots entirely (see DROP_ARTIFACTS). Where the token reserve is known
+    (slot['tok'], the Helius path) a slot is an artifact if tok < ARTIFACT_RESERVE_FRAC x the pool's median tok.
+    On a price-only capture (no 'tok') it is the price image of that same collapse: price > (1/frac) x the pool's
+    median price. A price-free series (all prices equal, e.g. the shred half of a capture) is left untouched."""
+    toks = [s["tok"] for s in slots if s.get("tok")]
+    if toks:
+        med = _median(toks)
+        if med > 0:
+            lo = ARTIFACT_RESERVE_FRAC * med
+            return [s for s in slots if not (s.get("tok") and s["tok"] < lo)]
+        return slots
+    prices = [s["price"] for s in slots if s.get("price")]
+    if prices and max(prices) > min(prices):
+        med = _median(prices)
+        if med > 0:
+            hi = med / ARTIFACT_RESERVE_FRAC
+            return [s for s in slots if not (s.get("price") and s["price"] > hi)]
+    return slots
+
 
 # flurry definitions: (label, field, threshold).  A slot is a flurry slot if field >= threshold.
 # field 'n_buys' = buy txs in the slot; 'buy_sol' = SOL bought into the pool that slot; 'net_sol' = buy - sell SOL.
@@ -183,7 +226,7 @@ def slot_flow(rec: dict, vis: str = "full", include_failed: bool = False) -> dic
         tok_after, sol_after = r[_TOKA], r[_SOLA]
         kind = classify(r[_TOKD] or 0.0, r[_SOLD] or 0.0)
         s = by_slot.setdefault(slot, {"slot": slot, "n_buys": 0, "buy_sol": 0.0, "n_sells": 0, "sell_sol": 0.0,
-                                      "price": None, "buyers": [], "max_buy": 0.0})
+                                      "price": None, "tok": None, "buyers": [], "max_buy": 0.0})
         visible = vis == "full" or (len(r) > _VIS and bool(r[_VIS]))
         if visible:
             if kind == "buy":
@@ -202,7 +245,10 @@ def slot_flow(rec: dict, vis: str = "full", include_failed: bool = False) -> dic
             s["buyers"].append(r[_PAYER])
         if tok_after and tok_after > 0:                   # price after this tx = end-of-slot price so far
             s["price"] = (float(sol_after) + vq_sol) / float(tok_after)
+            s["tok"] = float(tok_after)                   # end-of-slot token reserve (for the artifact filter)
     slots = [by_slot[k] for k in sorted(by_slot)]
+    if DROP_ARTIFACTS:                                    # drop reserve-collapse spikes BEFORE the carry-forward,
+        slots = _drop_artifacts(slots)                    # so an artifact's exploded price never carries forward
     # carry a price forward over slots whose last tx did not leave a readable reserve
     last = None
     for s in slots:
@@ -955,6 +1001,8 @@ def _flow_from_series(rows, priced):
                       "n_sells": ns, "sell_sol": ss, "net_sol": bs - ss,
                       "buyers": buyers, "price": price})
     slots.sort(key=lambda s: s["slot"])
+    if DROP_ARTIFACTS:                                    # price-only capture: drop the price image of a reserve
+        slots = _drop_artifacts(slots)                    # collapse (no-op on a price-free shred series)
     return {"slots": slots, "pull_slot": None}
 
 
