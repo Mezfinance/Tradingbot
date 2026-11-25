@@ -266,3 +266,20 @@ def test_pertx_capture_on_notification_decodes_and_drops_reverts(tmp_path):
     assert cap.on_notification(_notif(11, "X", 980, 970, 102, 104, err={"e": 1}), POOL, MINT) is None  # reverted
     assert cap.on_tx(_swap(12, "y"), "UNOPENED") is None    # an unopened pool is ignored
     assert len(cap._pools[POOL]["rows"]) == 1               # only the successful buy was buffered
+
+
+def test_pertx_capture_write_all_atomic_rewrite_round_trips(tmp_path):
+    # the box pattern: buffer every pool in memory, atomically rewrite the whole file on a timer (write_all).
+    path = str(tmp_path / "wscap.jsonl")
+    cap = live.PerTxCapture(path, now=lambda: 10.0)
+    cap.open_pool("P", "M", 7.0)
+    for slot, payer in [(1, "a"), (2, "b"), (3, "c")]:
+        cap.on_tx(_swap(slot, payer), "P")
+    cap.open_pool("Q", "N", 7.0)                            # a pool with no txs is dropped from the file
+    assert cap.write_all() == 1                             # only P has rows
+    cap.on_tx(_swap(4, "d"), "P")                           # keeps accumulating; rewrite reflects the new state
+    assert cap.write_all() == 1
+    metas, have = fl.flows_from_file(path)
+    assert [m["pool"] for m in metas] == ["P"]
+    assert [r[fl._SLOT] for r in have["P"]["txs"]] == [1, 2, 3, 4]   # no pop: the full stream is rewritten each time
+    assert len(cap.records()) == 1                          # records() is a snapshot, it does not pop either

@@ -482,22 +482,48 @@ class PerTxCapture:
         self._path = path
         self._now = now
         self._pools: dict = {}   # pool -> {"mint": str, "create_ts": float, "rows": list}
+        self._lock = __import__("threading").Lock()   # the box opens pools on the discovery thread, on_tx on the WS thread
 
     def open_pool(self, pool: str, token_mint: str, create_ts) -> None:
-        if pool not in self._pools:
-            self._pools[pool] = {"mint": token_mint, "create_ts": float(create_ts or 0.0), "rows": []}
+        with self._lock:
+            if pool not in self._pools:
+                self._pools[pool] = {"mint": token_mint, "create_ts": float(create_ts or 0.0), "rows": []}
 
     def on_tx(self, swap: dict, pool: str):
         """Append one decoded swap (swap_from_tx output) to the pool's buffer. Returns the row, or None if the pool
         is not open or the swap is empty/missing a slot."""
-        p = self._pools.get(pool)
-        if p is None or not swap or swap.get("slot") is None:
+        if not swap or swap.get("slot") is None:
             return None
-        sec = round(self._now() - p["create_ts"], 3)
-        row = [sec, swap["slot"], swap.get("payer"), swap.get("tok_delta"), swap.get("sol_delta"),
-               swap.get("tok_after"), swap.get("sol_after")]
-        p["rows"].append(row)
-        return row
+        with self._lock:
+            p = self._pools.get(pool)
+            if p is None:
+                return None
+            row = [round(self._now() - p["create_ts"], 3), swap["slot"], swap.get("payer"),
+                   swap.get("tok_delta"), swap.get("sol_delta"), swap.get("tok_after"), swap.get("sol_after")]
+            p["rows"].append(row)
+            return row
+
+    def _record(self, pool: str, p: dict) -> dict:
+        return {"pool": pool, "token_mint": p["mint"], "create_ts": p["create_ts"],
+                "rec": {"create_ts": p["create_ts"], "txs": p["rows"]}}
+
+    def records(self) -> list:
+        """Snapshot of every buffered pool's record (no pop). The shape flows_from_file reads as a plain rec."""
+        with self._lock:
+            return [self._record(pool, p) for pool, p in self._pools.items() if p["rows"]]
+
+    def write_all(self, path: str = None) -> int:
+        """Atomically rewrite the whole capture file with every buffered pool (memory-resident, like run_ws's
+        per-slot cap_write): a crash never leaves a half file, and the file always reflects all pools. Call it on a
+        timer and at shutdown. Returns the pool count written."""
+        recs = self.records()
+        dest = path or self._path
+        text = "\n".join(json.dumps(r) for r in recs)
+        tmp = dest + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.write(text + ("\n" if text else ""))
+        __import__("os").replace(tmp, dest)
+        return len(recs)
 
     def on_notification(self, result: dict, pool: str, token_mint: str):
         """One Helius transactionSubscribe params.result -> decode + append. Lazy-imports helius_feature_ws so the
@@ -510,19 +536,19 @@ class PerTxCapture:
         return self.on_tx(swap, pool) if swap else None
 
     def close_pool(self, pool: str):
-        """Write the pool's JSONL line (append) and forget it. Returns the record written, or None if nothing was
-        buffered for the pool."""
-        p = self._pools.pop(pool, None)
-        if not p or not p["rows"]:
-            return None
-        rec = {"pool": pool, "token_mint": p["mint"], "create_ts": p["create_ts"],
-               "rec": {"create_ts": p["create_ts"], "txs": p["rows"]}}
-        with open(self._path, "a") as fh:
-            fh.write(json.dumps(rec) + "\n")
-        return rec
+        """Append the pool's JSONL line and forget it (append-style alternative to write_all). Returns the record
+        written, or None if nothing was buffered for the pool."""
+        with self._lock:
+            p = self._pools.pop(pool, None)
+            if not p or not p["rows"]:
+                return None
+            rec = self._record(pool, p)
+            with open(self._path, "a") as fh:
+                fh.write(json.dumps(rec) + "\n")
+            return rec
 
     def flush(self) -> int:
-        """Write every open pool's line (teardown). Returns the number of pools written."""
+        """Append every open pool's line (teardown). Returns the number of pools written."""
         n = 0
         for pool in list(self._pools):
             if self.close_pool(pool):
