@@ -868,14 +868,19 @@ def test_frontrun_finds_the_precursor_and_it_pays():
         pre = out["logit_precursor"]                                 # the precursor-only (front-run) logit excludes move rules
         assert not any(fl._is_move_rule(p["name"]) for p in pre["predictors"][1:])
         assert "rows" in out["logit_gate_precursor"]
-        sweep = out["gate_offset_sweep"]                            # the landing-offset sweep is wired for N+1..N+4
+        sweep = out["gate_offset_sweep"]                            # each landing is a full RE-FIT for N+1..N+4
         assert set(sweep) == set(fl.FRONT_ENTRY_OFFSETS)
-        assert all("rows" in sweep[o] and "control" in sweep[o] for o in sweep)
-        # offset 1 reproduces the front-of-N+1 precursor gate (same decision, same fill)
-        assert [r["n"] for r in sweep[1]["rows"]] == [r["n"] for r in out["logit_gate_precursor"]["rows"]]
+        # every offset refit its own discover + logit + gate against the move a front-of-N+k fill reads
+        assert all(sweep[o]["offset"] == o and "survivors" in sweep[o] and "logit" in sweep[o]
+                   and "rows" in sweep[o]["gate"] and "control" in sweep[o]["gate"] for o in sweep)
+        # offset 1 is refit to target_by_offset[1] == the N+1 precursor target, so when the net lead is the entry
+        # lead it reproduces the front-of-N+1 precursor gate (same target, same specs, same fit)
+        if out["net_lead"] == fl.FRONT_ENTRY_LEAD:
+            assert [r["n"] for r in sweep[1]["gate"]["rows"]] == [r["n"] for r in out["logit_gate_precursor"]["rows"]]
         # a later landing actually shifts the fill: some offset's control mean differs from N+1's
-        c1 = {h: sweep[1]["control"][h].get("mean") for h in fl.FRONT_HOLDS if sweep[1]["control"].get(h, {}).get("n")}
-        assert c1 and any(sweep[o]["control"].get(h, {}).get("mean") != c1.get(h)
+        c1g = sweep[1]["gate"]["control"]
+        c1 = {h: c1g[h].get("mean") for h in fl.FRONT_HOLDS if c1g.get(h, {}).get("n")}
+        assert c1 and any((sweep[o]["gate"]["control"].get(h, {}) or {}).get("mean") != c1.get(h)
                           for o in (2, 3, 4) for h in c1)
         assert fl.render_frontrun(out)
     finally:

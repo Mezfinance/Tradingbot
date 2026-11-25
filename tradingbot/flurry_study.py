@@ -2848,11 +2848,13 @@ def _logit_fit(X, y, ridge=1e-4, iters=60):
     return beta, se, mu
 
 
-def _front_logit(tr, ho, specfn, rules, lead):
+def _front_logit(tr, ho, specfn, rules, lead, tkey="target_by_lead"):
     """Multivariate logistic on the surviving indicators: joint coefficients + Wald z/p for the up-move within
     `lead` slots, controlling for the correlation between indicators (a univariate lead that looks strong can
     add nothing once another is in the model). Fit on TRAIN; generalization read as the holdout AUC. This is the
-    'regression with confidence' -- discover gives per-rule univariate z, the logistic gives the joint fit."""
+    'regression with confidence' -- discover gives per-rule univariate z, the logistic gives the joint fit.
+    `tkey` selects which per-record target map to read (target_by_lead for the N+1 fit, target_by_offset for the
+    entry-offset refits, which anchor the move window on the N+k fill)."""
     seen, uniq = set(), []
     for r in rules:                                        # dedupe, keep z-order, only rules we can evaluate
         if r in specfn and r not in seen:
@@ -2869,7 +2871,7 @@ def _front_logit(tr, ho, specfn, rules, lead):
         return X
 
     Xtr = design(tr)
-    ytr = np.array([r["target_by_lead"][lead] for r in tr], float)
+    ytr = np.array([r[tkey][lead] for r in tr], float)
     keep = [j for j in range(1, Xtr.shape[1]) if 0 < Xtr[:, j].sum() < len(tr)]   # drop constants (unidentified)
     cols = [0] + keep
     kept = [uniq[j - 1] for j in keep]
@@ -2886,7 +2888,7 @@ def _front_logit(tr, ho, specfn, rules, lead):
     auc = None
     if ho:
         Xho = design(ho)[:, cols]
-        yho = np.array([r["target_by_lead"][lead] for r in ho], float)
+        yho = np.array([r[tkey][lead] for r in ho], float)
         if 0 < yho.sum() < len(yho):
             auc = _rank_auc(Xho @ beta, yho)
     p0 = float(ytr.mean())
@@ -2987,6 +2989,34 @@ def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS, entry
                 if v is not None:
                     ctrl[h].append(v)
     return {"rows": rows, "control": {h: _agg(v) for h, v in ctrl.items()}}
+
+
+def _front_offset_study(tr, ho, specs, specfn, pool_flows, cost, zc, offset):
+    """Entry-offset refit: re-run discover and the precursor logit against the move a front-of-N+k fill actually
+    reads (target_by_offset[offset], anchored on the N+k fill point), then gate + scalp at that offset. This is the
+    honest study -- the N+1 gate scored at a later fill is just a worse version of itself; here each landing's
+    predictor is trained on the move ahead of THAT landing. Decision is still made on slot N (features unchanged);
+    only the target and the fill move forward. Returns survivors, the joint logit and the gate for this offset."""
+    ttr = np.array([r["target_by_offset"][offset] for r in tr], float)
+    tho = np.array([r["target_by_offset"][offset] for r in ho], float)
+    btr = float(ttr.mean()) if len(ttr) else 0.0
+    bho = float(tho.mean()) if len(tho) else 0.0
+    surv = []
+    for spec in specs:
+        etr = _eval_spec(spec, tr, ttr, btr)
+        eho = _eval_spec(spec, ho, tho, bho)
+        if not etr or not eho:
+            continue
+        if (etr["lift"] - 1.0) * (eho["lift"] - 1.0) > 0 and eho["lift"] > 1.0 and abs(eho["z"]) >= zc:
+            surv.append({"rule": spec["rule"], "lift": eho["lift"], "z": eho["z"], "n": eho["n"], "base": bho})
+    surv.sort(key=lambda s: -s["z"])
+    surv = surv[:DISC_TOP]
+    pre = [s["rule"] for s in surv if not _is_move_rule(s["rule"])]   # precursor-only: fire BEFORE the move
+    pre += _forced_precursors(specfn, set(pre))
+    lg = _front_logit(tr, ho, specfn, pre, offset, tkey="target_by_offset")
+    gate = _front_logit_gate(ho, pool_flows, specfn, lg, cost, entry_offset=offset)
+    return {"offset": offset, "lead": FRONT_ENTRY_LEAD, "base_rate": bho, "n_survivors": len(surv),
+            "survivors": surv, "logit": lg, "gate": gate}
 
 
 def front_gate_tail(ho, pool_flows, specfn, lg, cost, pcts=FRONT_GATE_PCTS, holds=FRONT_HOLDS):
@@ -3167,6 +3197,11 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
         for idx, r in enumerate(recs):
             sn = feat["slots"][idx]["slot"]
             r["target_by_lead"] = {L: _front_label(sn, events, L) for L in leads}
+            # per-offset target for the entry-offset refits: a front-of-N+k fill lands at the end of slot sn+k-1,
+            # so the move it can still catch is one landing AFTER that fill point. Anchor the label there (not on
+            # the decision slot sn) and fix the horizon at FRONT_ENTRY_LEAD so each offset is refit to the move it
+            # actually reads. A move before the fill is already gone, so it must not count as a hit.
+            r["target_by_offset"] = {k: _front_label(sn + k - 1, events, FRONT_ENTRY_LEAD) for k in FRONT_ENTRY_OFFSETS}
             r["pool"], r["idx"], r["slot"] = m["pool"], idx, sn   # slot NUMBER: the net/gate scalp prices by it
             #   because the decision (shred/direct) slot set is not positionally aligned with the confirmed/full
             #   price path the scalp enters on (capture: independent feeds; hybrid: direct is a subset of full)
@@ -3272,11 +3307,12 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
     out["forced_precursors"] = [r for r in pre_rules if r not in {s["rule"] for s in survivors.get(lead_net, [])}]
     out["logit_precursor"] = _front_logit(tr, ho, specfn, pre_rules, lead_net)
     out["logit_gate_precursor"] = _front_logit_gate(ho, pool_flows, specfn, out["logit_precursor"], cost)
-    # ENTRY-OFFSET SWEEP: the same precursor gate, scored on slot N, but the buy LANDS at front of N+k (k in
-    # FRONT_ENTRY_OFFSETS). Decision is identical across offsets; only the entry/exit prices shift forward. Answers
-    # "given we can't fill N+1, which landing slot still has a predictable move ahead of it" -- read the best mean.
+    # ENTRY-OFFSET SWEEP: for each landing N+k, RE-FIT discover and the precursor logit to the move a front-of-N+k
+    # fill actually reads (target anchored on the N+k fill point), then gate + scalp at that offset. Scoring the
+    # N+1-targeted gate at a later fill is just a worse version of it; this trains each landing's predictor on its
+    # own move. Answers "given we can't fill N+1, which landing has a predictable move ahead = best mean."
     out["gate_offset_sweep"] = {
-        off: _front_logit_gate(ho, pool_flows, specfn, out["logit_precursor"], cost, entry_offset=off)
+        off: _front_offset_study(tr, ho, specs, specfn, pool_flows, cost, zc, off)
         for off in FRONT_ENTRY_OFFSETS}
     if tail:                                                 # broad-vs-spikes concentration of the precursor gate cells
         out["gate_tail"] = front_gate_tail(ho, pool_flows, specfn, out["logit_precursor"], cost)
@@ -3490,15 +3526,21 @@ def render_frontrun(out):
     if sweep:
         MIN_CELL = 50
         L.append("")
-        L.append("  ENTRY-OFFSET SWEEP (precursor gate; decide on COMPLETE slot N, the buy LANDS front of N+k) -- feed-lag")
-        L.append("  means N+1 is usually unfillable, so which landing slot still has a predictable move ahead? Best (top-k%,")
-        L.append("  hold) cell per landing offset vs its OWN offset-matched random control.")
-        L.append("  %-6s %10s %7s %9s %9s %6s %6s %10s %9s" %
-                 ("land", "cut/hold", "n", "mean", "median", "win%", "rug%", "ctrl mean", "edge pts"))
+        L.append("  ENTRY-OFFSET SWEEP (decide on COMPLETE slot N, the buy LANDS front of N+k) -- feed-lag means N+1 is")
+        L.append("  usually unfillable, so EACH landing is a full RE-FIT: discover + the precursor logit retrained on the")
+        L.append("  move a front-of-N+k fill actually reads (target anchored on the N+k fill point), then gated + scalped")
+        L.append("  at that offset, vs its OWN offset-matched random control. surv = holdout-confirmed precursors; auc =")
+        L.append("  that landing's logit holdout AUC.")
+        L.append("  %-6s %5s %5s %9s %8s %7s %9s %9s %6s %6s %10s %9s" %
+                 ("land", "surv", "auc", "base", "cut/hold", "n", "mean", "median", "win%", "rug%", "ctrl mean", "edge pts"))
         best_by_off = {}
         for off in sorted(sweep):
-            g = sweep[off] or {}
+            st = sweep[off] or {}
+            g = st.get("gate") or {}
             ctrl = g.get("control") or {}
+            auc = ((st.get("logit") or {}).get("auc_hold"))
+            nsurv = st.get("n_survivors", 0)
+            base = st.get("base_rate", 0.0)
             best = None
             for row in g.get("rows") or []:
                 for h, a in (row.get("holds") or {}).items():
@@ -3509,22 +3551,23 @@ def render_frontrun(out):
                     if best is None or edge > best["edge"]:
                         best = {"pct": row["pct"], "h": h, "a": a, "cm": cm, "edge": edge}
             best_by_off[off] = best
+            aucs = ("%.2f" % auc) if auc is not None else "--"
             if best is None:
-                L.append("  N+%-4d %10s  (no cell with n >= %d)" % (off, "--", MIN_CELL))
+                L.append("  N+%-4d %5d %5s %8.1f%% %8s  (no cell with n >= %d)" % (off, nsurv, aucs, base * 100, "--", MIN_CELL))
                 continue
             a, cm = best["a"], best["cm"]
-            L.append("  N+%-4d top %4g h%-2d %7d %+8.1f%% %+8.1f%% %5.0f%% %5.0f%% %+9.1f%% %+9.1f" % (
-                off, 100 - best["pct"], best["h"], a["n"], a["mean"] * 100, a["median"] * 100,
+            L.append("  N+%-4d %5d %5s %8.1f%% top %2g h%-2d %7d %+8.1f%% %+8.1f%% %5.0f%% %5.0f%% %+9.1f%% %+9.1f" % (
+                off, nsurv, aucs, base * 100, 100 - best["pct"], best["h"], a["n"], a["mean"] * 100, a["median"] * 100,
                 a["win_pct"], a["rugged_pct"], (cm * 100 if cm is not None else 0.0), best["edge"] * 100))
         cand = [(o, b) for o, b in best_by_off.items() if b and b["a"]["mean"] > 0 and b["edge"] > 0]
         if cand:
             o, b = max(cand, key=lambda ob: ob[1]["a"]["mean"])
-            L.append("  => BEST LANDING N+%d: top %g%% / hold %d, mean %+.1f%% (%+.1f pts over its control) -- the realistic "
-                     "entry to validate live with a reactive NET probe" % (
-                         o, 100 - b["pct"], b["h"], b["a"]["mean"] * 100, b["edge"] * 100))
+            L.append("  => BEST LANDING N+%d: top %g%% / hold %d, mean %+.1f%% (%+.1f pts over its control) -- a predictor "
+                     "RE-FIT to the N+%d move; the realistic entry to validate live with a reactive NET probe" % (
+                         o, 100 - b["pct"], b["h"], b["a"]["mean"] * 100, b["edge"] * 100, o))
         else:
-            L.append("  => NO LANDING SLOT beats its control on a positive mean -- the precursor does not lead the move at "
-                     "any reachable entry (N+2/N+3/N+4); the front-run has no edge we can fill")
+            L.append("  => NO LANDING SLOT beats its control on a positive mean, even refit to its own move -- the precursor "
+                     "does not lead a fillable move at any reachable entry (N+2/N+3/N+4); the front-run has no edge we can fill")
 
     gt = out.get("gate_tail")
     if gt:
