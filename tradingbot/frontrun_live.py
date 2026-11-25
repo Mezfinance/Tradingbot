@@ -261,6 +261,85 @@ class HybridConsumer:
         self.runners.pop(pool, None)                         # pool aged out of the fresh window
 
 
+class WsOnlyConsumer:
+    """Per-pool orchestration of WS-ONLY Runners for the box -- the one-feed architecture the --ws-only study fits.
+
+    There is a SINGLE feed: a Helius transactionSubscribe (commitment=processed, maxSupportedTransactionVersion>=1)
+    per fresh pool. The processed WS is same-slot + complete (proven: ws_latency 100% same-slot, 0 drops), so that
+    one feed is BOTH the current-slot decision and the price path -- no shred stream, no hybrid rebase, no frontier.
+    The box aggregates each pool's notifications to complete per-slot aggregates with
+    helius_feature_ws.FullSlotAggregator (same shape flurry_study.slot_flow emits) and routes them here; this scores
+    the gate on the closing slot N and, on a fire for a FRESH pool, emits the FireSignal (enter front of N+1, exit
+    N+hold). Mirrors HybridConsumer's fresh-pool gate and pool routing, minus the second feed and its timing
+    contract -- so it is strictly simpler and has no WS-vs-shred ordering to get wrong.
+
+    Box loop sketch (pseudocode; the WS socket + the Jito send + NET fill logging are box-only):
+        import helius_feature_ws as hw
+        gate = precursor_gate.load("gate_wsonly.json")
+        con  = WsOnlyConsumer(gate, tier="0.5", on_fire=on_fire, on_pool=open_sub, fresh_window_slots=450)
+        aggs = {}
+        def open_sub(pool):                                  # con calls this the first time it sees a pool
+            ws_subscribe(pool)                               # transactionSubscribe(accountInclude=[pool], processed, maxTxVersion>=1)
+        def on_notification(pool, token_mint, result):       # one WS tx notification
+            swap = hw.swap_from_tx(hw.normalize_notification(result), pool, token_mint)
+            if swap: aggs.setdefault(pool, hw.FullSlotAggregator(lambda s, _p=pool: con.on_slot(_p, s))).push(swap)
+        def on_fire(sig):                                    # land a buy at the FRONT of sig["entry_slot"]=N+1 via a
+            executor.front_run(sig)                          # Jito bundle, sell at N+hold, log net_return(entry,exit)
+    The box opens each pool's subscription at launch detection (the LP-mint sighting the scorer already uses), so a
+    pool's first WS slot ~= its creation and the fresh-window gate is meaningful. No per-pool fire dedup (every
+    qualifying slot fires), matching HybridConsumer and the study's raw fire rate."""
+
+    def __init__(self, gate: dict, tier: str = "1", flurry_min: int = DEFAULT_FLURRY_MIN,
+                 on_fire=None, on_pool=None, fresh_window_slots: int = 0):
+        self.gate = gate if "_terms" in gate else precursor_gate.compile_gate(gate)
+        self.tier = str(tier)
+        self.flurry_min = flurry_min
+        self.on_fire = on_fire
+        self.on_pool = on_pool
+        self.fresh_window_slots = int(fresh_window_slots)    # see HybridConsumer: new-pools-only warm-up gate
+        self._start_slot = None
+        self._first: dict = {}
+        self.runners: dict = {}
+
+    def _runner(self, pool: str) -> "Runner":
+        r = self.runners.get(pool)
+        if r is None:
+            r = Runner(self.gate, self.tier, self.flurry_min)
+            self.runners[pool] = r
+            if self.on_pool:
+                self.on_pool(pool)                           # box opens transactionSubscribe(accountInclude=[pool])
+        return r
+
+    def _fresh_ok(self, pool: str, slot: int) -> bool:
+        w = self.fresh_window_slots
+        if w <= 0:
+            return True
+        first = self._first.get(pool)
+        if self._start_slot is None or first is None:
+            return False
+        if (first - self._start_slot) < w:                   # pool first seen during warm-up -> maybe mid-life
+            return False
+        return (slot - first) <= w
+
+    def on_slot(self, pool: str, slot_agg: dict):
+        """One complete per-slot aggregate for `pool` (from FullSlotAggregator). Advances the pool's bank (always,
+        to keep the online history correct) and returns/forwards a FireSignal when the gate fires on a fresh pool."""
+        slot = slot_agg["slot"]
+        if self._start_slot is None:
+            self._start_slot = slot
+        self._first.setdefault(pool, slot)                   # first sight of the pool on the WS feed
+        sig = self._runner(pool).on_slot(slot_agg)           # advance the bank even if suppressed (keep tracking)
+        if sig is None or not self._fresh_ok(pool, slot):
+            return None
+        sig["pool"] = pool
+        if self.on_fire:
+            self.on_fire(sig)
+        return sig
+
+    def drop(self, pool: str) -> None:
+        self.runners.pop(pool, None)                         # pool aged out of the fresh window
+
+
 def net_return(entry_fill: float, exit_fill: float, cost: float = 0.01) -> float:
     """NET return of a filled front-run: exit_fill / entry_fill - 1 - cost (round-trip cost, default 1%). The box
     passes its REAL fill prices (entry at the front of N+1, exit at N+hold) so the live number is fills, not the

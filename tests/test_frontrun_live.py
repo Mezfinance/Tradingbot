@@ -77,3 +77,70 @@ def test_runner_reproduces_the_exported_gate_decision():
             assert (sig is not None) == pg.fires(w, gate, "2")
     finally:
         fl.USE_VQ = saved
+
+
+# --- WS-only consumer: one feed (Helius processed WS), per-pool routing + fresh gate --------------
+
+def _fire_gate():                        # a gate that fires on sym == N (new wallet), as _cre_front produces
+    g = {"hold": 3, "intercept": 0.0, "threshold": {"0.5": 5.0},
+         "predictors": [{"name": "sym == N  (new)", "coef": 10.0,
+                         "predicate": {"kind": "symbol", "symv": "N"}}]}
+    pg.compile_gate(g)
+    return g
+
+
+def _always_gate():                      # eta = intercept (no predictors) >= 0 -> fires on every slot
+    g = {"hold": 3, "intercept": 100.0, "threshold": {"0.5": 0.0}, "predictors": []}
+    pg.compile_gate(g)
+    return g
+
+
+def _agg(slot):                          # a minimal complete per-slot aggregate (FullSlotAggregator shape)
+    return {"slot": slot, "price": 1.0, "n_buys": 1, "buy_sol": 0.1, "max_buy": 0.1,
+            "n_sells": 0, "sell_sol": 0.0, "buyers": ["w%d" % slot], "net_sol": 0.1}
+
+
+def test_ws_only_consumer_matches_a_bare_runner_per_pool_and_stamps_the_pool():
+    # fresh gate off: WsOnlyConsumer.on_slot(pool, s) must forward exactly the fires a bare Runner gives on the
+    # same single feed, with the pool stamped and on_fire/on_pool called.
+    gate = _fire_gate()
+    flow = fl.slot_flow(_cre_front(0))
+    runner = live.Runner(gate, tier="0.5", flurry_min=3)
+    want = [runner.on_slot(s) for s in flow["slots"]]
+    fires, opened = [], []
+    con = live.WsOnlyConsumer(gate, tier="0.5", flurry_min=3,
+                              on_fire=fires.append, on_pool=opened.append, fresh_window_slots=0)
+    got = [con.on_slot("POOLX", s) for s in flow["slots"]]
+    assert opened == ["POOLX"]                               # subscription opened once, on first sight
+    for g, w in zip(got, want):
+        assert (g is not None) == (w is not None)
+        if g is not None:
+            assert g["signal_slot"] == w["signal_slot"] and g["entry_slot"] == w["entry_slot"]
+            assert g["exit_slot"] == w["exit_slot"] and g["hold"] == 3 and g["pool"] == "POOLX"
+    assert [s["pool"] for s in fires] == ["POOLX"] * len(fires)
+    assert len(fires) == sum(1 for g in got if g is not None) > 0
+
+
+def test_ws_only_consumer_routes_pools_independently():
+    gate = _always_gate()
+    opened = []
+    con = live.WsOnlyConsumer(gate, tier="0.5", on_pool=opened.append, fresh_window_slots=0)
+    con.on_slot("A", _agg(0)); con.on_slot("B", _agg(0))
+    assert set(opened) == {"A", "B"} and set(con.runners) == {"A", "B"}
+    con.drop("A")
+    assert set(con.runners) == {"B"}                         # aged-out pool dropped
+
+
+def test_ws_only_consumer_fresh_window_gates_mid_life_and_late_fires():
+    # new-pools-only: a pool first seen during the warm-up (first - start < w) is mid-life -> never forwarded,
+    # even though the always-gate fires every slot; a pool first seen after warm-up fires only within w of its
+    # first sight.
+    gate = _always_gate()
+    fires = []
+    con = live.WsOnlyConsumer(gate, tier="0.5", on_fire=fires.append, fresh_window_slots=5)
+    assert con.on_slot("MID", _agg(0)) is None               # start_slot=0, first[MID]=0 -> (0-0)<5 -> mid-life
+    assert con.on_slot("MID", _agg(3)) is None               # still inside warm-up, suppressed
+    assert con.on_slot("FRESH", _agg(10)) is not None        # (10-0)>=5 fresh, (10-10)=0<=5 -> fires
+    assert con.on_slot("FRESH", _agg(15)) is not None        # (15-10)=5<=5 -> fires
+    assert con.on_slot("FRESH", _agg(16)) is None            # (16-10)=6>5 -> aged past the window
+    assert [s["pool"] for s in fires] == ["FRESH", "FRESH"]
