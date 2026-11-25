@@ -57,6 +57,16 @@ def test_net_return_is_fills_minus_cost():
     assert live.net_return(0.0, 1.0) == 0.0                       # no entry fill -> no return
 
 
+def test_swap_return_is_the_price_move_with_no_cost():
+    # swap % = the move a trade captured, fee-free -- so a $0.01 probe still shows what it WOULD have made at scale
+    assert abs(live.swap_return(1.0, 1.10) - 0.10) < 1e-12
+    assert abs(live.swap_return(2.0, 1.0) + 0.50) < 1e-12         # a -50% move
+    assert live.swap_return(0.0, 1.0) == 0.0                      # no entry fill -> no return
+    # net is exactly swap minus the round-trip cost
+    for ef, xf, c in ((1.0, 1.10, 0.01), (1.0, 0.80, 0.06), (3.0, 4.5, 0.0)):
+        assert abs(live.net_return(ef, xf, c) - (live.swap_return(ef, xf) - c)) < 1e-12
+
+
 def test_runner_reproduces_the_exported_gate_decision():
     # end to end: fit + export on planted flows, load the gate, and the runner's live decision must equal
     # scoring the study's own causal record with precursor_gate.

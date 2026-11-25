@@ -18,8 +18,8 @@ Box loop sketch (pseudocode):
     runner = frontrun_live.Runner(gate, tier="1")          # top 1% of the joint logit
     for slot_agg in shredstream_active_slots():            # as each slot N closes
         sig = runner.on_slot(slot_agg)
-        if sig:                                            # land a buy at the FRONT of sig["entry_slot"]=N+1,
-            executor.front_run(sig)                        # hold to sig["exit_slot"]=N+hold, log NET fills
+        if sig:                                            # land a buy at the FRONT of sig["entry_slot"]=N+1, hold
+            executor.front_run(sig)                        # to sig["exit_slot"]=N+hold, log swap_return + net_return
 """
 from collections import Counter
 
@@ -284,7 +284,8 @@ class WsOnlyConsumer:
             swap = hw.swap_from_tx(hw.normalize_notification(result), pool, token_mint)
             if swap: aggs.setdefault(pool, hw.FullSlotAggregator(lambda s, _p=pool: con.on_slot(_p, s))).push(swap)
         def on_fire(sig):                                    # land a buy at the FRONT of sig["entry_slot"]=N+1 via a
-            executor.front_run(sig)                          # Jito bundle, sell at N+hold, log net_return(entry,exit)
+            executor.front_run(sig)                          # Jito bundle, sell at N+hold, log swap_return + net_return
+            #                                                # (swap % = the move even a $0.01 probe would've made)
     The box opens each pool's subscription at launch detection (the LP-mint sighting the scorer already uses), so a
     pool's first WS slot ~= its creation and the fresh-window gate is meaningful. No per-pool fire dedup (every
     qualifying slot fires), matching HybridConsumer and the study's raw fire rate."""
@@ -340,10 +341,21 @@ class WsOnlyConsumer:
         self.runners.pop(pool, None)                         # pool aged out of the fresh window
 
 
-def net_return(entry_fill: float, exit_fill: float, cost: float = 0.01) -> float:
-    """NET return of a filled front-run: exit_fill / entry_fill - 1 - cost (round-trip cost, default 1%). The box
-    passes its REAL fill prices (entry at the front of N+1, exit at N+hold) so the live number is fills, not the
-    study's mid-to-mid -- the only thing that settles whether the up-side tail survives contact."""
+def swap_return(entry_fill: float, exit_fill: float) -> float:
+    """SWAP-only return: exit_fill / entry_fill - 1, the price move with NO cost term. Log it beside net_return on
+    every fire so a tiny ($0.01) probe still shows the % the trade WOULD have made at a size where the fixed
+    per-tx fees are negligible -- the signal's raw edge, read apart from the fee drag that dominates (and buries)
+    a cent-sized trade's net. Same idea as canary_rugs.swap_return, computed from the two fill prices."""
     if not entry_fill:
         return 0.0
-    return exit_fill / entry_fill - 1.0 - cost
+    return exit_fill / entry_fill - 1.0
+
+
+def net_return(entry_fill: float, exit_fill: float, cost: float = 0.01) -> float:
+    """NET return of a filled front-run: swap_return - cost (round-trip cost, default 1%). The box passes its REAL
+    fill prices (entry at the front of N+1, exit at N+hold) so the live number is fills, not the study's
+    mid-to-mid -- the only thing that settles whether the up-side tail survives contact. At $0.01 the cost term
+    swamps this, so read swap_return(entry, exit) alongside it to see the move the trade actually captured."""
+    if not entry_fill:
+        return 0.0
+    return swap_return(entry_fill, exit_fill) - cost
