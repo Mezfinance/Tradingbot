@@ -1013,12 +1013,22 @@ def main(argv: list[str] | None = None) -> None:
                                              int(args.max_credits or 0), prog, with_vis=_with_vis,
                                              include_failed=_incl_failed)
             if args.min_liq_usd and args.min_liq_usd > 0:   # match the live bot's $5k floor (peek5 carries no liq field)
-                _metas, _have, _lqs = _fl.filter_by_liq(_ws.query, _metas, _have, args.min_liq_usd)
+                _extra = None
+                if fl_helius is not None:                   # --fetch: backfill decision-time liq for pools the scorer missed
+                    _scmap = _fl.scorer_liq(_ws.query, [m["pool"] for m in _metas])
+                    _unknown = [m["pool"] for m in _metas if m["pool"] not in _scmap]
+                    _mints = {m["pool"]: m.get("token_mint") for m in _metas}
+                    print(f"liquidity floor: {len(_unknown)} pools lack a scorer record -- reading seed liq from Helius "
+                          f"(research key, ~10 credits/pool, cached)...", flush=True)
+                    _extra = _fl.backfill_liq(fl_helius, _ws, _unknown, _mints, args.sol_usd,
+                                              int(args.max_credits or 0), prog)
+                _metas, _have, _lqs = _fl.filter_by_liq(_ws.query, _metas, _have, args.min_liq_usd, extra_liq=_extra)
                 if _lqs.get("error"):
                     print(f"liquidity floor ${args.min_liq_usd:,.0f}: no watch_launch_live join ({_lqs['error']}) -- NOT filtered", flush=True)
                 else:
                     print(f"liquidity floor ${_lqs['floor']:,.0f}: kept {_lqs['kept']}/{_lqs['total']} pools "
-                          f"({_lqs['dropped_below']} below floor, {_lqs['dropped_unknown']} no scorer liq record)", flush=True)
+                          f"(liq from scorer {_lqs['from_scorer']} + fetch {_lqs['from_fetch']}; "
+                          f"{_lqs['dropped_below']} below floor, {_lqs['dropped_unknown']} still no liq record)", flush=True)
             _tgt = _fl._tgt(args.target, args.flurry_min, args.horizon, args.move_pct)
             if args.multibuy:  # band flurries by buy count, enter the slot after, sweep the hold 1-10
                 out = _fl.multibuy_study(_have, _metas, args.cost_pct / 100.0)

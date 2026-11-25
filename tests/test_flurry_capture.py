@@ -265,8 +265,64 @@ def test_filter_by_liq_keeps_only_pools_at_or_above_the_floor():
     kept, have2, stats = fs.filter_by_liq(query, metas, have, 5000.0)
     assert [m["pool"] for m in kept] == ["A", "D"]          # >= 5000 only (B below, C unknown)
     assert set(have2) == {"A", "D"}                         # have filtered to match the kept metas
-    assert stats == {"floor": 5000.0, "total": 4, "with_liq": 3, "kept": 2,
-                     "dropped_below": 1, "dropped_unknown": 1}
+    assert stats == {"floor": 5000.0, "total": 4, "with_liq": 3, "from_scorer": 3, "from_fetch": 0,
+                     "kept": 2, "dropped_below": 1, "dropped_unknown": 1}
+
+
+def test_filter_by_liq_extra_liq_backfills_a_scorer_gap():
+    # C has no scorer record; an extra_liq fetch result >= floor rescues it from the unknown-drop.
+    def query(sql, params):
+        return [{"pool": "A", "liq_usd": 9000.0}] if "A" in params else []
+
+    metas = [{"pool": p, "token_mint": "m" + p, "create_ts": 1.0} for p in ("A", "C")]
+    have = {p: {"confirmed": []} for p in ("A", "C")}
+    kept, have2, stats = fs.filter_by_liq(query, metas, have, 5000.0, extra_liq={"C": 12000.0})
+    assert [m["pool"] for m in kept] == ["A", "C"]          # C now clears the floor from the fetch
+    assert stats["from_scorer"] == 1 and stats["from_fetch"] == 1 and stats["dropped_unknown"] == 0
+
+
+class _FakeStore:
+    def __init__(self):
+        self.rows = {}
+
+    def execute(self, sql, params=()):
+        if sql.startswith("INSERT"):
+            self.rows[params[0]] = params[1]
+
+    def query(self, sql, params=()):
+        if "watch_capture_liq" in sql:
+            return [{"pool": p, "liq_usd": self.rows[p]} for p in params if p in self.rows]
+        return []
+
+
+class _FakeHelius:
+    def __init__(self, sol):          # sol: pool -> SOL vault reserve at second ~4
+        self.sol = sol
+        self.calls = 0
+
+    def history_from_start(self, pool, span_s, pages):
+        self.calls += 1
+        s = self.sol.get(pool)
+        if s is None:
+            return ([], True, True)
+        # one early row: [sec, slot, payer, dtok, dsol, tok_after, sol_after]
+        return ([{"blockTime": 100, "slot": 1, "meta": {}, "transaction": {}}], True, True)
+
+    # launch_record is patched per-test to avoid parsing a real tx
+
+
+def test_backfill_liq_reads_seed_liq_and_caches(monkeypatch):
+    store = _FakeStore()
+    hel = _FakeHelius({"P1": 40.0, "P2": 10.0})   # P1 ~ $6.6k at $83 x 2 x 40; P2 ~ $1.6k
+    import tradingbot.data.helius as _h
+    monkeypatch.setattr(_h, "launch_record",
+                        lambda txs, pool, mint, window_s=30: {"txs": [[2, 1, "x", 0, 0, 0, hel.sol[pool]]]})
+    out = fs.backfill_liq(hel, store, ["P1", "P2", "P3"], {"P1": "m1", "P2": "m2", "P3": "m3"}, 83.0)
+    assert round(out["P1"]) == round(2 * 40.0 * 83.0) and round(out["P2"]) == round(2 * 10.0 * 83.0)
+    assert "P3" not in out                          # no reserve read -> cached 0 -> left unknown
+    assert hel.calls == 3
+    out2 = fs.backfill_liq(hel, store, ["P1", "P2", "P3"], {}, 83.0)   # all cached now
+    assert hel.calls == 3 and round(out2["P1"]) == round(2 * 40.0 * 83.0)
 
 
 def test_filter_by_liq_fails_open_when_the_table_is_missing():

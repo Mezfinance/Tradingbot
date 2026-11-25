@@ -399,29 +399,92 @@ def flows_from_file(path: str) -> tuple[list[dict], dict]:
     return metas, have
 
 
-def filter_by_liq(query, metas, have, floor):
-    """Keep only capture pools whose scorer-recorded liquidity at second 4 (watch_launch_live.liq_usd) is >= floor,
-    so the study measures the pool population the LIVE bot would actually trade (model_book_min_liq_usd = $5000). A
-    WS-only / LocalShred capture (peek5) carries no liquidity field and the fresh-window gate has no liquidity floor,
-    so sub-$5k pools -- where the raw reserve ratio is most inflated and genuine % moves are largest -- otherwise swamp
-    the ceiling. The floor is joined from the scorer table (free, local on /data). A pool with no liq record is DROPPED
-    (we cannot confirm it clears the floor; keeping it would re-admit exactly the thin pools we are excluding).
-    Returns (metas, have, stats)."""
-    pools = [m["pool"] for m in metas]
+def scorer_liq(query, pools):
+    """{pool: liq_usd} from the scorer's watch_launch_live for the given pools (liquidity measured at second 4)."""
     liq: dict[str, float] = {}
+    for i in range(0, len(pools), 400):
+        chunk = pools[i:i + 400]
+        q = ("SELECT pool, liq_usd FROM watch_launch_live WHERE liq_usd IS NOT NULL AND pool IN (%s)"
+             % ",".join("?" * len(chunk)))
+        for r in query(q, tuple(chunk)):
+            liq[r["pool"]] = r["liq_usd"]
+    return liq
+
+
+def backfill_liq(helius, store, pools, mints, sol_usd, max_credits=0, progress=None):
+    """Decision-time liquidity (2 x SOL vault at ~second 6 x sol_usd) for capture pools with NO scorer record -- one
+    first-tx history read per pool (helius.history_from_start, 1 page, ~10 credits; research key). This is the
+    scorer-MATCHING early-life liquidity, robust to a later rug: a current-reserve read would value a long-since-drained
+    pool at ~0 and wrongly drop exactly the ruggers, biasing the ceiling UP (survivorship). Cached in watch.db
+    watch_capture_liq so reruns are free. Returns {pool: liq_usd} for pools it could read (>0). A pool it cannot read
+    is cached 0 and left unknown (dropped by the floor), not refetched."""
+    import time as _t
+    out: dict[str, float] = {}
+    have_cache: dict[str, float] = {}
     try:
+        store.execute("CREATE TABLE IF NOT EXISTS watch_capture_liq(pool TEXT PRIMARY KEY, liq_usd REAL, ts REAL)")
         for i in range(0, len(pools), 400):
             chunk = pools[i:i + 400]
-            q = ("SELECT pool, liq_usd FROM watch_launch_live WHERE liq_usd IS NOT NULL AND pool IN (%s)"
-                 % ",".join("?" * len(chunk)))
-            for r in query(q, tuple(chunk)):
-                liq[r["pool"]] = r["liq_usd"]
+            q = "SELECT pool, liq_usd FROM watch_capture_liq WHERE pool IN (%s)" % ",".join("?" * len(chunk))
+            for r in store.query(q, tuple(chunk)):
+                have_cache[r["pool"]] = r["liq_usd"]
+    except Exception:
+        pass
+    credits = 0
+    for i, pool in enumerate(pools):
+        if pool in have_cache:                              # cached (incl. a cached 0 = tried, unreadable)
+            if have_cache[pool]:
+                out[pool] = have_cache[pool]
+            continue
+        if max_credits and credits >= max_credits:
+            break
+        mint = (mints or {}).get(pool)
+        liq = 0.0
+        if mint and helius is not None:
+            res = helius.history_from_start(pool, 30.0, 1)
+            credits += 10
+            txs = res[0] if res else None
+            if txs:
+                from tradingbot.data.helius import launch_record
+                rec = launch_record(txs, pool, mint, window_s=30)
+                rows = rec.get("txs") or []
+                early = [r for r in rows if r[0] <= 6 and r[6]]   # SOL vault within the first 6 s (scorer's fill read)
+                sol = (early[-1][6] if early else None) or rec.get("seed_sol")
+                if sol:
+                    liq = 2.0 * float(sol) * float(sol_usd)
+        try:
+            store.execute("INSERT OR REPLACE INTO watch_capture_liq VALUES(?,?,?)", (pool, liq, _t.time()))
+        except Exception:
+            pass
+        if liq:
+            out[pool] = liq
+        if progress and i % 50 == 0:
+            progress(i, len(pools), credits)
+    return out
+
+
+def filter_by_liq(query, metas, have, floor, extra_liq=None):
+    """Keep only capture pools whose decision-time liquidity is >= floor, so the study measures the pool population the
+    LIVE bot would actually trade (model_book_min_liq_usd = $5000). A WS-only / LocalShred capture (peek5) carries no
+    liquidity field and the fresh-window gate has no liquidity floor, so sub-$5k pools -- where the raw reserve ratio is
+    most inflated and genuine % moves are largest -- otherwise swamp the ceiling. Liquidity is joined from the scorer
+    table (free, local on /data); `extra_liq` (pool -> liq_usd) backfills pools the scorer never recorded (see
+    backfill_liq). A pool still with no liquidity is DROPPED (we cannot confirm it clears the floor; keeping it re-admits
+    exactly the thin pools we are excluding). Returns (metas, have, stats)."""
+    try:
+        liq = scorer_liq(query, [m["pool"] for m in metas])
     except Exception as e:                                   # table/column missing (e.g. a test store) -> no filter
         return metas, have, {"floor": floor, "error": str(e), "total": len(metas), "kept": len(metas)}
+    n_scorer = len(liq)
+    if extra_liq:
+        for p, v in extra_liq.items():
+            if v and p not in liq:                          # fallback only fills pools the scorer missed
+                liq[p] = v
     kept = [m for m in metas if (liq.get(m["pool"]) or 0) >= floor]
     keptset = {m["pool"] for m in kept}
     have2 = {p: v for p, v in have.items() if p in keptset} if have else have
-    stats = {"floor": floor, "total": len(metas), "with_liq": len(liq), "kept": len(kept),
+    stats = {"floor": floor, "total": len(metas), "with_liq": len(liq), "from_scorer": n_scorer,
+             "from_fetch": len(liq) - n_scorer, "kept": len(kept),
              "dropped_below": sum(1 for m in metas if m["pool"] in liq and liq[m["pool"]] < floor),
              "dropped_unknown": sum(1 for m in metas if m["pool"] not in liq)}
     return kept, have2, stats
