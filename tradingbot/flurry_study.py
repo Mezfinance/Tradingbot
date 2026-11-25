@@ -984,6 +984,12 @@ HYBRID = False   # box live architecture: score the CURRENT slot from the DIRECT
 WS_ONLY = False  # WS-only capture: use the Helius-WS ('confirmed') per-slot series as the single complete+priced feed --
 #                  no shred, no hybrid rebase. The processed WS is same-slot + complete (proven), so shreds buy nothing
 #                  for an N+1 entry; this studies/serves the simpler one-feed architecture. Set from the CLI --ws-only.
+MID_SLOT = False  # the re-fit for front-of-N+1: a complete slot is only knowable once the NEXT slot starts, so a
+#                   complete-slot gate (Runner) tops out at front-of-N+2 (feed-lag 2-3 in practice). To land front of
+#                   N+1 we must decide DURING N, so the gate is fit on the PARTIAL current slot at its FIRST tx (the
+#                   earliest during-slot decision) + the completed prior slots as history, predicting N+1. Served by
+#                   frontrun_live.StreamingRunner (first-tx-only), so train == serve by construction (same SlotBank).
+#                   Set from the CLI --mid-slot (with --frontrun). Plain single-full-feed path only (not hybrid/ws/cap).
 
 
 def _flow_from_series(rows, priced):
@@ -1079,6 +1085,66 @@ def _hybrid_bank_from_capture(cap, create_ts, tgt):
         return psl, p2sl
 
     return _hybrid_from_flows(full_flow, direct_flow, create_ts, tgt, prior_fn=prior_fn)
+
+
+def _first_tx_partials(rec, kept):
+    """For each COMPLETE slot in `kept`, the partial aggregate after its FIRST surviving tx (full vis), shaped like
+    a slot_flow slot so frontrun_live.SlotBank.peek can score it. This is the earliest DURING-slot decision point:
+    the live StreamingRunner (first-tx-only) scores exactly this. Mirrors slot_flow's per-tx classify + vq-aware
+    price, so the partial is consistent with the complete slot the history is committed from. Only slots slot_flow
+    kept (post failed-drop / artifact-drop / price>0) are built, so the alignment to the full flow holds."""
+    txs = rec.get("txs") or []
+    vq_sol = (rec.get("vq") or 0) / 1e9 if USE_VQ else 0.0
+    out: dict[int, dict] = {}
+    for r in txs:
+        slot = r[_SLOT]
+        if slot is None or slot not in kept or slot in out:
+            continue
+        if len(r) > _FAILED and bool(r[_FAILED]):          # a reverted swap: not in the success-only training view
+            continue
+        kind = classify(r[_TOKD] or 0.0, r[_SOLD] or 0.0)
+        s = {"slot": slot, "n_buys": 0, "buy_sol": 0.0, "max_buy": 0.0, "n_sells": 0, "sell_sol": 0.0,
+             "buyers": [], "price": None, "net_sol": 0.0}
+        if kind == "buy":
+            dsol = float(r[_SOLD] or 0.0)
+            s["n_buys"], s["buy_sol"], s["max_buy"], s["buyers"] = 1, dsol, dsol, [r[_PAYER]]
+        elif kind == "sell":
+            s["n_sells"], s["sell_sol"] = 1, -float(r[_SOLD] or 0.0)
+        tok_after = r[_TOKA]
+        if tok_after and tok_after > 0:
+            s["price"] = (float(r[_SOLA]) + vq_sol) / float(tok_after)
+        s["net_sol"] = s["buy_sol"] - s["sell_sol"]
+        out[slot] = s
+    return out
+
+
+def _mid_slot_bank(rec, create_ts, tgt):
+    """The MID_SLOT re-fit bank: one record per COMPLETE slot C, built from the PARTIAL current slot at its first tx
+    + the completed prior slots as history, with the target 'does slot C+1 move' (so the gate predicts N+1 from a
+    during-N partial). Aligned positionally to slot_flow(rec,'full')['slots'] -- a drop-in for _slot_bank in the
+    plain front-run path. Uses frontrun_live.SlotBank (commit each COMPLETE slot, peek the first-tx partial), the
+    SAME code the live StreamingRunner runs, so the fitted gate fires on the same partials live as in the backtest."""
+    from tradingbot import frontrun_live   # pure-python; lazy to keep flurry_study's import graph unchanged
+    full_flow = slot_flow(rec, "full")
+    if not full_flow:
+        return []
+    slots = full_flow["slots"]
+    by_slot = {s["slot"]: s for s in slots}
+    partials = _first_tx_partials(rec, set(by_slot))
+    bank = frontrun_live.SlotBank(flurry_min=tgt["flurry_min"])
+    out = []
+    for idx, s in enumerate(slots):
+        partial = partials.get(s["slot"]) or {"slot": s["slot"], "n_buys": 0, "buy_sol": 0.0, "max_buy": 0.0,
+                                              "n_sells": 0, "sell_sol": 0.0, "buyers": [], "price": None, "net_sol": 0.0}
+        if partial["price"] is None:                        # carry forward the last committed price (as StreamingRunner._priced)
+            partial = dict(partial)
+            partial["price"] = bank.prev_price if bank.prev_price is not None else 0.0
+        r = dict(bank.peek(partial))                        # record for the during-C first-tx partial + prior history
+        r["target"] = _target_hit(slots, by_slot, idx, tgt)  # does C+1 move (same ground truth as the complete-slot gate)
+        r["create_ts"] = create_ts
+        out.append(r)
+        bank.push(s)                                        # commit the COMPLETE slot C to history for the next peek
+    return out
 
 
 def _bank_for(rec, flow, create_ts, tgt):
@@ -2992,12 +3058,16 @@ def export_gate(out, hold: int = 2):
     predictors = [{"name": p["name"], "coef": float(p["coef"]), "predicate": meta.get(p["name"])}
                   for p in preds[1:]]
     threshold = {str(100 - r["pct"]): float(r["thr"]) for r in rows if "thr" in r}
+    mid = bool(out.get("mid_slot", False))
     return {
         "kind": "frontrun_precursor",
         "vis": out.get("vis", "full"),            # the ShredStream visibility the gate was fit on (box view = direct)
+        "mid_slot": mid,                          # True = fit on the during-N first-tx partial; serve with
+        #                                           frontrun_live.StreamingRunner (first-tx-only), not Runner (complete-slot)
         "move": float(out.get("move", FRONT_MOVE)),
         "lead": int(out.get("net_lead", FRONT_ENTRY_LEAD)),
-        "entry": "front of N+1 (immediately after the signal slot)",
+        "entry": ("decide on slot N's FIRST tx, buy front of N+1" if mid
+                  else "front of N+1 (immediately after the signal slot)"),
         "hold": int(hold),
         "intercept": intercept,
         "predictors": predictors,
@@ -3079,6 +3149,8 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
             recs = _hybrid_bank_from_capture(cap, ct.get(m["pool"], 0), base_tgt)   # shred current + confirmed prior (frontier-capped)
         elif cap is None and HYBRID:
             recs = _hybrid_bank(rec, ct.get(m["pool"], 0), base_tgt)
+        elif cap is None and MID_SLOT:                        # the re-fit: decide DURING N on the first-tx partial
+            recs = _mid_slot_bank(rec, ct.get(m["pool"], 0), base_tgt)
         else:                                                 # WS-only capture, or the plain single-feed path
             recs = _slot_bank(feat, ct.get(m["pool"], 0), base_tgt)
         for idx, r in enumerate(recs):
@@ -3090,7 +3162,7 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
         all_recs.extend(recs)
 
     out = {"mode": "frontrun", "move": move, "cost": cost, "leads": list(leads), "use_vq": USE_VQ, "vis": vis,
-           "include_failed": include_failed, "ws_only": WS_ONLY,
+           "include_failed": include_failed, "ws_only": WS_ONLY, "mid_slot": MID_SLOT,
            "pools": n_pools, "slots": n_slots, "events": n_events,
            "event_rate": (n_events / n_slots if n_slots else 0.0),
            "ceiling": {f"{k}-{j}": _agg(v) for (k, j), v in sorted(ceiling.items())},

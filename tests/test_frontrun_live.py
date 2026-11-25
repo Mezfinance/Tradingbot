@@ -163,6 +163,11 @@ def _swap(slot, payer):                  # a buy in the swap_from_tx shape (toke
             "tok_after": 100.0, "sol_after": 1.0}
 
 
+def _sell(slot, payer):                  # a sell (tokens in, SOL out)
+    return {"slot": slot, "payer": payer, "tok_delta": 10.0, "sol_delta": -0.1,
+            "tok_after": 100.0, "sol_after": 1.0}
+
+
 def test_peek_record_equals_push_and_does_not_mutate():
     a = _agg(5)
     bp, br = live.SlotBank(3), live.SlotBank(3)
@@ -181,17 +186,26 @@ def test_peeks_before_a_push_do_not_change_the_committed_record():
     assert b1.push(b) == b2.push(b)                           # the committed record is identical to the un-peeked bank
 
 
-def test_streaming_runner_fires_once_per_slot_on_the_first_tripping_tx():
+def test_streaming_runner_decides_on_the_first_tx_of_the_slot():
     gate = _fire_gate()                                       # fires on sym == N (new wallet), hold 3
     sr = live.StreamingRunner(gate, tier="0.5", flurry_min=3)
     sig = sr.on_tx(_swap(100, "w_a"))                         # first tx of slot 100: new wallet -> sym N -> fires mid-slot
     assert sig is not None and sig["signal_slot"] == 100 and sig["partial"] is True
     assert sig["entry_slot"] == 101 and sig["exit_slot"] == 103 and sig["hold"] == 3 and sig["sym"] == "N"
     assert sr.cur["slot"] == 100                              # slot 100 is still OPEN (partial), not yet committed
-    assert sr.on_tx(_swap(100, "w_b")) is None               # same slot -> at most one fire
-    sig2 = sr.on_tx(_swap(101, "w_c"))                        # a new slot commits 100 to history, can fire again
+    assert sr.on_tx(_swap(100, "w_b")) is None               # later txs of the slot do not re-decide
+    sig2 = sr.on_tx(_swap(101, "w_c"))                        # a new slot commits 100 to history, decides again
     assert sig2 is not None and sig2["signal_slot"] == 101
     assert sr.bank.prev_sym == "N"                            # slot 100 (buyers w_a,w_b, both new) committed as N
+
+
+def test_streaming_runner_first_tx_only_ignores_a_later_tripping_tx():
+    # first-tx-only: the decision uses N's FIRST tx. A first tx that does not trip the gate is not rescued by a
+    # later tx that would -- the whole point of deciding at slot start to land front of N+1.
+    gate = _fire_gate()                                       # fires on sym == N
+    sr = live.StreamingRunner(gate, tier="0.5", flurry_min=3)
+    assert sr.on_tx(_sell(50, "seller")) is None             # first tx is a sell -> sym S, gate (N) does not fire
+    assert sr.on_tx(_swap(50, "newbuyer")) is None           # a later new-wallet buy would make the slot N, but we decided
 
 
 def test_streaming_runner_committed_history_matches_complete_slot_pushes():

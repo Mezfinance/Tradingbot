@@ -872,6 +872,64 @@ def test_frontrun_no_throttle_drops_the_family_wise_z_guard():
         fl.USE_VQ = saved
 
 
+def test_mid_slot_bank_scores_the_first_tx_partial_with_prior_complete_history():
+    # the MID_SLOT re-fit decides DURING a slot on its FIRST tx. A slot whose first tx is a SELL has the during-N
+    # partial symbol 'S', even though the COMPLETE slot (sell then buy) would classify differently -- and the record
+    # must match what the live StreamingRunner's SlotBank computes (commit the prior complete slot, peek the first tx).
+    from tradingbot import frontrun_live as live
+    saved = (fl.USE_VQ, fl.DROP_ARTIFACTS, fl.CAUSAL_WALLET)
+    try:
+        fl.USE_VQ = False; fl.DROP_ARTIFACTS = False; fl.CAUSAL_WALLET = True
+        txs = [                                           # [sec, slot, payer, tokΔ, solΔ, tok_after, sol_after]
+            [0.0, 0, "a", -10.0, 1.0, 100.0, 10.0],       # slot 0: a new-wallet buy -> complete sym N
+            [0.4, 1, "x", 10.0, -1.0, 110.0, 9.0],        # slot 1 FIRST tx: a SELL -> during-N partial sym S
+            [0.5, 1, "b", -10.0, 1.0, 100.0, 11.0],       # slot 1 second tx: a buy (complete slot 1 = 1 buy, 1 sell)
+            [0.8, 2, "c", -10.0, 1.0, 50.0, 30.0],        # slot 2: a buy, price jumps -> an up-move (target for slot 1)
+        ]
+        rec = {"txs": txs}
+        tgt = fl._tgt("price", 3, 1, 50.0)
+        recs = fl._mid_slot_bank(rec, 100.0, tgt)
+        flow = fl.slot_flow(rec, "full")
+        assert flow is not None and len(recs) == len(flow["slots"])    # one record per complete slot, aligned
+        i0 = next(i for i, s in enumerate(flow["slots"]) if s["slot"] == 0)
+        i1 = next(i for i, s in enumerate(flow["slots"]) if s["slot"] == 1)
+        assert recs[i0]["sym"] == "N"                                  # slot 0: new wallet
+        assert recs[i1]["sym"] == "S"                                  # slot 1 FIRST tx is a sell -> partial S (not the complete slot)
+        assert recs[i1]["m2"] == recs[i0]["sym"] + "S"                 # m2 = prior COMPLETE symbol + the partial symbol
+        assert recs[i1]["target"] == 1.0                               # slot 2's up-move follows slot 1
+        # parity with the live serve path: commit slot 0 complete, peek slot 1's first-tx partial
+        bank = live.SlotBank(flurry_min=3)
+        bank.push(flow["slots"][i0])
+        partial = {"slot": 1, "n_buys": 0, "buy_sol": 0.0, "max_buy": 0.0, "n_sells": 1, "sell_sol": 1.0,
+                   "buyers": [], "price": 9.0 / 110.0, "net_sol": -1.0}
+        peek = bank.peek(partial)
+        assert peek["sym"] == recs[i1]["sym"] and peek["m2"] == recs[i1]["m2"]
+        for k in peek["f"]:
+            assert abs(peek["f"][k] - recs[i1]["f"][k]) < 1e-9, k
+    finally:
+        fl.USE_VQ, fl.DROP_ARTIFACTS, fl.CAUSAL_WALLET = saved
+
+
+def test_frontrun_mid_slot_fits_the_precursor_and_stamps_the_gate():
+    # MID_SLOT re-fit end to end: the frontrun pipeline, deciding on each slot's first tx, still discovers the
+    # new-wallet precursor on the planted data (one tx per slot -> the first-tx partial == the complete slot), and
+    # export_gate stamps mid_slot so the box serves it with StreamingRunner (first-tx-only).
+    saved = (fl.USE_VQ, fl.MID_SLOT)
+    try:
+        fl.USE_VQ, fl.MID_SLOT = False, True
+        metas = [{"pool": "P%d" % i, "token_mint": "M%d" % i, "create_ts": float(i)} for i in range(6)]
+        have = {"P%d" % i: _cre_front(i) for i in range(6)}
+        out = fl.frontrun(have, metas, move=0.30, cost=0.01)
+        assert out["mid_slot"] is True
+        surv = [s["rule"] for L in out["leads"] for s in out["survivors"][L]]
+        assert any("sym == N" in r for r in surv)                     # the new-wallet precursor survives the holdout
+        spec = fl.export_gate(out, hold=2)
+        assert spec is not None and spec["mid_slot"] is True
+        assert "FIRST tx" in spec["entry"]
+    finally:
+        fl.USE_VQ, fl.MID_SLOT = saved
+
+
 def test_logit_fit_recovers_a_positive_coefficient_with_finite_se():
     rng = fl.np.random.default_rng(0)
     n = 2000

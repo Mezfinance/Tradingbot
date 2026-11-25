@@ -139,21 +139,21 @@ class Runner:
 
 
 class StreamingRunner:
-    """Score the gate on the STREAMING current slot -- after each transaction, not only once the slot closes.
+    """Score the gate on slot N's FIRST streamed transaction -- the earliest DURING-N decision, so a buy can be sent
+    to land at the FRONT of N+1.
 
     A complete slot is only knowable after the NEXT slot starts (that is what "complete" means), so a complete-slot
-    decision (Runner.on_slot) can never be sent before N+1 begins -- it tops out at front-of-N+2. To land at the
-    FRONT of N+1 we must decide DURING N, on the slot as its transactions arrive. This runner keeps the prior slots
-    committed to the bank as COMPLETE (a tx in a new slot proves the old one closed) and the current slot PARTIAL;
-    after each swap it peeks (non-mutating) the gate on [prior complete history] + [current partial] and fires on
-    the first tx whose partial trips the gate (at most once per slot).
+    decision (Runner.on_slot) can never be sent before N+1 begins -- it tops out at front-of-N+2 (feed-lag 2-3 in
+    practice). To land front-of-N+1 we must decide DURING N. This runner keeps the prior slots committed to the bank
+    as COMPLETE (a tx in a new slot proves the old one closed) and scores the gate on the PARTIAL current slot at its
+    FIRST tx -- [prior complete history] + [N's first tx]. It decides once per slot, on that first tx (later txs of
+    the slot only accumulate, for when the slot is committed as history).
 
-    IMPORTANT -- this is the serve MECHANISM, not a validated signal yet. The exported gate is fit on the COMPLETE
-    slot's symbol/motif (Runner), so scoring a PARTIAL current slot here is train/serve skew: the current slot's
-    symbol is provisional until it closes (a '.' dead slot or a final 'S'/'F' is unknowable mid-stream), and any
-    predictor on the current slot can flip as more txs land. The gate must be RE-FIT to this mid-slot decision
-    point (flurry_study, decision = first partial that trips) before a fire here means money. Until then, run it in
-    MEASURE mode (how early, and on what partial, would the current gate fire) to size the re-fit.
+    This serves the MID_SLOT re-fit gate (flurry_study --frontrun --mid-slot): that gate is fit on exactly this
+    record -- the first-tx partial + completed prior slots, predicting N+1 -- using the SAME SlotBank peek/push code,
+    so the gate fires on the same partials live as in the backtest (train == serve). A gate fit the OLD way (on the
+    COMPLETE slot, flurry_study without --mid-slot) must be served by Runner, not this runner: scoring a partial with
+    a complete-slot gate is train/serve skew (the current slot's symbol is provisional at its first tx).
 
     Feed raw swaps (helius_feature_ws.swap_from_tx shape: slot, payer, tok_delta, sol_delta, tok_after, sol_after),
     NOT FullSlotAggregator output -- this runner owns its own bank and commits slots itself from the tx stream, so
@@ -166,7 +166,6 @@ class StreamingRunner:
         self.hold = int(gate.get("hold", 2))
         self.bank = SlotBank(flurry_min)
         self.cur: dict | None = None        # the current slot's running partial aggregate
-        self.fired_slot = None
 
     @staticmethod
     def _blank(slot: int) -> dict:
@@ -195,19 +194,24 @@ class StreamingRunner:
         return agg
 
     def on_tx(self, swap: dict):
-        """One streamed swap. Commits the prior slot to history when a new slot's first tx arrives, accumulates the
-        current slot, and returns a FireSignal when the growing partial first trips the gate (else None)."""
+        """One streamed swap. Commits the prior slot to history when a new slot's first tx arrives, then DECIDES on
+        that first tx (the earliest during-N point): scores the gate on [prior complete history] + [N's first tx]
+        and returns a FireSignal if it trips. Later txs of the same slot only accumulate (no decision), so the gate
+        fires at most once per slot, at its start."""
         slot = swap["slot"]
+        first = False
         if self.cur is not None and slot != self.cur["slot"]:
             self.bank.push(self._priced(self.cur))          # the prior slot is complete now -> commit to history
             self.cur = None
         if self.cur is None:
             self.cur = self._blank(slot)
+            first = True                                    # this is slot N's first tx -> the decision point
         self._add(swap)
-        rec = self.bank.peek(self._priced(self.cur))        # gate on prior-complete history + this partial slot
-        if self.fired_slot == slot or not precursor_gate.fires(rec, self.gate, self.tier):
+        if not first:
+            return None                                     # decide only on the first tx (front of N+1 from slot start)
+        rec = self.bank.peek(self._priced(self.cur))        # gate on prior-complete history + N's first-tx partial
+        if not precursor_gate.fires(rec, self.gate, self.tier):
             return None
-        self.fired_slot = slot
         return {"signal_slot": slot, "entry_slot": slot + 1, "exit_slot": slot + self.hold,
                 "hold": self.hold, "tier": self.tier, "eta": precursor_gate.eta(rec, self.gate),
                 "sym": rec["sym"], "m2": rec["m2"], "partial": True}
