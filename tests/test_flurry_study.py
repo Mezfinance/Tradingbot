@@ -76,6 +76,25 @@ def test_scalp_is_positive_on_continuation_flat_on_quiet_and_minus_100_on_a_pull
     assert fl._scalp(pslots, pflow["pull_slot"], pi, 1, 0.01) == -1.0   # pull inside the hold = trapped
 
 
+def test_scalp_entry_offset_shifts_the_fill_to_front_of_n_plus_k():
+    # move lands at slot 13: flat 1.0 through slot 12, then 2.0
+    slots = [{"slot": s, "price": p} for s, p in
+             ((10, 1.0), (11, 1.0), (12, 1.0), (13, 2.0), (14, 2.0))]
+    # N = slots[0] (slot 10), hold 1, no cost
+    assert fl._scalp(slots, None, 0, 1, 0.0, entry_offset=1) == 0.0        # front N+1 (enter@10 1.0 -> exit@11 1.0)
+    assert abs(fl._scalp(slots, None, 0, 1, 0.0, entry_offset=3) - 1.0) < 1e-9  # front N+3 (enter@12 1.0 -> exit@13 2.0): catches it
+    assert fl._scalp(slots, None, 0, 1, 0.0, entry_offset=4) == 0.0        # front N+4 (enter@13 2.0 -> exit@14 2.0): bought the top
+    assert fl._scalp(slots, None, 0, 1, 0.0) == fl._scalp(slots, None, 0, 1, 0.0, entry_offset=1)  # default == N+1
+
+
+def test_scalp_entry_offset_pull_trap_anchors_at_the_decision_slot():
+    slots = [{"slot": s, "price": 1.0} for s in range(10, 15)]
+    # pull at slot 12 is between the decision (N=10) and the exit of a front-N+3 entry (exit slot 13) -> trapped
+    assert fl._scalp(slots, 12, 0, 1, 0.0, entry_offset=3) == -1.0
+    # a pull well after the exit window does not trap
+    assert fl._scalp(slots, 20, 0, 1, 0.0, entry_offset=3) == 0.0
+
+
 def _run(monkeypatch, rec, n=80):
     from tradingbot import pool_tracker as pt
     pools = {f"P{i}": {"create_ts": 1.0, "token_mint": "M"} for i in range(n)}
@@ -849,6 +868,15 @@ def test_frontrun_finds_the_precursor_and_it_pays():
         pre = out["logit_precursor"]                                 # the precursor-only (front-run) logit excludes move rules
         assert not any(fl._is_move_rule(p["name"]) for p in pre["predictors"][1:])
         assert "rows" in out["logit_gate_precursor"]
+        sweep = out["gate_offset_sweep"]                            # the landing-offset sweep is wired for N+1..N+4
+        assert set(sweep) == set(fl.FRONT_ENTRY_OFFSETS)
+        assert all("rows" in sweep[o] and "control" in sweep[o] for o in sweep)
+        # offset 1 reproduces the front-of-N+1 precursor gate (same decision, same fill)
+        assert [r["n"] for r in sweep[1]["rows"]] == [r["n"] for r in out["logit_gate_precursor"]["rows"]]
+        # a later landing actually shifts the fill: some offset's control mean differs from N+1's
+        c1 = {h: sweep[1]["control"][h].get("mean") for h in fl.FRONT_HOLDS if sweep[1]["control"].get(h, {}).get("n")}
+        assert c1 and any(sweep[o]["control"].get(h, {}).get("mean") != c1.get(h)
+                          for o in (2, 3, 4) for h in c1)
         assert fl.render_frontrun(out)
     finally:
         fl.USE_VQ = saved

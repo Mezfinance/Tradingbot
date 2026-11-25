@@ -278,17 +278,23 @@ RET_CAP = 3.0   # +300%, as every other pumpswap study: bounds reserve-ratio spi
 #               # ~0 tokens for one tx, exploding sol_after/tok_after) so a single artifact can't swamp the mean
 
 
-def _scalp(slots: list[dict], pull_slot, s_idx: int, hold: int, cost: float) -> float | None:
-    """Return of buying at the end of flurry slot `slots[s_idx]` (front of the next slot) and selling `hold`
-    slots later: exit/entry - 1 - cost, capped to [-1.0, +RET_CAP], or -1.0 if a pull lands in (s, s+hold].
-    None if no exit price."""
+def _scalp(slots: list[dict], pull_slot, s_idx: int, hold: int, cost: float, entry_offset: int = 1) -> float | None:
+    """Return of entering at the FRONT of slot N+entry_offset (N = slots[s_idx]) and selling `hold` slots later:
+    exit/entry - 1 - cost, capped to [-1.0, +RET_CAP], or -1.0 if a pull lands in (N, entry_slot+hold]. None if
+    no entry/exit price.
+
+    entry_offset = 1 (default) = front of N+1, immediately after the signal slot (the aspirational fill). An
+    offset > 1 models landing LATE because feed-lag means we cannot reliably fill N+1: we still DECIDE on the
+    complete slot N but our buy lands at the front of N+2 / N+3 / N+4, so the entry/exit prices shift forward
+    while the pull-trap window stays anchored at the decision slot N (committed from the decision onward)."""
     s0 = slots[s_idx]["slot"]
-    entry = slots[s_idx]["price"]
+    e_slot = s0 + entry_offset - 1                        # front of N+entry_offset = end of slot N+entry_offset-1
+    entry = _price_at(slots, e_slot)
     if not entry:
         return None
-    if pull_slot is not None and s0 < pull_slot <= s0 + hold:
-        return -1.0                                       # trapped: the LP was pulled inside our hold
-    exit_price = _price_at(slots, s0 + hold)
+    if pull_slot is not None and s0 < pull_slot <= e_slot + hold:
+        return -1.0                                       # trapped: the LP was pulled before we exit
+    exit_price = _price_at(slots, e_slot + hold)
     if not exit_price:
         return None
     return max(-1.0, min(exit_price / entry - 1.0 - cost, RET_CAP))
@@ -1628,16 +1634,17 @@ def abs_move_sweep(have: dict, metas: list[dict], tgt: dict, cost: float,
     return out
 
 
-def _raw_scalp(slots: list[dict], pull_slot, s_idx: int, hold: int, cost: float):
+def _raw_scalp(slots: list[dict], pull_slot, s_idx: int, hold: int, cost: float, entry_offset: int = 1):
     """(raw, capped) return of the same scalp as _scalp, so the tail report can see whether the capped
     mean rests on a few uncapped reserve-ratio spikes. raw has no +RET_CAP ceiling (pulls are still -1.0)."""
     s0 = slots[s_idx]["slot"]
-    entry = slots[s_idx]["price"]
+    e_slot = s0 + entry_offset - 1
+    entry = _price_at(slots, e_slot)
     if not entry:
         return None
-    if pull_slot is not None and s0 < pull_slot <= s0 + hold:
+    if pull_slot is not None and s0 < pull_slot <= e_slot + hold:
         return (-1.0, -1.0)
-    exit_price = _price_at(slots, s0 + hold)
+    exit_price = _price_at(slots, e_slot + hold)
     if not exit_price:
         return None
     raw = exit_price / entry - 1.0 - cost
@@ -2749,6 +2756,10 @@ FRONT_K = (1, 2, 3)         # ceiling: enter at the close of slot T-k. Prices ar
 #   the move = a backrun), so it is deliberately not here.
 FRONT_J = (1, 2, 3, 4)      # ceiling: exit this many slots AFTER T (the spec trade window: exit 1-4 after the move)
 FRONT_ENTRY_LEAD = 3        # the deployed enter-on-signal window: an up-move within this many slots ahead
+FRONT_ENTRY_OFFSETS = (1, 2, 3, 4)  # front of N+k the buy LANDS at: 1 = aspirational N+1; 2/3/4 = the realistic
+#                                     late fills we must accept (feed-lag means N+1 is usually unfillable). We still
+#                                     DECIDE on the complete slot N (precursor gate, no abs_move); the sweep asks
+#                                     which landing slot still has a predictable move ahead of it = best mean.
 FRONT_HOLDS = (2, 3, 4, 5, 6)  # enter-on-signal holds (raw slots from entry): entry is front of N+1 and the move
 #   lands within the lead, so holds 2-6 span ~T+1..T+4 across the window (the spec's "exit 1-4 after the move")
 FRONT_CONTROL = 60          # random active slots per pool for the enter-on-signal control
@@ -2922,7 +2933,7 @@ def _forced_precursors(specfn, already):
     return out
 
 
-def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS):
+def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS, entry_offset=1):
     """The decisive precision test: score every HOLDOUT slot with the fitted joint logit (out of sample -- it was
     fit on train), then enter-on-signal only when that score is in its top k%. A single rule fires too broadly
     (16k fires for ~700 moves -> -1% median); the joint gate at a high threshold fires on far fewer, far cleaner
@@ -2958,7 +2969,7 @@ def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS):
                     continue
                 n_fire += 1
                 for h in holds:
-                    v = _scalp(slots, pull, ci, h, cost)
+                    v = _scalp(slots, pull, ci, h, cost, entry_offset)
                     if v is not None:
                         rr[h].append(v)
         rows.append({"pct": pct, "n": n_fire, "thr": thr, "holds": {h: _agg(v) for h, v in rr.items()}})
@@ -2972,7 +2983,7 @@ def _front_logit_gate(ho, pool_flows, specfn, lg, cost, holds=FRONT_HOLDS):
         slots, pull = flow["slots"], flow["pull_slot"]
         for idx in rng.sample(range(len(slots) - 1), min(FRONT_CONTROL, len(slots) - 1)):
             for h in holds:
-                v = _scalp(slots, pull, idx, h, cost)
+                v = _scalp(slots, pull, idx, h, cost, entry_offset)
                 if v is not None:
                     ctrl[h].append(v)
     return {"rows": rows, "control": {h: _agg(v) for h, v in ctrl.items()}}
@@ -3261,6 +3272,12 @@ def _frontrun(have, metas, move, cost, leads, seed, flurry_min, vis="full", incl
     out["forced_precursors"] = [r for r in pre_rules if r not in {s["rule"] for s in survivors.get(lead_net, [])}]
     out["logit_precursor"] = _front_logit(tr, ho, specfn, pre_rules, lead_net)
     out["logit_gate_precursor"] = _front_logit_gate(ho, pool_flows, specfn, out["logit_precursor"], cost)
+    # ENTRY-OFFSET SWEEP: the same precursor gate, scored on slot N, but the buy LANDS at front of N+k (k in
+    # FRONT_ENTRY_OFFSETS). Decision is identical across offsets; only the entry/exit prices shift forward. Answers
+    # "given we can't fill N+1, which landing slot still has a predictable move ahead of it" -- read the best mean.
+    out["gate_offset_sweep"] = {
+        off: _front_logit_gate(ho, pool_flows, specfn, out["logit_precursor"], cost, entry_offset=off)
+        for off in FRONT_ENTRY_OFFSETS}
     if tail:                                                 # broad-vs-spikes concentration of the precursor gate cells
         out["gate_tail"] = front_gate_tail(ho, pool_flows, specfn, out["logit_precursor"], cost)
     return out
@@ -3468,6 +3485,46 @@ def render_frontrun(out):
 
     backrun_edge = gate_block(out.get("logit_gate"), "LOGIT-GATE ENTER-ON-SIGNAL (all predictors)", False)
     gate_block(out.get("logit_gate_precursor"), "FRONT-RUN GATE (precursors only)", True, backrun=backrun_edge)
+
+    sweep = out.get("gate_offset_sweep")
+    if sweep:
+        MIN_CELL = 50
+        L.append("")
+        L.append("  ENTRY-OFFSET SWEEP (precursor gate; decide on COMPLETE slot N, the buy LANDS front of N+k) -- feed-lag")
+        L.append("  means N+1 is usually unfillable, so which landing slot still has a predictable move ahead? Best (top-k%,")
+        L.append("  hold) cell per landing offset vs its OWN offset-matched random control.")
+        L.append("  %-6s %10s %7s %9s %9s %6s %6s %10s %9s" %
+                 ("land", "cut/hold", "n", "mean", "median", "win%", "rug%", "ctrl mean", "edge pts"))
+        best_by_off = {}
+        for off in sorted(sweep):
+            g = sweep[off] or {}
+            ctrl = g.get("control") or {}
+            best = None
+            for row in g.get("rows") or []:
+                for h, a in (row.get("holds") or {}).items():
+                    if a.get("n", 0) < MIN_CELL:
+                        continue
+                    cm = (ctrl.get(h) or {}).get("mean")
+                    edge = (a["mean"] - cm) if cm is not None else a["mean"]
+                    if best is None or edge > best["edge"]:
+                        best = {"pct": row["pct"], "h": h, "a": a, "cm": cm, "edge": edge}
+            best_by_off[off] = best
+            if best is None:
+                L.append("  N+%-4d %10s  (no cell with n >= %d)" % (off, "--", MIN_CELL))
+                continue
+            a, cm = best["a"], best["cm"]
+            L.append("  N+%-4d top %4g h%-2d %7d %+8.1f%% %+8.1f%% %5.0f%% %5.0f%% %+9.1f%% %+9.1f" % (
+                off, 100 - best["pct"], best["h"], a["n"], a["mean"] * 100, a["median"] * 100,
+                a["win_pct"], a["rugged_pct"], (cm * 100 if cm is not None else 0.0), best["edge"] * 100))
+        cand = [(o, b) for o, b in best_by_off.items() if b and b["a"]["mean"] > 0 and b["edge"] > 0]
+        if cand:
+            o, b = max(cand, key=lambda ob: ob[1]["a"]["mean"])
+            L.append("  => BEST LANDING N+%d: top %g%% / hold %d, mean %+.1f%% (%+.1f pts over its control) -- the realistic "
+                     "entry to validate live with a reactive NET probe" % (
+                         o, 100 - b["pct"], b["h"], b["a"]["mean"] * 100, b["edge"] * 100))
+        else:
+            L.append("  => NO LANDING SLOT beats its control on a positive mean -- the precursor does not lead the move at "
+                     "any reachable entry (N+2/N+3/N+4); the front-run has no edge we can fill")
 
     gt = out.get("gate_tail")
     if gt:
