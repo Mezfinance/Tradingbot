@@ -109,6 +109,11 @@ def apply_rule(rule: dict, data: bytes, accounts, account_keys) -> Optional[str]
         if ai < 0 or ai >= len(account_keys):
             return None
         return rule["wsol_is"] if account_keys[ai] == WSOL else rule["other"]
+    if kind == "byte_flag":                                        # a side/swap_base_in arg past the discriminator
+        o = int(rule["offset"])
+        if o < 0 or o >= len(data):
+            return None
+        return rule["map"].get("%02x" % data[o])                  # unseen byte value -> None (abstain)
     return None
 
 
@@ -207,6 +212,68 @@ def fetch_label(helius, sig: str, pool: str) -> Optional[str]:
     return label_from_tx(res, pool)
 
 
+def _routed_sample(tx: dict) -> Optional[dict]:
+    """From a getTransactionsForAddress(PUMPSWAP) tx: a labeled ROUTER sample when the pumpswap swap is an
+    inner CPI under a non-pumpswap top-level instruction (a ROUTED swap). None for a direct swap (pumpswap is
+    top-level) or a non-swap. The router's top-level instruction is the shred-visible view (for fitting); the
+    inner pumpswap CPI is the TRUE label -- both from the one tx, naturally balanced and recent."""
+    meta = (tx or {}).get("meta") or {}
+    top = (((tx or {}).get("transaction") or {}).get("message") or {}).get("instructions") or []
+    for grp in meta.get("innerInstructions") or []:
+        idx = grp.get("index")
+        if idx is None or idx >= len(top):
+            continue
+        for ins in grp.get("instructions") or []:
+            if ins.get("programId") != PUMPSWAP:
+                continue
+            accts = ins.get("accounts") or []
+            data = _b58decode(ins.get("data") or "")
+            if len(accts) < 5 or len(data) < 8:
+                continue
+            d = _dir_from_pumpswap(data[:8], accts[3], accts[4])
+            if not d:
+                continue
+            rix = top[idx]
+            router = rix.get("programId")
+            if router == PUMPSWAP:                                # pumpswap was itself top-level = direct, skip
+                return None
+            rdata = _b58decode(rix.get("data") or "")
+            raccts = list(rix.get("accounts") or [])
+            if not rdata or not raccts:
+                return None
+            return {"router": router, "sig": _sig_of(tx), "pool": None, "payer": raccts[0],
+                    "data": rdata, "accounts": list(range(len(raccts))), "keys": raccts, "dir": d}
+    return None
+
+
+def fetch_pumpswap_routed(helius, max_pages: int = 6, per_page: int = 1000) -> list:
+    """Recent routed pumpswap swaps, bucketed by their top-level router, straight from the pumpswap program.
+    One desc-paginated getTransactionsForAddress(PUMPSWAP) sweep is a recent, balanced, volume-weighted sample
+    of every router in proportion to its real pumpswap activity: the biggest routers saturate in the first
+    pages, the tail stays thin (and the tail is buyer_plus anyway). Far better than one fetch per router --
+    no genesis-window bias (the sortOrder=asc trap that starved the two biggest routers to 1 sample) and the
+    buy/sell split is natural, not a one-sided slice. ~10 credits per 100 txs."""
+    out: list = []
+    token = None
+    for _ in range(max_pages):
+        opts = {"transactionDetails": "full", "sortOrder": "desc", "limit": per_page,
+                "maxSupportedTransactionVersion": 1, "encoding": "jsonParsed"}
+        if token:
+            opts["paginationToken"] = token
+        res = helius._rpc("getTransactionsForAddress", [PUMPSWAP, opts], max(10, 10 * per_page // 100))
+        if not isinstance(res, dict):
+            break
+        page = res.get("data") or []
+        for tx in page:
+            s = _routed_sample(tx)
+            if s:
+                out.append(s)
+        token = res.get("paginationToken")
+        if not page or not token:
+            break
+    return out
+
+
 # --- reverse-engineering: fit a direction rule to labeled router samples (held-out precision) -------------
 
 def _disc_rule(train) -> Optional[dict]:
@@ -246,6 +313,27 @@ def _wsol_rule(train) -> Optional[dict]:
     return None
 
 
+def _byte_flag_rule(train) -> Optional[dict]:
+    """A single data byte past the 8-byte discriminator whose value separates direction cleanly -- an Anchor
+    `side`/`swap_base_in`/enum arg the disc rule (first 8 bytes only) misses. The holdout precision guard in
+    find_rule rejects a spurious split (e.g. a byte of the amount)."""
+    min_len = min((len(s["data"]) for s in train), default=0)
+    for o in range(8, min_len):
+        m: dict = {}                                              # byte value -> direction
+        ok = True
+        for s in train:
+            v = s["data"][o]
+            prev = m.get(v)
+            if prev is None:
+                m[v] = s["dir"]
+            elif prev != s["dir"]:
+                ok = False
+                break
+        if ok and len(m) >= 2:                                    # both directions seen at distinct byte values
+            return {"kind": "byte_flag", "offset": o, "map": {("%02x" % k): v for k, v in m.items()}}
+    return None
+
+
 def _score(rule: dict, test) -> tuple[int, int, int]:
     """(correct, fired, n): how often the rule fires on held-out, and how often it is right when it fires."""
     correct = fired = 0
@@ -275,7 +363,7 @@ def find_rule(labeled, seed: int = 0) -> dict:
     train = [labeled[i] for i in order[:cut]]
     test = [labeled[i] for i in order[cut:]] or train            # tiny n: score on train (precision still guards)
     best = None
-    for fit in (_disc_rule, _wsol_rule):
+    for fit in (_disc_rule, _wsol_rule, _byte_flag_rule):         # structural rules first, byte search last
         rule = fit(train)
         if rule is None:
             continue

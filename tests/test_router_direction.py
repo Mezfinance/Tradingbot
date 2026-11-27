@@ -74,6 +74,69 @@ def test_find_rule_accepts_a_wsol_index_split():
     assert r["accepted"] and r["kind"] == "wsol_index"
 
 
+def test_apply_byte_flag_rule():
+    rule = {"kind": "byte_flag", "offset": 8, "map": {"00": "buy", "01": "sell"}}
+    assert rd.apply_rule(rule, b"\xaa" * 8 + b"\x00", [], []) == "buy"
+    assert rd.apply_rule(rule, b"\xaa" * 8 + b"\x01", [], []) == "sell"
+    assert rd.apply_rule(rule, b"\xaa" * 8 + b"\x02", [], []) is None   # unseen flag value -> abstain
+    assert rd.apply_rule(rule, b"\xaa" * 8, [], []) is None             # offset past the data -> abstain
+
+
+def test_find_rule_accepts_a_byte_flag_split():
+    # same 8-byte discriminator for both directions; the side is byte[8] -- the disc rule can't see it
+    out = []
+    for i in range(20):
+        d = "buy" if i % 2 == 0 else "sell"
+        flag = b"\x00" if d == "buy" else b"\x01"
+        out.append({"data": b"\x09" * 8 + flag + bytes(7), "accounts": [0], "keys": ["X"], "dir": d})
+    r = rd.find_rule(out, seed=7)
+    assert r["accepted"] and r["kind"] == "byte_flag" and r["rule"]["offset"] == 8 and r["precision"] == 1.0
+
+
+def _pumpswap_routed_tx(router, disc, base, quote, sig="S", router_accts=("U", "SRC", "DST")):
+    # a getTransactionsForAddress(PUMPSWAP) tx: top-level router ix at index 1, inner pumpswap CPI under it
+    return {"transaction": {"signatures": [sig], "message": {"instructions": [
+        {"programId": "ComputeBudget111111111111111111111111111111", "accounts": [], "data": "11"},
+        {"programId": router, "accounts": list(router_accts), "data": _b58encode(b"\xab" * 8 + b"\x01")}]}},
+        "meta": {"innerInstructions": [{"index": 1, "instructions": [
+            {"programId": PUMPSWAP, "accounts": ["POOL", "x", "x", base, quote, "y"],
+             "data": _b58encode(disc + bytes(16))}]}]}}
+
+
+def test_routed_sample_labels_a_routed_swap_and_skips_a_direct_one():
+    s = rd._routed_sample(_pumpswap_routed_tx(BOT, BUY_EXACT_QUOTE_IN, "TOKEN", WSOL))
+    assert s and s["router"] == BOT and s["dir"] == "buy" and s["payer"] == "U"
+    assert s["keys"] == ["U", "SRC", "DST"] and s["accounts"] == [0, 1, 2]
+    # a direct swap: pumpswap is itself the top-level program -> not routed -> None
+    direct = {"transaction": {"signatures": ["D"], "message": {"instructions": [
+        {"programId": PUMPSWAP, "accounts": ["POOL"], "data": "11"}]}},
+        "meta": {"innerInstructions": [{"index": 0, "instructions": [
+            {"programId": PUMPSWAP, "accounts": ["POOL", "x", "x", "TOKEN", WSOL, "y"],
+             "data": _b58encode(SELL + bytes(16))}]}]}}
+    assert rd._routed_sample(direct) is None
+
+
+class _FakeRpc:
+    def __init__(self, pages):
+        self._pages = pages
+        self.credits_used = 0
+
+    def _rpc(self, method, params, credits):
+        self.credits_used += credits
+        return self._pages.pop(0) if self._pages else None
+
+
+def test_fetch_pumpswap_routed_buckets_by_router_over_pages():
+    p1 = {"data": [_pumpswap_routed_tx(BOT, BUY_EXACT_QUOTE_IN, "TOKEN", WSOL, sig="a"),
+                   _pumpswap_routed_tx(JUP, SELL, "TOKEN", WSOL, sig="b")], "paginationToken": "t"}
+    p2 = {"data": [_pumpswap_routed_tx(BOT, SELL, "TOKEN", WSOL, sig="c")], "paginationToken": None}
+    rpc = _FakeRpc([p1, p2])
+    out = rd.fetch_pumpswap_routed(rpc, max_pages=6, per_page=1000)
+    assert len(out) == 3 and rpc.credits_used > 0
+    assert {s["router"] for s in out} == {BOT, JUP}
+    assert {s["dir"] for s in out if s["router"] == BOT} == {"buy", "sell"}   # balanced, both directions
+
+
 def test_find_rule_rejects_an_unseparable_router():
     # same discriminator and no WSOL-position signal -> no rule, not accepted
     out = [{"data": b"\x07" * 8, "accounts": [0], "keys": ["X"], "dir": ("buy" if i % 2 else "sell")}

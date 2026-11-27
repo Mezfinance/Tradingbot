@@ -233,6 +233,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--routers", type=str, default=None, help="router-direction: fetch labeled samples from Helius for these router program ids (comma-separated, or 'pins' for the built-in top-20). One getTransactionsForAddress per router gives the top-level router ix + the inner pumpswap CPI (true direction) -- no box capture needed")
     parser.add_argument("--routers-file", type=str, default=None, help="router-direction: a JSON {program_id: routed-tx count} (the box's full cpi_routers dump) -- fetch+fit EVERY router (highest volume first, budget-capped) and report volume-weighted coverage of the routed flow")
     parser.add_argument("--per-router", type=int, default=200, help="router-direction fetch: transactions to read per router (Helius caps getTransactionsForAddress at 1000; ~20 credits per router at 200)")
+    parser.add_argument("--from-pumpswap", action="store_true", help="router-direction: sample from the pumpswap side (one desc sweep of the pumpswap program, bucketed by top-level router) instead of one fetch per router -- recent, balanced, no genesis-window bias. Use --routers-file for the coverage denominator")
     parser.add_argument("--fires", type=str, default=None, help="frontrun-verify: JSON/JSONL of box fires {pool, slot, token_mint?, sym?, m2?, eta?} or a raw box log to grep for 'GATE FIRE' lines")
     parser.add_argument("--pairs", type=str, default=None, help="frontrun-verify: box fires by hand as 'pool:slot[:mint],pool:slot'")
     parser.add_argument("--gate", type=str, default=None, help="frontrun-verify: the exported gate JSON (flurry-study --export-gate)")
@@ -945,32 +946,39 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot import router_direction as _rd
         import httpx as _rd_httpx
         from tradingbot.data.helius import Helius as _RdHelius
-        if args.routers or args.routers_file:   # fetch mode: labeled samples straight from Helius, no box capture
+        if args.from_pumpswap or args.routers or args.routers_file:   # fetch mode: labeled samples from Helius
             _counts = None
-            if args.routers_file:
+            if args.routers_file:                                 # the box's routed-volume tally = coverage denominator
                 with open(args.routers_file) as f:
                     _counts = {str(k): int(v) for k, v in json.load(f).items()}
-                _progs = sorted(_counts, key=lambda p: -_counts[p])      # highest routed volume first
-            elif args.routers == "pins":
-                _progs = sorted(_rd.PIN_TARGETS)
-            else:
-                _progs = [p.strip() for p in args.routers.split(",") if p.strip()]
             _h = _RdHelius(client=_rd_httpx.Client(timeout=60))   # research (backup) key, never the live key
             _h.min_interval_s = 1 / max(args.rps, 0.1)
-            _per = max(1, min(1000, int(args.per_router)))
             _cap = int(args.max_credits or 50_000)
-            _rd_samples, _fetched = [], 0
-            for _prog in _progs:
-                if _h.credits_used >= _cap:
-                    print(f"credit cap {_cap} reached after {_fetched}/{len(_progs)} routers", file=sys.stderr)
-                    break
-                _got = _rd.fetch_router_samples(_h, _prog, limit=_per)
-                _rd_samples += _got
-                _fetched += 1
-                if _fetched % 20 == 0:
-                    print(f"fetched {_fetched}/{len(_progs)} routers, {_h.credits_used} credits", file=sys.stderr, flush=True)
+            if args.from_pumpswap:                                # recent, balanced, volume-weighted: one pumpswap sweep
+                _pages = max(1, _cap // 100)                      # ~100 credits per 1000-tx page
+                _rd_samples = _rd.fetch_pumpswap_routed(_h, max_pages=_pages, per_page=1000)
+                print(f"pumpswap-side sweep: {len(_rd_samples)} routed samples over "
+                      f"{len({s['router'] for s in _rd_samples})} routers, {_h.credits_used} credits",
+                      file=sys.stderr, flush=True)
+            else:
+                if args.routers_file:
+                    _progs = sorted(_counts, key=lambda p: -_counts[p])  # highest routed volume first
+                elif args.routers == "pins":
+                    _progs = sorted(_rd.PIN_TARGETS)
+                else:
+                    _progs = [p.strip() for p in args.routers.split(",") if p.strip()]
+                _per = max(1, min(1000, int(args.per_router)))
+                _rd_samples, _fetched = [], 0
+                for _prog in _progs:
+                    if _h.credits_used >= _cap:
+                        print(f"credit cap {_cap} reached after {_fetched}/{len(_progs)} routers", file=sys.stderr)
+                        break
+                    _rd_samples += _rd.fetch_router_samples(_h, _prog, limit=_per)
+                    _fetched += 1
+                    if _fetched % 20 == 0:
+                        print(f"fetched {_fetched}/{len(_progs)} routers, {_h.credits_used} credits",
+                              file=sys.stderr, flush=True)
             _rd_out = _rd.study(_rd_samples, counts=_counts, seed=0)
-            _rd_out["fetched_routers"] = _fetched
             if args.out:
                 with open(args.out, "w") as f:
                     json.dump(_rd_out["accepted"], f, indent=2)
