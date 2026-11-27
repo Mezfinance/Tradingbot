@@ -232,6 +232,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--samples", type=str, default=None, help="router-direction: the box's router-samples JSONL ({router,sig,pool,payer,data(hex),accounts,keys})")
     parser.add_argument("--routers", type=str, default=None, help="router-direction: fetch labeled samples from Helius for these router program ids (comma-separated, or 'pins' for the built-in top-20). One getTransactionsForAddress per router gives the top-level router ix + the inner pumpswap CPI (true direction) -- no box capture needed")
     parser.add_argument("--routers-file", type=str, default=None, help="router-direction: a JSON {program_id: routed-tx count} (the box's full cpi_routers dump) -- fetch+fit EVERY router (highest volume first, budget-capped) and report volume-weighted coverage of the routed flow")
+    parser.add_argument("--per-router", type=int, default=200, help="router-direction fetch: transactions to read per router (Helius caps getTransactionsForAddress at 1000; ~20 credits per router at 200)")
     parser.add_argument("--fires", type=str, default=None, help="frontrun-verify: JSON/JSONL of box fires {pool, slot, token_mint?, sym?, m2?, eta?} or a raw box log to grep for 'GATE FIRE' lines")
     parser.add_argument("--pairs", type=str, default=None, help="frontrun-verify: box fires by hand as 'pool:slot[:mint],pool:slot'")
     parser.add_argument("--gate", type=str, default=None, help="frontrun-verify: the exported gate JSON (flurry-study --export-gate)")
@@ -956,7 +957,7 @@ def main(argv: list[str] | None = None) -> None:
                 _progs = [p.strip() for p in args.routers.split(",") if p.strip()]
             _h = _RdHelius(client=_rd_httpx.Client(timeout=60))   # research (backup) key, never the live key
             _h.min_interval_s = 1 / max(args.rps, 0.1)
-            _per = int(args.max_pools or 100)
+            _per = max(1, min(1000, int(args.per_router)))
             _cap = int(args.max_credits or 50_000)
             _rd_samples, _fetched = [], 0
             for _prog in _progs:
