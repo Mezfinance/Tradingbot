@@ -316,6 +316,69 @@ def test_cpi_drop_counter_counts_invisible_routed_swaps():
     assert c.cpi_txs == 1
 
 
+def _cpi_router_tx(verdict_prog="ROUTER", pool="POOL", payer="PAYER"):
+    # a routed tx: top-level instruction is the router's; pumpswap is only in the account list (CPI), and the
+    # pool is one of the router instruction's accounts
+    keys = [payer, verdict_prog, lc.PROGRAM, pool, "TOKENMINT", lc.WSOL]
+    ins = [(verdict_prog, [3, 4, 5], b"\x01" * 8)]           # references the pool at account index 3
+    return keys, ins
+
+
+def test_routed_recovery_off_by_default():
+    c = lc.Consumer(gate={}, runner_factory=lambda: _AlwaysFire())   # route_classify None
+    keys, ins = _cpi_router_tx()
+    c.add_pool("POOL", "TOKENMINT")
+    c.on_tx(5, keys, ins)
+    assert c.cpi_txs == 1 and "POOL" not in c.pools          # counted, but nothing recovered
+
+
+def test_routed_recovery_true_direction_and_buyer():
+    seen = {}
+    c = lc.Consumer(gate={}, runner_factory=lambda: _AlwaysFire(),
+                    route_classify=lambda prog, data, accts, keys: seen.get("v", "buy"))
+    c.add_pool("POOL", "TOKENMINT")
+    keys, ins = _cpi_router_tx()
+    seen["v"] = "buy"
+    c.on_tx(5, keys, ins)
+    st = c.pools["POOL"]
+    assert st.n_buys == 1 and st.buyers == ["PAYER"] and st.n_sells == 0
+    seen["v"] = "sell"
+    c.on_tx(5, *_cpi_router_tx(payer="W2"))                  # same slot, a routed sell
+    assert st.n_sells == 1 and st.buyers == ["PAYER"]        # seller not added as a buyer
+
+
+def test_routed_recovery_buyer_plus_counts_a_buy_and_drop_skips():
+    v = {"x": "buyer_plus"}
+    c = lc.Consumer(gate={}, runner_factory=lambda: _AlwaysFire(),
+                    route_classify=lambda *a: v["x"])
+    c.add_pool("POOL", "TOKENMINT")
+    keys, ins = _cpi_router_tx()
+    c.on_tx(5, keys, ins)
+    assert c.pools["POOL"].n_buys == 1                       # buyer_plus -> a buy
+    v["x"] = "drop"
+    c.on_tx(5, *_cpi_router_tx(payer="W3"))
+    assert c.pools["POOL"].n_buys == 1                       # drop -> nothing added
+
+
+def test_routed_recovery_needs_a_tracked_pool():
+    c = lc.Consumer(gate={}, runner_factory=lambda: _AlwaysFire(),
+                    route_classify=lambda *a: "buy")         # pool NOT added
+    keys, ins = _cpi_router_tx()
+    c.on_tx(5, keys, ins)
+    assert "POOL" not in c.pools and c.cpi_txs == 1          # unknown pool -> not recovered
+
+
+def test_add_pool_bootstraps_a_routed_first_pool_and_fires():
+    fires = []
+    c = lc.Consumer(gate={}, on_fire=fires.append, runner_factory=lambda: _AlwaysFire(),
+                    route_classify=lambda *a: "buy")
+    c.add_pool("POOL", "TOKENMINT")                          # discovered before any swap
+    keys, ins = _cpi_router_tx()
+    c.on_tx(5, keys, ins)                                    # routed buy in slot 5 (pool bootstrapped)
+    c.on_tx(6, *_cpi_router_tx(payer="W2"))                 # slot advances -> flush slot 5 -> _AlwaysFire fires
+    assert len(fires) == 1 and fires[0]["pool"] == "POOL"
+
+
 def test_router_breakdown_tallies_the_invoking_aggregator():
     # Phase 0: a dropped-CPI tx is attributed to the non-infra top-level program that carried it, so
     # router_top() sizes which aggregators a CPI-aware decoder must cover.

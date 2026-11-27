@@ -153,7 +153,7 @@ class Consumer:
                  on_fire: Optional[Callable[[dict], None]] = None, runner_factory=None,
                  fresh_window_slots: int = 0, on_capture: Optional[Callable] = None,
                  handmade_only: bool = True, on_pool: Optional[Callable] = None, reserves=None,
-                 is_armed: Optional[Callable] = None):
+                 is_armed: Optional[Callable] = None, route_classify: Optional[Callable] = None):
         self.gate = gate
         self.tier = str(tier)
         self.flurry_min = flurry_min
@@ -194,6 +194,14 @@ class Consumer:
         # (the non-infra, non-pumpswap top-level program). router_top() sizes which routers a CPI-aware
         # decoder must cover to recover the invisible swaps -- the Pareto set, not every router.
         self.cpi_routers: dict = {}
+        # Phase 2 (router-aware recovery): route_classify(program, data, accounts, account_keys) ->
+        # "buy"/"sell" (a validated top-router rule), "buyer_plus" (tail: recover the buyer, count a buy),
+        # or "drop" (denylist / a pin-target without a validated rule -> never guess direction). Built by the
+        # box from tradingbot.router_direction (kept out of this module to avoid a circular import). None =
+        # off (the decode stays direct-only, existing behaviour). known_pools (via add_pool at discovery, and
+        # every pool we decode) is the set a routed tx's accounts are intersected against to find its pool.
+        self.route_classify = route_classify
+        self.known_pools: dict = {}
 
     def _slot_rec(self, st: _PoolState) -> dict:
         # price/sol fields are 0.0: the precursor gate is price- and magnitude-free (sym/m2/m3 only).
@@ -238,6 +246,13 @@ class Consumer:
             self.on_fire(sig)
         return sig
 
+    def add_pool(self, pool: str, token: Optional[str] = None) -> None:
+        """Register a discovered pool -> its token so a routed swap on it (whose only instruction is the
+        router's, not pumpswap's) can be attributed by intersecting the tx's accounts with this set. The box
+        calls this at discovery/enroll, so a pool whose FIRST activity is routed is still caught."""
+        if pool and (token or pool not in self.known_pools):
+            self.known_pools[pool] = token
+
     def on_swap(self, slot: int, pool: str, token: Optional[str], is_buy: bool, payer) -> Optional[dict]:
         if self._start_slot is None:
             self._start_slot = slot
@@ -248,6 +263,7 @@ class Consumer:
             st = _PoolState(self._make_runner())
             st.first_slot = slot
             self.pools[pool] = st
+            self.known_pools.setdefault(pool, token)     # any pool we track is recoverable for routed swaps
             if self.on_pool:
                 self.on_pool(pool)                           # first sight -> box subscribes this pool's vaults
         fired = None
@@ -275,11 +291,38 @@ class Consumer:
             self.cpi_txs += 1
             for pid in {ins[0] for ins in instructions} - INFRA_PROGRAMS - {PROGRAM}:
                 self.cpi_routers[pid] = self.cpi_routers.get(pid, 0) + 1
+            if self.route_classify is not None:          # Phase 2: recover the routed swap (two-tier)
+                payer = fee_payer if fee_payer is not None else (account_keys[0] if account_keys else None)
+                for ins in instructions:
+                    f = self._recover_routed(slot, ins, account_keys, payer)
+                    if f:
+                        fires.append(f)
         for sw in swaps:
             f = self.on_swap(slot, sw.pool, sw.token, sw.is_buy, sw.payer)
             if f:
                 fires.append(f)
         return fires
+
+    def _recover_routed(self, slot, ins, account_keys, payer) -> Optional[dict]:
+        """One top-level router instruction of a routed tx -> an on_swap, when route_classify gives a
+        direction (or buyer_plus) AND one of this instruction's accounts is a tracked pool. "drop"
+        (denylist / unpinned pin-target / an abstaining rule) -> nothing, never a guessed direction."""
+        program_id, accts, data = ins
+        if program_id == PROGRAM or program_id in INFRA_PROGRAMS:
+            return None
+        verdict = self.route_classify(program_id, data, accts, account_keys)
+        if verdict not in ("buy", "sell", "buyer_plus"):
+            return None                                      # "drop" / unknown -> skip (conservative)
+        pool = token = None
+        for a in accts:                                      # the pumpswap pool is passed to the CPI, so it is
+            if 0 <= a < len(account_keys):                   # among this router instruction's own accounts
+                k = account_keys[a]
+                if k in self.known_pools:
+                    pool, token = k, self.known_pools[k]
+                    break
+        if pool is None:
+            return None                                      # pool not tracked (not discovered / not ours)
+        return self.on_swap(slot, pool, token, verdict != "sell", payer)
 
     def router_top(self, n: int = 5):
         """Top aggregator programs by dropped-CPI tx count (Phase 0 sizing): which routers carry the

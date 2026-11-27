@@ -93,7 +93,80 @@ live, `tx_view(resolve=…)` rebuilds the full resolved account list, so the rou
 its fixed instruction-index resolves **whether static or LUT-indexed**. That removes the one fragility
 the 11-23 check surfaced; the fixed-index read is now sound.
 
-### Staged plan (measure first, decode the Pareto set)
+### Phase 0 RESULT (2026-11-27): a LONG TAIL, not a Pareto set — go router-agnostic
+
+The box breakdown (`[routers]` line) came back far wider than expected: **~170+ distinct router programs,
+a flat top (top two `CtjS9o7rj3UuiNSjUdh4vHih5WiEoLXDk6XE1y3LN8Vg` ~16% + `DiabLokxisGR8P4Qqp2QL6PmBhhVsdzPstCE4WoLxc5z`
+~14% ≈ 30% together, no cliff), and a real ~20% TAIL across ~160 tiny programs.** Identified: `JUP6Lkb…`
+= Jupiter v6 (~3%); `FLASHX8…` = a flash-loan/arb program (its "buyers" are wash buy+sell, a NOISE source);
+`DF1ow…` ≈ DFlow aggregator; the rest (`DiabLokx…`, `deadpz…`, `proVF…`, `Livei…`, `PopSt…`, `H16rUHa5…`,
+`BmGwqQXt…`, `3vHAVbq…`, `9KGuApSJ…`) are vanity-addressed sniper bots. New bots appear constantly, so the
+tail is irreducible.
+
+**Consequence: per-router layout decoding is dead** (we will not write 170 decoders, and the tail defeats
+"decode the Pareto set"). The tail forces the correct architecture — **router-agnostic recovery**, because
+the two things the precursor gate keys on are feed-level, not router-specific:
+
+1. **Pool** — a routed pumpswap swap MUST list the pumpswap pool account in its (LUT-resolved) account
+   list (CPI requires every touched account in the message). Intersect the tx's resolved accounts with the
+   box's discovered/armed pool set → the pool/token. **One implementation, all ~170 routers, zero per-router
+   code.** (Intersect against the ARM/discovery set, not `Consumer.pools`, so a pool whose FIRST activity is
+   routed is still caught and bootstrapped.)
+2. **Buyer** = fee payer `keys[0]`. Router-agnostic.
+
+That recovers `N`/`O`/`B` (new wallet / outsider / dominant) across the whole routed 43–46%, tail included —
+the bulk of the lost recall. **Direction** (the `S` seller symbol) is the only per-router gap; on fresh pools
+snipers overwhelmingly BUY, so counting routed swaps as buys is approximately right, with the option to pin
+true direction for only the top 2–3 if measurement shows `S` matters.
+
+**The caveat to measure, not assume:** the 11-21 `--vis-experiment` found `buyer_plus` LOWERED edge-per-fire —
+but on the mature/scored population, where routed flow is thin and noisy (incl. arb like `FLASHX`). On the
+FRESH-pool firehose the routed buyers ARE the organic `N`/`O` snipers, so it may help far more here; and the
+arb programs are deny-listable. Re-running the vis-experiment on a capture with pool-intersection recovery on
+(`full` / `direct` / `poolbuyers`) is the go/no-go: recall↑ AND edge held.
+
+### Owner correction (2026-11-27): per-router TRUE direction for the bulk, buyer_plus only for the tail
+
+The gate is symbol-flip fragile, so approximating all routed swaps as "buy" (`buyer_plus`) on the bulk is
+unacceptable — it injects the exact `N`/`S` noise that breaks it. The owner's split: **TRUE direction for
+the top routers (~80%+ of routed volume), `buyer_plus` only for the long tail.** Governing rule: **never
+guess direction.** A per-router rule is accepted only when its held-out PRECISION is 1.0 (it may abstain,
+which is a safe drop); a high-volume router with no validated rule DROPS, it does not fall to a guessed
+`buyer_plus`. For this gate a drop (a missing buyer) is recoverable; a wrong direction is not.
+
+### Full-coverage build (2026-11-27, BUILT): `router_direction.py` + `router-direction` CLI
+
+The router set is open-ended (170 → 300 distinct and still climbing), so we drive off the box's FULL
+`cpi_routers` list, not a hardcoded set, and chase complete coverage. The key unlock: a router's buy/sell
+discriminator is **pool- and token-independent**, so labeled samples come straight from Helius — no box
+capture. One `getTransactionsForAddress(router)` per router gives, per tx, both the **top-level router
+instruction** (the shred-visible view, for fitting) and the **inner pumpswap CPI** (the TRUE direction, for
+the label, via our own discriminator + base/quote flip). ~300 routers × 10 credits ≈ 3,000 credits.
+
+- `router_direction.find_rule` fits per router: a discriminator→direction map (`disc` rule, the common
+  Anchor case: separate buy/sell instructions) or a WSOL-at-fixed-account-index rule (`wsol_index`, one-swap
+  routers like Jupiter). Accepted only at held-out precision 1.0.
+- `router_direction.study(samples, counts)` reports **volume-weighted COVERAGE**: the share of routed flow a
+  validated rule now decodes, the denylist(arb) share, the uncovered share, and the top UNCOVERED routers by
+  volume (what blocks fuller coverage — too few sell samples / unseparable).
+- `router_direction.router_classify` is the two-tier live decision: validated rule → true buy/sell; denylist
+  (`FLASHX…` flash/arb = wash) → drop; a pin-target/high-volume router without a rule → drop (never guess);
+  the tail → `buyer_plus`. Validated rules load from a json (`load_rules`) so the box picks them up with no
+  code change; an empty table just drops every pin-target (fail-safe).
+- Consumer wiring (off by default, `route_classify=None`): `Consumer.add_pool(pool, token)` (box calls it at
+  discovery) + a routed-tx path in `on_tx` that classifies each top-level router instruction and, on a
+  buy/sell/buyer_plus, finds the tracked pool among the router instruction's accounts → `on_swap`.
+
+**Run it:** box dumps `cpi_routers` → `router-counts.json` each heartbeat; then
+`router-direction --routers-file router-counts.json --out router_rules.json --fetch` (research key) prints
+the coverage table and writes the validated rules. Read COVERAGE: the uncovered high-volume routers are the
+only ones that then need a manual on-chain/IDL look (or stay `buyer_plus`).
+
+- **Next — capture + re-run the vis-experiment** on the current fresh population with recovery on; confirm
+  recall↑ AND the +17.9% edge held before any live fire (the arbiter is the verify + a live reactive NET,
+  not the decode being correct).
+
+### (superseded) staged plan — per-router, pre-long-tail
 
 - **Phase 0 — router breakdown. BUILT 2026-11-27.** `Consumer.cpi_routers` tallies each dropped-CPI tx
   to the non-infra, non-pumpswap top-level program that carried it (`INFRA_PROGRAMS` subtracts compute

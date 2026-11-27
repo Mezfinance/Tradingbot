@@ -127,7 +127,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "launch-late-entry", "launch-early-pulls",
                                             "launch-pull-train", "launch-token-age", "launch-d12-trades",
                                             "launch-filter-study", "launch-rw-train", "launch-rw24-train", "launch-big-train", "dashboard-summary",
-                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify", "frontrun-fill", "localshred-merge", "capture-fresh", "shred-completeness", "symbol-flip"])
+                                            "canary-status", "canary-stop", "canary-start", "canary-one", "canary-smoke", "canary-feint-smoke", "canary-probe-smoke", "rw-check", "early-rw-check", "early-rw-study", "fill-gap-study", "size-study", "canary-rug-check", "canary-sweep", "block-compare", "market-monitor", "rw-bands", "band-rw-study", "band-compare", "risk-model", "history-backfill", "hold-study", "band-prize", "sz-whatif", "safeguards", "thin-sizing", "missed-signals", "flag-tracker", "dd-limits", "sz-stops", "canary-package", "canary-trades", "pool-tracker", "canary-slots", "probe-exits", "pool-wallets", "flurry-study", "frontrun-verify", "frontrun-fill", "localshred-merge", "capture-fresh", "shred-completeness", "symbol-flip", "router-direction"])
     parser.add_argument("path", nargs="?",
                         help="backup: destination file; code-diff/code-rollback: version (vN, or 'image')")
     parser.add_argument("-v", "--verbose", action="store_true")
@@ -229,6 +229,9 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--gate-vis", choices=["full", "direct", "buyer_plus"], default="direct", help="flurry-study --frontrun: the ShredStream visibility to FIT the gate on. The live box decodes only TOP-LEVEL pumpswap swaps, so 'direct' (default) makes the exported gate fire on the box's own view (the vis-experiment showed direct carries ~89%% of the full edge); 'full' reproduces the historical full-flow study. frontrun-verify reads the gate's stamped vis to replay through the same view.")
     parser.add_argument("--vis-experiment", action="store_true", help="flurry-study: refit the front-run gate on each box-reproducible VISIBILITY (full / direct-only / buyer-plus) with the target always the real full-flow move, and compare the precursor gate's holdout edge -- does the box's ShredStream view (top-level pumpswap only; aggregator CPIs invisible) carry the study's edge? Forces --vq; needs --fetch to visibility-tag the rows.")
     parser.add_argument("--entry-window", type=int, nargs="?", const=10, default=None, metavar="W", help="flurry-study: patience study -- keep the safe 1-2 slot hold, but sweep WHICH entry slot (N+1..N+W, default W=10) to take it after a slot-N signal. A pull during the wait = no entry (no loss); reports per-offset EV, best-of-window ceiling, and a causal up-tick-ride rule vs a random-active-slot control, out of sample.")
+    parser.add_argument("--samples", type=str, default=None, help="router-direction: the box's router-samples JSONL ({router,sig,pool,payer,data(hex),accounts,keys})")
+    parser.add_argument("--routers", type=str, default=None, help="router-direction: fetch labeled samples from Helius for these router program ids (comma-separated, or 'pins' for the built-in top-20). One getTransactionsForAddress per router gives the top-level router ix + the inner pumpswap CPI (true direction) -- no box capture needed")
+    parser.add_argument("--routers-file", type=str, default=None, help="router-direction: a JSON {program_id: routed-tx count} (the box's full cpi_routers dump) -- fetch+fit EVERY router (highest volume first, budget-capped) and report volume-weighted coverage of the routed flow")
     parser.add_argument("--fires", type=str, default=None, help="frontrun-verify: JSON/JSONL of box fires {pool, slot, token_mint?, sym?, m2?, eta?} or a raw box log to grep for 'GATE FIRE' lines")
     parser.add_argument("--pairs", type=str, default=None, help="frontrun-verify: box fires by hand as 'pool:slot[:mint],pool:slot'")
     parser.add_argument("--gate", type=str, default=None, help="frontrun-verify: the exported gate JSON (flurry-study --export-gate)")
@@ -935,6 +938,96 @@ def main(argv: list[str] | None = None) -> None:
                             max_credits=int(args.max_credits or 40_000), span_s=args.span_s,
                             max_pools=args.max_pools, progress=_sf_prog)
         print(json.dumps(_sf_out, indent=2) if args.json else _sf.render(_sf_out))
+        return
+
+    if args.command == "router-direction":  # per-router buy/sell rule from Helius-truth labels (11-27)
+        from tradingbot import router_direction as _rd
+        import httpx as _rd_httpx
+        from tradingbot.data.helius import Helius as _RdHelius
+        if args.routers or args.routers_file:   # fetch mode: labeled samples straight from Helius, no box capture
+            _counts = None
+            if args.routers_file:
+                with open(args.routers_file) as f:
+                    _counts = {str(k): int(v) for k, v in json.load(f).items()}
+                _progs = sorted(_counts, key=lambda p: -_counts[p])      # highest routed volume first
+            elif args.routers == "pins":
+                _progs = sorted(_rd.PIN_TARGETS)
+            else:
+                _progs = [p.strip() for p in args.routers.split(",") if p.strip()]
+            _h = _RdHelius(client=_rd_httpx.Client(timeout=60))   # research (backup) key, never the live key
+            _h.min_interval_s = 1 / max(args.rps, 0.1)
+            _per = int(args.max_pools or 100)
+            _cap = int(args.max_credits or 50_000)
+            _rd_samples, _fetched = [], 0
+            for _prog in _progs:
+                if _h.credits_used >= _cap:
+                    print(f"credit cap {_cap} reached after {_fetched}/{len(_progs)} routers", file=sys.stderr)
+                    break
+                _got = _rd.fetch_router_samples(_h, _prog, limit=_per)
+                _rd_samples += _got
+                _fetched += 1
+                if _fetched % 20 == 0:
+                    print(f"fetched {_fetched}/{len(_progs)} routers, {_h.credits_used} credits", file=sys.stderr, flush=True)
+            _rd_out = _rd.study(_rd_samples, counts=_counts, seed=0)
+            _rd_out["fetched_routers"] = _fetched
+            if args.out:
+                with open(args.out, "w") as f:
+                    json.dump(_rd_out["accepted"], f, indent=2)
+                print(f"wrote {_rd_out['n_accepted']} validated rules to {args.out}", file=sys.stderr)
+            print(json.dumps(_rd_out, indent=2, default=str) if args.json else _rd.render(_rd_out))
+            return
+        _samp_path = args.samples or "/root/ls/router-samples.jsonl"
+        try:
+            _rd_samples = _rd.load_samples(_samp_path)
+        except FileNotFoundError:
+            print(f"router-direction: no samples at {_samp_path} (pass --samples <file>; the box writes router-samples.jsonl)", file=sys.stderr)
+            sys.exit(2)
+        if not _rd_samples:
+            print(f"router-direction: {_samp_path} has no samples", file=sys.stderr)
+            sys.exit(2)
+        _cache_path = _samp_path + ".labels.json"   # {sig: "buy"/"sell"} so reruns are free
+        try:
+            with open(_cache_path) as f:
+                _labels = json.load(f)
+        except (OSError, ValueError):
+            _labels = {}
+        if args.fetch:
+            _h = _RdHelius(client=_rd_httpx.Client(timeout=60))   # research (backup) key, never the live key
+            _h.min_interval_s = 1 / max(args.rps, 0.1)
+            _cap = int(args.max_credits or 20_000)
+            _spent = _n = 0
+            for s in _rd_samples:
+                sig = s.get("sig")
+                if not sig:
+                    continue
+                if sig in _labels:
+                    s["dir"] = _labels[sig]
+                    continue
+                if _spent + _rd.GETTX_CREDITS > _cap:
+                    break
+                d = _rd.fetch_label(_h, sig, s.get("pool"))
+                _spent += _rd.GETTX_CREDITS
+                _n += 1
+                if d:
+                    _labels[sig] = d
+                    s["dir"] = d
+                if _n % 50 == 0:
+                    print(f"labeled {_n}, {_spent} credits", file=sys.stderr, flush=True)
+            try:
+                with open(_cache_path, "w") as f:
+                    json.dump(_labels, f)
+            except OSError:
+                pass
+        else:
+            for s in _rd_samples:
+                if s.get("sig") in _labels:
+                    s["dir"] = _labels[s["sig"]]
+        _rd_out = _rd.study(_rd_samples, seed=0)
+        if args.out:
+            with open(args.out, "w") as f:
+                json.dump(_rd_out["accepted"], f, indent=2)
+            print(f"wrote {_rd_out['n_accepted']} validated rules to {args.out}", file=sys.stderr)
+        print(json.dumps(_rd_out, indent=2, default=str) if args.json else _rd.render(_rd_out))
         return
 
     if args.command == "flurry-study":  # slot-level buy-flurry continuation for the reactive-backrun scalp (11-17)
