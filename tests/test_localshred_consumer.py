@@ -335,7 +335,7 @@ def test_routed_recovery_off_by_default():
 def test_routed_recovery_true_direction_and_buyer():
     seen = {}
     c = lc.Consumer(gate={}, runner_factory=lambda: _AlwaysFire(),
-                    route_classify=lambda prog, data, accts, keys: seen.get("v", "buy"))
+                    route_classify=lambda prog, data, accts, keys, token: seen.get("v", "buy"))
     c.add_pool("POOL", "TOKENMINT")
     keys, ins = _cpi_router_tx()
     seen["v"] = "buy"
@@ -345,6 +345,17 @@ def test_routed_recovery_true_direction_and_buyer():
     seen["v"] = "sell"
     c.on_tx(5, *_cpi_router_tx(payer="W2"))                  # same slot, a routed sell
     assert st.n_sells == 1 and st.buyers == ["PAYER"]        # seller not added as a buyer
+
+
+def test_routed_recovery_passes_the_pool_token_to_the_classifier():
+    got = {}
+    def _rc(prog, data, accts, keys, token):
+        got["token"] = token
+        return "buy"
+    c = lc.Consumer(gate={}, runner_factory=lambda: _AlwaysFire(), route_classify=_rc)
+    c.add_pool("POOL", "TOKENMINT")
+    c.on_tx(5, *_cpi_router_tx())
+    assert got["token"] == "TOKENMINT" and c.pools["POOL"].n_buys == 1   # token_order rules can use it
 
 
 def test_routed_recovery_buyer_plus_counts_a_buy_and_drop_skips():

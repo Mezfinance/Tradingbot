@@ -310,9 +310,6 @@ class Consumer:
         program_id, accts, data = ins
         if program_id == PROGRAM or program_id in INFRA_PROGRAMS:
             return None
-        verdict = self.route_classify(program_id, data, accts, account_keys)
-        if verdict not in ("buy", "sell", "buyer_plus"):
-            return None                                      # "drop" / unknown -> skip (conservative)
         pool = token = None
         for a in accts:                                      # the pumpswap pool is passed to the CPI, so it is
             if 0 <= a < len(account_keys):                   # among this router instruction's own accounts
@@ -322,6 +319,9 @@ class Consumer:
                     break
         if pool is None:
             return None                                      # pool not tracked (not discovered / not ours)
+        verdict = self.route_classify(program_id, data, accts, account_keys, token)   # token for mint_order rules
+        if verdict not in ("buy", "sell", "buyer_plus"):
+            return None                                      # "drop" / unknown -> skip (conservative)
         return self.on_swap(slot, pool, token, verdict != "sell", payer)
 
     def router_top(self, n: int = 5):

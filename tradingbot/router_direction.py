@@ -94,10 +94,11 @@ def _b58decode(s: str) -> bytes:
 
 # --- rule application (pure) ------------------------------------------------------------------------------
 
-def apply_rule(rule: dict, data: bytes, accounts, account_keys) -> Optional[str]:
+def apply_rule(rule: dict, data: bytes, accounts, account_keys, token: Optional[str] = None) -> Optional[str]:
     """Apply a validated per-router rule to a routed instruction's pre-execution view. Returns "buy" / "sell",
     or None (abstain -> the caller DROPS, which is safe). `data` = the router ix data bytes; `accounts` = its
-    account-index list; `account_keys` = the tx's resolved account keys."""
+    account-index list; `account_keys` = the tx's resolved account keys; `token` = the pool's non-WSOL mint
+    (the live box knows it from the tracked pool), needed only by the token-aware `mint_order` rule."""
     kind = rule.get("kind")
     if kind == "disc":
         return rule["map"].get(data[:8].hex())                    # unknown discriminator -> None (abstain)
@@ -114,6 +115,22 @@ def apply_rule(rule: dict, data: bytes, accounts, account_keys) -> Optional[str]
         if o < 0 or o >= len(data):
             return None
         return rule["map"].get("%02x" % data[o])                  # unseen byte value -> None (abstain)
+    if kind == "mint_order":                                       # WSOL before/after the token in the account list
+        if not token:
+            return None                                            # token unknown -> abstain (safe)
+        wi = ti = None
+        for p, a in enumerate(accounts):
+            ai = int(a)
+            if ai < 0 or ai >= len(account_keys):
+                continue
+            k = account_keys[ai]
+            if wi is None and k == WSOL:
+                wi = p
+            if ti is None and k == token:
+                ti = p
+        if wi is None or ti is None:
+            return None                                            # one of the mints absent -> abstain
+        return rule["wsol_first"] if wi < ti else rule["other"]
     return None
 
 
@@ -197,9 +214,23 @@ def fetch_router_samples(helius, router: str, limit: int = 100) -> list:
             continue
         data, accts = ix
         out.append({"router": router, "sig": _sig_of(tx), "pool": None,
-                    "payer": accts[0] if accts else None, "data": data,
-                    "accounts": list(range(len(accts))), "keys": accts, "dir": d})
+                    "payer": accts[0] if accts else None, "token": _inner_token(tx),
+                    "data": data, "accounts": list(range(len(accts))), "keys": accts, "dir": d})
     return out
+
+
+def _inner_token(tx: dict) -> Optional[str]:
+    """The non-WSOL mint of the tx's first inner pumpswap swap (for the mint_order rule). None if absent."""
+    for grp in ((tx or {}).get("meta") or {}).get("innerInstructions") or []:
+        for ix in grp.get("instructions") or []:
+            if ix.get("programId") != PUMPSWAP:
+                continue
+            accts = ix.get("accounts") or []
+            if len(accts) >= 5:
+                base, quote = accts[3], accts[4]
+                if (base == WSOL) != (quote == WSOL):
+                    return base if quote == WSOL else quote
+    return None
 
 
 def fetch_label(helius, sig: str, pool: str) -> Optional[str]:
@@ -241,7 +272,8 @@ def _routed_sample(tx: dict) -> Optional[dict]:
             raccts = list(rix.get("accounts") or [])
             if not rdata or not raccts:
                 return None
-            return {"router": router, "sig": _sig_of(tx), "pool": None, "payer": raccts[0],
+            token = accts[3] if accts[4] == WSOL else accts[4]    # the non-WSOL side (for the mint_order rule)
+            return {"router": router, "sig": _sig_of(tx), "pool": None, "payer": raccts[0], "token": token,
                     "data": rdata, "accounts": list(range(len(raccts))), "keys": raccts, "dir": d}
     return None
 
@@ -334,11 +366,43 @@ def _byte_flag_rule(train) -> Optional[dict]:
     return None
 
 
+def _mint_order_rule(train) -> Optional[dict]:
+    """Direction from the relative position of WSOL vs the token mint in the router's account list (input mint
+    before output mint, say) -- catches routers where WSOL is present but not at a fixed index, which a
+    wsol_index rule misses. Token-aware: the live box supplies the pool's token. A sample with no token, or
+    where either mint is absent from the account list, is not separable this way, so the rule is not fitted."""
+    mapping: dict = {}                                            # (WSOL before token) -> direction
+    for s in train:
+        tok = s.get("token")
+        if not tok:
+            return None
+        keys, accts = s["keys"], s["accounts"]
+        wi = ti = None
+        for p, a in enumerate(accts):
+            if 0 <= int(a) < len(keys):
+                k = keys[int(a)]
+                if wi is None and k == WSOL:
+                    wi = p
+                if ti is None and k == tok:
+                    ti = p
+        if wi is None or ti is None:
+            return None
+        wf = wi < ti
+        prev = mapping.get(wf)
+        if prev is None:
+            mapping[wf] = s["dir"]
+        elif prev != s["dir"]:
+            return None
+    if len(mapping) == 2:                                         # both orderings seen, each pure
+        return {"kind": "mint_order", "wsol_first": mapping[True], "other": mapping[False]}
+    return None
+
+
 def _score(rule: dict, test) -> tuple[int, int, int]:
     """(correct, fired, n): how often the rule fires on held-out, and how often it is right when it fires."""
     correct = fired = 0
     for s in test:
-        pred = apply_rule(rule, s["data"], s["accounts"], s["keys"])
+        pred = apply_rule(rule, s["data"], s["accounts"], s["keys"], s.get("token"))
         if pred is not None:
             fired += 1
             if pred == s["dir"]:
@@ -363,7 +427,7 @@ def find_rule(labeled, seed: int = 0) -> dict:
     train = [labeled[i] for i in order[:cut]]
     test = [labeled[i] for i in order[cut:]] or train            # tiny n: score on train (precision still guards)
     best = None
-    for fit in (_disc_rule, _wsol_rule, _byte_flag_rule):         # structural rules first, byte search last
+    for fit in (_disc_rule, _wsol_rule, _byte_flag_rule, _mint_order_rule):   # structural first, token-aware last
         rule = fit(train)
         if rule is None:
             continue
@@ -416,7 +480,7 @@ def load_samples(path: str) -> list:
             except ValueError:
                 continue
             out.append({"router": r.get("router"), "sig": r.get("sig"), "pool": r.get("pool"),
-                        "payer": r.get("payer"), "data": data,
+                        "payer": r.get("payer"), "token": r.get("token"), "data": data,
                         "accounts": [int(a) for a in (r.get("accounts") or [])],
                         "keys": list(r.get("keys") or []), "dir": r.get("dir")})
     return out
@@ -484,7 +548,7 @@ def render(report: dict) -> str:
     return "\n".join(lines)
 
 
-def router_classify(program: str, data: bytes, accounts, account_keys,
+def router_classify(program: str, data: bytes, accounts, account_keys, token: Optional[str] = None,
                     rules: Optional[dict] = None,
                     pin_targets=PIN_TARGETS, denylist=DENYLIST) -> str:
     """Classify a routed top-level instruction into one of: "buy" / "sell" (a validated rule fired),
@@ -494,7 +558,7 @@ def router_classify(program: str, data: bytes, accounts, account_keys,
     if program in denylist:
         return "drop"
     if program in rules:
-        d = apply_rule(rules[program], data, accounts, account_keys)
+        d = apply_rule(rules[program], data, accounts, account_keys, token)
         return d if d in ("buy", "sell") else "drop"              # rule abstains -> drop (safe)
     if program in pin_targets:
         return "drop"                                             # committed to pin; do not guess

@@ -93,6 +93,27 @@ def test_find_rule_accepts_a_byte_flag_split():
     assert r["accepted"] and r["kind"] == "byte_flag" and r["rule"]["offset"] == 8 and r["precision"] == 1.0
 
 
+def test_apply_mint_order_rule():
+    rule = {"kind": "mint_order", "wsol_first": "buy", "other": "sell"}
+    assert rd.apply_rule(rule, b"", [0, 1, 2], ["POOL", WSOL, "TOK"], token="TOK") == "buy"   # WSOL before token
+    assert rd.apply_rule(rule, b"", [0, 1, 2], ["POOL", "TOK", WSOL], token="TOK") == "sell"  # token before WSOL
+    assert rd.apply_rule(rule, b"", [0, 1, 2], ["POOL", WSOL, "TOK"], token=None) is None      # no token -> abstain
+    assert rd.apply_rule(rule, b"", [0, 1, 2], ["POOL", "A", "B"], token="TOK") is None         # token absent -> abstain
+
+
+def test_find_rule_accepts_a_mint_order_split():
+    # one discriminator, WSOL at a VARYING index (so no fixed wsol_index works); direction = WSOL before token
+    pats = {"buy": [["a", WSOL, "TOK"], ["a", "b", WSOL, "TOK"]],
+            "sell": [["TOK", WSOL, "c"], ["a", "TOK", WSOL]]}
+    out = []
+    for i in range(24):
+        d = "buy" if i % 2 == 0 else "sell"
+        keys = pats[d][(i // 2) % 2]
+        out.append({"data": b"\x05" * 8, "accounts": list(range(len(keys))), "keys": keys, "token": "TOK", "dir": d})
+    r = rd.find_rule(out, seed=11)
+    assert r["accepted"] and r["kind"] == "mint_order"
+
+
 def _pumpswap_routed_tx(router, disc, base, quote, sig="S", router_accts=("U", "SRC", "DST")):
     # a getTransactionsForAddress(PUMPSWAP) tx: top-level router ix at index 1, inner pumpswap CPI under it
     return {"transaction": {"signatures": [sig], "message": {"instructions": [
@@ -105,7 +126,7 @@ def _pumpswap_routed_tx(router, disc, base, quote, sig="S", router_accts=("U", "
 
 def test_routed_sample_labels_a_routed_swap_and_skips_a_direct_one():
     s = rd._routed_sample(_pumpswap_routed_tx(BOT, BUY_EXACT_QUOTE_IN, "TOKEN", WSOL))
-    assert s and s["router"] == BOT and s["dir"] == "buy" and s["payer"] == "U"
+    assert s and s["router"] == BOT and s["dir"] == "buy" and s["payer"] == "U" and s["token"] == "TOKEN"
     assert s["keys"] == ["U", "SRC", "DST"] and s["accounts"] == [0, 1, 2]
     # a direct swap: pumpswap is itself the top-level program -> not routed -> None
     direct = {"transaction": {"signatures": ["D"], "message": {"instructions": [
