@@ -37,6 +37,19 @@ def test_non_sol_pair_and_short_account_are_rejected():
     assert ps.parse_pool(bytes(no_sol)) is None
 
 
+def test_arm_ok_accepts_handmade_sol_pool_and_rejects_the_rest():
+    # the sec-4 arm gate: hand-made + SOL pair + LP not pulled, else drop
+    assert ps.arm_ok(HAND) is True                       # hand-made SOL pair, LP live
+    assert ps.arm_ok(GRAD) is False                      # graduation (coin_creator set) -> not hand-made
+    no_sol = bytearray(HAND)
+    no_sol[43:75] = bytes(32)                            # base mint no longer wSOL -> not a SOL pair
+    assert ps.arm_ok(bytes(no_sol)) is False
+    pulled = bytearray(HAND)
+    pulled[203:211] = bytes(8)                           # lp_supply 0 -> fully pulled
+    assert ps.arm_ok(bytes(pulled)) is False
+    assert ps.arm_ok(HAND[:200]) is False               # short account
+
+
 def test_token_amount_and_spot_price():
     acct = bytes(64) + (5_000_000).to_bytes(8, "little") + bytes(93)
     assert ps.token_amount(acct) == 5_000_000 and ps.token_amount(bytes(10)) is None

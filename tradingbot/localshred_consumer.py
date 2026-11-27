@@ -139,7 +139,8 @@ class Consumer:
     def __init__(self, gate, tier: str = "1", flurry_min: int = DEFAULT_FLURRY_MIN,
                  on_fire: Optional[Callable[[dict], None]] = None, runner_factory=None,
                  fresh_window_slots: int = 0, on_capture: Optional[Callable] = None,
-                 handmade_only: bool = True, on_pool: Optional[Callable] = None, reserves=None):
+                 handmade_only: bool = True, on_pool: Optional[Callable] = None, reserves=None,
+                 is_armed: Optional[Callable] = None):
         self.gate = gate
         self.tier = str(tier)
         self.flurry_min = flurry_min
@@ -166,6 +167,11 @@ class Consumer:
         # 0 disables it (the raw core, for tests/replay); run_localshred.py sets ~450 (~180s at 0.4s/slot).
         self.fresh_window_slots = int(fresh_window_slots)
         self._start_slot = None
+        # Helius sec-4 arm gate: is_armed(pool) -> True fires, anything else (False = confirmed not hand-made /
+        # pulled, None = not read yet) suppresses. The box does ONE getAccountInfo at ~sec 4, pumpswap.arm_ok on
+        # it, and keeps a {pool: bool} the callable reads; None (not provided) = no arm gate (tests/replay). The
+        # bank still advances while unarmed, so a pool armed late fires on its later slots with full history.
+        self.is_armed = is_armed
 
     def _slot_rec(self, st: _PoolState) -> dict:
         # price/sol fields are 0.0: the precursor gate is price- and magnitude-free (sym/m2/m3 only).
@@ -197,6 +203,8 @@ class Consumer:
         st.buyers = []
         if not sig or not self._fresh_ok(signal_slot, st):
             return None
+        if self.is_armed is not None and not self.is_armed(pool):
+            return None                                      # Helius arm gate: only confirmed hand-made pools fire
         sig = dict(sig)
         sig["pool"] = pool
         sig["slot"] = sig["signal_slot"]

@@ -37,6 +37,16 @@ def parse_pool(raw: bytes) -> dict | None:
     }
 
 
+def arm_ok(raw: bytes) -> bool:
+    """Helius sec-4 arm gate: True iff this pool account is a hand-made, SOL-pair pumpswap pool whose LP has
+    not been fully pulled -- the only pools the front-run gate should fire on. `raw` is the pool account's data
+    from a getAccountInfo. coin_creator all zeros = hand-made (pump.fun graduations carry a real creator);
+    parse_pool returns None for a non-SOL pair; lp_supply 0 = fully pulled. Liquidity is NOT gated here (the
+    executor sizes down to 2% of the pool), only structure."""
+    p = parse_pool(raw)
+    return bool(p and p["handmade"] and p["lp_supply"] > 0)
+
+
 def parse_lp_mint(raw: bytes) -> dict | None:
     """Token-2022 base mint layout: COption<authority> (u32 tag + 32 bytes), supply u64, decimals u8."""
     if len(raw) != LP_MINT_SIZE:

@@ -167,6 +167,34 @@ def test_freshness_gate_off_by_default_fires_on_everything():
     assert len(fires) == 1 and fires[0]["pool"] == "OLD"
 
 
+def test_arm_gate_fires_only_on_armed_pools():
+    # The box's Helius sec-4 hand-made read fills `armed`; is_armed reads it. True fires; False (confirmed not
+    # hand-made / pulled) and None (not read yet) suppress -- and the bank keeps advancing while unarmed, so a
+    # pool armed LATE fires on its later slots.
+    fires = []
+    armed = {"YES": True, "NO": False}       # LATE absent -> is_armed returns None (undecided)
+    c = lc.Consumer(gate={}, on_fire=fires.append, runner_factory=lambda: _AlwaysFire(),
+                    is_armed=lambda p: armed.get(p))
+    c.on_swap(10, "YES", "T", True, "a")
+    c.on_swap(11, "YES", "T", True, "a")     # flush YES@10 -> armed -> FIRES
+    c.on_swap(10, "NO", "U", True, "b")
+    c.on_swap(11, "NO", "U", True, "b")      # flush NO@10 -> confirmed not armed -> suppressed
+    c.on_swap(10, "LATE", "V", True, "c")
+    c.on_swap(11, "LATE", "V", True, "c")    # flush LATE@10 -> undecided (None) -> suppressed
+    armed["LATE"] = True                      # the sec-4 read lands
+    c.on_swap(12, "LATE", "V", True, "c")    # flush LATE@11 -> now armed -> FIRES (history kept building)
+    assert [f["pool"] for f in fires] == ["YES", "LATE"]
+    assert sorted(f["signal_slot"] for f in fires) == [10, 11]
+
+
+def test_arm_gate_off_by_default_fires_on_everything():
+    fires = []
+    c = lc.Consumer(gate={}, on_fire=fires.append, runner_factory=lambda: _AlwaysFire())  # is_armed None = off
+    c.on_swap(10, "P", "T", True, "a")
+    c.on_swap(11, "P", "T", True, "a")       # no arm gate -> fires
+    assert len(fires) == 1 and fires[0]["pool"] == "P"
+
+
 def test_end_to_end_through_a_real_precursor_gate():
     # A minimal real gate: fire (eta >= 0.5) exactly when sym == 'S'. Proves decode -> aggregate ->
     # frontrun_live.Runner -> precursor_gate compose and emit a box-shaped fire.
