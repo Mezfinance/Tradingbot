@@ -66,6 +66,66 @@ aggregate difference (it would not). Only a per-slot trade-level diff — the bo
 set for a mismatch pool — would, and that needs a box logging change on the retiring feed; the
 LocalShred verify is the cheaper definitive answer.
 
+## RESULT (2026-11-27): router decoder RE-GREENLIT — live gauge shows ~27–30% routed on fresh pools
+
+The `gate_1790` MEASURE run went live on the box and under-fires badly (~5 fires/hr at tier 1). The
+CPI-drop gauge (`localshred_consumer.Consumer.direct_swaps` / `cpi_txs`, box `[health]` line) quantified
+why on the real live population: **`cpi-dropped=6179 direct=16308 (27% routed)`** on the fresh-pool
+firehose — about **27–30% of pumpswap-touching txs are routed through an aggregator CPI and invisible to
+the top-level decode.** A slot whose organic buyers all came through a router reads **dead** (no `N`/`O`
+symbol forms), so the precursor never appears and the gate never fires. That is the recall wall, and no
+tier change recovers it (the slot is invisible, not low-eta).
+
+**This flips the 2026-11-21 "not needed" verdict — because it measures a different axis.** The 11-21
+`--vis-experiment` measured **edge-per-fire** on the *traded/scored* population (direct keeps ~89% of the
+edge). This gauge measures **recall** on the *fresh-pool firehose*, where aggregator/bot activity is far
+heavier and the dropped buyers are exactly the organic `N`/`O` precursors the gate keys on. Edge-per-fire
+and fires-per-hour are different axes; the router decoder is a **recall** fix. The 11-23 "routers are 0.2%
+of our flow" measured the scored (mature) population too — the fresh-launch firehose is a different, much
+more routed world. Owner's call (2026-11-27): build the CPI-router-aware decode.
+
+**Key de-risk since 11-21: LUT resolution is now live and working** (`lut_fetch.make_live_resolver`,
+`localshred_tap.LutResolver.resolve_cached` + a background warmer; box log `[lut] resolved=… miss=0`).
+The layer-1 spec below says "maintain no LUT cache for v1" on the assumption the router mints sit in the
+STATIC keys. On-chain (11-23) that assumption was partly wrong (the message is v0; mint accounts are
+LUT-indexed, which is why the recorded mint indices decoded to program+authority). With LUT resolution
+live, `tx_view(resolve=…)` rebuilds the full resolved account list, so the router's token-mint account at
+its fixed instruction-index resolves **whether static or LUT-indexed**. That removes the one fragility
+the 11-23 check surfaced; the fixed-index read is now sound.
+
+### Staged plan (measure first, decode the Pareto set)
+
+- **Phase 0 — router breakdown. BUILT 2026-11-27.** `Consumer.cpi_routers` tallies each dropped-CPI tx
+  to the non-infra, non-pumpswap top-level program that carried it (`INFRA_PROGRAMS` subtracts compute
+  budget / system / token / ATA / memo); `Consumer.router_top(n)` ranks them; the box `[routers]` health
+  line prints the top 5. This sizes the build — it names which aggregators carry the 27% so Phase 2
+  decodes the Pareto set (likely Jupiter + 2–3 others for ~90%), not every router. Run it on the box for
+  an hour and read the `[routers]` line.
+- **Phase 1 — pin the layouts.** For each top router by volume, get the authoritative account-index
+  layout + discriminators. The 11-23 lesson: the recorded Jupiter shortcut was partly wrong (dominant
+  discriminator `[187,100,250,204,49,196,175,20]` = `route_v2`, and acct 7/8 were program+authority, not
+  mints). Pull from the Jupiter v6 Anchor IDL and cross-validate on-chain against a routed-pumpswap batch.
+  Write the confirmed table into "Layer 1 — B" below.
+- **Phase 2 — the decoder (repo, tested).** In `localshred_consumer` (or a `router_decode.py`), for each
+  top-level instruction whose program is a known router, read `(token mint from the fixed instruction
+  account index of the RESOLVED key list, direction from which side is WSOL, buyer = fee payer)` → emit a
+  synthetic `Swap` into `on_swap`. Needs a `token_mint → pool` map in `Consumer` (the reverse of the
+  `pool → token` it already holds from the arm/decode). Unit-test against pinned real router txs, like the
+  pumpswap tests. `buyer_plus` fallback: a router we can't decode, or a token→token / ambiguous route,
+  counts the fee payer as a directionless buyer so recall still climbs for the tail.
+- **Phase 3 — wire + verify.** Re-run MEASURE → `frontrun-verify`. The CPI-complete decode should (a)
+  raise the fire rate and (b) lift the symbol-flip reproduction, since the shred view now sees the same
+  buyers the WS vault-delta fit view sees (closing the train/serve distribution mismatch). This re-checks
+  the edge-per-fire on the newly-visible slots — not assumed to hold, read from the verify + the live NET.
+- **Phase 4 — latency.** The router decode is a discriminator compare + two account reads + one WSOL
+  compare per routed tx (trivial); the only real cost (the LUT resolve) is already cached/warmed
+  off-thread. Confirm the per-slot decode still beats the N+1 ~400 ms deadline on the live feed.
+
+**Honest caveats (unchanged from the spec):** split routes over-count SOL (direction stays right),
+multi-hop and token→token legs degrade to `buyer_plus` (all rare for fresh memecoins); and the whole thing
+is still a mid-to-mid, untouched-pool, positive-skew tail — the arbiter is `frontrun-verify` reproduction
++ a live reactive NET run, not the decode being correct.
+
 ## Verdict: feasible, and simpler than feared
 
 The de-risking insight from the Jupiter v6 account layout (confirmed below): **we do not parse the

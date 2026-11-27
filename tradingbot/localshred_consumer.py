@@ -57,6 +57,19 @@ BUY_BASE_OUT = bytes([102, 6, 61, 18, 1, 218, 235, 234])   # pump_amm `buy` (buy
 # box's direct view (so frontrun-verify's only variable is the feed, not the discriminator set).
 BUY_DISCS = frozenset({BUY_EXACT_QUOTE_IN, BUY_BASE_OUT})
 
+# Well-known infrastructure programs that sit as top-level instructions in a routed tx but are NOT the
+# aggregator. Subtract these (and pumpswap itself) to attribute a dropped-CPI swap to the router program
+# that carried it (Consumer.router_top / the Phase 0 breakdown: which aggregators to build a decoder for).
+INFRA_PROGRAMS = frozenset({
+    "ComputeBudget111111111111111111111111111111",
+    "11111111111111111111111111111111",                      # System
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",            # SPL Token
+    "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",            # Token-2022
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",           # Associated Token Account
+    "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",            # Memo
+    "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo",            # Memo v1
+})
+
 DEFAULT_FLURRY_MIN = frontrun_live.DEFAULT_FLURRY_MIN
 
 
@@ -177,6 +190,10 @@ class Consumer:
         # top level (routed through an aggregator CPI), so this feed dropped the swap. The box health line reads them.
         self.direct_swaps = 0
         self.cpi_txs = 0
+        # Phase 0 (router-breakdown): per dropped-CPI tx, tally the aggregator program id that carried it
+        # (the non-infra, non-pumpswap top-level program). router_top() sizes which routers a CPI-aware
+        # decoder must cover to recover the invisible swaps -- the Pareto set, not every router.
+        self.cpi_routers: dict = {}
 
     def _slot_rec(self, st: _PoolState) -> dict:
         # price/sol fields are 0.0: the precursor gate is price- and magnitude-free (sym/m2/m3 only).
@@ -256,11 +273,18 @@ class Consumer:
         # message carries no inner instructions), so we drop it. A proxy count of the invisible CPI swaps.
         if PROGRAM in account_keys and not any(ins[0] == PROGRAM for ins in instructions):
             self.cpi_txs += 1
+            for pid in {ins[0] for ins in instructions} - INFRA_PROGRAMS - {PROGRAM}:
+                self.cpi_routers[pid] = self.cpi_routers.get(pid, 0) + 1
         for sw in swaps:
             f = self.on_swap(slot, sw.pool, sw.token, sw.is_buy, sw.payer)
             if f:
                 fires.append(f)
         return fires
+
+    def router_top(self, n: int = 5):
+        """Top aggregator programs by dropped-CPI tx count (Phase 0 sizing): which routers carry the
+        invisible swaps, so a CPI-aware decoder covers the Pareto set rather than every router."""
+        return sorted(self.cpi_routers.items(), key=lambda kv: kv[1], reverse=True)[:n]
 
     def flush_all(self) -> list:
         """Finalize every pool's held slot. For a bounded replay; live trading instead sweeps all pools

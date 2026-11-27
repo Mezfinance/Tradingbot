@@ -314,3 +314,18 @@ def test_cpi_drop_counter_counts_invisible_routed_swaps():
     # a tx with neither pumpswap top-level nor pumpswap in the keys is not a drop
     c.on_tx(12, ["A", "B", "C"], [("Other", [0, 1], b"\x00" * 8)])
     assert c.cpi_txs == 1
+
+
+def test_router_breakdown_tallies_the_invoking_aggregator():
+    # Phase 0: a dropped-CPI tx is attributed to the non-infra top-level program that carried it, so
+    # router_top() sizes which aggregators a CPI-aware decoder must cover.
+    c = lc.Consumer(gate={}, runner_factory=lambda: _AlwaysFire())
+    JUP = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+    CB = "ComputeBudget111111111111111111111111111111"
+    keys = ["PAYER", CB, JUP, lc.PROGRAM, "POOL", "TOKEN", lc.WSOL]
+    # top level: a compute-budget ix (infra, ignored) and a Jupiter route (the real router); pumpswap only via CPI
+    ins = [(CB, [1], b"\x02\x00\x00\x00"), (JUP, [0, 2, 3, 4, 5, 6], b"\x00" * 16)]
+    c.on_tx(10, keys, ins)
+    assert c.cpi_txs == 1 and c.cpi_routers == {JUP: 1}            # infra + pumpswap excluded, Jupiter tallied
+    c.on_tx(11, keys, ins)
+    assert c.router_top()[0] == (JUP, 2)
