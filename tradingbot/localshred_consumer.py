@@ -172,6 +172,11 @@ class Consumer:
         # it, and keeps a {pool: bool} the callable reads; None (not provided) = no arm gate (tests/replay). The
         # bank still advances while unarmed, so a pool armed late fires on its later slots with full history.
         self.is_armed = is_armed
+        # CPI-drop gauge (a count, not a fix -- CPI swaps are invisible to a top-level decode by construction).
+        # direct_swaps = top-level pumpswap swaps we decoded; cpi_txs = txs where pumpswap was invoked but NOT at
+        # top level (routed through an aggregator CPI), so this feed dropped the swap. The box health line reads them.
+        self.direct_swaps = 0
+        self.cpi_txs = 0
 
     def _slot_rec(self, st: _PoolState) -> dict:
         # price/sol fields are 0.0: the precursor gate is price- and magnitude-free (sym/m2/m3 only).
@@ -244,7 +249,14 @@ class Consumer:
 
     def on_tx(self, slot: int, account_keys, instructions, fee_payer=None) -> list:
         fires = []
-        for sw in decode_tx(account_keys, instructions, fee_payer):
+        swaps = decode_tx(account_keys, instructions, fee_payer)
+        self.direct_swaps += len(swaps)
+        # CPI drop: pumpswap was invoked in this tx (its program id is in the account list) but there is no
+        # top-level pumpswap instruction to decode -> the swap was routed through an aggregator CPI (a compiled
+        # message carries no inner instructions), so we drop it. A proxy count of the invisible CPI swaps.
+        if PROGRAM in account_keys and not any(ins[0] == PROGRAM for ins in instructions):
+            self.cpi_txs += 1
+        for sw in swaps:
             f = self.on_swap(slot, sw.pool, sw.token, sw.is_buy, sw.payer)
             if f:
                 fires.append(f)

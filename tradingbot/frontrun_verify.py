@@ -36,6 +36,11 @@ from .data import pumpswap
 _FIRE_RE = re.compile(r"GATE FIRE\s+(\S+)\s+slot\s+(\d+)")
 
 
+STAKE_USD = 50.0    # $/trade for the mid-to-mid $ estimate (matches the study's $/fire)
+COST_PCT = 0.01     # round-trip cost charged to the scalp
+RET_CAP = 3.0       # +300% cap (codebase standard; -100% floor)
+
+
 def parse_fires(text: str) -> list[dict]:
     """Accept a JSON list / JSONL of {pool, slot, token_mint?, sym?, m2?, eta?} OR a raw box log (grep the
     'GATE FIRE <pool> slot <N>' lines). Returns [{pool, slot, box}] where box holds whatever the box recorded."""
@@ -153,11 +158,17 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
             # is ahead, in N+1..N+hold); large => the fire overlaps a move already landed (backrun contamination).
             # In hybrid the current-slot abs_move is zeroed (shreds carry no price), so it is always ~0 by design.
             entry = s.get("price") or fl._price_at(slots, slot)
+            price_np1 = fl._price_at(slots, slot + 1)           # price at the ENTRY slot N+1
             exitp = fl._price_at(slots, slot + hold)
             fwd = (exitp / entry - 1.0) if (entry and exitp) else None
+            m_np1 = (abs(price_np1 / entry - 1.0) if (entry and price_np1) else None)  # the move IN the entry slot N+1
+            ret = (max(-1.0, min(RET_CAP, fwd - COST_PCT)) if fwd is not None else None)  # mid-to-mid scalp net of cost
             at = {"sym": r["sym"], "m2": r["m2"], "m3": r["m3"], "eta": round(e, 4), "fires": hit,
                   "abs_move": round(float(r["f"].get("abs_move", 0.0)), 4),
-                  "fwd_move": (round(fwd, 4) if fwd is not None else None)}
+                  "abs_move_np1": (round(m_np1, 4) if m_np1 is not None else None),
+                  "fwd_move": (round(fwd, 4) if fwd is not None else None),
+                  "ret": (round(ret, 4) if ret is not None else None),
+                  "usd": (round(STAKE_USD * ret, 2) if ret is not None else None)}
     if at is None and _is_truncated(slot, flow, reached):
         res["status"] = "truncated"
         res["note"] = "fetch capped at %d pages before the fired slot (raise --pages; not a box error)" % (max_pages or fl.MAX_PAGES)
@@ -191,9 +202,11 @@ def verify(fires: list[dict], gate: dict, helius=None, have: dict | None = None,
     ok = [r for r in rows if r.get("status") == "ok"]
     repro = sum(1 for r in ok if r["reproduced"])
     trunc = sum(1 for r in rows if r.get("status") == "truncated")
+    usd = [r["offline"]["usd"] for r in ok if (r.get("offline") or {}).get("usd") is not None]
     return {"tier": tier, "vis": gate.get("vis", "full"), "box_exact": box_exact, "hybrid": hybrid,
             "n_fires": len(fires), "n_checked": len(ok), "n_reproduced": repro, "n_diverged": len(ok) - repro,
-            "n_truncated": trunc, "dist": _distance(ok), "rows": rows}
+            "n_truncated": trunc, "dist": _distance(ok), "rows": rows,
+            "usd_total": round(sum(usd), 2), "usd_n": len(usd), "usd_stake": STAKE_USD}
 
 
 def _distance(ok: list[dict]) -> dict:
@@ -250,7 +263,7 @@ def render(out: dict) -> str:
               f"    mean |eta gap|      {'n/a' if d.get('mean_abs_eta_gap') is None else format(d['mean_abs_eta_gap'], '.3f')}"
               "   <- scoring closeness when it does fire", ""]
     L.append(f"  {'pool':<20}{'slot':>12}{'in?':>5}{'fires?':>7}{'sym':>5}{'m2':>5}{'eta':>8}"
-             f"{'absmv@N':>9}{'fwd':>8}  kind  match")
+             f"{'absmv@N+1':>10}{'fwd':>8}{'$':>8}  kind  match")
     for r in out["rows"]:
         if r.get("status") != "ok":
             L.append(f"  {r['pool'][:20]:<20}{r['slot']:>12}  -- {r.get('status')}")
@@ -259,14 +272,23 @@ def render(out: dict) -> str:
         mm = r.get("match")
         ms = "" if mm is None else ("ok" if all(mm.values()) else "MISMATCH " + ",".join(k for k, v in mm.items() if not v))
         flag = "  <-- box fired but ground truth does NOT" if not r["reproduced"] else ""
-        am = o.get("abs_move")
+        am = o.get("abs_move")             # @N: the backrun discriminator (kept for `kind`)
+        amp = o.get("abs_move_np1")        # @N+1: the move IN the entry slot (displayed)
         fw = o.get("fwd_move")
+        usd = o.get("usd")
         # abs_move at N near 0 = clean precursor (front-run); large = overlaps a landed move (backrun territory)
         kind = "?" if am is None else ("precursor" if am < 0.01 else "backrun?")
         L.append(f"  {r['pool'][:20]:<20}{r['slot']:>12}{('y' if r['in_flow'] else 'n'):>5}"
                  f"{('y' if o.get('fires') else 'n'):>7}{str(o.get('sym','')):>5}{str(o.get('m2','')):>5}"
                  f"{(o.get('eta') if o.get('eta') is not None else 0):>8.3f}"
-                 f"{(am if am is not None else 0):>9.4f}{(fw if fw is not None else 0):>+8.3f}  {kind:<10}{ms}{flag}")
+                 f"{(amp if amp is not None else 0):>10.4f}{(fw if fw is not None else 0):>+8.3f}"
+                 f"{(usd if usd is not None else 0):>+8.2f}  {kind:<10}{ms}{flag}")
+    if out.get("usd_n"):
+        L += ["", f"  $ RESULT  {out['usd_total']:+.2f} over {out['usd_n']} priced fires "
+                  f"(mid-to-mid, ${out.get('usd_stake', STAKE_USD):.0f}/trade, {COST_PCT * 100:.0f}% cost, "
+                  f"+{RET_CAP * 100:.0f}% cap)",
+              "    OPTIMISTIC: mid-to-mid overstates the up-side (fills buy the spike, sell the reversion); "
+              "the live NET fire run is the real number."]
     if out.get("n_truncated"):
         L += ["", f"  {out['n_truncated']} fires were FETCH-TRUNCATED (busy pool, history capped before the slot) --",
               "  not divergences; raise --pages to fetch them. They are excluded from reproduced/DIVERGED."]

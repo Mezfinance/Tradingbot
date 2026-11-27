@@ -297,3 +297,20 @@ def test_fire_consumer_wires_the_gate_and_a_fires_writer(tmp_path):
     rec = json.loads(fires_path.read_text().strip())
     assert rec == {"pool": "P", "slot": 7, "eta": 1.2, "sym": "N", "m2": ".N",
                    "tier": "1", "token_mint": "Mxyz"}
+
+
+def test_cpi_drop_counter_counts_invisible_routed_swaps():
+    # direct_swaps = top-level pumpswap swaps we decode; cpi_txs = pumpswap invoked via CPI (program id in the
+    # account list, but no top-level pumpswap instruction) -> a swap this feed drops. A gauge of the CPI gap.
+    c = lc.Consumer(gate={}, runner_factory=lambda: _AlwaysFire())
+    keys, ins = _tx(lc.SELL, "TOKEN", lc.WSOL, pool="P")          # a direct top-level pumpswap swap
+    c.on_tx(10, keys, ins)
+    assert c.direct_swaps == 1 and c.cpi_txs == 0
+    # pumpswap is in the account list but the only top-level instruction is a router -> CPI-routed, dropped
+    cpi_keys = ["PAYER", "ROUTER", lc.PROGRAM, "POOL", "TOKEN", lc.WSOL]
+    cpi_ins = [("JupiterRouter", [0, 1, 2, 3], b"\x00" * 16)]
+    assert c.on_tx(11, cpi_keys, cpi_ins) == []                  # nothing decoded
+    assert c.cpi_txs == 1 and c.direct_swaps == 1                # one CPI counted, direct unchanged
+    # a tx with neither pumpswap top-level nor pumpswap in the keys is not a drop
+    c.on_tx(12, ["A", "B", "C"], [("Other", [0, 1], b"\x00" * 8)])
+    assert c.cpi_txs == 1
