@@ -50,6 +50,17 @@ def test_arm_ok_accepts_handmade_sol_pool_and_rejects_the_rest():
     assert ps.arm_ok(HAND[:200]) is False               # short account
 
 
+def test_b58_fallback_matches_helius_on_every_key():
+    # the box-flat _b58 must be byte-identical to helius.b58encode, else the box decode drifts
+    from tradingbot.data.helius import b58encode as hz
+    for raw in (HAND, GRAD, LP):
+        for o in (11, 43, 75, 107, 139, 171, 211):
+            if o + 32 <= len(raw):
+                assert ps._b58(raw[o:o + 32]) == hz(raw[o:o + 32])
+    assert ps._b58(bytes(32)) == hz(bytes(32)) == ps.NO_KEY   # all-zero -> 32 ones
+    assert ps._b58(b"") == hz(b"")
+
+
 def test_token_amount_and_spot_price():
     acct = bytes(64) + (5_000_000).to_bytes(8, "little") + bytes(93)
     assert ps.token_amount(acct) == 5_000_000 and ps.token_amount(bytes(10)) is None

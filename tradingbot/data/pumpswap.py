@@ -10,7 +10,23 @@ is added, removed or first minted, never on swaps, so a websocket on 82-byte Tok
 pool (and every pull) for ~120 Helius credits a day."""
 from __future__ import annotations
 
-from tradingbot.data.helius import b58encode
+
+def _b58(b: bytes) -> str:
+    """Standalone base58 of raw bytes (Solana/Bitcoin alphabet) -- the box-flat fallback for helius.b58encode,
+    pinned identical by tests/test_pumpswap.py so the box decode matches the in-package one."""
+    n = int.from_bytes(b, "big")
+    alpha = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    out = ""
+    while n > 0:
+        n, r = divmod(n, 58)
+        out = alpha[r] + out
+    return "1" * (len(b) - len(b.lstrip(b"\x00"))) + out
+
+
+try:                                     # in-package: use helius's encoder (the single source)
+    from tradingbot.data.helius import b58encode
+except ImportError:                      # box-flat: no package -> the standalone copy (identical output)
+    b58encode = _b58
 
 PROGRAM = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 TOKEN_2022 = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
