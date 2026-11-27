@@ -202,6 +202,13 @@ class Consumer:
         # every pool we decode) is the set a routed tx's accounts are intersected against to find its pool.
         self.route_classify = route_classify
         self.known_pools: dict = {}
+        # Armed-scoped CPI gauge: the global cpi_txs/cpi_routers above count EVERY pumpswap-touching routed tx
+        # in the firehose (mature pools, arb, routine aggregator flow) -- but the gate only fires on armed
+        # pools, so those are the router set that actually matters. cpi_*_armed count routed CPIs only on a tx
+        # that touches a tracked pool we would fire on (is_armed, else any known pool). Almost certainly a short
+        # sniper-bot head, vs the 500+ whole-stream tail.
+        self.cpi_txs_armed = 0
+        self.cpi_routers_armed: dict = {}
 
     def _slot_rec(self, st: _PoolState) -> dict:
         # price/sol fields are 0.0: the precursor gate is price- and magnitude-free (sym/m2/m3 only).
@@ -289,8 +296,14 @@ class Consumer:
         # message carries no inner instructions), so we drop it. A proxy count of the invisible CPI swaps.
         if PROGRAM in account_keys and not any(ins[0] == PROGRAM for ins in instructions):
             self.cpi_txs += 1
-            for pid in {ins[0] for ins in instructions} - INFRA_PROGRAMS - {PROGRAM}:
+            routers = {ins[0] for ins in instructions} - INFRA_PROGRAMS - {PROGRAM}
+            for pid in routers:
                 self.cpi_routers[pid] = self.cpi_routers.get(pid, 0) + 1
+            apool = next((k for k in account_keys if k in self.known_pools), None)   # a pool we track?
+            if apool is not None and (self.is_armed is None or self.is_armed(apool)):   # ...and would fire on
+                self.cpi_txs_armed += 1
+                for pid in routers:
+                    self.cpi_routers_armed[pid] = self.cpi_routers_armed.get(pid, 0) + 1
             if self.route_classify is not None:          # Phase 2: recover the routed swap (two-tier)
                 payer = fee_payer if fee_payer is not None else (account_keys[0] if account_keys else None)
                 for ins in instructions:

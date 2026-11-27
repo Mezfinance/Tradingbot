@@ -347,6 +347,23 @@ def test_routed_recovery_true_direction_and_buyer():
     assert st.n_sells == 1 and st.buyers == ["PAYER"]        # seller not added as a buyer
 
 
+def test_armed_scoped_cpi_gauge_counts_only_tracked_pools():
+    c = lc.Consumer(gate={}, runner_factory=lambda: _AlwaysFire())   # route_classify None -> gauge only
+    c.on_tx(5, *_cpi_router_tx())                        # pool NOT tracked yet
+    assert c.cpi_txs == 1 and c.cpi_txs_armed == 0       # whole-firehose gauge counts, armed scope does not
+    c.add_pool("POOL", "TOKENMINT")
+    c.on_tx(6, *_cpi_router_tx(payer="W2"))
+    assert c.cpi_txs == 2 and c.cpi_txs_armed == 1       # now a tracked pool is touched -> armed scope counts
+    assert c.cpi_routers_armed and set(c.cpi_routers_armed) <= set(c.cpi_routers)
+
+
+def test_armed_scoped_gauge_respects_the_arm_gate():
+    c = lc.Consumer(gate={}, runner_factory=lambda: _AlwaysFire(), is_armed=lambda p: False)
+    c.add_pool("POOL", "TOKENMINT")
+    c.on_tx(5, *_cpi_router_tx())
+    assert c.cpi_txs == 1 and c.cpi_txs_armed == 0       # tracked but not armed -> excluded from the gauge
+
+
 def test_routed_recovery_passes_the_pool_token_to_the_classifier():
     got = {}
     def _rc(prog, data, accts, keys, token):
