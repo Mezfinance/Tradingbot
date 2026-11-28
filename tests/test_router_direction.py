@@ -382,3 +382,28 @@ def test_load_samples_merges_files_without_duplicate_sigs(tmp_path):
     b.write_text(line % "s2" + line % "s3")
     got = rd.load_samples("%s,%s" % (a, b))
     assert [s["sig"] for s in got] == ["s1", "s2", "s3"]
+
+
+def test_why_dropped_names_the_reason():
+    R = "RouterProg"
+    base = _pumpswap_routed_tx(R, SELL, "TOKEN", WSOL)
+    assert rd.why_dropped(base, R) == "kept"
+    assert rd.why_dropped(base, "OtherRouter").startswith("no top-level router ix")
+    no_ps = {"transaction": {"message": {"instructions": [{"programId": R, "accounts": ["U"], "data": "11"}]}},
+             "meta": {"innerInstructions": []}}
+    assert rd.why_dropped(no_ps, R) == "no inner pumpswap ix"
+    odd = _pumpswap_routed_tx(R, b"\x09" * 8, "TOKEN", WSOL)
+    assert rd.why_dropped(odd, R) == "pumpswap disc " + "09" * 8
+    failed = {**base, "meta": {**base["meta"], "err": {"x": 1}}}
+    assert rd.why_dropped(failed, R) == "failed tx"
+
+
+def test_diagnose_router_tallies_one_page():
+    R = "RouterProg"
+
+    class H:
+        def _rpc(self, method, params, credits):
+            return {"data": [_pumpswap_routed_tx(R, SELL, "TOKEN", WSOL),
+                             _pumpswap_routed_tx(R, b"\x09" * 8, "TOKEN", WSOL)]}
+    out = rd.diagnose_router(H(), R)
+    assert out["txs"] == 2 and out["reasons"]["kept"] == 1

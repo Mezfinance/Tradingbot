@@ -234,6 +234,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--routers-file", type=str, default=None, help="router-direction: a JSON {program_id: routed-tx count} (the box's full cpi_routers dump) -- fetch+fit EVERY router (highest volume first, budget-capped) and report volume-weighted coverage of the routed flow")
     parser.add_argument("--per-router", type=int, default=2000, help="router-direction per-router fetch: recent (desc) transactions to read per router, paged in 1000s (~10 credits per 100). Deep enough to see buy AND sell")
     parser.add_argument("--top", type=int, default=0, help="router-direction: only fetch/decode the top-N routers by --routers-file volume (0 = all). The owner's 'top 20 routers'")
+    parser.add_argument("--diagnose", type=str, default=None, help="router-direction: comma-separated router ids; read ONE page (100 txs, ~10 credits) each and print why its txs were kept/dropped as samples")
     parser.add_argument("--skip-sampled", nargs="?", const="__default__", default=None, help="router-direction --routers-file: skip routers we already hold enough samples for (>=4 buy AND >=4 sell). Default list = the summary shipped in tradingbot/router_data/router_sampled.json; or pass a summary json / samples JSONL path. Only routers that still need samples are fetched")
     parser.add_argument("--decode", action="store_true", help="router-direction: print a per-router decode worksheet (buy vs sell discriminators + the side-encoding rule) as well as the coverage table")
     parser.add_argument("--dump", action="store_true", help="router-direction: print RAW per-router buy/sell example transactions for hand decoding (no rule-fitting), and save all labeled samples to --samples-out")
@@ -951,6 +952,13 @@ def main(argv: list[str] | None = None) -> None:
         from tradingbot import router_direction as _rd
         import httpx as _rd_httpx
         from tradingbot.data.helius import Helius as _RdHelius
+        if args.diagnose:                                         # why does a router yield no samples? ~10 credits each
+            _h = _RdHelius(client=_rd_httpx.Client(timeout=60))   # research (backup) key, never the live key
+            _h.min_interval_s = 1 / max(args.rps, 0.1)
+            for _prog in [p.strip() for p in args.diagnose.split(",") if p.strip()]:
+                print(json.dumps(_rd.diagnose_router(_h, _prog)), flush=True)
+            print(f"credits used: {_h.credits_used}", file=sys.stderr)
+            return
         if args.from_pumpswap or args.routers or args.routers_file:   # fetch mode: labeled samples from Helius
             _counts = None
             if args.routers_file:                                 # the box's routed-volume tally = coverage denominator

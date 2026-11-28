@@ -242,6 +242,52 @@ def fetch_router_samples(helius, router: str, pages: int = 2, per_page: int = 10
     return out
 
 
+def why_dropped(tx: dict, router: str) -> str:
+    """Why fetch_router_samples kept or dropped one tx (for diagnosing a router that yields 0 samples):
+    'kept' / 'no top-level router ix' / 'no inner pumpswap ix' / 'pumpswap disc <hex>' (not a swap we label)
+    / 'pumpswap not SOL-paired' / 'failed tx'."""
+    if ((tx or {}).get("meta") or {}).get("err") is not None:
+        return "failed tx"
+    found = []
+    for grp in ((tx or {}).get("meta") or {}).get("innerInstructions") or []:
+        for ix in grp.get("instructions") or []:
+            if ix.get("programId") == PUMPSWAP:
+                found.append(ix)
+    msg = ((tx or {}).get("transaction") or {}).get("message") or {}
+    top = [ix.get("programId") for ix in msg.get("instructions") or []]
+    if not found:
+        return "no inner pumpswap ix" + (" (pumpswap top-level)" if PUMPSWAP in top else "")
+    if label_from_tx(tx, None) is None:
+        ix = found[0]
+        data = _b58decode(ix.get("data") or "")
+        if data[:8] != SELL and data[:8] not in BUY_DISCS:
+            return "pumpswap disc %s" % data[:8].hex()
+        return "pumpswap not SOL-paired"
+    if _router_top_ix(tx, router) is None:
+        return "no top-level router ix" + (" (router invoked by CPI)" if router not in top else " (empty data)")
+    return "kept"
+
+
+def diagnose_router(helius, router: str, limit: int = 100) -> dict:
+    """ONE page of a router's recent txs (~limit/10 credits) and a tally of why_dropped, plus the top-level
+    programs of the dropped ones -- shows why a router yields no labeled samples before spending more."""
+    opts = {"transactionDetails": "full", "sortOrder": "desc", "limit": limit,
+            "maxSupportedTransactionVersion": 1, "encoding": "jsonParsed"}
+    res = helius._rpc("getTransactionsForAddress", [router, opts], max(10, 10 * limit // 100))
+    page = (res or {}).get("data") or [] if isinstance(res, dict) else []
+    reasons: Counter = Counter()
+    tops: Counter = Counter()
+    for tx in page:
+        r = why_dropped(tx, router)
+        reasons[r] += 1
+        if r != "kept":
+            msg = ((tx or {}).get("transaction") or {}).get("message") or {}
+            for ix in msg.get("instructions") or []:
+                tops[ix.get("programId")] += 1
+    return {"router": router, "txs": len(page), "reasons": dict(reasons.most_common()),
+            "top_programs_of_dropped": dict(tops.most_common(8))}
+
+
 def _inner_token(tx: dict) -> Optional[str]:
     """The non-WSOL mint of the tx's first inner pumpswap swap (for the mint_order rule). None if absent."""
     for grp in ((tx or {}).get("meta") or {}).get("innerInstructions") or []:
