@@ -3,7 +3,7 @@ from tradingbot.localshred_tap import _b58encode
 from tradingbot.localshred_consumer import PROGRAM as PUMPSWAP, WSOL, SELL, BUY_EXACT_QUOTE_IN
 
 JUP = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
-BOT = "CtjS9o7rj3UuiNSjUdh4vHih5WiEoLXDk6XE1y3LN8Vg"   # a pin-target
+BOT = "H16rUHa5roA8T8cqDpCqGWRQsXqDEgrWWiSww7GBWa5t"   # a pin-target
 TAIL = "ZzTailRouter11111111111111111111111111111111"
 
 
@@ -258,7 +258,7 @@ def test_load_samples_and_study_and_render(tmp_path):
 
 def test_study_reports_volume_weighted_coverage():
     # router A: clean disc split (accepted); router B: unseparable (not accepted)
-    A, B = BOT, "DiabLokxisGR8P4Qqp2QL6PmBhhVsdzPstCE4WoLxc5z"
+    A, B = BOT, "9is6NreU9HdcLBdph8fe4CxfYwMu6fjoBB6BDZFBvKNh"
     samples = []
     for i in range(20):
         d = "buy" if i % 2 == 0 else "sell"
@@ -283,3 +283,195 @@ def test_load_rules_fails_safe(tmp_path):
     good.write_text('{"%s": {"kind": "disc", "map": {}}, "skip": {"no": "kind"}}' % JUP)
     loaded = rd.load_rules(str(good))
     assert JUP in loaded and "skip" not in loaded
+
+
+# --- chunk 1 (2026-11-28): per-instruction rules, data-blind guard, split stability ----------------------
+
+SIDE_IX = b"\xaf\x05\x19\x81\xa0\xd8\x38\x9d"     # buy/sell ix with a side byte at [24] (6Vo3245-style)
+SELL_IX = b"\xfd\x9c\xb9\xe4\xf0\x69\xdc\xa9"     # sell-only ix
+
+
+def _side_samples(n=40):
+    out = []
+    for i in range(n):
+        amt = (1000 + 37 * i).to_bytes(8, "little") + (5 + i).to_bytes(8, "little")
+        if i % 4 == 3:
+            out.append({"data": SELL_IX + amt + b"\x01" * 9, "accounts": [0], "keys": ["A"], "dir": "sell"})
+        else:
+            d = "buy" if i % 2 == 0 else "sell"
+            out.append({"data": SIDE_IX + amt + (b"\x01" if d == "buy" else b"\x00") + b"\x00",
+                        "accounts": [0], "keys": ["A"], "dir": d})
+    return out
+
+
+def test_apply_per_disc_nested_and_abstain():
+    rule = {"kind": "per_disc", "prefix": 8, "map": {
+        SIDE_IX.hex(): {"kind": "byte_flag", "offset": 24, "map": {"01": "buy", "00": "sell"}},
+        SELL_IX.hex(): "sell"}}
+    body = bytes(16)
+    assert rd.apply_rule(rule, SIDE_IX + body + b"\x01\x00", [], []) == "buy"
+    assert rd.apply_rule(rule, SIDE_IX + body + b"\x00\x00", [], []) == "sell"
+    assert rd.apply_rule(rule, SIDE_IX + body + b"\x07\x00", [], []) is None     # unseen side value
+    assert rd.apply_rule(rule, SELL_IX + body, [], []) == "sell"
+    assert rd.apply_rule(rule, b"\x11" * 26, [], []) is None                      # unseen ix
+    tag = {"kind": "per_disc", "prefix": 1, "map": {"06": "sell"}}
+    assert rd.apply_rule(tag, b"\x06abc", [], []) == "sell"
+    assert rd.apply_rule(tag, b"\x08abc", [], []) is None
+
+
+def test_find_rule_stable_fits_a_side_byte_next_to_a_sell_only_ix():
+    r = rd.find_rule_stable(_side_samples())
+    assert r["accepted"] and r["kind"] == "per_disc"
+    sub = r["rule"]["map"][SIDE_IX.hex()]
+    assert sub["kind"] == "byte_flag" and sub["offset"] == 24
+    assert r["rule"]["map"][SELL_IX.hex()] == "sell"
+    assert rd.rule_fire_rate(r["rule"], _side_samples()) == 1.0
+
+
+def test_data_blind_router_is_rejected():
+    # identical instruction bytes labelled buy AND sell: the side is chosen at execution -> never decode
+    out = []
+    for i in range(20):
+        out.append({"data": b"\x0c" * 8 + bytes([i % 3]) * 8, "accounts": [0], "keys": ["A"],
+                    "dir": "buy" if i % 2 else "sell"})
+    r = rd.find_rule_stable(out)
+    assert not r["accepted"] and r["reason"].startswith("data-blind")
+
+
+def test_disc_rule_refuses_amount_memorisation():
+    # 30 distinct 8-byte prefixes (a native tag + amount bytes) is not an instruction set
+    out = [{"data": b"\x02" + (i * 7919).to_bytes(7, "little"), "accounts": [0], "keys": ["A"],
+            "dir": "buy" if i % 2 else "sell"} for i in range(30)]
+    assert rd._disc_rule(out) is None
+
+
+def test_study_reports_effective_coverage():
+    ss = [{**s, "router": "R1"} for s in _side_samples()]
+    rep = rd.study(ss, counts={"R1": 100, "R2": 300})
+    assert rep["n_accepted"] == 1
+    assert rep["coverage"] == 0.25 and rep["effective_coverage"] == 0.25
+    assert "EFFECTIVE" in rd.render(rep)
+
+
+def test_routers_to_fetch_skips_what_we_already_hold():
+    counts = {"BIG": 1000, "HALF": 500, "DONE": 400, "ARB": 300, "NEW": 10}
+    have = {"HALF": [112, 0], "DONE": [9, 5]}
+    out = rd.routers_to_fetch(counts, have, denylist=frozenset({"ARB"}))
+    assert out == ["BIG", "HALF", "NEW"]                 # DONE fit-able, ARB denylisted; volume order
+
+
+def test_load_sampled_from_summary_and_jsonl(tmp_path):
+    summ = tmp_path / "s.json"
+    summ.write_text('{"R": [3, 1]}')
+    assert rd.load_sampled(str(summ)) == {"R": [3, 1]}
+    j = tmp_path / "a.jsonl"
+    j.write_text('{"router":"R","sig":"x","data":"00","accounts":[],"keys":[],"dir":"sell"}\n')
+    assert rd.load_sampled(str(j)) == {"R": [0, 1]}
+    assert rd.load_sampled(str(tmp_path / "missing.json")) == {}
+
+
+def test_shipped_sampled_summary_loads():
+    have = rd.load_sampled(rd.SAMPLED_PATH)
+    assert len(have) > 100 and all(len(v) == 2 for v in have.values())
+
+
+def test_load_samples_merges_files_without_duplicate_sigs(tmp_path):
+    line = '{"router":"R","sig":"%s","data":"00","accounts":[],"keys":[],"dir":"buy"}\n'
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    a.write_text(line % "s1" + line % "s2")
+    b.write_text(line % "s2" + line % "s3")
+    got = rd.load_samples("%s,%s" % (a, b))
+    assert [s["sig"] for s in got] == ["s1", "s2", "s3"]
+
+
+def test_why_dropped_names_the_reason():
+    R = "RouterProg"
+    base = _pumpswap_routed_tx(R, SELL, "TOKEN", WSOL)
+    assert rd.why_dropped(base, R) == "kept"
+    assert rd.why_dropped(base, "OtherRouter").startswith("no top-level router ix")
+    no_ps = {"transaction": {"message": {"instructions": [{"programId": R, "accounts": ["U"], "data": "11"}]}},
+             "meta": {"innerInstructions": []}}
+    assert rd.why_dropped(no_ps, R) == "no inner pumpswap ix"
+    odd = _pumpswap_routed_tx(R, b"\x09" * 8, "TOKEN", WSOL)
+    assert rd.why_dropped(odd, R) == "pumpswap disc " + "09" * 8
+    failed = {**base, "meta": {**base["meta"], "err": {"x": 1}}}
+    assert rd.why_dropped(failed, R) == "failed tx"
+
+
+def test_diagnose_router_tallies_one_page():
+    R = "RouterProg"
+
+    class H:
+        def _rpc(self, method, params, credits):
+            return {"data": [_pumpswap_routed_tx(R, SELL, "TOKEN", WSOL),
+                             _pumpswap_routed_tx(R, b"\x09" * 8, "TOKEN", WSOL)]}
+    out = rd.diagnose_router(H(), R)
+    assert out["txs"] == 2 and out["reasons"]["kept"] == 1
+
+
+def test_raw_record_keeps_every_tx_with_balances():
+    tx = _pumpswap_routed_tx("R", b"\x09" * 8, "TOKEN", WSOL)       # an unlabelled tx is still recorded
+    tx["meta"].update({"preTokenBalances": [{"owner": "U", "mint": "TOKEN", "uiTokenAmount": {"amount": "5"}}],
+                       "postTokenBalances": [{"owner": "U", "mint": "TOKEN", "uiTokenAmount": {"amount": "9"}}],
+                       "preBalances": [100], "postBalances": [60]})
+    seen = []
+    class H:
+        def _rpc(self, method, params, credits):
+            return {"data": [tx]}
+    out = rd.fetch_router_samples(H(), "R", pages=1, per_page=10, raw_sink=seen.append)
+    assert out == [] and len(seen) == 1
+    r = seen[0]
+    assert r["tok"] == [["U", "TOKEN", 4]] and r["payer_sol"] == -40
+    assert r["top"][1]["p"] == "R" and r["inner"][0]["ix"][0]["p"] == PUMPSWAP
+
+
+def test_v2_pumpswap_discs_label():
+    assert rd._dir_from_pumpswap(rd.SELL_V2, "TOKEN", WSOL) == "sell"
+    assert rd._dir_from_pumpswap(rd.BUY_V2, "TOKEN", WSOL) == "buy"
+    assert rd._dir_from_pumpswap(rd.BUY_EXACT_QUOTE_IN_V2, "TOKEN", WSOL) == "buy"
+    assert rd.label_from_tx(_inner_tx(rd.SELL_V2, "TOKEN", WSOL), "POOL") == "sell"
+
+
+def _raw(disc, payer_delta, err=None, extra=None):
+    ix = {"p": PUMPSWAP, "a": ["POOL", "U", "x", "TOKEN", WSOL], "d": _b58encode(disc + bytes(8))}
+    return {"router": "R", "sig": "S", "err": err, "payer": "U",
+            "top": [{"p": "R", "a": ["U", "POOL"], "d": _b58encode(b"\xaa" * 8)}],
+            "inner": [{"i": 0, "ix": [ix] + (extra or [])}], "tok": [["U", "TOKEN", payer_delta]]}
+
+
+def test_label_raw_checks_balances_and_washes():
+    assert rd.label_raw(_raw(rd.BUY_V2, 50)) == ("buy", "TOKEN")
+    assert rd.label_raw(_raw(rd.SELL_V2, -50)) == ("sell", "TOKEN")
+    assert rd.label_raw(_raw(rd.BUY_V2, -50)) is None                      # balances contradict -> drop
+    assert rd.label_raw(_raw(rd.BUY_V2, 0)) == ("buy", "TOKEN")            # payer unmoved: trust the ix
+    assert rd.label_raw(_raw(rd.BUY_V2, 50, err={"x": 1})) is None         # failed tx
+    wash = {"p": PUMPSWAP, "a": ["POOL", "U", "x", "TOKEN", WSOL], "d": _b58encode(rd.SELL_V2 + bytes(8))}
+    assert rd.label_raw(_raw(rd.BUY_V2, 0, extra=[wash])) is None          # buy+sell in one tx
+
+
+def test_samples_from_raw(tmp_path):
+    import gzip
+    import json as _j
+    p = tmp_path / "raw.jsonl.gz"
+    with gzip.open(p, "wt") as f:
+        f.write(_j.dumps(_raw(rd.BUY_V2, 5)) + "\n" + _j.dumps(_raw(rd.SELL_V2, 0, err={"e": 1})) + "\n")
+    out = rd.samples_from_raw(str(p))
+    assert len(out) == 1 and out[0]["dir"] == "buy" and out[0]["keys"] == ["U", "POOL"]
+    assert out[0]["data"] == b"\xaa" * 8 and out[0]["token"] == "TOKEN"
+
+
+def test_bit_flag_and_sentinel_rules():
+    tr = [{"data": b"\x01" * 11 + bytes([0x10 | (i % 4)]), "dir": "buy"} for i in range(8)] + \
+         [{"data": b"\x01" * 11 + bytes([0x20 | (i % 4)]), "dir": "sell"} for i in range(8)]
+    r = rd._bit_flag_rule(tr)
+    assert r["offset"] == 11 and rd.apply_rule(r, b"\x01" * 11 + b"\x13", [], []) == "buy"
+    assert rd.apply_rule(r, b"\x01" * 11 + b"\x22", [], []) == "sell"
+    mx = b"\xff" * 8
+    tr2 = [{"data": b"\x00" * 8 + (i + 1).to_bytes(8, "little"), "dir": "buy"} for i in range(6)] + \
+          [{"data": b"\x00" * 8 + mx, "dir": "sell"} for _ in range(6)] + \
+          [{"data": b"\x00" * 8 + (99).to_bytes(8, "little"), "dir": "sell"}]   # one sell without the sentinel
+    assert rd._const_field_rule(tr2) is None                                  # two-sided fails on the odd sell
+    s = rd._sentinel_rule(tr2)
+    assert s["is"] == "sell" and s["other"] is None
+    assert rd.apply_rule(s, b"\x00" * 8 + mx, [], []) == "sell"
+    assert rd.apply_rule(s, b"\x00" * 8 + (3).to_bytes(8, "little"), [], []) is None   # abstain, never 'buy'

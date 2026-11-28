@@ -1,0 +1,1207 @@
+{
+ "2A6m4MBgk3xL6a8SBMdKmAmFc85tTLh4Ds6wy7dBxBxb": {
+  "index": 11,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "2UUgGySTVXmKFatH7pGQo84ZrzdSYF5zw9iqrGwBMuuj": {
+  "kind": "byte_flag",
+  "map": {
+   "00": "buy",
+   "63": "sell"
+  },
+  "offset": 8
+ },
+ "352rY7FF1Dk4LtQWSAWEKWA67iVKi9MDax1j4GXMMuCR": {
+  "kind": "per_disc",
+  "map": {
+   "4152424702000100": {
+    "kind": "byte_flag",
+    "map": {
+     "02": "buy",
+     "03": "sell",
+     "04": "buy"
+    },
+    "offset": 25
+   },
+   "4152424702000200": "buy"
+  },
+  "prefix": 8
+ },
+ "3Bq3XQfudBmu8jRBqL4BxXskXCA5t9nSCXUswYP2Vssw": {
+  "kind": "per_disc",
+  "map": {
+   "0240420f00000000": {
+    "kind": "byte_flag",
+    "map": {
+     "03": "sell",
+     "04": "buy",
+     "06": "sell"
+    },
+    "offset": 9
+   },
+   "0340420f00000000": "buy"
+  },
+  "prefix": 8
+ },
+ "3uzFH72KiPE3ThrF67j8AnJDHs8tMAcTtBi4tmFruNa4": {
+  "kind": "byte_flag",
+  "map": {
+   "02": "buy",
+   "03": "sell"
+  },
+  "offset": 26
+ },
+ "3vHAVbqXVS4i9gqmfuxsWMb92HRncQo38uQCKDRJyBHg": {
+  "kind": "per_disc",
+  "map": {
+   "415d16c21d4a1ac0": {
+    "kind": "bit_flag",
+    "map": {
+     "00": "sell",
+     "10": "buy"
+    },
+    "mask": 16,
+    "offset": 11
+   }
+  },
+  "prefix": 8
+ },
+ "3xHrUxnNuVm6RaRUjKjmKvoJxVboo7nqZqqGifFyCDuX": {
+  "is": "buy",
+  "kind": "const_field",
+  "offset": 23,
+  "other": null,
+  "value": "1c0000000006001a",
+  "width": 8
+ },
+ "45WsrbziFRaAc2R5oQYYYQPQCWVS3LQxFj7HRhShHWd1": {
+  "index": 6,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "47db2zQxySA2fRDrnFKi8cvZRqkZTUUid6Lg4ktCZ1jU": {
+  "index": 5,
+  "kind": "wsol_index",
+  "other": "buy",
+  "wsol_is": "sell"
+ },
+ "4jKaNVZiHKDskK5Eqc6g2CWhk4s4hp8YuW1xwLf8PYJp": {
+  "kind": "disc",
+  "map": {
+   "1baeed336f30bde0": "buy",
+   "4498846bfbf86ad4": "sell"
+  }
+ },
+ "4w3DZU3zBu7149sTmEZ2XFTNxuvuX3F9f9heQFi6YtS6": {
+  "kind": "per_disc",
+  "map": {
+   "3343e4924235db0f": {
+    "kind": "bit_flag",
+    "map": {
+     "00": "buy",
+     "02": "sell"
+    },
+    "mask": 2,
+    "offset": 70
+   }
+  },
+  "prefix": 8
+ },
+ "526JmxdgpoxWp7pHZzPwDTm67u1twRango8nvDSHXng4": {
+  "is": "buy",
+  "kind": "const_field",
+  "offset": 43,
+  "other": null,
+  "value": "0007060108091600",
+  "width": 8
+ },
+ "6HBPd3xPVSUqUq1VjdMamxMpi4mAHun6b5d7oNyiC8Ub": {
+  "index": 14,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "6Vo3245eszAb5wuqEMw8mGdbfRUdKbHhDHP5LcaGuTAB": {
+  "kind": "per_disc",
+  "map": {
+   "af051981a0d8389d": {
+    "kind": "byte_flag",
+    "map": {
+     "00": "sell",
+     "01": "buy"
+    },
+    "offset": 24
+   },
+   "fd9cb9e4f069dca9": "sell"
+  },
+  "prefix": 8
+ },
+ "6eZtcgPZiR8RjyLtv3XSbUjqkVNQzcLTKhsswkqGEZX": {
+  "kind": "per_disc",
+  "map": {
+   "5254545241444533": {
+    "kind": "bit_flag",
+    "map": {
+     "00": "buy",
+     "04": "sell"
+    },
+    "mask": 4,
+    "offset": 63
+   }
+  },
+  "prefix": 8
+ },
+ "718obpDKoh5Jff4hiXaj2GJ8SptMgjUxgm4VkQn5HmbX": {
+  "index": 7,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "7TRGGNEt2sUhfmHvPZXy5nApSTVr31gh52ZLuJNSZKMT": {
+  "kind": "disc",
+  "map": {
+   "3884dc653207d6cf": "buy",
+   "3a1779c6c5b9f6e8": "sell",
+   "9d057e41c3e1d10f": "sell"
+  }
+ },
+ "7purZgepHiFc88L5UDAnGR8h9pwp2KACbhCgjzWHeMub": {
+  "is": "buy",
+  "kind": "const_field",
+  "offset": 10,
+  "other": null,
+  "value": "0000000000000001",
+  "width": 8
+ },
+ "8J2njBaReTfkohiLkinXGvJ2Hn55e9gp9mC4nCnd32d2": {
+  "kind": "byte_flag",
+  "map": {
+   "00": "sell",
+   "dc": "buy",
+   "e8": "sell"
+  },
+  "offset": 32
+ },
+ "91sSK7FvcKwEvxDzswuKLfzq8vSjLt7fYq7HaHc9P44Y": {
+  "kind": "per_disc",
+  "map": {
+   "02": {
+    "is": "buy",
+    "kind": "const_field",
+    "offset": 15,
+    "other": "sell",
+    "value": "0000000200000004",
+    "width": 8
+   }
+  },
+  "prefix": 1
+ },
+ "9AF1yGem13TsKuZxTHmnVZwkv2p2akbfwb6QP9J8HBzJ": {
+  "index": 8,
+  "kind": "wsol_index",
+  "other": "buy",
+  "wsol_is": "sell"
+ },
+ "9GCBb4NsSDRuEkkGfQkN37oppmMVPops5sXDWhAKAvQQ": {
+  "kind": "per_disc",
+  "map": {
+   "0a0200000036124b": "sell",
+   "0a020000004b001b": "buy"
+  },
+  "prefix": 8
+ },
+ "9KGuApSJZmxHaFzk7pYM6W3feZvowVT1q6thnEGsTfzv": {
+  "kind": "per_disc",
+  "map": {
+   "03": "sell",
+   "06": "buy"
+  },
+  "prefix": 1
+ },
+ "9a7wJZRYKtpbe6ThyncvgmjEhiGSt3wdYCpTwjqGxUD": {
+  "kind": "byte_flag",
+  "map": {
+   "00": "buy",
+   "08": "sell",
+   "44": "sell"
+  },
+  "offset": 26
+ },
+ "A7ipVDSLXWRZvv38bE5omZpTQcE7abNoY57TmMfQdgmp": {
+  "kind": "byte_flag",
+  "map": {
+   "00": "sell",
+   "01": "buy"
+  },
+  "offset": 76
+ },
+ "AEWJpxjRAHPbS2pcoxZ36MxsqmpBLyNTtDf8kunqu9cM": {
+  "index": 8,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "AveaiuA1emN71q9mS2QQ9BEWNAAHmp8sHSvwLFHQjufM": {
+  "is": "buy",
+  "kind": "const_field",
+  "offset": 27,
+  "other": null,
+  "value": "0006000000000101",
+  "width": 8
+ },
+ "B7qnnCiZd6WfNHc4becittNreSCjxqPSrKRtWc1YEZ1R": {
+  "index": 9,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "BANANAjs7FJiPQqJTGFzkZJndT9o7UmKiYYGaJz6frGu": {
+  "index": 8,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "Bgo4vNe3vxRv37j8mmQarJo8vbjHEKgkhJDZzxiizBid": {
+  "is": "sell",
+  "kind": "const_field",
+  "offset": 36,
+  "other": null,
+  "value": "00000000ffffffff",
+  "width": 8
+ },
+ "BjvSt5bGER4HrA3UU8bQeJscVamFTkT87qzuZEDNgppr": {
+  "kind": "byte_flag",
+  "map": {
+   "00": "buy",
+   "01": "sell"
+  },
+  "offset": 8
+ },
+ "BxM2ipMbq66MuCdSDgjxMpc3cPUvoKLZ9CcSxqwmWQH": {
+  "is": "buy",
+  "kind": "const_field",
+  "offset": 10,
+  "other": null,
+  "value": "0000000000000601",
+  "width": 8
+ },
+ "C6io3t72E4QZiKDx37NKspBq2hp65Ks8BRuLNBDYNNm5": {
+  "index": 9,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "CASHQXt6HBTFsf3762fw1Rdh9dJsRmTjw87Xyf7JCCW6": {
+  "kind": "per_disc",
+  "map": {
+   "0101000000000000": "sell"
+  },
+  "prefix": 8
+ },
+ "CGGqPC3oERK5a7X38ttJGVTdR1YCSm53nxTMrhAvBRJX": {
+  "index": 33,
+  "kind": "wsol_index",
+  "other": "buy",
+  "wsol_is": "sell"
+ },
+ "CiELoEVnttYuFuZ2X2CHDXTbP5yMS4orreVQLzvXrzo": {
+  "kind": "byte_flag",
+  "map": {
+   "03": "buy",
+   "04": "sell"
+  },
+  "offset": 29
+ },
+ "CjjcsoPE6AeAtbKanWDmGxrgbK6VZdmjrqnsRGdpXu4c": {
+  "kind": "byte_flag",
+  "map": {
+   "01": "buy",
+   "02": "sell"
+  },
+  "offset": 168
+ },
+ "Cq7LUWhQgAi1tuEXBNv6puGpJgyX9BPUtZJtvmfE2ny9": {
+  "is": "buy",
+  "kind": "const_field",
+  "offset": 14,
+  "other": null,
+  "value": "0000000200000001",
+  "width": 8
+ },
+ "DqDhXJ2EdFJ4KBacGkyNMhpYN1mjT85rnRi8JTRh3wU5": {
+  "kind": "byte_flag",
+  "map": {
+   "00": "sell",
+   "2f": "buy"
+  },
+  "offset": 10
+ },
+ "E4D7pxGf8u7FdMGACFVam5Kv4u9PwxrAsBmdxuzFyegv": {
+  "index": 7,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "EX1r3CbD6zBYJVCJkmNJZAiwNiV1X81pQ6SkTpZXSgfR": {
+  "kind": "per_disc",
+  "map": {
+   "010541564d310001": {
+    "kind": "bit_flag",
+    "map": {
+     "00": "buy",
+     "10": "sell"
+    },
+    "mask": 16,
+    "offset": 35
+   }
+  },
+  "prefix": 8
+ },
+ "Efru6BfwuxmWyJXLY1hz7PKp87F8k1EffMxaczRoJrbf": {
+  "index": 3,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "FASTrea7xraedkkZFLRrCWva3UiawvjmoJ6jd4w8322H": {
+  "kind": "byte_flag",
+  "map": {
+   "00": "buy",
+   "01": "sell"
+  },
+  "offset": 12
+ },
+ "FYcQ63T1a2emdbjAhjJvMPD7RCtoym6U1CtoPRbHKCW4": {
+  "kind": "byte_flag",
+  "map": {
+   "11": "sell",
+   "13": "sell",
+   "1a": "buy"
+  },
+  "offset": 12
+ },
+ "Fmhh4ChgWHuV24ppoHecdCF7wEPf5x7VKuLQhoYzCMqY": {
+  "kind": "per_disc",
+  "map": {
+   "06": "sell"
+  },
+  "prefix": 1
+ },
+ "Fo31nF1C8wZKjqExaZQJ3sdPUL8vLMHDeB8mAFFYTfa7": {
+  "kind": "byte_flag",
+  "map": {
+   "00": "sell",
+   "01": "buy"
+  },
+  "offset": 43
+ },
+ "GLCNMEV6Z7P72YtUciTUzMczWPALAkV9F6k5z9jHsfwy": {
+  "is": "buy",
+  "kind": "const_field",
+  "offset": 16,
+  "other": null,
+  "value": "0002000202000001",
+  "width": 8
+ },
+ "GnZr2LD3N1F7mr5mNdgN7doBMxFNAF9dKtpoNHGCkrx2": {
+  "index": 6,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "Htogmd68JyjQmGAkh4vk1n4yqEu2m6PnkXSd5RqvpGQE": {
+  "kind": "per_disc",
+  "map": {
+   "740296759d8b69fa": {
+    "is": "sell",
+    "kind": "const_field",
+    "offset": 28,
+    "other": "buy",
+    "value": "0000000001000000",
+    "width": 8
+   }
+  },
+  "prefix": 8
+ },
+ "L6pUpkHtq3CLtJRTrZ9GsBxfweZ8iPS6CnDQMdmcbad": {
+  "is": "buy",
+  "kind": "const_field",
+  "offset": 11,
+  "other": null,
+  "value": "0000000000091cff",
+  "width": 8
+ },
+ "LVDVYRcogqF4Ti2n5kPr852cDMgrPwGg6gShxypp34K": {
+  "is": "buy",
+  "kind": "const_field",
+  "offset": 54,
+  "other": null,
+  "value": "0708090a0b0c0d0e",
+  "width": 8
+ },
+ "LiveiNLxbiyvZECvKAnhmuSzR4t9CWNY7Rj7XbThu9j": {
+  "kind": "disc",
+  "map": {
+   "0201000000111e05": "sell",
+   "02010000001a1905": "buy",
+   "0240420f00111e05": "sell",
+   "0240420f001a1905": "buy",
+   "0289130000111e05": "sell",
+   "02891300001a1905": "buy",
+   "02902c1000111e05": "sell",
+   "04752200000f2b09": "sell"
+  }
+ },
+ "LuteGGtejDsrjNyVDrdJZWrnzwAxysqRY9X2nN7JdPG": {
+  "kind": "byte_flag",
+  "map": {
+   "00": "buy",
+   "01": "sell"
+  },
+  "offset": 18
+ },
+ "RaptorD5ojtsqDDtJeRsunPLg6GvLYNnwKJWxYE4m87": {
+  "index": 3,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "S5rHfPfbMUN8d4u7xaY8eJzifpZSVSBWqpcvADykFc1": {
+  "kind": "bit_flag",
+  "map": {
+   "00": "sell",
+   "20": "buy"
+  },
+  "mask": 32,
+  "offset": 23
+ },
+ "T1TANpTeScyeqVzzgNViGDNrkQ6qHz9KrSBS4aNXvGT": {
+  "kind": "mint_order",
+  "other": "sell",
+  "wsol_first": "buy"
+ },
+ "TKWFTw5smvXbe8juvBsP1MnjyWwGer93diWG31qh8Zs": {
+  "index": 11,
+  "kind": "wsol_index",
+  "other": "buy",
+  "wsol_is": "sell"
+ },
+ "ThorUjdJ9fZTTeEgCnxSA91YD9Ydy9FwktfVXkXU9or": {
+  "index": 2,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "XYU4x4wV2Tq5VVnFBoTEyfte8kHtsFFnUFdWH7bxbmq": {
+  "index": 6,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "arctAE22ktV3ejWhG3Bv6pco3Vc2xNuEqvmLVwKDQtc": {
+  "index": 5,
+  "kind": "wsol_index",
+  "other": "sell",
+  "wsol_is": "buy"
+ },
+ "b1oomGGqPKGD6errbyfbVMBuzSC8WtAAYo8MwNafWW1": {
+  "kind": "per_disc",
+  "map": {
+   "912a6c1877534a0d": {
+    "kind": "byte_flag",
+    "map": {
+     "00": "sell",
+     "38": "buy",
+     "b8": "buy"
+    },
+    "offset": 9
+   },
+   "f60b35a94e71d218": "sell"
+  },
+  "prefix": 8
+ },
+ "cqXpiki8fwAWY72xtzqPLmstzf3MZ4kjJBhRatZrWMs": {
+  "kind": "per_disc",
+  "map": {
+   "0460900f00000000": "buy",
+   "04c0e1e400000000": "buy"
+  },
+  "prefix": 8
+ },
+ "fprojCUBjtu1KSHBT8uv3s9UCeVKkqGrXQm8JAWsAXS": {
+  "kind": "per_disc",
+  "map": {
+   "06": "buy",
+   "07": "sell",
+   "ff": {
+    "kind": "byte_flag",
+    "map": {
+     "05": "buy",
+     "06": "sell"
+    },
+    "offset": 10
+   }
+  },
+  "prefix": 1
+ },
+ "fxckso1g4zPGWcoAtsgKsatficCCPSHAL1bWFMvSSzA": {
+  "kind": "disc",
+  "map": {
+   "a3529c104b7e8840": "buy",
+   "a3529c104b7e8841": "sell"
+  }
+ },
+ "giftBX9qeXhyECT79zNvJBTMFDxRny8w4yS8iky8BsK": {
+  "is": "buy",
+  "kind": "const_field",
+  "offset": 10,
+  "other": null,
+  "value": "0000000200000000",
+  "width": 8
+ },
+ "iQuEPytBrtdzxswBgjTo8ChFiXTEDbpYbLiX3rAe54j": {
+  "kind": "per_disc",
+  "map": {
+   "00": {
+    "kind": "bit_flag",
+    "map": {
+     "00": "sell",
+     "02": "buy"
+    },
+    "mask": 2,
+    "offset": 21
+   }
+  },
+  "prefix": 1
+ },
+ "q2ps11PLEw7EareiJ728NYP4qf893rcFBPejfVgCdp1": {
+  "kind": "per_disc",
+  "map": {
+   "04": "buy",
+   "05": "sell"
+  },
+  "prefix": 1
+ },
+ "rexhfZLRRxRkPkw9izswgMFRPDb9U58jeinH7wqUVuw": {
+  "is": "buy",
+  "kind": "const_field",
+  "offset": 25,
+  "other": null,
+  "value": "0000000000041000",
+  "width": 8
+ },
+ "s7SunwrPG5SbViEKiViaDThPRJxkkTrNx2iRPN3exNC": {
+  "is": "sell",
+  "kind": "const_field",
+  "offset": 35,
+  "other": null,
+  "value": "0000002402001027",
+  "width": 8
+ },
+ "term9YPb9mzAsABaqN71A4xdbxHmpBNZavpBiQKZzN3": {
+  "kind": "per_disc",
+  "map": {
+   "afaf6d1f0d989bed": "buy"
+  },
+  "prefix": 8
+ },
+ "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4": {
+  "kind": "per_disc",
+  "prefix": 8,
+  "map": {
+   "e517cb977ae3ad2a": {
+    "kind": "mint_index",
+    "index": 5,
+    "wsol_is": "sell",
+    "token_is": "buy"
+   },
+   "bb64facc31c4af14": {
+    "kind": "mint_index",
+    "index": 4,
+    "wsol_is": "sell",
+    "token_is": "buy"
+   },
+   "5368c096b4479cc6": {
+    "kind": "mint_index",
+    "index": 3,
+    "wsol_is": "sell",
+    "token_is": "buy"
+   },
+   "a0752c34dc4d5140": {
+    "kind": "mint_index",
+    "index": 4,
+    "wsol_is": "sell",
+    "token_is": "buy"
+   }
+  },
+  "note": "hand-fit 2026-11-28 on router-raw8: route/route_v2/... dest mint index; 745 right, 0 wrong, 79 abstain (other-mint legs)"
+ },
+ "proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u": {
+  "kind": "per_disc",
+  "prefix": 8,
+  "map": {
+   "8765e34498744609": {
+    "kind": "mint_conds",
+    "conds": [
+     [
+      4,
+      "token",
+      "buy"
+     ]
+    ]
+   },
+   "bbc9d433109bec3c": {
+    "kind": "mint_conds",
+    "conds": [
+     [
+      4,
+      "token",
+      "buy"
+     ],
+     [
+      3,
+      "wsol",
+      "buy"
+     ],
+     [
+      3,
+      "token",
+      "sell"
+     ],
+     [
+      4,
+      "wsol",
+      "sell"
+     ],
+     [
+      43,
+      "wsol",
+      "buy"
+     ],
+     [
+      33,
+      "wsol",
+      "buy"
+     ],
+     [
+      37,
+      "wsol",
+      "buy"
+     ],
+     [
+      51,
+      "wsol",
+      "buy"
+     ],
+     [
+      50,
+      "token",
+      "buy"
+     ],
+     [
+      32,
+      "token",
+      "buy"
+     ],
+     [
+      67,
+      "wsol",
+      "buy"
+     ],
+     [
+      60,
+      "token",
+      "buy"
+     ],
+     [
+      48,
+      "token",
+      "buy"
+     ],
+     [
+      28,
+      "wsol",
+      "buy"
+     ],
+     [
+      75,
+      "wsol",
+      "buy"
+     ],
+     [
+      66,
+      "token",
+      "buy"
+     ],
+     [
+      55,
+      "token",
+      "buy"
+     ],
+     [
+      54,
+      "token",
+      "buy"
+     ],
+     [
+      48,
+      "wsol",
+      "buy"
+     ],
+     [
+      47,
+      "token",
+      "buy"
+     ],
+     [
+      36,
+      "token",
+      "buy"
+     ],
+     [
+      24,
+      "wsol",
+      "buy"
+     ]
+    ]
+   },
+   "be9ca9b0959aa16c": {
+    "kind": "mint_conds",
+    "conds": [
+     [
+      4,
+      "token",
+      "buy"
+     ],
+     [
+      57,
+      "wsol",
+      "buy"
+     ],
+     [
+      56,
+      "token",
+      "buy"
+     ],
+     [
+      81,
+      "token",
+      "buy"
+     ]
+    ]
+   }
+  },
+  "note": "hand-fit 2026-11-28 on router-raw15; 8765 decodes buys only, 93f1 undecoded"
+ },
+ "DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH": {
+  "kind": "per_disc",
+  "prefix": 8,
+  "map": {
+   "f8c69e91e17587c8": {
+    "kind": "mint_conds",
+    "conds": [
+     [
+      10,
+      "token",
+      "buy"
+     ],
+     [
+      9,
+      "token",
+      "sell"
+     ],
+     [
+      21,
+      "wsol",
+      "sell"
+     ],
+     [
+      20,
+      "token",
+      "sell"
+     ],
+     [
+      40,
+      "token",
+      "buy"
+     ],
+     [
+      54,
+      "wsol",
+      "buy"
+     ],
+     [
+      53,
+      "token",
+      "buy"
+     ],
+     [
+      33,
+      "wsol",
+      "buy"
+     ],
+     [
+      39,
+      "wsol",
+      "buy"
+     ],
+     [
+      17,
+      "wsol",
+      "sell"
+     ],
+     [
+      16,
+      "token",
+      "sell"
+     ],
+     [
+      38,
+      "token",
+      "buy"
+     ],
+     [
+      22,
+      "wsol",
+      "buy"
+     ],
+     [
+      19,
+      "wsol",
+      "buy"
+     ],
+     [
+      50,
+      "wsol",
+      "buy"
+     ],
+     [
+      42,
+      "token",
+      "buy"
+     ],
+     [
+      18,
+      "wsol",
+      "buy"
+     ],
+     [
+      57,
+      "wsol",
+      "buy"
+     ],
+     [
+      56,
+      "token",
+      "buy"
+     ],
+     [
+      33,
+      "token",
+      "buy"
+     ],
+     [
+      36,
+      "token",
+      "buy"
+     ],
+     [
+      81,
+      "wsol",
+      "buy"
+     ],
+     [
+      80,
+      "token",
+      "buy"
+     ],
+     [
+      53,
+      "wsol",
+      "buy"
+     ],
+     [
+      49,
+      "token",
+      "buy"
+     ],
+     [
+      40,
+      "wsol",
+      "buy"
+     ],
+     [
+      28,
+      "token",
+      "buy"
+     ],
+     [
+      23,
+      "wsol",
+      "buy"
+     ],
+     [
+      73,
+      "wsol",
+      "buy"
+     ],
+     [
+      72,
+      "token",
+      "buy"
+     ],
+     [
+      56,
+      "wsol",
+      "buy"
+     ],
+     [
+      52,
+      "token",
+      "buy"
+     ],
+     [
+      49,
+      "wsol",
+      "buy"
+     ],
+     [
+      48,
+      "token",
+      "buy"
+     ],
+     [
+      39,
+      "token",
+      "buy"
+     ]
+    ]
+   },
+   "2f3e9bac83cd25c9": {
+    "kind": "mint_conds",
+    "conds": [
+     [
+      2,
+      "wsol",
+      "buy"
+     ]
+    ]
+   },
+   "414b3f4ceb5b5b88": {
+    "kind": "mint_conds",
+    "conds": [
+     [
+      9,
+      "token",
+      "sell"
+     ],
+     [
+      16,
+      "wsol",
+      "sell"
+     ],
+     [
+      15,
+      "token",
+      "sell"
+     ],
+     [
+      10,
+      "token",
+      "buy"
+     ],
+     [
+      14,
+      "token",
+      "sell"
+     ],
+     [
+      20,
+      "wsol",
+      "sell"
+     ],
+     [
+      19,
+      "token",
+      "sell"
+     ],
+     [
+      58,
+      "token",
+      "buy"
+     ],
+     [
+      38,
+      "wsol",
+      "buy"
+     ],
+     [
+      38,
+      "token",
+      "buy"
+     ],
+     [
+      30,
+      "wsol",
+      "buy"
+     ],
+     [
+      29,
+      "wsol",
+      "sell"
+     ],
+     [
+      21,
+      "wsol",
+      "buy"
+     ],
+     [
+      18,
+      "wsol",
+      "buy"
+     ]
+    ]
+   },
+   "a8ac184dc59c8765": {
+    "kind": "mint_conds",
+    "conds": [
+     [
+      13,
+      "token",
+      "buy"
+     ],
+     [
+      18,
+      "wsol",
+      "buy"
+     ],
+     [
+      39,
+      "wsol",
+      "buy"
+     ],
+     [
+      38,
+      "token",
+      "buy"
+     ],
+     [
+      12,
+      "token",
+      "sell"
+     ],
+     [
+      19,
+      "token",
+      "sell"
+     ],
+     [
+      33,
+      "wsol",
+      "sell"
+     ],
+     [
+      52,
+      "wsol",
+      "buy"
+     ],
+     [
+      51,
+      "token",
+      "buy"
+     ],
+     [
+      19,
+      "wsol",
+      "sell"
+     ],
+     [
+      18,
+      "token",
+      "sell"
+     ]
+    ]
+   },
+   "9bb38297c48bfda3": {
+    "kind": "mint_conds",
+    "conds": [
+     [
+      4,
+      "token",
+      "sell"
+     ]
+    ]
+   },
+   "5f7bd5f67a0156e7": {
+    "kind": "mint_conds",
+    "conds": [
+     [
+      19,
+      "wsol",
+      "sell"
+     ],
+     [
+      18,
+      "token",
+      "sell"
+     ],
+     [
+      12,
+      "token",
+      "sell"
+     ],
+     [
+      38,
+      "wsol",
+      "buy"
+     ],
+     [
+      37,
+      "token",
+      "buy"
+     ],
+     [
+      33,
+      "wsol",
+      "sell"
+     ],
+     [
+      22,
+      "wsol",
+      "buy"
+     ],
+     [
+      13,
+      "token",
+      "buy"
+     ],
+     [
+      6,
+      "token",
+      "buy"
+     ]
+    ]
+   }
+  },
+  "note": "hand-fit 2026-11-28 on router-raw15 (mint_conds per instruction, stable on 5 holdout splits)"
+ },
+ "Cy91y8eNt72wDxutUBgSQhrG5KGRqQa28T55suZNngsQ": {
+  "kind": "per_disc",
+  "prefix": 1,
+  "map": {
+   "01": "sell",
+   "02": "buy"
+  }
+ },
+ "GdvhFdVAJxVXecXRyVRqEz1DyHA8YAC8ZW7s7UviMzL4": {
+  "kind": "per_disc",
+  "prefix": 1,
+  "map": {
+   "01": "sell",
+   "02": "buy"
+  }
+ }
+}

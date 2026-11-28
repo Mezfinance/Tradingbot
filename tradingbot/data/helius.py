@@ -52,7 +52,10 @@ SOL_MINT = "So11111111111111111111111111111111111111112"
 # instruction -- a failed tx moves no vaults, so launch_record's vault-delta path can't see it.
 _SWAP_SELL = bytes([51, 230, 133, 164, 1, 127, 131, 173])                   # sell
 _SWAP_BUYS = frozenset({bytes([198, 46, 21, 82, 180, 217, 232, 112]),        # buy_exact_quote_in
-                        bytes([102, 6, 61, 18, 1, 218, 235, 234])})          # buy (buy_base_out)
+                        bytes([102, 6, 61, 18, 1, 218, 235, 234]),           # buy (buy_base_out)
+                        bytes.fromhex("b817ee6167c5d33d"),                   # buy_v2 (same accounts as v1)
+                        bytes.fromhex("c2ab1c46684d5b2f")})                  # buy_exact_quote_in_v2
+_SWAP_SELLS = frozenset({_SWAP_SELL, bytes.fromhex("5df6823ce7e940b2")})     # sell, sell_v2
 _FAILED_SENTINEL = 1e-9   # magnitude for a failed tx's vault-delta sign (direction only; the gate is magnitude-free)
 # Program log lines of a liquidity withdrawal (pumpswap `Withdraw`, Meteora/Raydium remove-liquidity variants).
 WITHDRAW_RE = re.compile(r"Instruction: (Withdraw|RemoveLiquidity|RemoveAllLiquidity|RemoveBalanceLiquidity|"
@@ -658,7 +661,7 @@ def swap_direction(tx: dict) -> bool | None:
             disc = _b58decode(ix.get("data") or "")[:8]
         except ValueError:
             continue
-        if disc == _SWAP_SELL:
+        if disc in _SWAP_SELLS:
             inst_buy = False
         elif disc in _SWAP_BUYS:
             inst_buy = True

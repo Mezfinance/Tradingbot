@@ -56,6 +56,20 @@ BUY_BASE_OUT = bytes([102, 6, 61, 18, 1, 218, 235, 234])   # pump_amm `buy` (buy
 # sell_exact_quote_out the box does NOT decode, so they stay out too, keeping this an exact parity of the
 # box's direct view (so frontrun-verify's only variable is the feed, not the discriminator set).
 BUY_DISCS = frozenset({BUY_EXACT_QUOTE_IN, BUY_BASE_OUT})
+# pump_amm v2 swaps (2026-11-28): Anchor sha256("global:<name>")[:8]. The big routers' flow moved to v2 (router
+# study, docs/ROUTER_DECODE.md); a v1-only decode silently drops every direct v2 swap. Same account layout as v1
+# (verified on the raw top-26 router fetch, 5880 v2 ixs, 17 accounts each: 0 = pool (the vault owner on all 200
+# successful txs), 1 = user (== fee payer), 2 = global_config, 3 = base_mint, 4 = quote_mint), and the disc
+# direction matched the payer's token-balance change on 474/474 txs, so the same orientation flip applies.
+# The study's visibility tag (helius._top_level_pumpswap) is log-based and disc-agnostic, so the gate was fit
+# WITH top-level v2 swaps; decoding them here closes a train/serve gap rather than opening one.
+SELL_V2 = bytes.fromhex("5df6823ce7e940b2")                 # sell_v2
+BUY_V2 = bytes.fromhex("b817ee6167c5d33d")                  # buy_v2
+BUY_EXACT_QUOTE_IN_V2 = bytes.fromhex("c2ab1c46684d5b2f")   # buy_exact_quote_in_v2
+SELL_DISCS = frozenset({SELL, SELL_V2})
+BUY_DISCS_V2 = frozenset({BUY_V2, BUY_EXACT_QUOTE_IN_V2})
+DIRECT_BUY_DISCS = BUY_DISCS | BUY_DISCS_V2                 # what classify_instruction decodes as a buy
+V2_DISCS = frozenset({SELL_V2}) | BUY_DISCS_V2                # the v2 subset (for the v2 info line)
 
 # Well-known infrastructure programs that sit as top-level instructions in a routed tx but are NOT the
 # aggregator. Subtract these (and pumpswap itself) to attribute a dropped-CPI swap to the router program
@@ -78,6 +92,7 @@ class Swap(NamedTuple):
     token: str     # the non-WSOL mint of the pool (for the fires jsonl; frontrun_verify re-derives it anyway)
     is_buy: bool   # TOKEN buy (after the orientation flip), not the raw instruction kind
     payer: str     # tx fee payer (account_keys[0]) = the trading wallet, per the study
+    v2: bool = False  # decoded from a pump_amm v2 instruction (buy_v2 / sell_v2 / buy_exact_quote_in_v2)
 
 
 def classify_instruction(program_id: str, accts, data, account_keys, fee_payer) -> Optional[Swap]:
@@ -91,9 +106,9 @@ def classify_instruction(program_id: str, accts, data, account_keys, fee_payer) 
         if len(data) < 8:
             return None
         disc = bytes(data[:8])
-        if disc == SELL:
+        if disc in SELL_DISCS:
             inst_buy = False
-        elif disc in BUY_DISCS:
+        elif disc in DIRECT_BUY_DISCS:
             inst_buy = True
         else:
             return None
@@ -111,7 +126,7 @@ def classify_instruction(program_id: str, accts, data, account_keys, fee_payer) 
     token_is_base = not base_is_sol              # the token is the non-WSOL mint
     token_buy = (inst_buy == token_is_base)      # the box flip: a SOL-base pool's token BUY is the `sell` ix
     token = base_mint if token_is_base else quote_mint
-    return Swap(pool=pool, token=token, is_buy=token_buy, payer=fee_payer)
+    return Swap(pool=pool, token=token, is_buy=token_buy, payer=fee_payer, v2=disc in V2_DISCS)
 
 
 def decode_tx(account_keys, instructions, fee_payer=None):
@@ -153,7 +168,8 @@ class Consumer:
                  on_fire: Optional[Callable[[dict], None]] = None, runner_factory=None,
                  fresh_window_slots: int = 0, on_capture: Optional[Callable] = None,
                  handmade_only: bool = True, on_pool: Optional[Callable] = None, reserves=None,
-                 is_armed: Optional[Callable] = None, route_classify: Optional[Callable] = None):
+                 is_armed: Optional[Callable] = None, route_classify: Optional[Callable] = None,
+                 route_measure_only: bool = False):
         self.gate = gate
         self.tier = str(tier)
         self.flurry_min = flurry_min
@@ -190,6 +206,11 @@ class Consumer:
         # top level (routed through an aggregator CPI), so this feed dropped the swap. The box health line reads them.
         self.direct_swaps = 0
         self.cpi_txs = 0
+        # v2_swaps = the direct swaps that came from a v2 instruction. Every v2_log_s seconds on_tx prints one
+        # 'v2 decoded' info line (cumulative counts) so the box log shows v2 working; 0 = off.
+        self.v2_swaps = 0
+        self.v2_log_s = 60.0
+        self._v2_last = time.monotonic()
         # Phase 0 (router-breakdown): per dropped-CPI tx, tally the aggregator program id that carried it
         # (the non-infra, non-pumpswap top-level program). router_top() sizes which routers a CPI-aware
         # decoder must cover to recover the invisible swaps -- the Pareto set, not every router.
@@ -209,6 +230,11 @@ class Consumer:
         # sniper-bot head, vs the 500+ whole-stream tail.
         self.cpi_txs_armed = 0
         self.cpi_routers_armed: dict = {}
+        # Router recovery tally (route_classify set): one count per router instruction on a TRACKED pool, by
+        # verdict (buy / sell / buyer_plus = tail, counted a buy / drop). route_measure_only=True tallies
+        # but never feeds on_swap, so the gate and its fires are exactly as with recovery off.
+        self.route_measure_only = route_measure_only
+        self.route_counts: dict = {}
 
     def _slot_rec(self, st: _PoolState) -> dict:
         # price/sol fields are 0.0: the precursor gate is price- and magnitude-free (sym/m2/m3 only).
@@ -291,6 +317,14 @@ class Consumer:
         fires = []
         swaps = decode_tx(account_keys, instructions, fee_payer)
         self.direct_swaps += len(swaps)
+        self.v2_swaps += sum(1 for sw in swaps if sw.v2)
+        if self.v2_log_s:
+            now = time.monotonic()
+            if now - self._v2_last >= self.v2_log_s:
+                self._v2_last = now
+                print(self.v2_line(), flush=True)
+                if self.route_classify is not None:
+                    print(self.route_line(), flush=True)
         # CPI drop: pumpswap was invoked in this tx (its program id is in the account list) but there is no
         # top-level pumpswap instruction to decode -> the swap was routed through an aggregator CPI (a compiled
         # message carries no inner instructions), so we drop it. A proxy count of the invisible CPI swaps.
@@ -333,9 +367,27 @@ class Consumer:
         if pool is None:
             return None                                      # pool not tracked (not discovered / not ours)
         verdict = self.route_classify(program_id, data, accts, account_keys, token)   # token for mint_order rules
+        self.route_counts[verdict] = self.route_counts.get(verdict, 0) + 1
+        if self.route_measure_only:
+            return None                                      # measure only: count, never feed the gate
         if verdict not in ("buy", "sell", "buyer_plus"):
             return None                                      # "drop" / unknown -> skip (conservative)
         return self.on_swap(slot, pool, token, verdict != "sell", payer)
+
+    def v2_line(self) -> str:
+        """The 'v2 decoded' info line: cumulative v2 swaps out of all direct swaps decoded."""
+        pct = 100.0 * self.v2_swaps / self.direct_swaps if self.direct_swaps else 0.0
+        return "v2 decoded: %d of %d direct swaps (%.1f%%)" % (self.v2_swaps, self.direct_swaps, pct)
+
+    def route_line(self) -> str:
+        """The 'routed' info line: router instructions on tracked pools, by verdict (cumulative)."""
+        c = self.route_counts
+        n = sum(c.values())
+        rec = c.get("buy", 0) + c.get("sell", 0)
+        pct = 100.0 * rec / n if n else 0.0
+        return ("routed (tracked pools): buy=%d sell=%d tail=%d drop=%d -> rule-decoded %d of %d (%.1f%%)%s"
+                % (c.get("buy", 0), c.get("sell", 0), c.get("buyer_plus", 0), c.get("drop", 0), rec, n, pct,
+                   " [measure only]" if self.route_measure_only else " [feeding the gate]"))
 
     def router_top(self, n: int = 5):
         """Top aggregator programs by dropped-CPI tx count (Phase 0 sizing): which routers carry the
