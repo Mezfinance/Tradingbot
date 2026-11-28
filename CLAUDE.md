@@ -4,6 +4,8 @@ Context for new Claude Code sessions in this repo. **Read this first, then updat
 
 **Never guess.** Verify on the machine (fly machine exec) or in the code before stating a cause or giving a command. If unverified, say so and give a check command first.
 
+**Background every `fly machine exec`.** Long commands: `nohup sh -c "..." > /data/<job>.log 2>&1 &`, then poll with `tail`/`ps` in separate short execs. Never run a long job in the foreground (it times out/hangs).
+
 ## What this repo is
 
 A Python 3.10+ Claude-driven Solana memecoin scanner/trader. Paper trading is the default. It was built as a better version of the "Grok bots" people promote online. `RESEARCH.md` holds the findings: the viral returns are survivorship bias, and the realistic edge comes from risk control plus measurement.
