@@ -92,6 +92,7 @@ Other docs: `DEPLOY.md` (Fly steps, canary arming), `FACTORS.md` (300 candidate 
 - **Never guess** (user, 11-28). Verify on the machine (`fly machine exec`) or in the code before stating a cause or giving a command; if unverified, say so and give a check command first.
 - **`fly ssh sftp` put never overwrites** (user, 11-28). Before re-uploading, `rm` the target via a `fly machine exec`, then put, then verify it landed.
 - **Box restarts: `pkill -f "[r]un_<script>.py"; sleep 25` before relaunching** (user, 11-28), so the LocalShred proxy releases the old connection first. Use it in every box restart command, e.g. `pkill -f "[r]un_localshred.py"; sleep 25; cd /root/ls && set -a; . ~/.shredenv; set +a; nohup /root/sv/bin/python -u run_localshred.py --gate gate_1790.json --arm --tier 1 > localshred.log 2>&1 & echo started`.
+- **Scratch package for Fly: `tar czf /tmp/rdpkg.tgz tradingbot` from the repo root** (user, 11-28; `git archive` doesn't work on Jerome's Mac). `rm` the old `/data/rdpkg*` first, put it, `tar xzf` into `/data/rdpkg`, run with `PYTHONPATH=/data/rdpkg`.
 
 ## Current state (2026-11-28)
 
