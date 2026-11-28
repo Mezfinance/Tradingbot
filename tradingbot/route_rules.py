@@ -51,6 +51,37 @@ DENYLIST = frozenset({
     "81eej9NUm883KBEbYFxxLx3cbduVC1VQU8KmgwCpCp3",    # 10,000 ok, 5 swaps
     "2TK4sdgGTG89Rh3TurnbViNzkJRyg8CaXhhAEQimX3ia",   # 10,000 ok, 8 swaps
     # Counting any of them as a buyer (tail) would add ~1,000 phantom buys per real one, so they DROP.
+    # 2026-11-28 raw15 (+raw26/raw8) noise routers: <5% of their pumpswap-referencing txs land a real swap and
+    # they have no rule, so on a tracked pool they fell into the tail and counted as phantom buyers. Includes the
+    # buy-only snipers AKWt and 7gET (Jerome: leave them dropped).
+    "AS1QpzurEfa72SPadgEQTjBy42JmfdpMe3tGSuWmfvwp",  # 14 of 5000 pumpswap-referencing txs land a real swap (0 failed)
+    "AKWt4XTTtvr9Tch6Wt7vNsp52Xw2h63Yf1jL5RS4C6fb",  # 17 of 5000 pumpswap-referencing txs land a real swap (4983 failed)
+    "9hNfSmU8to3vJU5w45eRzbvkfX15JBtRnZhc7bQn8aTf",  # 17 of 5000 pumpswap-referencing txs land a real swap (0 failed)
+    "7BAkoJjbd8g3fLChA8Nw7WDmhRiyccGz5pT2MzQBCrPg",  # 103 of 5000 pumpswap-referencing txs land a real swap (20 failed)
+    "7gET6n9MBVDfYMkKqd1a6b6iYPqVugmutM5pacPHxGQt",  # 9 of 5000 pumpswap-referencing txs land a real swap (0 failed)
+    "BPodLBws7bPeqyCPhXuA9hchrqnB7CdLViVmay5VB9Vc",  # 11 of 5000 pumpswap-referencing txs land a real swap (12 failed)
+    "4Qv3mbzcq1bKmrhGG4voS3EemfPd7f838FLUU7wBHSyi",  # 6 of 4583 pumpswap-referencing txs land a real swap (754 failed)
+    "EHbpdi8WraHgjcQebkPTjgRQEHUhiayDr3SXFyc2uPpr",  # 9 of 4378 pumpswap-referencing txs land a real swap (3831 failed)
+    "2ygRa2JZreUe2iQsUzySxGSM7LoLSuFkS1EzsSGK9Bd4",  # 3 of 4267 pumpswap-referencing txs land a real swap (0 failed)
+    "NA777pkN8YYSsQKk1zvwKgJmThtuWbmhonzJxRARQm5",   # 17 of 3125 pumpswap-referencing txs land a real swap (1041 failed)
+    "5CzA1ojKsSBSmKFwqeawrHvkUhfH61S68Fk5sfyu35rY",  # 0 of 3000 pumpswap-referencing txs land a real swap (0 failed)
+    "B4vFc6B89Gxhchs4S2PK2ihbG9spUaeyGinNVA3BfDZn",  # 4 of 3000 pumpswap-referencing txs land a real swap (815 failed)
+    "CZqFPJ35PQT1Jx2o3QAirY8pdTQp7tErJsiQm2GD6xw5",  # 4 of 3000 pumpswap-referencing txs land a real swap (2996 failed)
+    "D3JGiTfCCqGxqKEEPjR7burcm1DeXZka7J1UGxgn8v5b",  # 4 of 3000 pumpswap-referencing txs land a real swap (206 failed)
+    "38V4CympZFuDKfZyXujSxCcEr1jhBgyfKYTGzUcPJgAf",  # 6 of 3000 pumpswap-referencing txs land a real swap (0 failed)
+    "ERfhoTm5C4cQ1U7M2K5R83nnCzWMqZr9Df21Nzx4sm5e",  # 3 of 3000 pumpswap-referencing txs land a real swap (2997 failed)
+    "D1S8Z2J1dAySKJFp391H1rbaMUuiJR62mk4vH37FSWRv",  # 0 of 3000 pumpswap-referencing txs land a real swap (0 failed)
+    "4rNUovFo5y92gPu79mvnkCDiteM5NCxgYBMw97uQkqgj",  # 0 of 3000 pumpswap-referencing txs land a real swap (3000 failed)
+    "8ZkM1BNwh2ttak7zsC9DP2QHXqZaMxaZ6ryrpQe1G6C4",  # 62 of 3000 pumpswap-referencing txs land a real swap (0 failed)
+    "E5xDXQZGS859ieWc8GpCJJQP1fsFEYYz7FrjJ2KLhJ89",  # 34 of 2997 pumpswap-referencing txs land a real swap (0 failed)
+    "4i9Z2N9zbMScC63eUGCmw5JrbZDv2dhJ3dstNtAcNjAv",  # 30 of 2994 pumpswap-referencing txs land a real swap (1597 failed)
+    "ZEPHYRuoTyquTiT1JHJbHyU7hqsGZNmd91SzxfXmF57",   # 46 of 2083 pumpswap-referencing txs land a real swap (2037 failed)
+    "BMofZXeaBSzWWdSnMbnRQNFCabDfziwxMMeS32jKUoyf",  # 0 of 1973 pumpswap-referencing txs land a real swap (1973 failed)
+    "Prism8hsRo6Ww5jiN5Zeh3YDPLZHqHduCPSAV7JF7qv",   # 2 of 763 pumpswap-referencing txs land a real swap (297 failed)
+    "ECd2e3Tjy8wAE8kHsgo3YjkjEyAG73uPT3RQJpEnpm9e",  # 0 of 504 pumpswap-referencing txs land a real swap (504 failed)
+    "8Tww5R7ZqEH1YNULRsPfhodvpePaeWSj7LiQnSiQ413y",  # 0 of 437 pumpswap-referencing txs land a real swap (0 failed)
+    "GmEkUmJkcc7bEjkHDymxdsnBaMCHj8qEvGwp7BQiXp3c",  # 0 of 429 pumpswap-referencing txs land a real swap (429 failed)
+    "MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz",   # 4 of 246 pumpswap-referencing txs land a real swap (135 failed)
 })
 
 

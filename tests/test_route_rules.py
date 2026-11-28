@@ -143,3 +143,20 @@ def test_shipped_prov_rule_decodes_sells_on_the_pool_carrying_ix():
     assert classify(prov, bytes.fromhex("aa2955b184501f35"), list(range(5)),
                     ["P0", "PAYER", "X", rr.WSOL, "MINTX"], tok) == "buy"
     assert classify(prov, data, list(range(5)), ["P0", "PAYER", "X", "A", "B"], tok) == "drop"
+
+
+def test_noise_routers_drop_instead_of_counting_as_tail_buyers():
+    for r in ("AS1QpzurEfa72SPadgEQTjBy42JmfdpMe3tGSuWmfvwp", "AKWt4XTTtvr9Tch6Wt7vNsp52Xw2h63Yf1jL5RS4C6fb",
+              "Prism8hsRo6Ww5jiN5Zeh3YDPLZHqHduCPSAV7JF7qv", "MEViEnscUm6tsQRoGd9h6nLQaQspKj7DB2M5FwM3Xvz"):
+        assert r in rr.DENYLIST
+        assert rr.router_classify(r, b"\x00" * 8, [0], ["X"], None) == "drop"
+    assert rr.router_classify("Unkn0wn1111111111111111111111111111111111111", b"", [0], ["X"]) == "buyer_plus"
+
+
+def test_route_line_names_the_tail_routers():
+    c = lc.Consumer(None, route_classify=lambda *a, **k: "buyer_plus", route_measure_only=True,
+                    runner_factory=lambda: None)
+    c.route_counts["buyer_plus"] = 5
+    c.route_tail.update({"GYLVJVVfKTuEKbxcmJnpi1v6ygsRost1sx1pjeoYxoyk": 4, "EQ7zKzeX9JeRehn3YxeABfhH44re5tuHWWqYK5otgqHV": 1})
+    line = c.route_line()
+    assert line.endswith("  tail top: GYLVJVVf=4 EQ7zKzeX=1") and "[measure only]" in line

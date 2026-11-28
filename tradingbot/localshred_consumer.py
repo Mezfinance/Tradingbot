@@ -235,6 +235,7 @@ class Consumer:
         # but never feeds on_swap, so the gate and its fires are exactly as with recovery off.
         self.route_measure_only = route_measure_only
         self.route_counts: dict = {}
+        self.route_tail: dict = {}             # buyer_plus verdicts by router program (route_tail_line)
 
     def _slot_rec(self, st: _PoolState) -> dict:
         # price/sol fields are 0.0: the precursor gate is price- and magnitude-free (sym/m2/m3 only).
@@ -368,6 +369,8 @@ class Consumer:
             return None                                      # pool not tracked (not discovered / not ours)
         verdict = self.route_classify(program_id, data, accts, account_keys, token)   # token for mint_order rules
         self.route_counts[verdict] = self.route_counts.get(verdict, 0) + 1
+        if verdict == "buyer_plus":                         # which unruled routers fill the tail
+            self.route_tail[program_id] = self.route_tail.get(program_id, 0) + 1
         if self.route_measure_only:
             return None                                      # measure only: count, never feed the gate
         if verdict not in ("buy", "sell", "buyer_plus"):
@@ -387,7 +390,13 @@ class Consumer:
         pct = 100.0 * rec / n if n else 0.0
         return ("routed (tracked pools): buy=%d sell=%d tail=%d drop=%d -> rule-decoded %d of %d (%.1f%%)%s"
                 % (c.get("buy", 0), c.get("sell", 0), c.get("buyer_plus", 0), c.get("drop", 0), rec, n, pct,
-                   " [measure only]" if self.route_measure_only else " [feeding the gate]"))
+                   " [measure only]" if self.route_measure_only else " [feeding the gate]")
+                + self.route_tail_line())
+
+    def route_tail_line(self, n: int = 6) -> str:
+        """Top unruled routers behind the tail count (short ids), so the next raw fetch targets them."""
+        top = sorted(self.route_tail.items(), key=lambda kv: kv[1], reverse=True)[:n]
+        return ("  tail top: " + " ".join("%s=%d" % (k[:8], v) for k, v in top)) if top else ""
 
     def router_top(self, n: int = 5):
         """Top aggregator programs by dropped-CPI tx count (Phase 0 sizing): which routers carry the

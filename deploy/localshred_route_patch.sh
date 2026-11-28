@@ -117,6 +117,27 @@ else:
     print("step C: route measure-only already present")
 
 
+# Step E: name the routers behind the tail count on the routed line (skipped if already applied)
+if "route_tail" not in s:
+    E1 = "        self.route_counts: dict = {}\n"
+    E2 = "        self.route_counts[verdict] = self.route_counts.get(verdict, 0) + 1\n"
+    E3 = "                   \" [measure only]\" if self.route_measure_only else \" [feeding the gate]\"))\n"
+    s = step(s, [
+        (E1, E1 + "        self.route_tail: dict = {}             # buyer_plus verdicts by router program (route_tail_line)\n"),
+        (E2, E2 + "        if verdict == \"buyer_plus\":                         # which unruled routers fill the tail\n"
+                  "            self.route_tail[program_id] = self.route_tail.get(program_id, 0) + 1\n"),
+        (E3, "                   \" [measure only]\" if self.route_measure_only else \" [feeding the gate]\")\n"
+             "                + self.route_tail_line())\n\n"
+             "    def route_tail_line(self, n: int = 6) -> str:\n"
+             "        \"\"\"Top unruled routers behind the tail count (short ids), so the next raw fetch targets them.\"\"\"\n"
+             "        top = sorted(self.route_tail.items(), key=lambda kv: kv[1], reverse=True)[:n]\n"
+             "        return (\"  tail top: \" + \" \".join(\"%s=%d\" % (k[:8], v) for k, v in top)) if top else \"\"\n"),
+    ], "route tail")
+    print("step E: tail-by-router on the routed line added")
+else:
+    print("step E: tail-by-router already present")
+
+
 new_lc, orig_lc = s, orig
 
 # ---------------- run_localshred.py: --route-rules / --route-feed (step D) ----------------
@@ -165,7 +186,9 @@ got = [(sw.is_buy, sw.v2) for d in (lc.BUY_V2, lc.SELL_V2, lc.BUY_EXACT_QUOTE_IN
 assert got == [(True, True), (False, True), (True, True), (True, False), (False, False)], got
 c = lc.Consumer(None, route_classify=cls, route_measure_only=True, runner_factory=lambda: None)
 assert c.route_measure_only and n > 0, n
+c.route_tail["GYLVJVVfKTuEKbxcmJnpi1v6ygsRost1sx1pjeoYxoyk"] = 3
+assert "tail top: GYLVJVVf=3" in c.route_line(), c.route_line()
 src = open("run_localshred.py").read()
 assert "--route-rules" in src and "route_measure_only=not args.route_feed" in src
-print("self-check OK: %d router rules load; v2 decode %s; measure-only consumer builds" % (n, got))
+print("self-check OK: %d router rules load, %d denylisted routers; v2 decode %s; measure-only consumer builds; tail line OK" % (n, len(rr.DENYLIST), got))
 PY
