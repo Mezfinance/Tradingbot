@@ -234,6 +234,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--routers-file", type=str, default=None, help="router-direction: a JSON {program_id: routed-tx count} (the box's full cpi_routers dump) -- fetch+fit EVERY router (highest volume first, budget-capped) and report volume-weighted coverage of the routed flow")
     parser.add_argument("--per-router", type=int, default=2000, help="router-direction per-router fetch: recent (desc) transactions to read per router, paged in 1000s (~10 credits per 100). Deep enough to see buy AND sell")
     parser.add_argument("--top", type=int, default=0, help="router-direction: only fetch/decode the top-N routers by --routers-file volume (0 = all). The owner's 'top 20 routers'")
+    parser.add_argument("--skip-sampled", nargs="?", const="__default__", default=None, help="router-direction --routers-file: skip routers we already hold enough samples for (>=4 buy AND >=4 sell). Default list = the summary shipped in tradingbot/router_data/router_sampled.json; or pass a summary json / samples JSONL path. Only routers that still need samples are fetched")
     parser.add_argument("--decode", action="store_true", help="router-direction: print a per-router decode worksheet (buy vs sell discriminators + the side-encoding rule) as well as the coverage table")
     parser.add_argument("--dump", action="store_true", help="router-direction: print RAW per-router buy/sell example transactions for hand decoding (no rule-fitting), and save all labeled samples to --samples-out")
     parser.add_argument("--samples-out", type=str, default="/data/router-samples.jsonl", help="router-direction --dump: path to write the raw labeled samples JSONL (download and feed in chunks)")
@@ -965,7 +966,13 @@ def main(argv: list[str] | None = None) -> None:
                       f"{len({s['router'] for s in _rd_samples})} routers, {_h.credits_used} credits",
                       file=sys.stderr, flush=True)
             else:
-                if args.routers_file:
+                if args.routers_file and args.skip_sampled:      # top-up: only routers still missing samples
+                    _sp = _rd.SAMPLED_PATH if args.skip_sampled == "__default__" else args.skip_sampled
+                    _have = _rd.load_sampled(_sp)
+                    _progs = _rd.routers_to_fetch(_counts, _have)
+                    print(f"skip-sampled: {len(_have)} routers already held; {len(_progs)} still need samples",
+                          file=sys.stderr, flush=True)
+                elif args.routers_file:
                     _progs = sorted(_counts, key=lambda p: -_counts[p])  # highest routed volume first
                 elif args.routers == "pins":
                     _progs = sorted(_rd.PIN_TARGETS)
@@ -986,6 +993,14 @@ def main(argv: list[str] | None = None) -> None:
                         print(f"fetched {_fetched}/{len(_progs)} routers, {_h.credits_used} credits",
                               file=sys.stderr, flush=True)
             if args.dump:                                         # raw examples for hand decoding + full JSONL
+                _seen_sigs: set = set()
+                _uniq = []
+                for s in _rd_samples:                             # a tx routed through 2 fetched routers: keep once
+                    if s.get("sig") and (s["router"], s["sig"]) in _seen_sigs:
+                        continue
+                    _seen_sigs.add((s["router"], s.get("sig")))
+                    _uniq.append(s)
+                _rd_samples = _uniq
                 with open(args.samples_out, "w") as f:
                     for s in _rd_samples:
                         f.write(json.dumps({"router": s["router"], "sig": s.get("sig"), "pool": s.get("pool"),

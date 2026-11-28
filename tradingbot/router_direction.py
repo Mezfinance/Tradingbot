@@ -651,6 +651,42 @@ def dump_examples(samples: list, counts: Optional[dict] = None, per_dir: int = 6
     return "\n".join(out)
 
 
+ROUTER_DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "router_data")
+SAMPLED_PATH = os.path.join(ROUTER_DATA, "router_sampled.json")    # {router: [buys, sells]} already in the JSONL
+COUNTS_PATH = os.path.join(ROUTER_DATA, "router_counts.json")      # {router: routed-tx volume} (box cpi_routers)
+
+
+def load_sampled(path: str) -> dict:
+    """{router: [buys, sells]} of samples we ALREADY hold. Accepts the compact summary json (shipped in the
+    image) or a raw samples JSONL. Missing file -> {} (nothing excluded)."""
+    try:
+        if path.endswith(".jsonl"):
+            out: dict = {}
+            for s in load_samples(path):
+                c = out.setdefault(s["router"], [0, 0])
+                c[0 if s["dir"] == "buy" else 1] += 1
+            return out
+        with open(path) as f:
+            return {str(k): [int(v[0]), int(v[1])] for k, v in json.load(f).items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def routers_to_fetch(counts: dict, sampled: dict, denylist=DENYLIST) -> list:
+    """Routers that still NEED samples, highest routed volume first: every router without at least
+    MIN_PER_DIR buys AND MIN_PER_DIR sells already in hand (so a fitted rule can be validated), minus the
+    denylist. Routers we can already fit are skipped, so a fetch never re-buys what we have."""
+    need = []
+    for r, v in counts.items():
+        if r in denylist:
+            continue
+        b, s = sampled.get(r, (0, 0))
+        if b >= MIN_PER_DIR and s >= MIN_PER_DIR:
+            continue
+        need.append(r)
+    return sorted(need, key=lambda r: -int(counts.get(r, 0)))
+
+
 def load_rules(path: str) -> dict:
     """Load validated per-router rules from a json {program_id: rule}. Missing/bad file -> {} (fail safe:
     an empty table just means every pin-target DROPS, never a wrong direction)."""
@@ -663,6 +699,21 @@ def load_rules(path: str) -> dict:
 
 
 def load_samples(path: str) -> list:
+    """Load one or more router-samples JSONLs (comma-separated paths), de-duplicated by signature (a later
+    file's copy of a sig is dropped), so a top-up fetch can be merged with the original file safely."""
+    if "," in path:
+        out, seen = [], set()
+        for p in [x for x in path.split(",") if x]:
+            for s in _load_samples_one(p):
+                if s.get("sig") and s["sig"] in seen:
+                    continue
+                seen.add(s.get("sig"))
+                out.append(s)
+        return out
+    return _load_samples_one(path)
+
+
+def _load_samples_one(path: str) -> list:
     """Load the box's router-samples JSONL. Each line: {"router","sig","pool","payer","data"(hex),
     "accounts"[int],"keys"[str]}. `data` is coerced to bytes. A bad line is skipped."""
     out = []

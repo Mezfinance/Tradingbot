@@ -351,3 +351,34 @@ def test_study_reports_effective_coverage():
     assert rep["n_accepted"] == 1
     assert rep["coverage"] == 0.25 and rep["effective_coverage"] == 0.25
     assert "EFFECTIVE" in rd.render(rep)
+
+
+def test_routers_to_fetch_skips_what_we_already_hold():
+    counts = {"BIG": 1000, "HALF": 500, "DONE": 400, "ARB": 300, "NEW": 10}
+    have = {"HALF": [112, 0], "DONE": [9, 5]}
+    out = rd.routers_to_fetch(counts, have, denylist=frozenset({"ARB"}))
+    assert out == ["BIG", "HALF", "NEW"]                 # DONE fit-able, ARB denylisted; volume order
+
+
+def test_load_sampled_from_summary_and_jsonl(tmp_path):
+    summ = tmp_path / "s.json"
+    summ.write_text('{"R": [3, 1]}')
+    assert rd.load_sampled(str(summ)) == {"R": [3, 1]}
+    j = tmp_path / "a.jsonl"
+    j.write_text('{"router":"R","sig":"x","data":"00","accounts":[],"keys":[],"dir":"sell"}\n')
+    assert rd.load_sampled(str(j)) == {"R": [0, 1]}
+    assert rd.load_sampled(str(tmp_path / "missing.json")) == {}
+
+
+def test_shipped_sampled_summary_loads():
+    have = rd.load_sampled(rd.SAMPLED_PATH)
+    assert len(have) > 100 and all(len(v) == 2 for v in have.values())
+
+
+def test_load_samples_merges_files_without_duplicate_sigs(tmp_path):
+    line = '{"router":"R","sig":"%s","data":"00","accounts":[],"keys":[],"dir":"buy"}\n'
+    a, b = tmp_path / "a.jsonl", tmp_path / "b.jsonl"
+    a.write_text(line % "s1" + line % "s2")
+    b.write_text(line % "s2" + line % "s3")
+    got = rd.load_samples("%s,%s" % (a, b))
+    assert [s["sig"] for s in got] == ["s1", "s2", "s3"]

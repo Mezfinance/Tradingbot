@@ -15,3 +15,9 @@ Validated rules: `Router Data/router_rules.json` (`load_rules` reads it; precisi
   (ix af05..: byte[24] 01=buy/00=sell; ix fd9c..: sell). Fmhh4: tag 06=sell, tag 08 undecodable.
 - Next: fresh box fetch for the top 30 by volume (`router-direction --routers-file router-counts.json
   --top 30 --dump`), then decode those in chunks.
+
+## Top-up fetch (2026-11-28)
+- `--skip-sampled` (router-direction --routers-file): fetches only routers lacking >=4 buy AND >=4 sell in
+  `tradingbot/router_data/router_sampled.json` (summary of the 62MB JSONL). Counts copy:
+  `tradingbot/router_data/router_counts.json`. Top 30 still-missing = 73.3% of routed volume.
+- Merge: `--samples "Router Data/router-samples.jsonl,Router Data/router-samples-top30.jsonl"` dedupes by sig.
