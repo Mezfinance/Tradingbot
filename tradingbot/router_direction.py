@@ -208,7 +208,35 @@ def _router_top_ix(tx: dict, router: str):
     return None
 
 
-def fetch_router_samples(helius, router: str, pages: int = 2, per_page: int = 1000) -> list:
+def raw_record(tx: dict, router: str) -> dict:
+    """Compact, label-free copy of one fetched tx for offline decoding (every tx, kept or not): the top-level
+    instructions, every inner instruction (program, accounts, data), token-balance deltas per (owner, mint) and
+    the fee payer's SOL delta. Enough to recover direction from balances without re-spending credits."""
+    tx = tx or {}
+    meta = tx.get("meta") or {}
+    msg = (tx.get("transaction") or {}).get("message") or {}
+    keys = [k.get("pubkey") if isinstance(k, dict) else k for k in msg.get("accountKeys") or []]
+
+    def ixs(lst):
+        return [{"p": ix.get("programId"), "a": ix.get("accounts") or [], "d": ix.get("data") or ""}
+                for ix in lst or [] if "parsed" not in ix]
+    bal: dict = {}
+    for side, sign in (("preTokenBalances", -1), ("postTokenBalances", 1)):
+        for b in meta.get(side) or []:
+            k = (b.get("owner"), b.get("mint"))
+            amt = int(((b.get("uiTokenAmount") or {}).get("amount")) or 0)
+            bal[k] = bal.get(k, 0) + sign * amt
+    pre, post = meta.get("preBalances") or [], meta.get("postBalances") or []
+    return {"router": router, "sig": _sig_of(tx), "slot": tx.get("slot"), "err": meta.get("err"),
+            "payer": keys[0] if keys else None,
+            "payer_sol": (post[0] - pre[0]) if pre and post else None,
+            "top": ixs(msg.get("instructions")),
+            "inner": [{"i": g.get("index"), "ix": ixs(g.get("instructions"))}
+                      for g in meta.get("innerInstructions") or []],
+            "tok": [[o, m, d] for (o, m), d in bal.items() if d]}
+
+
+def fetch_router_samples(helius, router: str, pages: int = 2, per_page: int = 1000, raw_sink=None) -> list:
     """Labeled samples for one router, MOST-RECENT-FIRST (desc) and paged DEEP. getTransactionsForAddress(
     router) gives each tx's TOP-LEVEL router instruction (data + account pubkeys = the shred-visible view, for
     fitting) AND its inner pumpswap CPI (the TRUE direction, for the label). Desc + deep is the fix for the
@@ -226,6 +254,8 @@ def fetch_router_samples(helius, router: str, pages: int = 2, per_page: int = 10
             break
         page = res.get("data") or []
         for tx in page:
+            if raw_sink is not None:
+                raw_sink(raw_record(tx, router))                  # every tx, before any filter
             d = label_from_tx(tx, None)                           # true direction from the inner pumpswap swap
             if not d:
                 continue

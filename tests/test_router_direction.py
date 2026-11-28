@@ -407,3 +407,19 @@ def test_diagnose_router_tallies_one_page():
                              _pumpswap_routed_tx(R, b"\x09" * 8, "TOKEN", WSOL)]}
     out = rd.diagnose_router(H(), R)
     assert out["txs"] == 2 and out["reasons"]["kept"] == 1
+
+
+def test_raw_record_keeps_every_tx_with_balances():
+    tx = _pumpswap_routed_tx("R", b"\x09" * 8, "TOKEN", WSOL)       # an unlabelled tx is still recorded
+    tx["meta"].update({"preTokenBalances": [{"owner": "U", "mint": "TOKEN", "uiTokenAmount": {"amount": "5"}}],
+                       "postTokenBalances": [{"owner": "U", "mint": "TOKEN", "uiTokenAmount": {"amount": "9"}}],
+                       "preBalances": [100], "postBalances": [60]})
+    seen = []
+    class H:
+        def _rpc(self, method, params, credits):
+            return {"data": [tx]}
+    out = rd.fetch_router_samples(H(), "R", pages=1, per_page=10, raw_sink=seen.append)
+    assert out == [] and len(seen) == 1
+    r = seen[0]
+    assert r["tok"] == [["U", "TOKEN", 4]] and r["payer_sol"] == -40
+    assert r["top"][1]["p"] == "R" and r["inner"][0]["ix"][0]["p"] == PUMPSWAP

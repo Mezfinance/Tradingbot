@@ -234,6 +234,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--routers-file", type=str, default=None, help="router-direction: a JSON {program_id: routed-tx count} (the box's full cpi_routers dump) -- fetch+fit EVERY router (highest volume first, budget-capped) and report volume-weighted coverage of the routed flow")
     parser.add_argument("--per-router", type=int, default=2000, help="router-direction per-router fetch: recent (desc) transactions to read per router, paged in 1000s (~10 credits per 100). Deep enough to see buy AND sell")
     parser.add_argument("--top", type=int, default=0, help="router-direction: only fetch/decode the top-N routers by --routers-file volume (0 = all). The owner's 'top 20 routers'")
+    parser.add_argument("--raw-out", type=str, default=None, help="router-direction fetch: also write EVERY fetched tx (label-free compact record, gzip JSONL) here, for offline decoding")
     parser.add_argument("--diagnose", type=str, default=None, help="router-direction: comma-separated router ids; read ONE page (100 txs, ~10 credits) each and print why its txs were kept/dropped as samples")
     parser.add_argument("--skip-sampled", nargs="?", const="__default__", default=None, help="router-direction --routers-file: skip routers we already hold enough samples for (>=4 buy AND >=4 sell). Default list = the summary shipped in tradingbot/router_data/router_sampled.json; or pass a summary json / samples JSONL path. Only routers that still need samples are fetched")
     parser.add_argument("--decode", action="store_true", help="router-direction: print a per-router decode worksheet (buy vs sell discriminators + the side-encoding rule) as well as the coverage table")
@@ -961,6 +962,7 @@ def main(argv: list[str] | None = None) -> None:
             return
         if args.from_pumpswap or args.routers or args.routers_file:   # fetch mode: labeled samples from Helius
             _counts = None
+            _raw_f = None
             if args.routers_file:                                 # the box's routed-volume tally = coverage denominator
                 with open(args.routers_file) as f:
                     _counts = {str(k): int(v) for k, v in json.load(f).items()}
@@ -991,15 +993,24 @@ def main(argv: list[str] | None = None) -> None:
                 _pp = min(1000, max(1, int(args.per_router)))     # per-page follows --per-router (budget spread)
                 _pages = max(1, (int(args.per_router) + _pp - 1) // _pp)
                 _rd_samples, _fetched = [], 0
+                if args.raw_out:
+                    import gzip as _rd_gz
+                    _raw_f = _rd_gz.open(args.raw_out, "at")
                 for _prog in _progs:
                     if _h.credits_used >= _cap:
                         print(f"credit cap {_cap} reached after {_fetched}/{len(_progs)} routers", file=sys.stderr)
                         break
-                    _rd_samples += _rd.fetch_router_samples(_h, _prog, pages=_pages, per_page=_pp)
+                    _sink = (lambda r: _raw_f.write(json.dumps(r, separators=(",", ":")) + "\n")) if _raw_f else None
+                    _rd_samples += _rd.fetch_router_samples(_h, _prog, pages=_pages, per_page=_pp, raw_sink=_sink)
+                    if _raw_f:
+                        _raw_f.flush()
                     _fetched += 1
                     if _fetched % 10 == 0:
                         print(f"fetched {_fetched}/{len(_progs)} routers, {_h.credits_used} credits",
                               file=sys.stderr, flush=True)
+            if args.raw_out and _raw_f:
+                _raw_f.close()
+                print(f"wrote raw txs to {args.raw_out}", file=sys.stderr)
             if args.dump:                                         # raw examples for hand decoding + full JSONL
                 _seen_sigs: set = set()
                 _uniq = []
