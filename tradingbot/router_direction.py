@@ -162,9 +162,8 @@ def apply_rule(rule: dict, data: bytes, accounts, account_keys, token: Optional[
 # pump_amm v2 swaps (2026-11): Anchor sha256("global:<name>")[:8], checked against the raw top-26 fetch, where
 # disc direction matched the payer's token-balance change on 474/474 txs. v1-only labelling silently dropped
 # every router whose flow had moved to v2 (the 26 "empty" top routers).
-BUY_V2 = bytes.fromhex("b817ee6167c5d33d")                     # buy_v2
-SELL_V2 = bytes.fromhex("5df6823ce7e940b2")                    # sell_v2
-BUY_EXACT_QUOTE_IN_V2 = bytes.fromhex("c2ab1c46684d5b2f")      # buy_exact_quote_in_v2
+# Defined once in localshred_consumer (the box decoder decodes them too); re-exported here.
+from .localshred_consumer import BUY_V2, SELL_V2, BUY_EXACT_QUOTE_IN_V2  # noqa: E402
 SELL_ALL = frozenset({SELL, SELL_V2})
 BUY_ALL = frozenset(BUY_DISCS) | {BUY_V2, BUY_EXACT_QUOTE_IN_V2}
 

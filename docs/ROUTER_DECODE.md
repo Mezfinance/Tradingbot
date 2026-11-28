@@ -41,4 +41,4 @@ Validated rules: `Router Data/router_rules.json` (`load_rules` reads it; precisi
   `_sentinel_rule` (one-sided: sentinel -> side, else abstain; Bgo4v sells = u64::MAX limit).
 - Result: 70 rules, **37.6% of routed volume, 30.3% effective**. Undecodable (state-decided bots, same
   instruction both ways): 4i9Z, E5xD, 8ZkM. Too few successful samples: DiabLokx, CtjS, B4vF, JDk3, 38V4.
-- NOTE: `localshred_consumer.decode_tx` also only knows v1 discs, so direct v2 swaps are invisible on the box.
+- `localshred_consumer.decode_tx` now decodes v2 too (2026-11-28, same account layout as v1); the box copy needs the patch from the HISTORY.md 11-28 entry.

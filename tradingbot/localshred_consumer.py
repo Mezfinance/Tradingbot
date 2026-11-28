@@ -56,6 +56,19 @@ BUY_BASE_OUT = bytes([102, 6, 61, 18, 1, 218, 235, 234])   # pump_amm `buy` (buy
 # sell_exact_quote_out the box does NOT decode, so they stay out too, keeping this an exact parity of the
 # box's direct view (so frontrun-verify's only variable is the feed, not the discriminator set).
 BUY_DISCS = frozenset({BUY_EXACT_QUOTE_IN, BUY_BASE_OUT})
+# pump_amm v2 swaps (2026-11-28): Anchor sha256("global:<name>")[:8]. The big routers' flow moved to v2 (router
+# study, docs/ROUTER_DECODE.md); a v1-only decode silently drops every direct v2 swap. Same account layout as v1
+# (verified on the raw top-26 router fetch, 5880 v2 ixs, 17 accounts each: 0 = pool (the vault owner on all 200
+# successful txs), 1 = user (== fee payer), 2 = global_config, 3 = base_mint, 4 = quote_mint), and the disc
+# direction matched the payer's token-balance change on 474/474 txs, so the same orientation flip applies.
+# The study's visibility tag (helius._top_level_pumpswap) is log-based and disc-agnostic, so the gate was fit
+# WITH top-level v2 swaps; decoding them here closes a train/serve gap rather than opening one.
+SELL_V2 = bytes.fromhex("5df6823ce7e940b2")                 # sell_v2
+BUY_V2 = bytes.fromhex("b817ee6167c5d33d")                  # buy_v2
+BUY_EXACT_QUOTE_IN_V2 = bytes.fromhex("c2ab1c46684d5b2f")   # buy_exact_quote_in_v2
+SELL_DISCS = frozenset({SELL, SELL_V2})
+BUY_DISCS_V2 = frozenset({BUY_V2, BUY_EXACT_QUOTE_IN_V2})
+DIRECT_BUY_DISCS = BUY_DISCS | BUY_DISCS_V2                 # what classify_instruction decodes as a buy
 
 # Well-known infrastructure programs that sit as top-level instructions in a routed tx but are NOT the
 # aggregator. Subtract these (and pumpswap itself) to attribute a dropped-CPI swap to the router program
@@ -91,9 +104,9 @@ def classify_instruction(program_id: str, accts, data, account_keys, fee_payer) 
         if len(data) < 8:
             return None
         disc = bytes(data[:8])
-        if disc == SELL:
+        if disc in SELL_DISCS:
             inst_buy = False
-        elif disc in BUY_DISCS:
+        elif disc in DIRECT_BUY_DISCS:
             inst_buy = True
         else:
             return None
