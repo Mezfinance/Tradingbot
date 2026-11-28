@@ -4,7 +4,7 @@ Context for new Claude Code sessions in this repo. **Read this first, then updat
 
 **Never guess.** Verify on the machine (fly machine exec) or in the code before stating a cause or giving a command. If unverified, say so and give a check command first.
 
-**Background every `fly machine exec`.** Long commands: `nohup sh -c "..." > /data/<job>.log 2>&1 &`, then poll with `tail`/`ps` in separate short execs. Never run a long job in the foreground (it times out/hangs).
+**Background every `fly machine exec`.** Long commands: `nohup sh -c "..." > /data/<job>.log 2>&1 & echo started`, then poll with `tail`/`ps` in separate short execs. Never run a long job in the foreground (it times out/hangs).
 
 ## What this repo is
 
