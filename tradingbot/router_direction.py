@@ -498,6 +498,46 @@ def decode_report(samples: list, counts: Optional[dict] = None) -> str:
     return "\n".join(lines)
 
 
+def _mark_accounts(keys, token: Optional[str]) -> str:
+    """Account list with WSOL and the token mint marked, others truncated -- so the layout is readable."""
+    out = []
+    for k in keys:
+        if k == WSOL:
+            out.append("WSOL")
+        elif token and k == token:
+            out.append("TOK")
+        else:
+            out.append((k or "")[:4])
+    return "[" + " ".join(out) + "]"
+
+
+def dump_examples(samples: list, counts: Optional[dict] = None, per_dir: int = 6, data_bytes: int = 48) -> str:
+    """Raw per-router buy/sell examples for HAND decoding -- no rule-fitting. Per router (sorted by volume): a
+    few buys and a few sells, each as the top-level router instruction's data (hex, first `data_bytes` bytes =
+    discriminator + args) and its account list with WSOL/token marked. Paste this; the discriminator and any
+    side byte are visible, and the hand-written rule goes into router_rules.json (the box's lookup table)."""
+    by: dict = {}
+    for s in samples:
+        by.setdefault(s["router"], []).append(s)
+
+    def vol(r):
+        return (counts or {}).get(r, 0)
+
+    out = ["ROUTER TX DUMP -- paste for hand decoding (data = router ix, first %d bytes)" % data_bytes]
+    for r in sorted(by, key=lambda r: (-vol(r), -len(by[r]))):
+        ss = by[r]
+        nb = sum(1 for s in ss if s["dir"] == "buy")
+        ns = sum(1 for s in ss if s["dir"] == "sell")
+        out.append("")
+        out.append("=== %s  vol=%d  n=%d  buys=%d sells=%d ===" % (r, vol(r), len(ss), nb, ns))
+        for label in ("BUY", "SELL"):
+            for s in [x for x in ss if x["dir"] == label.lower()][:per_dir]:
+                d = s["data"]
+                hx = d[:data_bytes].hex() + (".." if len(d) > data_bytes else "")
+                out.append("  %-4s %s  %s" % (label, hx, _mark_accounts(s["keys"], s.get("token"))))
+    return "\n".join(out)
+
+
 def load_rules(path: str) -> dict:
     """Load validated per-router rules from a json {program_id: rule}. Missing/bad file -> {} (fail safe:
     an empty table just means every pin-target DROPS, never a wrong direction)."""

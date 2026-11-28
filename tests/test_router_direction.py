@@ -226,6 +226,19 @@ def test_decode_report_shows_buy_and_sell_discriminators():
     assert "aaaaaaaaaaaaaaaa(8)" in txt and "bbbbbbbbbbbbbbbb(8)" in txt and "ACCEPT disc" in txt
 
 
+def test_dump_examples_shows_raw_buy_and_sell_for_hand_decoding():
+    s = []
+    for _ in range(3):
+        s.append({"router": BOT, "data": b"\xc6\x2e\x15\x52\xb4\xd9\xe8\x70" + bytes(8),
+                  "accounts": [0, 1, 2], "keys": ["U", WSOL, "TOK"], "token": "TOK", "dir": "buy"})
+        s.append({"router": BOT, "data": b"\x33\xe6\x85\xa4\x01\x7f\x83\xad" + bytes(8),
+                  "accounts": [0, 1, 2], "keys": ["U", "TOK", WSOL], "token": "TOK", "dir": "sell"})
+    txt = rd.dump_examples(s, counts={BOT: 99}, per_dir=2)
+    assert "ROUTER TX DUMP" in txt and "vol=99" in txt
+    assert "BUY  c62e1552b4d9e870" in txt and "SELL 33e685a4017f83ad" in txt   # discriminators visible
+    assert "[U WSOL TOK]" in txt and "[U TOK WSOL]" in txt                     # account layout marked
+
+
 def test_load_samples_and_study_and_render(tmp_path):
     p = tmp_path / "router-samples.jsonl"
     lines = []

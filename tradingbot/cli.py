@@ -235,6 +235,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--per-router", type=int, default=2000, help="router-direction per-router fetch: recent (desc) transactions to read per router, paged in 1000s (~10 credits per 100). Deep enough to see buy AND sell")
     parser.add_argument("--top", type=int, default=0, help="router-direction: only fetch/decode the top-N routers by --routers-file volume (0 = all). The owner's 'top 20 routers'")
     parser.add_argument("--decode", action="store_true", help="router-direction: print a per-router decode worksheet (buy vs sell discriminators + the side-encoding rule) as well as the coverage table")
+    parser.add_argument("--dump", action="store_true", help="router-direction: print RAW per-router buy/sell example transactions for hand decoding (no rule-fitting), and save all labeled samples to --samples-out")
+    parser.add_argument("--samples-out", type=str, default="/data/router-samples.jsonl", help="router-direction --dump: path to write the raw labeled samples JSONL (download and feed in chunks)")
     parser.add_argument("--from-pumpswap", action="store_true", help="router-direction: sample from the pumpswap side (one desc sweep of the pumpswap program, bucketed by top-level router) instead of one fetch per router -- recent, balanced. Spreads thin across routers; prefer --routers-file --top N for deep per-router decode")
     parser.add_argument("--fires", type=str, default=None, help="frontrun-verify: JSON/JSONL of box fires {pool, slot, token_mint?, sym?, m2?, eta?} or a raw box log to grep for 'GATE FIRE' lines")
     parser.add_argument("--pairs", type=str, default=None, help="frontrun-verify: box fires by hand as 'pool:slot[:mint],pool:slot'")
@@ -983,6 +985,16 @@ def main(argv: list[str] | None = None) -> None:
                     if _fetched % 10 == 0:
                         print(f"fetched {_fetched}/{len(_progs)} routers, {_h.credits_used} credits",
                               file=sys.stderr, flush=True)
+            if args.dump:                                         # raw examples for hand decoding + full JSONL
+                with open(args.samples_out, "w") as f:
+                    for s in _rd_samples:
+                        f.write(json.dumps({"router": s["router"], "sig": s.get("sig"), "pool": s.get("pool"),
+                                            "payer": s.get("payer"), "token": s.get("token"),
+                                            "data": s["data"].hex(), "accounts": s["accounts"],
+                                            "keys": s["keys"], "dir": s["dir"]}) + "\n")
+                print(f"wrote {len(_rd_samples)} labeled samples to {args.samples_out}", file=sys.stderr)
+                print(_rd.dump_examples(_rd_samples, counts=_counts))
+                return
             if args.decode:
                 print(_rd.decode_report(_rd_samples, counts=_counts))
             _rd_out = _rd.study(_rd_samples, counts=_counts, seed=0)
