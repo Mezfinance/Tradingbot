@@ -126,3 +126,20 @@ def test_shipped_rules_have_the_raw15_routers():
     for r in ("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH", "proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u",
               "Cy91y8eNt72wDxutUBgSQhrG5KGRqQa28T55suZNngsQ", "GdvhFdVAJxVXecXRyVRqEz1DyHA8YAC8ZW7s7UviMzL4"):
         assert r in rules
+
+
+def test_shipped_prov_rule_decodes_sells_on_the_pool_carrying_ix():
+    """proV's swap ix (any disc) carries the pool: token@4 = buy, token@3 = sell; WSOL in the other slot."""
+    import os
+    path = os.path.join(os.path.dirname(__file__), "..", "Router Data", "router_rules.json")
+    classify, _ = rr.make_classifier(path)
+    prov = "proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u"
+    tok = "TokenMint11111111111111111111111111111pump"
+    sell = ["P0", "PAYER", "X", tok, "MINTX"]
+    buy = ["P0", "PAYER", "X", "MINTX", tok]
+    data = bytes.fromhex("0ebf2cf68ee1e09d")
+    assert classify(prov, data, list(range(5)), sell, tok) == "sell"
+    assert classify(prov, data, list(range(5)), buy, tok) == "buy"
+    assert classify(prov, bytes.fromhex("aa2955b184501f35"), list(range(5)),
+                    ["P0", "PAYER", "X", rr.WSOL, "MINTX"], tok) == "buy"
+    assert classify(prov, data, list(range(5)), ["P0", "PAYER", "X", "A", "B"], tok) == "drop"

@@ -640,161 +640,30 @@
   "note": "hand-fit 2026-11-28 on router-raw8: route/route_v2/... dest mint index; 745 right, 0 wrong, 79 abstain (other-mint legs)"
  },
  "proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u": {
-  "kind": "per_disc",
-  "prefix": 8,
-  "map": {
-   "8765e34498744609": {
-    "kind": "mint_conds",
-    "conds": [
-     [
-      4,
-      "token",
-      "buy"
-     ]
-    ]
-   },
-   "bbc9d433109bec3c": {
-    "kind": "mint_conds",
-    "conds": [
-     [
-      4,
-      "token",
-      "buy"
-     ],
-     [
-      3,
-      "wsol",
-      "buy"
-     ],
-     [
-      3,
-      "token",
-      "sell"
-     ],
-     [
-      4,
-      "wsol",
-      "sell"
-     ],
-     [
-      43,
-      "wsol",
-      "buy"
-     ],
-     [
-      33,
-      "wsol",
-      "buy"
-     ],
-     [
-      37,
-      "wsol",
-      "buy"
-     ],
-     [
-      51,
-      "wsol",
-      "buy"
-     ],
-     [
-      50,
-      "token",
-      "buy"
-     ],
-     [
-      32,
-      "token",
-      "buy"
-     ],
-     [
-      67,
-      "wsol",
-      "buy"
-     ],
-     [
-      60,
-      "token",
-      "buy"
-     ],
-     [
-      48,
-      "token",
-      "buy"
-     ],
-     [
-      28,
-      "wsol",
-      "buy"
-     ],
-     [
-      75,
-      "wsol",
-      "buy"
-     ],
-     [
-      66,
-      "token",
-      "buy"
-     ],
-     [
-      55,
-      "token",
-      "buy"
-     ],
-     [
-      54,
-      "token",
-      "buy"
-     ],
-     [
-      48,
-      "wsol",
-      "buy"
-     ],
-     [
-      47,
-      "token",
-      "buy"
-     ],
-     [
-      36,
-      "token",
-      "buy"
-     ],
-     [
-      24,
-      "wsol",
-      "buy"
-     ]
-    ]
-   },
-   "be9ca9b0959aa16c": {
-    "kind": "mint_conds",
-    "conds": [
-     [
-      4,
-      "token",
-      "buy"
-     ],
-     [
-      57,
-      "wsol",
-      "buy"
-     ],
-     [
-      56,
-      "token",
-      "buy"
-     ],
-     [
-      81,
-      "token",
-      "buy"
-     ]
-    ]
-   }
-  },
-  "note": "hand-fit 2026-11-28 on router-raw15; 8765 decodes buys only, 93f1 undecoded"
+  "kind": "mint_conds",
+  "conds": [
+   [
+    4,
+    "token",
+    "buy"
+   ],
+   [
+    3,
+    "token",
+    "sell"
+   ],
+   [
+    4,
+    "wsol",
+    "sell"
+   ],
+   [
+    3,
+    "wsol",
+    "buy"
+   ]
+  ],
+  "note": "refit 2026-11-28 on router-raw15: proV's swap ix (0ebf/aa29/bbc9/be9c) carries the pool, token@4=buy, token@3=sell; 8765 and 93f1 are pool-less helper ixs (ATA setup) the box never classifies. 1676 right, 0 wrong, 2 abstain of 1678"
  },
  "DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH": {
   "kind": "per_disc",
