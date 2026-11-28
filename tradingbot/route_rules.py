@@ -118,6 +118,20 @@ def apply_rule(rule: dict, data: bytes, accounts, account_keys, token: Optional[
         if k == token:
             return rule["token_is"]
         return None
+    if kind == "mint_conds":                                       # ordered (account index, "wsol"|"token", side)
+        if not token:                                              # conditions; first match wins, none -> abstain
+            return None                                            # (routers whose instruction carries several
+        for i, mk, side in rule["conds"]:                          # mint slots, e.g. DF1o / proV, 11-28)
+            i = int(i)
+            if i < 0 or i >= len(accounts):
+                continue
+            ai = int(accounts[i])
+            if ai < 0 or ai >= len(account_keys):
+                continue
+            k = account_keys[ai]
+            if (mk == "wsol" and k == WSOL) or (mk == "token" and k == token):
+                return side
+        return None
     if kind == "per_disc":                                         # one sub-rule per instruction (prefix bytes)
         n = int(rule.get("prefix", 8))
         if len(data) < n:

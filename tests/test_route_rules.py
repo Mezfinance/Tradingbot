@@ -107,3 +107,22 @@ def test_shipped_rules_include_jupiter_and_deny_the_no_swap_bots():
                 "2TK4sdgGTG89Rh3TurnbViNzkJRyg8CaXhhAEQimX3ia", "JDk32MFrBeUpA9AN7CciPryokhSDxuWEAJdJfQxqDrpE",
                 "BmGwqQXtzu8tLH6TiG5DEVakNs4chNo2boVSov5rr3DG"):
         assert bot in rr.DENYLIST and cls(bot, b"\x01" * 16, [], [], "TOKEN") == "drop"
+
+
+def test_mint_conds_first_match_wins_and_abstains():
+    rule = {"kind": "mint_conds", "conds": [[2, "token", "buy"], [1, "token", "sell"], [3, "wsol", "sell"]]}
+    keys = ["A", "TOKEN", "X", lc.WSOL]
+    assert rr.apply_rule(rule, b"", [0, 1, 2, 3], keys, "TOKEN") == "sell"       # acct1 is the token
+    assert rr.apply_rule(rule, b"", [0, 2, 1, 3], keys, "TOKEN") == "buy"        # acct2 is the token (first cond)
+    assert rr.apply_rule(rule, b"", [0, 2, 2, 2], keys, "TOKEN") is None         # nothing matches -> abstain
+    assert rr.apply_rule(rule, b"", [0, 1, 2, 3], keys, None) is None            # token unknown
+    assert rr.apply_rule(rule, b"", [0, 1], keys, "TOKEN") == "sell"              # short account list: skip conds
+
+
+def test_shipped_rules_have_the_raw15_routers():
+    import os
+    path = os.path.join(os.path.dirname(__file__), "..", "Router Data", "router_rules.json")
+    rules = rr.load_rules(path)
+    for r in ("DF1ow4tspfHX9JwWJsAb9epbkA8hmpSEAtxXy1V27QBH", "proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u",
+              "Cy91y8eNt72wDxutUBgSQhrG5KGRqQa28T55suZNngsQ", "GdvhFdVAJxVXecXRyVRqEz1DyHA8YAC8ZW7s7UviMzL4"):
+        assert r in rules
