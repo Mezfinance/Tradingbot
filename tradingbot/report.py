@@ -493,7 +493,7 @@ EXPECTED = {  # 10-28 backtests on the 10-26 backup, for comparison with the liv
     "early6t": "as early6 but the top 2% of the recent training scores. Walk-forward 10-16..11-03 (snapshot "
                "yardstick): +1.1%/trade, 27% emptied, 90% range -7.5%..+9.9% (n=202); -8.3% to 10-29, +15.2% after",
     "early6w": "as early6 but a wider cut-off: top 16% of the recent training scores. Walk-forward "
-               "(early-walk-forward, snapshot yardstick): see CLAUDE.md",
+               "(early-walk-forward, snapshot yardstick): see HISTORY.md",
     "launch4_2": "hand-made pools scored on their first 4 seconds of chain data (websocket), top 2%, bought at pool "
                  "second ~6 through Jupiter, out at minute 6. Walk-forward 10-28..11-02 without names, n=23: "
                  "+32.9%/trade on GeckoTerminal snapshot prices but +20..+22% on 1-minute trade candles "

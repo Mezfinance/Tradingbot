@@ -47,7 +47,7 @@ import time
 COST = 0.06                 # round-trip cost applied to every exit (as pool_tracker / the scorer)
 PULLED_SHARE = 0.10         # pool SOL below this share of its peak = pulled
 CONF_AFTER_S = 60.0         # confirmation ≈ probe age + the 48 s watch + margin (pool_tracker.CONF_AFTER_S)
-PROBE_COST = 0.30           # modelled cost of one committed probe (~fees, per CLAUDE.md 11-12)
+PROBE_COST = 0.30           # modelled cost of one committed probe (~fees, per HISTORY.md 11-12)
 ENTRY_USD = 25.0            # size we would enter a confirmed survivor at
 RET_CAP = 3.0               # cap a single trade at +300% (as the scorer / hold_study)
 
