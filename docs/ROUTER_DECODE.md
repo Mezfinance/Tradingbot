@@ -29,3 +29,16 @@ Validated rules: `Router Data/router_rules.json` (`load_rules` reads it; precisi
 - Jupiter (verified discs: `e517cb97…`=route, `bb64facc…`=route_v2): route dest_mint (acct 5) = token was
   labelled sell 3/10 times (multi-hop/arb), so no precision-1.0 rule. Needs route-plan parsing or more data.
 - Coverage: 5.0% of routed volume (3.8% effective), 44 rules. Merge dedupe is per (router, sig).
+
+## Chunk 3 (2026-11-28) — raw re-fetch of the 26 empty routers
+- `--raw-out` wrote all 78k fetched txs (`Router Data/router-raw26.jsonl.gz`, 14.9MB). Cause of the empty
+  result, verified: (1) the routers' flow is on pump_amm **v2** swaps (`buy_v2` b817ee61…, `sell_v2`
+  5df6823c…, `buy_exact_quote_in_v2` c2ab1c46…; Anchor names hashed), which the v1-only labeller ignored;
+  (2) many top routers are mostly FAILED txs (Bgo4v 97.5%; 52.5% volume-weighted across the 26).
+- `label_raw` labels from the v2/v1 disc and drops a tx whose payer token delta disagrees (disc matched
+  balances 474/474) or that buys and sells in one tx. `samples_from_raw` streams the gz into samples.
+- New fitters: `bit_flag` (side bit in a flags byte), `const_field` (one side always a sentinel),
+  `_sentinel_rule` (one-sided: sentinel -> side, else abstain; Bgo4v sells = u64::MAX limit).
+- Result: 70 rules, **37.6% of routed volume, 30.3% effective**. Undecodable (state-decided bots, same
+  instruction both ways): 4i9Z, E5xD, 8ZkM. Too few successful samples: DiabLokx, CtjS, B4vF, JDk3, 38V4.
+- NOTE: `localshred_consumer.decode_tx` also only knows v1 discs, so direct v2 swaps are invisible on the box.

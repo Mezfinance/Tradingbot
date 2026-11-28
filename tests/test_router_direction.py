@@ -423,3 +423,55 @@ def test_raw_record_keeps_every_tx_with_balances():
     r = seen[0]
     assert r["tok"] == [["U", "TOKEN", 4]] and r["payer_sol"] == -40
     assert r["top"][1]["p"] == "R" and r["inner"][0]["ix"][0]["p"] == PUMPSWAP
+
+
+def test_v2_pumpswap_discs_label():
+    assert rd._dir_from_pumpswap(rd.SELL_V2, "TOKEN", WSOL) == "sell"
+    assert rd._dir_from_pumpswap(rd.BUY_V2, "TOKEN", WSOL) == "buy"
+    assert rd._dir_from_pumpswap(rd.BUY_EXACT_QUOTE_IN_V2, "TOKEN", WSOL) == "buy"
+    assert rd.label_from_tx(_inner_tx(rd.SELL_V2, "TOKEN", WSOL), "POOL") == "sell"
+
+
+def _raw(disc, payer_delta, err=None, extra=None):
+    ix = {"p": PUMPSWAP, "a": ["POOL", "U", "x", "TOKEN", WSOL], "d": _b58encode(disc + bytes(8))}
+    return {"router": "R", "sig": "S", "err": err, "payer": "U",
+            "top": [{"p": "R", "a": ["U", "POOL"], "d": _b58encode(b"\xaa" * 8)}],
+            "inner": [{"i": 0, "ix": [ix] + (extra or [])}], "tok": [["U", "TOKEN", payer_delta]]}
+
+
+def test_label_raw_checks_balances_and_washes():
+    assert rd.label_raw(_raw(rd.BUY_V2, 50)) == ("buy", "TOKEN")
+    assert rd.label_raw(_raw(rd.SELL_V2, -50)) == ("sell", "TOKEN")
+    assert rd.label_raw(_raw(rd.BUY_V2, -50)) is None                      # balances contradict -> drop
+    assert rd.label_raw(_raw(rd.BUY_V2, 0)) == ("buy", "TOKEN")            # payer unmoved: trust the ix
+    assert rd.label_raw(_raw(rd.BUY_V2, 50, err={"x": 1})) is None         # failed tx
+    wash = {"p": PUMPSWAP, "a": ["POOL", "U", "x", "TOKEN", WSOL], "d": _b58encode(rd.SELL_V2 + bytes(8))}
+    assert rd.label_raw(_raw(rd.BUY_V2, 0, extra=[wash])) is None          # buy+sell in one tx
+
+
+def test_samples_from_raw(tmp_path):
+    import gzip
+    import json as _j
+    p = tmp_path / "raw.jsonl.gz"
+    with gzip.open(p, "wt") as f:
+        f.write(_j.dumps(_raw(rd.BUY_V2, 5)) + "\n" + _j.dumps(_raw(rd.SELL_V2, 0, err={"e": 1})) + "\n")
+    out = rd.samples_from_raw(str(p))
+    assert len(out) == 1 and out[0]["dir"] == "buy" and out[0]["keys"] == ["U", "POOL"]
+    assert out[0]["data"] == b"\xaa" * 8 and out[0]["token"] == "TOKEN"
+
+
+def test_bit_flag_and_sentinel_rules():
+    tr = [{"data": b"\x01" * 11 + bytes([0x10 | (i % 4)]), "dir": "buy"} for i in range(8)] + \
+         [{"data": b"\x01" * 11 + bytes([0x20 | (i % 4)]), "dir": "sell"} for i in range(8)]
+    r = rd._bit_flag_rule(tr)
+    assert r["offset"] == 11 and rd.apply_rule(r, b"\x01" * 11 + b"\x13", [], []) == "buy"
+    assert rd.apply_rule(r, b"\x01" * 11 + b"\x22", [], []) == "sell"
+    mx = b"\xff" * 8
+    tr2 = [{"data": b"\x00" * 8 + (i + 1).to_bytes(8, "little"), "dir": "buy"} for i in range(6)] + \
+          [{"data": b"\x00" * 8 + mx, "dir": "sell"} for _ in range(6)] + \
+          [{"data": b"\x00" * 8 + (99).to_bytes(8, "little"), "dir": "sell"}]   # one sell without the sentinel
+    assert rd._const_field_rule(tr2) is None                                  # two-sided fails on the odd sell
+    s = rd._sentinel_rule(tr2)
+    assert s["is"] == "sell" and s["other"] is None
+    assert rd.apply_rule(s, b"\x00" * 8 + mx, [], []) == "sell"
+    assert rd.apply_rule(s, b"\x00" * 8 + (3).to_bytes(8, "little"), [], []) is None   # abstain, never 'buy'

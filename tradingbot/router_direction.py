@@ -132,6 +132,18 @@ def apply_rule(rule: dict, data: bytes, accounts, account_keys, token: Optional[
         if wi is None or ti is None:
             return None                                            # one of the mints absent -> abstain
         return rule["wsol_first"] if wi < ti else rule["other"]
+    if kind == "bit_flag":                                         # side packed in a bitfield byte (flags & mask)
+        o = int(rule["offset"])
+        if o < 0 or o >= len(data):
+            return None
+        return rule["map"].get("%02x" % (data[o] & int(rule["mask"])))
+    if kind == "const_field":                                      # one side always carries a sentinel (u64::MAX)
+        o, w = int(rule["offset"]), int(rule["width"])
+        if o < 0 or o + w > len(data):
+            return None
+        if data[o:o + w].hex() == rule["value"]:
+            return rule["is"]
+        return rule.get("other")                                   # one-sided rule: other is None -> abstain
     if kind == "per_disc":                                         # one sub-rule per instruction (prefix bytes)
         n = int(rule.get("prefix", 8))
         if len(data) < n:
@@ -147,12 +159,22 @@ def apply_rule(rule: dict, data: bytes, accounts, account_keys, token: Optional[
 
 # --- ground-truth labeling from the inner pumpswap CPI (Helius) -------------------------------------------
 
+# pump_amm v2 swaps (2026-11): Anchor sha256("global:<name>")[:8], checked against the raw top-26 fetch, where
+# disc direction matched the payer's token-balance change on 474/474 txs. v1-only labelling silently dropped
+# every router whose flow had moved to v2 (the 26 "empty" top routers).
+BUY_V2 = bytes.fromhex("b817ee6167c5d33d")                     # buy_v2
+SELL_V2 = bytes.fromhex("5df6823ce7e940b2")                    # sell_v2
+BUY_EXACT_QUOTE_IN_V2 = bytes.fromhex("c2ab1c46684d5b2f")      # buy_exact_quote_in_v2
+SELL_ALL = frozenset({SELL, SELL_V2})
+BUY_ALL = frozenset(BUY_DISCS) | {BUY_V2, BUY_EXACT_QUOTE_IN_V2}
+
+
 def _dir_from_pumpswap(disc: bytes, base_mint: str, quote_mint: str) -> Optional[str]:
     """True token direction of an inner pumpswap swap, reusing the box flip. SELL ix / BUY ix + the
     base/quote WSOL orientation -> is the TOKEN being bought or sold."""
-    if disc == SELL:
+    if disc in SELL_ALL:
         inst_buy = False
-    elif disc in BUY_DISCS:
+    elif disc in BUY_ALL:
         inst_buy = True
     else:
         return None
@@ -236,6 +258,59 @@ def raw_record(tx: dict, router: str) -> dict:
             "tok": [[o, m, d] for (o, m), d in bal.items() if d]}
 
 
+def label_raw(rec: dict) -> Optional[tuple]:
+    """(direction, token) of a raw_record, or None. Every SOL-paired pumpswap swap in the tx (v1 or v2) must
+    agree (a buy+sell wash -> None), and when the fee payer's balance of that token moved, its sign must agree
+    too (the payer received tokens = buy). Failed txs -> None."""
+    if rec.get("err") is not None:
+        return None
+    dirs = set()
+    tok = None
+    for g in rec.get("inner") or []:
+        for ix in g.get("ix") or []:
+            if ix.get("p") != PUMPSWAP:
+                continue
+            a = ix.get("a") or []
+            if len(a) < 5:
+                continue
+            d = _dir_from_pumpswap(_b58decode(ix.get("d") or "")[:8], a[3], a[4])
+            if d:
+                dirs.add(d)
+                tok = a[4] if a[3] == WSOL else a[3]
+    if len(dirs) != 1:
+        return None
+    d = next(iter(dirs))
+    moved = sum(int(x[2]) for x in rec.get("tok") or [] if x[0] == rec.get("payer") and x[1] == tok)
+    if moved and (moved > 0) != (d == "buy"):
+        return None                                               # balances contradict the instruction: drop
+    return d, tok
+
+
+def samples_from_raw(path: str) -> list:
+    """Labeled router samples from a --raw-out gzip JSONL (streamed): the router's first top-level instruction
+    (the shred-visible view) + label_raw's direction. Same shape as fetch_router_samples / load_samples."""
+    import gzip
+    out = []
+    with gzip.open(path, "rt") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            lab = label_raw(rec)
+            if lab is None:
+                continue
+            r = rec.get("router")
+            ix = next((t for t in rec.get("top") or [] if t.get("p") == r and t.get("d") and t.get("a")), None)
+            if ix is None:
+                continue
+            accts = list(ix["a"])
+            out.append({"router": r, "sig": rec.get("sig"), "pool": None, "payer": rec.get("payer"),
+                        "token": lab[1], "data": _b58decode(ix["d"]), "accounts": list(range(len(accts))),
+                        "keys": accts, "dir": lab[0]})
+    return out
+
+
 def fetch_router_samples(helius, router: str, pages: int = 2, per_page: int = 1000, raw_sink=None) -> list:
     """Labeled samples for one router, MOST-RECENT-FIRST (desc) and paged DEEP. getTransactionsForAddress(
     router) gives each tx's TOP-LEVEL router instruction (data + account pubkeys = the shred-visible view, for
@@ -290,7 +365,7 @@ def why_dropped(tx: dict, router: str) -> str:
     if label_from_tx(tx, None) is None:
         ix = found[0]
         data = _b58decode(ix.get("data") or "")
-        if data[:8] != SELL and data[:8] not in BUY_DISCS:
+        if data[:8] not in SELL_ALL and data[:8] not in BUY_ALL:
             return "pumpswap disc %s" % data[:8].hex()
         return "pumpswap not SOL-paired"
     if _router_top_ix(tx, router) is None:
@@ -502,6 +577,72 @@ def _mint_order_rule(train) -> Optional[dict]:
     return None
 
 
+BIT_MASKS = tuple(1 << k for k in range(8)) + (0xF0, 0x0F)
+
+
+def _bit_flag_rule(train, start: int = 8) -> Optional[dict]:
+    """A side bit inside a flags byte: (data[o] & mask) separates direction with <= 3 masked values, where the
+    raw byte takes more (else byte_flag already has it). E.g. 3vHAV byte 11: 0x1x = buy, 0x2x = sell."""
+    min_len = min((len(s["data"]) for s in train), default=0)
+    for o in range(start, min_len):
+        for mask in BIT_MASKS:
+            m: dict = {}
+            ok = True
+            for s in train:
+                v = s["data"][o] & mask
+                if m.setdefault(v, s["dir"]) != s["dir"]:
+                    ok = False
+                    break
+            if ok and len(set(m.values())) == 2 and len(m) <= 3:
+                return {"kind": "bit_flag", "offset": o, "mask": mask,
+                        "map": {("%02x" % k): v for k, v in m.items()}}
+    return None
+
+
+def _const_field_rule(train, start: int = 8) -> Optional[dict]:
+    """One direction ALWAYS carries the same 8-byte value at an offset (a sentinel like u64::MAX for 'no limit'
+    on sells) and the other direction never does. E.g. Bgo4v: u64 at 40 == ffff..ff -> sell, else buy."""
+    min_len = min((len(s["data"]) for s in train), default=0)
+    w = 8
+    for o in range(start, min_len - w + 1):
+        for side in ("buy", "sell"):
+            vals = {s["data"][o:o + w] for s in train if s["dir"] == side}
+            if len(vals) != 1:
+                continue
+            v = next(iter(vals))
+            if any(s["data"][o:o + w] == v for s in train if s["dir"] != side):
+                continue
+            other = "sell" if side == "buy" else "buy"
+            return {"kind": "const_field", "offset": o, "width": w, "value": v.hex(), "is": side, "other": other}
+    return None
+
+
+SENTINEL_MIN = 5           # a one-sided sentinel must be seen at least this often
+
+
+def _sentinel_rule(train, start: int = 8) -> Optional[dict]:
+    """ONE-SIDED: an 8-byte value that appears only with one direction (>= SENTINEL_MIN times, >= half of that
+    side) -> that direction; anything else ABSTAINS. For routers whose side is partly decided at run time (Bgo4v:
+    u64::MAX limit on most sells, but some sells carry a real limit), so a two-sided rule is never 100% right."""
+    min_len = min((len(s["data"]) for s in train), default=0)
+    w = 8
+    best = None
+    for o in range(start, min_len - w + 1):
+        for side in ("buy", "sell"):
+            mine = [s["data"][o:o + w] for s in train if s["dir"] == side]
+            if not mine:
+                continue
+            v, n = Counter(mine).most_common(1)[0]
+            if n < SENTINEL_MIN or n * 2 < len(mine):            # (zeros are fine: a 0 amount on one side only)
+                continue
+            if any(s["data"][o:o + w] == v for s in train if s["dir"] != side):
+                continue
+            if best is None or n > best[0]:
+                best = (n, {"kind": "const_field", "offset": o, "width": w, "value": v.hex(), "is": side,
+                            "other": None})
+    return best[1] if best else None
+
+
 MIN_GROUP = 3              # per_disc: an instruction needs this many training samples to be mapped at all
 SUB_MAX_VALUES = 3         # per_disc byte flag: a real side/enum byte takes few values (an amount byte takes many)
 
@@ -527,6 +668,7 @@ def _per_disc_rule(train, prefix: int = 8) -> Optional[dict]:
         if min(sum(1 for s in g if s["dir"] == d) for d in ("buy", "sell")) < 2:
             continue                                              # a lone counter-example: not enough to fit a split
         sub = (_byte_flag_rule(g, start=prefix, max_values=SUB_MAX_VALUES)
+               or _bit_flag_rule(g, start=prefix) or _const_field_rule(g, start=prefix)
                or _wsol_rule(g) or _mint_order_rule(g))
         if sub is not None:
             m[key] = sub
@@ -543,7 +685,8 @@ def _per_disc1(train):
     return _per_disc_rule(train, 1)
 
 
-FITTERS = (_disc_rule, _wsol_rule, _byte_flag_rule, _mint_order_rule, _per_disc8, _per_disc1)
+FITTERS = (_disc_rule, _wsol_rule, _byte_flag_rule, _mint_order_rule, _per_disc8, _per_disc1,
+           _bit_flag_rule, _const_field_rule, _sentinel_rule)      # one-sided sentinel last
 
 
 def _score(rule: dict, test) -> tuple[int, int, int]:
