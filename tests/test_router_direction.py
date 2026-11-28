@@ -283,3 +283,71 @@ def test_load_rules_fails_safe(tmp_path):
     good.write_text('{"%s": {"kind": "disc", "map": {}}, "skip": {"no": "kind"}}' % JUP)
     loaded = rd.load_rules(str(good))
     assert JUP in loaded and "skip" not in loaded
+
+
+# --- chunk 1 (2026-11-28): per-instruction rules, data-blind guard, split stability ----------------------
+
+SIDE_IX = b"\xaf\x05\x19\x81\xa0\xd8\x38\x9d"     # buy/sell ix with a side byte at [24] (6Vo3245-style)
+SELL_IX = b"\xfd\x9c\xb9\xe4\xf0\x69\xdc\xa9"     # sell-only ix
+
+
+def _side_samples(n=40):
+    out = []
+    for i in range(n):
+        amt = (1000 + 37 * i).to_bytes(8, "little") + (5 + i).to_bytes(8, "little")
+        if i % 4 == 3:
+            out.append({"data": SELL_IX + amt + b"\x01" * 9, "accounts": [0], "keys": ["A"], "dir": "sell"})
+        else:
+            d = "buy" if i % 2 == 0 else "sell"
+            out.append({"data": SIDE_IX + amt + (b"\x01" if d == "buy" else b"\x00") + b"\x00",
+                        "accounts": [0], "keys": ["A"], "dir": d})
+    return out
+
+
+def test_apply_per_disc_nested_and_abstain():
+    rule = {"kind": "per_disc", "prefix": 8, "map": {
+        SIDE_IX.hex(): {"kind": "byte_flag", "offset": 24, "map": {"01": "buy", "00": "sell"}},
+        SELL_IX.hex(): "sell"}}
+    body = bytes(16)
+    assert rd.apply_rule(rule, SIDE_IX + body + b"\x01\x00", [], []) == "buy"
+    assert rd.apply_rule(rule, SIDE_IX + body + b"\x00\x00", [], []) == "sell"
+    assert rd.apply_rule(rule, SIDE_IX + body + b"\x07\x00", [], []) is None     # unseen side value
+    assert rd.apply_rule(rule, SELL_IX + body, [], []) == "sell"
+    assert rd.apply_rule(rule, b"\x11" * 26, [], []) is None                      # unseen ix
+    tag = {"kind": "per_disc", "prefix": 1, "map": {"06": "sell"}}
+    assert rd.apply_rule(tag, b"\x06abc", [], []) == "sell"
+    assert rd.apply_rule(tag, b"\x08abc", [], []) is None
+
+
+def test_find_rule_stable_fits_a_side_byte_next_to_a_sell_only_ix():
+    r = rd.find_rule_stable(_side_samples())
+    assert r["accepted"] and r["kind"] == "per_disc"
+    sub = r["rule"]["map"][SIDE_IX.hex()]
+    assert sub["kind"] == "byte_flag" and sub["offset"] == 24
+    assert r["rule"]["map"][SELL_IX.hex()] == "sell"
+    assert rd.rule_fire_rate(r["rule"], _side_samples()) == 1.0
+
+
+def test_data_blind_router_is_rejected():
+    # identical instruction bytes labelled buy AND sell: the side is chosen at execution -> never decode
+    out = []
+    for i in range(20):
+        out.append({"data": b"\x0c" * 8 + bytes([i % 3]) * 8, "accounts": [0], "keys": ["A"],
+                    "dir": "buy" if i % 2 else "sell"})
+    r = rd.find_rule_stable(out)
+    assert not r["accepted"] and r["reason"].startswith("data-blind")
+
+
+def test_disc_rule_refuses_amount_memorisation():
+    # 30 distinct 8-byte prefixes (a native tag + amount bytes) is not an instruction set
+    out = [{"data": b"\x02" + (i * 7919).to_bytes(7, "little"), "accounts": [0], "keys": ["A"],
+            "dir": "buy" if i % 2 else "sell"} for i in range(30)]
+    assert rd._disc_rule(out) is None
+
+
+def test_study_reports_effective_coverage():
+    ss = [{**s, "router": "R1"} for s in _side_samples()]
+    rep = rd.study(ss, counts={"R1": 100, "R2": 300})
+    assert rep["n_accepted"] == 1
+    assert rep["coverage"] == 0.25 and rep["effective_coverage"] == 0.25
+    assert "EFFECTIVE" in rd.render(rep)

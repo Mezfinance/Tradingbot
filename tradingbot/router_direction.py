@@ -132,6 +132,16 @@ def apply_rule(rule: dict, data: bytes, accounts, account_keys, token: Optional[
         if wi is None or ti is None:
             return None                                            # one of the mints absent -> abstain
         return rule["wsol_first"] if wi < ti else rule["other"]
+    if kind == "per_disc":                                         # one sub-rule per instruction (prefix bytes)
+        n = int(rule.get("prefix", 8))
+        if len(data) < n:
+            return None
+        v = rule["map"].get(data[:n].hex())
+        if isinstance(v, str):
+            return v if v in ("buy", "sell") else None
+        if isinstance(v, dict) and v.get("kind") != "per_disc":    # no nesting
+            return apply_rule(v, data, accounts, account_keys, token)
+        return None                                                # unseen instruction / undecodable -> abstain
     return None
 
 
@@ -321,6 +331,9 @@ def fetch_pumpswap_routed(helius, max_pages: int = 6, per_page: int = 1000) -> l
 
 # --- reverse-engineering: fit a direction rule to labeled router samples (held-out precision) -------------
 
+MAX_DISCS = 8              # a real program has a handful of swap instructions; more distinct prefixes = amounts
+
+
 def _disc_rule(train) -> Optional[dict]:
     """A discriminator->direction map, only if every seen 8-byte discriminator is pure (one direction)."""
     m: dict = {}
@@ -331,6 +344,8 @@ def _disc_rule(train) -> Optional[dict]:
             m[d] = s["dir"]
         elif prev != s["dir"]:
             return None                                           # a discriminator used for both -> not a disc rule
+    if len(m) > MAX_DISCS:                                        # dozens of "discriminators" = a native ix tag +
+        return None                                               # amount bytes memorised, not an instruction set
     return {"kind": "disc", "map": m} if m else None
 
 
@@ -358,12 +373,12 @@ def _wsol_rule(train) -> Optional[dict]:
     return None
 
 
-def _byte_flag_rule(train) -> Optional[dict]:
+def _byte_flag_rule(train, start: int = 8, max_values: Optional[int] = 3) -> Optional[dict]:
     """A single data byte past the 8-byte discriminator whose value separates direction cleanly -- an Anchor
     `side`/`swap_base_in`/enum arg the disc rule (first 8 bytes only) misses. The holdout precision guard in
     find_rule rejects a spurious split (e.g. a byte of the amount)."""
     min_len = min((len(s["data"]) for s in train), default=0)
-    for o in range(8, min_len):
+    for o in range(start, min_len):
         m: dict = {}                                              # byte value -> direction
         ok = True
         for s in train:
@@ -374,7 +389,7 @@ def _byte_flag_rule(train) -> Optional[dict]:
             elif prev != s["dir"]:
                 ok = False
                 break
-        if ok and len(m) >= 2:                                    # both directions seen at distinct byte values
+        if ok and len(m) >= 2 and len(set(m.values())) == 2 and (max_values is None or len(m) <= max_values):
             return {"kind": "byte_flag", "offset": o, "map": {("%02x" % k): v for k, v in m.items()}}
     return None
 
@@ -411,6 +426,50 @@ def _mint_order_rule(train) -> Optional[dict]:
     return None
 
 
+MIN_GROUP = 3              # per_disc: an instruction needs this many training samples to be mapped at all
+SUB_MAX_VALUES = 3         # per_disc byte flag: a real side/enum byte takes few values (an amount byte takes many)
+
+
+def _per_disc_rule(train, prefix: int = 8) -> Optional[dict]:
+    """One sub-rule per router instruction, keyed by the first `prefix` data bytes (8 = Anchor discriminator,
+    1 = a native program's instruction tag). An instruction seen with only one direction maps straight to it;
+    a mixed instruction (one `swap` ix for both sides) gets a side byte past the prefix, a WSOL account slot, or
+    the WSOL/token order -- else it is left out (abstain -> drop). Catches routers the flat rules miss: e.g. a
+    buy/sell ix carrying a side byte next to a sell-only ix, where a global byte_flag picks a spurious offset."""
+    groups: dict = {}
+    for s in train:
+        if len(s["data"]) >= prefix:
+            groups.setdefault(s["data"][:prefix].hex(), []).append(s)
+    m: dict = {}
+    for key, g in groups.items():
+        if len(g) < MIN_GROUP:
+            continue
+        dirs = {s["dir"] for s in g}
+        if len(dirs) == 1:
+            m[key] = next(iter(dirs))
+            continue
+        if min(sum(1 for s in g if s["dir"] == d) for d in ("buy", "sell")) < 2:
+            continue                                              # a lone counter-example: not enough to fit a split
+        sub = (_byte_flag_rule(g, start=prefix, max_values=SUB_MAX_VALUES)
+               or _wsol_rule(g) or _mint_order_rule(g))
+        if sub is not None:
+            m[key] = sub
+    if not m or len(m) > MAX_DISCS:
+        return None
+    return {"kind": "per_disc", "prefix": prefix, "map": m}
+
+
+def _per_disc8(train):
+    return _per_disc_rule(train, 8)
+
+
+def _per_disc1(train):
+    return _per_disc_rule(train, 1)
+
+
+FITTERS = (_disc_rule, _wsol_rule, _byte_flag_rule, _mint_order_rule, _per_disc8, _per_disc1)
+
+
 def _score(rule: dict, test) -> tuple[int, int, int]:
     """(correct, fired, n): how often the rule fires on held-out, and how often it is right when it fires."""
     correct = fired = 0
@@ -423,7 +482,7 @@ def _score(rule: dict, test) -> tuple[int, int, int]:
     return correct, fired, len(test)
 
 
-def find_rule(labeled, seed: int = 0) -> dict:
+def find_rule(labeled, seed: int = 0, only=None) -> dict:
     """Fit a direction rule to one router's labeled samples. Returns a report:
     {rule, kind, n, buys, sells, fired, correct, coverage, precision, accepted, reason}. A rule is accepted
     only when held-out precision == PRECISION_FLOOR (never wrong) with both directions present. `labeled` =
@@ -439,8 +498,19 @@ def find_rule(labeled, seed: int = 0) -> dict:
     cut = max(1, int(len(order) * 0.7))
     train = [labeled[i] for i in order[:cut]]
     test = [labeled[i] for i in order[cut:]] or train            # tiny n: score on train (precision still guards)
+    seen: dict = {}
+    data_blind = False                                            # identical ix bytes seen as buy AND sell: the
+    for s in labeled:                                             # side is chosen at execution (arb/MEV bot), so
+        prev = seen.setdefault(s["data"], s["dir"])               # no data-only rule can be trusted
+        if prev != s["dir"]:
+            data_blind = True
+            break
+    # structural first, token-aware, then per-instruction (Anchor disc, native tag); data-blind -> accounts only
+    fits = (_wsol_rule, _mint_order_rule) if data_blind else FITTERS
+    if only is not None:
+        fits = tuple(f for f in fits if f in only)
     best = None
-    for fit in (_disc_rule, _wsol_rule, _byte_flag_rule, _mint_order_rule):   # structural first, token-aware last
+    for fit in fits:
         rule = fit(train)
         if rule is None:
             continue
@@ -452,10 +522,53 @@ def find_rule(labeled, seed: int = 0) -> dict:
                 "accepted": precision >= PRECISION_FLOOR and fired > 0,
                 "reason": "ok" if precision >= PRECISION_FLOOR and fired > 0 else "precision %.3f below floor" % precision}
         if cand["accepted"]:
+            full = fit(labeled)                                   # held-out passed: refit on ALL samples so an ix
+            if full is not None and full.get("kind") == rule["kind"]:   # seen only in the test split is mapped too
+                fc, ff, _ = _score(full, labeled)
+                if ff and fc == ff:                               # never wrong on everything it was fit on
+                    cand = {**cand, "rule": full}
             return cand                                           # prefer the first clean rule (disc before wsol)
         if best is None or cand["precision"] > best["precision"]:
             best = cand
+    if best is None and data_blind:
+        return {**base, "reason": "data-blind: identical instruction data seen as buy and sell"}
     return best or {**base, "reason": "no discriminator or WSOL-index rule separates direction"}
+
+
+STABLE_SEEDS = 5           # a rule must pass held-out precision 1.0 on this many different train/test splits
+
+
+def find_rule_stable(labeled, seed: int = 0, seeds: int = STABLE_SEEDS) -> dict:
+    """find_rule, but a fitter's rule is accepted only if that SAME fitter passes held-out precision 1.0 on
+    EVERY one of `seeds` different train/test splits. Fitters are tried in find_rule's order; the first that
+    is stable wins. One lucky split is not proof on a fragile gate: this rejects a rule that hinges on which
+    samples landed in training (e.g. a byte that only looks like a side flag on 70% of the data)."""
+    first = find_rule(labeled, seed=seed)
+    if first["n"] and (first["buys"] < MIN_PER_DIR or first["sells"] < MIN_PER_DIR):
+        return first
+    if first.get("reason", "").startswith("data-blind"):
+        return first
+    unstable = None
+    for fit in FITTERS:
+        rep = find_rule(labeled, seed=seed, only=(fit,))
+        if not rep["accepted"]:
+            continue
+        bad = next((k for k in range(1, seeds)
+                    if not find_rule(labeled, seed=seed + k, only=(fit,))["accepted"]), None)
+        if bad is None:
+            return rep
+        unstable = unstable or {**rep, "accepted": False,
+                                "reason": "unstable: %s rejected on holdout split %d" % (rep["kind"], bad)}
+    return unstable or {**first, "accepted": False}
+
+
+def rule_fire_rate(rule: dict, samples) -> float:
+    """Share of a router's samples on which its rule fires (does not abstain) -- the router's own coverage."""
+    if not samples:
+        return 0.0
+    fired = sum(1 for s in samples
+                if apply_rule(rule, s["data"], s["accounts"], s["keys"], s.get("token")) is not None)
+    return fired / len(samples)
 
 
 # --- the validated decoder table + the two-tier classifier ------------------------------------------------
@@ -585,7 +698,8 @@ def study(samples: list, counts: Optional[dict] = None, seed: int = 0) -> dict:
         by_router.setdefault(s.get("router"), []).append(s)
     routers, accepted = [], {}
     for prog, ss in by_router.items():
-        rep = find_rule(ss, seed=seed)
+        rep = find_rule_stable(ss, seed=seed)
+        rep["fire_rate"] = rule_fire_rate(rep["rule"], ss) if rep["accepted"] else 0.0
         rep["router"] = prog
         rep["samples"] = len(ss)
         rep["count"] = int(counts.get(prog, 0))
@@ -600,9 +714,13 @@ def study(samples: list, counts: Optional[dict] = None, seed: int = 0) -> dict:
     if counts:
         total = sum(counts.values())
         covered = sum(counts.get(p, 0) for p in accepted)
+        fire = {r["router"]: r["fire_rate"] for r in routers}
+        effective = sum(counts.get(p, 0) * fire.get(p, 0.0) for p in accepted)
         deny = sum(v for p, v in counts.items() if p in DENYLIST)
         out.update({"total_volume": total, "covered_volume": covered,
                     "coverage": (covered / total) if total else 0.0,
+                    "effective_volume": int(round(effective)),
+                    "effective_coverage": (effective / total) if total else 0.0,
                     "denylist_volume": deny, "uncovered_volume": total - covered - deny,
                     "total_routers": len(counts)})
     return out
@@ -619,6 +737,9 @@ def render(report: dict) -> str:
                          100.0 * report["covered_volume"] / t, report["covered_volume"], report["total_volume"],
                          report.get("total_routers", report["n_routers"]),
                          100.0 * report["denylist_volume"] / t, 100.0 * report["uncovered_volume"] / t))
+        if "effective_volume" in report:
+            lines.append("EFFECTIVE: %.1f%% of routed volume gets a direction (router volume x the share of its "
+                         "txs its rule fires on; abstains drop)" % (100.0 * report["effective_volume"] / t))
         un = [r for r in report["routers"] if not r["accepted"] and not r["denylisted"]]
         if un:
             lines.append("top UNCOVERED by volume (what blocks fuller coverage):")
