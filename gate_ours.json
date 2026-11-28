@@ -1,0 +1,229 @@
+{
+  "kind": "frontrun_precursor",
+  "vis": "direct",
+  "move": 0.3,
+  "lead": 3,
+  "entry": "front of N+1 (immediately after the signal slot)",
+  "hold": 2,
+  "intercept": -6.932106892667678,
+  "predictors": [
+    {
+      "name": "N-1..N = S.",
+      "coef": 2.9087816708125334,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": "S."
+      }
+    },
+    {
+      "name": "N-1..N = O.",
+      "coef": 2.163572074395411,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": "O."
+      }
+    },
+    {
+      "name": "N-1..N = .S",
+      "coef": 4.6294841776624684,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": ".S"
+      }
+    },
+    {
+      "name": "N-1..N = B.",
+      "coef": 3.6677476578043344,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": "B."
+      }
+    },
+    {
+      "name": "N-1..N = b.",
+      "coef": 2.3066978582650237,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": "b."
+      }
+    },
+    {
+      "name": "N-2..N = NS.",
+      "coef": -0.7225681678360827,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "NS."
+      }
+    },
+    {
+      "name": "N-1..N = .O",
+      "coef": 2.268438788909452,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": ".O"
+      }
+    },
+    {
+      "name": "N-1..N = .B",
+      "coef": 2.957396056747043,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": ".B"
+      }
+    },
+    {
+      "name": "N-2..N = S..",
+      "coef": 3.6132246374762746,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "S.."
+      }
+    },
+    {
+      "name": "sym == .  (a dead slot)",
+      "coef": 1.1440500547628298,
+      "predicate": {
+        "kind": "symbol",
+        "field": null,
+        "thr": null,
+        "symv": ".",
+        "mkey": null,
+        "mot": null
+      }
+    },
+    {
+      "name": "N-1..N = SB",
+      "coef": 1.674189419773238,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": "SB"
+      }
+    },
+    {
+      "name": "N-2..N = N.B",
+      "coef": -1.6516545599169454,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "N.B"
+      }
+    },
+    {
+      "name": "N-2..N = SBS",
+      "coef": 4.175155515851267,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "SBS"
+      }
+    },
+    {
+      "name": "N-2..N = NO.",
+      "coef": -0.6381304037518484,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "NO."
+      }
+    },
+    {
+      "name": "N-2..N = S.S",
+      "coef": -0.5007111133514872,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "S.S"
+      }
+    },
+    {
+      "name": "N-2..N = SSB",
+      "coef": -0.29062581480137833,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "SSB"
+      }
+    },
+    {
+      "name": "sym == B  (the dominant wallet looped in N)",
+      "coef": 1.9376552226862485,
+      "predicate": {
+        "kind": "symbol",
+        "field": null,
+        "thr": null,
+        "symv": "B",
+        "mkey": null,
+        "mot": null
+      }
+    }
+  ],
+  "threshold": {
+    "20": -6.932106892667678,
+    "10": -5.788056837904848,
+    "5": -5.788056837904848,
+    "2": -4.994451669981429,
+    "1": -3.6887101731513314
+  },
+  "built": {
+    "pools": 666,
+    "events": 339,
+    "auc_hold": 0.6930408635417084,
+    "move_pct": 30.0,
+    "n_predictors": 17
+  }
+}

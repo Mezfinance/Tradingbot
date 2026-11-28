@@ -1,0 +1,231 @@
+{
+  "kind": "frontrun_precursor",
+  "vis": "direct",
+  "move": 0.2,
+  "lead": 3,
+  "entry": "front of N+1 (immediately after the signal slot)",
+  "hold": 2,
+  "intercept": -6.568385033251319,
+  "predictors": [
+    {
+      "name": "N-2..N = NN.",
+      "coef": 1.6505527484146438,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "NN."
+      }
+    },
+    {
+      "name": "sym == .  (a dead slot)",
+      "coef": -0.7268376152600087,
+      "predicate": {
+        "kind": "symbol",
+        "field": null,
+        "thr": null,
+        "symv": ".",
+        "mkey": null,
+        "mot": null
+      }
+    },
+    {
+      "name": "N-1..N = S.",
+      "coef": 5.423264274458996,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": "S."
+      }
+    },
+    {
+      "name": "N-1..N = .S",
+      "coef": 3.838287589155169,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": ".S"
+      }
+    },
+    {
+      "name": "N-2..N = S.N",
+      "coef": 1.6900432120423432,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "S.N"
+      }
+    },
+    {
+      "name": "N-2..N = NS.",
+      "coef": 0.008739828664250337,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "NS."
+      }
+    },
+    {
+      "name": "N-2..N = N.S",
+      "coef": -0.010742293945457488,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "N.S"
+      }
+    },
+    {
+      "name": "N-1..N = O.",
+      "coef": 4.036919577547257,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": "O."
+      }
+    },
+    {
+      "name": "N-1..N = N.",
+      "coef": 1.7181909095782413,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": "N."
+      }
+    },
+    {
+      "name": "N-1..N = .N",
+      "coef": 4.30164073476887,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m2",
+        "mot": ".N"
+      }
+    },
+    {
+      "name": "N-2..N = N.N",
+      "coef": -1.6466599070165557,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "N.N"
+      }
+    },
+    {
+      "name": "N-2..N = .NS",
+      "coef": 3.3231343550821992,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": ".NS"
+      }
+    },
+    {
+      "name": "N-2..N = NO.",
+      "coef": 0.05962840185692504,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "NO."
+      }
+    },
+    {
+      "name": "N-2..N = .NN",
+      "coef": 2.9366807537119874,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": ".NN"
+      }
+    },
+    {
+      "name": "N-2..N = .SN",
+      "coef": 3.7742862071151815,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": ".SN"
+      }
+    },
+    {
+      "name": "sym == N  (a brand-new wallet bought in N)",
+      "coef": -1.1280669791743725,
+      "predicate": {
+        "kind": "symbol",
+        "field": null,
+        "thr": null,
+        "symv": "N",
+        "mkey": null,
+        "mot": null
+      }
+    },
+    {
+      "name": "N-2..N = ..N",
+      "coef": -10.39218006840829,
+      "predicate": {
+        "kind": "motif",
+        "field": null,
+        "thr": null,
+        "symv": null,
+        "mkey": "m3",
+        "mot": "..N"
+      }
+    }
+  ],
+  "threshold": {
+    "20": -6.568385033251319,
+    "10": -6.568385033251319,
+    "5": -6.568385033251319,
+    "2": -5.577031738933087,
+    "1": -4.759771258713704,
+    "0.5": -3.9221658053105104,
+    "0.25": -3.1986746691071457
+  },
+  "built": {
+    "pools": 766,
+    "events": 290,
+    "auc_hold": 0.7011708508621749,
+    "move_pct": 20.0,
+    "n_predictors": 17
+  }
+}
