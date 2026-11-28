@@ -69,6 +69,7 @@ BUY_EXACT_QUOTE_IN_V2 = bytes.fromhex("c2ab1c46684d5b2f")   # buy_exact_quote_in
 SELL_DISCS = frozenset({SELL, SELL_V2})
 BUY_DISCS_V2 = frozenset({BUY_V2, BUY_EXACT_QUOTE_IN_V2})
 DIRECT_BUY_DISCS = BUY_DISCS | BUY_DISCS_V2                 # what classify_instruction decodes as a buy
+V2_DISCS = frozenset({SELL_V2}) | BUY_DISCS_V2                # the v2 subset (for the v2 info line)
 
 # Well-known infrastructure programs that sit as top-level instructions in a routed tx but are NOT the
 # aggregator. Subtract these (and pumpswap itself) to attribute a dropped-CPI swap to the router program
@@ -91,6 +92,7 @@ class Swap(NamedTuple):
     token: str     # the non-WSOL mint of the pool (for the fires jsonl; frontrun_verify re-derives it anyway)
     is_buy: bool   # TOKEN buy (after the orientation flip), not the raw instruction kind
     payer: str     # tx fee payer (account_keys[0]) = the trading wallet, per the study
+    v2: bool = False  # decoded from a pump_amm v2 instruction (buy_v2 / sell_v2 / buy_exact_quote_in_v2)
 
 
 def classify_instruction(program_id: str, accts, data, account_keys, fee_payer) -> Optional[Swap]:
@@ -124,7 +126,7 @@ def classify_instruction(program_id: str, accts, data, account_keys, fee_payer) 
     token_is_base = not base_is_sol              # the token is the non-WSOL mint
     token_buy = (inst_buy == token_is_base)      # the box flip: a SOL-base pool's token BUY is the `sell` ix
     token = base_mint if token_is_base else quote_mint
-    return Swap(pool=pool, token=token, is_buy=token_buy, payer=fee_payer)
+    return Swap(pool=pool, token=token, is_buy=token_buy, payer=fee_payer, v2=disc in V2_DISCS)
 
 
 def decode_tx(account_keys, instructions, fee_payer=None):
@@ -203,6 +205,11 @@ class Consumer:
         # top level (routed through an aggregator CPI), so this feed dropped the swap. The box health line reads them.
         self.direct_swaps = 0
         self.cpi_txs = 0
+        # v2_swaps = the direct swaps that came from a v2 instruction. Every v2_log_s seconds on_tx prints one
+        # 'v2 decoded' info line (cumulative counts) so the box log shows v2 working; 0 = off.
+        self.v2_swaps = 0
+        self.v2_log_s = 60.0
+        self._v2_last = time.monotonic()
         # Phase 0 (router-breakdown): per dropped-CPI tx, tally the aggregator program id that carried it
         # (the non-infra, non-pumpswap top-level program). router_top() sizes which routers a CPI-aware
         # decoder must cover to recover the invisible swaps -- the Pareto set, not every router.
@@ -304,6 +311,12 @@ class Consumer:
         fires = []
         swaps = decode_tx(account_keys, instructions, fee_payer)
         self.direct_swaps += len(swaps)
+        self.v2_swaps += sum(1 for sw in swaps if sw.v2)
+        if self.v2_log_s:
+            now = time.monotonic()
+            if now - self._v2_last >= self.v2_log_s:
+                self._v2_last = now
+                print(self.v2_line(), flush=True)
         # CPI drop: pumpswap was invoked in this tx (its program id is in the account list) but there is no
         # top-level pumpswap instruction to decode -> the swap was routed through an aggregator CPI (a compiled
         # message carries no inner instructions), so we drop it. A proxy count of the invisible CPI swaps.
@@ -349,6 +362,11 @@ class Consumer:
         if verdict not in ("buy", "sell", "buyer_plus"):
             return None                                      # "drop" / unknown -> skip (conservative)
         return self.on_swap(slot, pool, token, verdict != "sell", payer)
+
+    def v2_line(self) -> str:
+        """The 'v2 decoded' info line: cumulative v2 swaps out of all direct swaps decoded."""
+        pct = 100.0 * self.v2_swaps / self.direct_swaps if self.direct_swaps else 0.0
+        return "v2 decoded: %d of %d direct swaps (%.1f%%)" % (self.v2_swaps, self.direct_swaps, pct)
 
     def router_top(self, n: int = 5):
         """Top aggregator programs by dropped-CPI tx count (Phase 0 sizing): which routers carry the

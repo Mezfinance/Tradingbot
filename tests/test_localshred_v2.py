@@ -116,3 +116,26 @@ def test_helius_swap_direction_reads_v2_for_failed_txs():
             "accountKeys": [{"pubkey": accts[1]}],
             "instructions": [{"programId": helius.PUMPSWAP_PROGRAM, "accounts": accts, "data": d58}]}}}
         assert helius.swap_direction(tx) is (want == "buy")
+
+
+def test_v2_counter_and_info_line(capsys):
+    c = lc.Consumer(gate=None, runner_factory=lambda: _Rec())
+    c.v2_log_s = 0                                  # no timed print while counting
+    keys = ["PAYER", "POOL", "USER", "GCONF", "TOKEN", lc.WSOL]
+    for d in (lc.BUY_V2, lc.SELL_V2, lc.BUY_BASE_OUT, lc.SELL):
+        c.on_tx(10, keys, [(lc.PROGRAM, [1, 2, 3, 4, 5], d + bytes(16))])
+    assert c.v2_swaps == 2 and c.direct_swaps == 4
+    assert c.v2_line() == "v2 decoded: 2 of 4 direct swaps (50.0%)"
+    assert capsys.readouterr().out == ""
+    c.v2_log_s = 60.0
+    c._v2_last -= 61                                # due: the next tx prints the line once
+    c.on_tx(11, keys, [(lc.PROGRAM, [1, 2, 3, 4, 5], lc.BUY_V2 + bytes(16))])
+    c.on_tx(11, keys, [(lc.PROGRAM, [1, 2, 3, 4, 5], lc.BUY_V2 + bytes(16))])
+    assert capsys.readouterr().out == "v2 decoded: 3 of 5 direct swaps (60.0%)\n"
+
+
+def test_v2_flag_on_swaps():
+    keys = ["PAYER", "POOL", "USER", "GCONF", "TOKEN", lc.WSOL]
+    flags = [lc.decode_tx(keys, [(lc.PROGRAM, [1, 2, 3, 4, 5], d + bytes(16))])[0].v2
+             for d in (lc.BUY_V2, lc.SELL_V2, lc.BUY_EXACT_QUOTE_IN_V2, lc.BUY_BASE_OUT, lc.SELL, lc.BUY_EXACT_QUOTE_IN)]
+    assert flags == [True, True, True, False, False, False]
