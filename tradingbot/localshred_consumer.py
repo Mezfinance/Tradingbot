@@ -168,7 +168,8 @@ class Consumer:
                  on_fire: Optional[Callable[[dict], None]] = None, runner_factory=None,
                  fresh_window_slots: int = 0, on_capture: Optional[Callable] = None,
                  handmade_only: bool = True, on_pool: Optional[Callable] = None, reserves=None,
-                 is_armed: Optional[Callable] = None, route_classify: Optional[Callable] = None):
+                 is_armed: Optional[Callable] = None, route_classify: Optional[Callable] = None,
+                 route_measure_only: bool = False):
         self.gate = gate
         self.tier = str(tier)
         self.flurry_min = flurry_min
@@ -229,6 +230,11 @@ class Consumer:
         # sniper-bot head, vs the 500+ whole-stream tail.
         self.cpi_txs_armed = 0
         self.cpi_routers_armed: dict = {}
+        # Router recovery tally (route_classify set): one count per router instruction on a TRACKED pool, by
+        # verdict (buy / sell / buyer_plus = tail, counted a buy / drop). route_measure_only=True tallies
+        # but never feeds on_swap, so the gate and its fires are exactly as with recovery off.
+        self.route_measure_only = route_measure_only
+        self.route_counts: dict = {}
 
     def _slot_rec(self, st: _PoolState) -> dict:
         # price/sol fields are 0.0: the precursor gate is price- and magnitude-free (sym/m2/m3 only).
@@ -317,6 +323,8 @@ class Consumer:
             if now - self._v2_last >= self.v2_log_s:
                 self._v2_last = now
                 print(self.v2_line(), flush=True)
+                if self.route_classify is not None:
+                    print(self.route_line(), flush=True)
         # CPI drop: pumpswap was invoked in this tx (its program id is in the account list) but there is no
         # top-level pumpswap instruction to decode -> the swap was routed through an aggregator CPI (a compiled
         # message carries no inner instructions), so we drop it. A proxy count of the invisible CPI swaps.
@@ -359,6 +367,9 @@ class Consumer:
         if pool is None:
             return None                                      # pool not tracked (not discovered / not ours)
         verdict = self.route_classify(program_id, data, accts, account_keys, token)   # token for mint_order rules
+        self.route_counts[verdict] = self.route_counts.get(verdict, 0) + 1
+        if self.route_measure_only:
+            return None                                      # measure only: count, never feed the gate
         if verdict not in ("buy", "sell", "buyer_plus"):
             return None                                      # "drop" / unknown -> skip (conservative)
         return self.on_swap(slot, pool, token, verdict != "sell", payer)
@@ -367,6 +378,16 @@ class Consumer:
         """The 'v2 decoded' info line: cumulative v2 swaps out of all direct swaps decoded."""
         pct = 100.0 * self.v2_swaps / self.direct_swaps if self.direct_swaps else 0.0
         return "v2 decoded: %d of %d direct swaps (%.1f%%)" % (self.v2_swaps, self.direct_swaps, pct)
+
+    def route_line(self) -> str:
+        """The 'routed' info line: router instructions on tracked pools, by verdict (cumulative)."""
+        c = self.route_counts
+        n = sum(c.values())
+        rec = c.get("buy", 0) + c.get("sell", 0)
+        pct = 100.0 * rec / n if n else 0.0
+        return ("routed (tracked pools): buy=%d sell=%d tail=%d drop=%d -> rule-decoded %d of %d (%.1f%%)%s"
+                % (c.get("buy", 0), c.get("sell", 0), c.get("buyer_plus", 0), c.get("drop", 0), rec, n, pct,
+                   " [measure only]" if self.route_measure_only else " [feeding the gate]"))
 
     def router_top(self, n: int = 5):
         """Top aggregator programs by dropped-CPI tx count (Phase 0 sizing): which routers carry the
