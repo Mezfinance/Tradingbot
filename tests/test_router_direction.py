@@ -3,7 +3,7 @@ from tradingbot.localshred_tap import _b58encode
 from tradingbot.localshred_consumer import PROGRAM as PUMPSWAP, WSOL, SELL, BUY_EXACT_QUOTE_IN
 
 JUP = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
-BOT = "CtjS9o7rj3UuiNSjUdh4vHih5WiEoLXDk6XE1y3LN8Vg"   # a pin-target
+BOT = "H16rUHa5roA8T8cqDpCqGWRQsXqDEgrWWiSww7GBWa5t"   # a pin-target
 TAIL = "ZzTailRouter11111111111111111111111111111111"
 
 
@@ -258,7 +258,7 @@ def test_load_samples_and_study_and_render(tmp_path):
 
 def test_study_reports_volume_weighted_coverage():
     # router A: clean disc split (accepted); router B: unseparable (not accepted)
-    A, B = BOT, "DiabLokxisGR8P4Qqp2QL6PmBhhVsdzPstCE4WoLxc5z"
+    A, B = BOT, "9is6NreU9HdcLBdph8fe4CxfYwMu6fjoBB6BDZFBvKNh"
     samples = []
     for i in range(20):
         d = "buy" if i % 2 == 0 else "sell"

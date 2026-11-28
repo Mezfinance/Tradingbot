@@ -40,6 +40,17 @@ PIN_TARGETS = frozenset({
 # is pure noise for the gate. DROP, never decode. (FLASHX = flash/arb, seen at ~2% of routed.)
 DENYLIST = frozenset({
     "FLASHX8DrLbgeR8FcfNV1F5krxYcYMUdBkrP1EPBtxB9",
+    # 2026-11-28 raw fetch (10,000 recent txs each, `Router Data/router-raw8.jsonl.gz`): these reference pumpswap
+    # in ~every tx but almost never swap on it. >=99.7% FAILED (spam / sniper retries):
+    "CtjS9o7rj3UuiNSjUdh4vHih5WiEoLXDk6XE1y3LN8Vg",   # 9,974 failed / 10,000; 21 ok pumpswap swaps
+    "JDk32MFrBeUpA9AN7CciPryokhSDxuWEAJdJfQxqDrpE",   # 9,996 failed; 4 ok swaps
+    "BmGwqQXtzu8tLH6TiG5DEVakNs4chNo2boVSov5rr3DG",   # 9,976 failed; 6 ok swaps
+    # ...or succeed WITHOUT a pumpswap swap (check-and-abort arb): <=0.12% of their txs are real swaps:
+    "DiabLokxisGR8P4Qqp2QL6PmBhhVsdzPstCE4WoLxc5z",   # 9,701 ok, 12 swaps
+    "2xKALZWKqW9KSH98jVJxnom5csv3FKYdiu6Z595vXKRv",   # 10,000 ok, 5 swaps
+    "81eej9NUm883KBEbYFxxLx3cbduVC1VQU8KmgwCpCp3",    # 10,000 ok, 5 swaps
+    "2TK4sdgGTG89Rh3TurnbViNzkJRyg8CaXhhAEQimX3ia",   # 10,000 ok, 8 swaps
+    # Counting any of them as a buyer (tail) would add ~1,000 phantom buys per real one, so they DROP.
 })
 
 
@@ -94,6 +105,19 @@ def apply_rule(rule: dict, data: bytes, accounts, account_keys, token: Optional[
         if data[o:o + w].hex() == rule["value"]:
             return rule["is"]
         return rule.get("other")                                   # one-sided rule: other is None -> abstain
+    if kind == "mint_index":                                       # the mint at a fixed account index (Jupiter
+        i = int(rule["index"])                                     # route dest mint): WSOL -> one side, the pool's
+        if i < 0 or i >= len(accounts) or not token:               # token -> the other, any other mint (a USDC
+            return None                                            # leg, multi-hop) -> abstain
+        ai = int(accounts[i])
+        if ai < 0 or ai >= len(account_keys):
+            return None
+        k = account_keys[ai]
+        if k == WSOL:
+            return rule["wsol_is"]
+        if k == token:
+            return rule["token_is"]
+        return None
     if kind == "per_disc":                                         # one sub-rule per instruction (prefix bytes)
         n = int(rule.get("prefix", 8))
         if len(data) < n:

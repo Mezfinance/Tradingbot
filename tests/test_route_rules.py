@@ -80,3 +80,30 @@ def test_routed_line_printed_with_the_v2_line(capsys):
     c.on_tx(10, *_routed_tx(b"\x01" * 8))
     out = capsys.readouterr().out.splitlines()
     assert out[0].startswith("v2 decoded: ") and out[1].startswith("routed (tracked pools): ")
+
+
+def test_mint_index_rule_is_token_aware_and_abstains_on_other_mints():
+    rule = {"kind": "mint_index", "index": 1, "wsol_is": "sell", "token_is": "buy"}
+    keys = ["A", lc.WSOL, "TOKEN", "USDC"]
+    assert rr.apply_rule(rule, b"", [0, 1], keys, "TOKEN") == "sell"
+    assert rr.apply_rule(rule, b"", [0, 2], keys, "TOKEN") == "buy"
+    assert rr.apply_rule(rule, b"", [0, 3], keys, "TOKEN") is None     # a USDC leg -> abstain
+    assert rr.apply_rule(rule, b"", [0, 2], keys, None) is None        # token unknown -> abstain
+    assert rr.apply_rule(rule, b"", [0], keys, "TOKEN") is None        # index out of range
+    assert rr.apply_rule(rule, b"", [0, 9], keys, "TOKEN") is None
+
+
+def test_shipped_rules_include_jupiter_and_deny_the_no_swap_bots():
+    import os
+    path = os.path.join(os.path.dirname(__file__), "..", "Router Data", "router_rules.json")
+    cls, n = rr.make_classifier(path)
+    jup = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4"
+    keys = ["PAYER", "x", "y", "z", "q", "TOKEN"]                     # route (e517...): dest mint at account 5
+    data = bytes.fromhex("e517cb977ae3ad2a") + bytes(8)
+    assert cls(jup, data, list(range(6)), keys, "TOKEN") == "buy"
+    assert cls(jup, data, list(range(6)), keys[:5] + [lc.WSOL], "TOKEN") == "sell"
+    for bot in ("CtjS9o7rj3UuiNSjUdh4vHih5WiEoLXDk6XE1y3LN8Vg", "DiabLokxisGR8P4Qqp2QL6PmBhhVsdzPstCE4WoLxc5z",
+                "2xKALZWKqW9KSH98jVJxnom5csv3FKYdiu6Z595vXKRv", "81eej9NUm883KBEbYFxxLx3cbduVC1VQU8KmgwCpCp3",
+                "2TK4sdgGTG89Rh3TurnbViNzkJRyg8CaXhhAEQimX3ia", "JDk32MFrBeUpA9AN7CciPryokhSDxuWEAJdJfQxqDrpE",
+                "BmGwqQXtzu8tLH6TiG5DEVakNs4chNo2boVSov5rr3DG"):
+        assert bot in rr.DENYLIST and cls(bot, b"\x01" * 16, [], [], "TOKEN") == "drop"

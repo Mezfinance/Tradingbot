@@ -607,5 +607,36 @@
    "afaf6d1f0d989bed": "buy"
   },
   "prefix": 8
+ },
+ "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4": {
+  "kind": "per_disc",
+  "prefix": 8,
+  "map": {
+   "e517cb977ae3ad2a": {
+    "kind": "mint_index",
+    "index": 5,
+    "wsol_is": "sell",
+    "token_is": "buy"
+   },
+   "bb64facc31c4af14": {
+    "kind": "mint_index",
+    "index": 4,
+    "wsol_is": "sell",
+    "token_is": "buy"
+   },
+   "5368c096b4479cc6": {
+    "kind": "mint_index",
+    "index": 3,
+    "wsol_is": "sell",
+    "token_is": "buy"
+   },
+   "a0752c34dc4d5140": {
+    "kind": "mint_index",
+    "index": 4,
+    "wsol_is": "sell",
+    "token_is": "buy"
+   }
+  },
+  "note": "hand-fit 2026-11-28 on router-raw8: route/route_v2/... dest mint index; 745 right, 0 wrong, 79 abstain (other-mint legs)"
  }
 }
