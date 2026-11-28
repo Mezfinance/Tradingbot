@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import Counter
 from typing import Optional
 
 from .localshred_consumer import PROGRAM as PUMPSWAP, WSOL, SELL, BUY_DISCS
@@ -197,25 +198,37 @@ def _router_top_ix(tx: dict, router: str):
     return None
 
 
-def fetch_router_samples(helius, router: str, limit: int = 100) -> list:
-    """Labeled samples for one router straight from Helius: getTransactionsForAddress(router) gives each
-    tx's TOP-LEVEL router instruction (data + account pubkeys = the shred-visible view, for fitting) AND its
-    inner pumpswap CPI (the TRUE direction, for the label) in one call. The sample is normalised to
-    (accounts=identity indices, keys=the instruction's account pubkeys) so apply_rule reads the i-th account
-    of the router instruction whether the source is this fetch (pubkey list) or the live shred path (indices
-    into the resolved keys) -- the rule's index is instruction-relative in both."""
-    out = []
-    for tx in helius.history(router, limit) or []:
-        d = label_from_tx(tx, None)                               # true direction from the inner pumpswap swap
-        if not d:
-            continue
-        ix = _router_top_ix(tx, router)
-        if ix is None:
-            continue
-        data, accts = ix
-        out.append({"router": router, "sig": _sig_of(tx), "pool": None,
-                    "payer": accts[0] if accts else None, "token": _inner_token(tx),
-                    "data": data, "accounts": list(range(len(accts))), "keys": accts, "dir": d})
+def fetch_router_samples(helius, router: str, pages: int = 2, per_page: int = 1000) -> list:
+    """Labeled samples for one router, MOST-RECENT-FIRST (desc) and paged DEEP. getTransactionsForAddress(
+    router) gives each tx's TOP-LEVEL router instruction (data + account pubkeys = the shred-visible view, for
+    fitting) AND its inner pumpswap CPI (the TRUE direction, for the label). Desc + deep is the fix for the
+    sortOrder=asc trap that pulled a router's GENESIS window (1-2 one-sided samples); a deep recent fetch of a
+    single router gives plenty of buy AND sell. ~10 credits per 100 txs."""
+    out: list = []
+    token = None
+    for _ in range(max(1, pages)):
+        opts = {"transactionDetails": "full", "sortOrder": "desc", "limit": per_page,
+                "maxSupportedTransactionVersion": 1, "encoding": "jsonParsed"}
+        if token:
+            opts["paginationToken"] = token
+        res = helius._rpc("getTransactionsForAddress", [router, opts], max(10, 10 * per_page // 100))
+        if not isinstance(res, dict):
+            break
+        page = res.get("data") or []
+        for tx in page:
+            d = label_from_tx(tx, None)                           # true direction from the inner pumpswap swap
+            if not d:
+                continue
+            ix = _router_top_ix(tx, router)
+            if ix is None:
+                continue
+            data, accts = ix
+            out.append({"router": router, "sig": _sig_of(tx), "pool": None,
+                        "payer": accts[0] if accts else None, "token": _inner_token(tx),
+                        "data": data, "accounts": list(range(len(accts))), "keys": accts, "dir": d})
+        token = res.get("paginationToken")
+        if not page or not token:
+            break
     return out
 
 
@@ -448,6 +461,41 @@ def find_rule(labeled, seed: int = 0) -> dict:
 # --- the validated decoder table + the two-tier classifier ------------------------------------------------
 
 RULES: dict = {}            # program_id -> validated rule; empty until find_rule output is loaded
+
+
+def decode_report(samples: list, counts: Optional[dict] = None) -> str:
+    """Per-router decode worksheet, sorted by volume: each router's buy vs sell discriminators and the fitted
+    rule, so the direction encoding is visible at a glance. Different disc on buy vs sell -> disc rule; same
+    disc -> the side is a data byte (byte_flag) or a WSOL account slot (wsol_index)."""
+    by: dict = {}
+    for s in samples:
+        by.setdefault(s["router"], []).append(s)
+
+    def vol(r):
+        return (counts or {}).get(r, 0)
+
+    lines = ["ROUTER DECODE -- buy vs sell instruction data (top-level router instruction)"]
+    for r in sorted(by, key=lambda r: (-vol(r), -len(by[r]))):
+        ss = by[r]
+        buys = [s for s in ss if s["dir"] == "buy"]
+        sells = [s for s in ss if s["dir"] == "sell"]
+        bd = Counter(s["data"][:8].hex() for s in buys)
+        sd = Counter(s["data"][:8].hex() for s in sells)
+        rep = find_rule(ss)
+        status = "ACCEPT %s" % (rep.get("kind") or "") if rep["accepted"] else rep.get("reason", "")
+        lines += ["",
+                  "%s  vol=%d  n=%d  buys=%d sells=%d  -> %s" % (r, vol(r), len(ss), len(buys), len(sells), status),
+                  "  buy  disc: " + (", ".join("%s(%d)" % (k, v) for k, v in bd.most_common(4)) or "-"),
+                  "  sell disc: " + (", ".join("%s(%d)" % (k, v) for k, v in sd.most_common(4)) or "-")]
+        if rep["accepted"]:
+            rule = rep["rule"]
+            if rule["kind"] == "byte_flag":
+                lines.append("  side = data byte[%d]: %s" % (rule["offset"], rule["map"]))
+            elif rule["kind"] == "wsol_index":
+                lines.append("  side = WSOL at account index %d (wsol->%s)" % (rule["index"], rule["wsol_is"]))
+            elif rule["kind"] == "mint_order":
+                lines.append("  side = WSOL vs token order (wsol-first->%s)" % rule["wsol_first"])
+    return "\n".join(lines)
 
 
 def load_rules(path: str) -> dict:

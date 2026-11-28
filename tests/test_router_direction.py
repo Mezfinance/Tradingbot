@@ -187,16 +187,8 @@ def test_router_classify_encodes_the_two_tier_risk_split():
     assert rd.router_classify(TAIL, b"\x01" * 8, [], [], rules=rules) == "buyer_plus"
 
 
-class _FakeHelius:
-    def __init__(self, txs):
-        self._txs = txs
-
-    def history(self, address, limit=100):
-        return self._txs
-
-
 def _history_tx(router, disc, base_mint, quote_mint, sig="SIG", router_accts=("U", "SRC", "DST")):
-    # a getTransactionsForAddress tx: top-level router ix + inner pumpswap CPI (the label)
+    # a getTransactionsForAddress(router) tx: top-level router ix at index 1 + inner pumpswap CPI (the label)
     return {"transaction": {"signatures": [sig], "message": {"instructions": [
         {"programId": "ComputeBudget111111111111111111111111111111", "accounts": [], "data": "11"},
         {"programId": router, "accounts": list(router_accts), "data": _b58encode(b"\xab" * 8 + b"\x00\x00")}]}},
@@ -205,23 +197,33 @@ def _history_tx(router, disc, base_mint, quote_mint, sig="SIG", router_accts=("U
              "data": _b58encode(disc + bytes(16))}]}]}}
 
 
-def test_fetch_router_samples_labels_from_the_inner_pumpswap_cpi():
+def test_fetch_router_samples_labels_recent_desc_over_pages():
     router = BOT
     txs = []
     for i in range(12):
-        # base=TOKEN/quote=WSOL: BUY disc -> buy, SELL disc -> sell. The router ix data is the SAME here,
-        # so direction is NOT in the discriminator -> but the router's source account flips WSOL/TOKEN
+        # same router disc both ways; WSOL at router account index 1 on a buy -> a wsol_index rule should fit
         d_buy = i % 2 == 0
         disc = BUY_EXACT_QUOTE_IN if d_buy else SELL
-        accts = ("U", WSOL, "TOK") if d_buy else ("U", "TOK", WSOL)   # WSOL at router account index 1 on a buy
+        accts = ("U", WSOL, "TOK") if d_buy else ("U", "TOK", WSOL)
         txs.append(_history_tx(router, disc, "TOKEN", WSOL, sig="S%d" % i, router_accts=accts))
-    samples = rd.fetch_router_samples(_FakeHelius(txs), router, limit=12)
-    assert len(samples) == 12
-    assert all(s["dir"] in ("buy", "sell") for s in samples)
+    rpc = _FakeRpc([{"data": txs[:8], "paginationToken": "t"}, {"data": txs[8:], "paginationToken": None}])
+    samples = rd.fetch_router_samples(rpc, router, pages=3, per_page=1000)
+    assert len(samples) == 12 and rpc.credits_used > 0           # paged desc until the token ran out
     assert samples[0]["keys"][0] == "U" and samples[0]["accounts"] == [0, 1, 2]
-    # a wsol-index rule should fit (WSOL at router account index 1 => buy)
     out = rd.study(samples, seed=5)
     assert out["n_accepted"] == 1 and out["accepted"][router]["kind"] == "wsol_index"
+
+
+def test_decode_report_shows_buy_and_sell_discriminators():
+    # router uses distinct discriminators for buy vs sell -> a disc rule, and the worksheet shows both
+    samples = []
+    for i in range(16):
+        d = "buy" if i % 2 == 0 else "sell"
+        disc = (b"\xaa" * 8) if d == "buy" else (b"\xbb" * 8)
+        samples.append({"router": BOT, "data": disc + bytes(8), "accounts": [0], "keys": ["X"], "dir": d})
+    txt = rd.decode_report(samples, counts={BOT: 123})
+    assert "ROUTER DECODE" in txt and BOT in txt and "vol=123" in txt
+    assert "aaaaaaaaaaaaaaaa(8)" in txt and "bbbbbbbbbbbbbbbb(8)" in txt and "ACCEPT disc" in txt
 
 
 def test_load_samples_and_study_and_render(tmp_path):

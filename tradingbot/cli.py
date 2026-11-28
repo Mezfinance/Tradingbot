@@ -232,8 +232,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--samples", type=str, default=None, help="router-direction: the box's router-samples JSONL ({router,sig,pool,payer,data(hex),accounts,keys})")
     parser.add_argument("--routers", type=str, default=None, help="router-direction: fetch labeled samples from Helius for these router program ids (comma-separated, or 'pins' for the built-in top-20). One getTransactionsForAddress per router gives the top-level router ix + the inner pumpswap CPI (true direction) -- no box capture needed")
     parser.add_argument("--routers-file", type=str, default=None, help="router-direction: a JSON {program_id: routed-tx count} (the box's full cpi_routers dump) -- fetch+fit EVERY router (highest volume first, budget-capped) and report volume-weighted coverage of the routed flow")
-    parser.add_argument("--per-router", type=int, default=200, help="router-direction fetch: transactions to read per router (Helius caps getTransactionsForAddress at 1000; ~20 credits per router at 200)")
-    parser.add_argument("--from-pumpswap", action="store_true", help="router-direction: sample from the pumpswap side (one desc sweep of the pumpswap program, bucketed by top-level router) instead of one fetch per router -- recent, balanced, no genesis-window bias. Use --routers-file for the coverage denominator")
+    parser.add_argument("--per-router", type=int, default=2000, help="router-direction per-router fetch: recent (desc) transactions to read per router, paged in 1000s (~10 credits per 100). Deep enough to see buy AND sell")
+    parser.add_argument("--top", type=int, default=0, help="router-direction: only fetch/decode the top-N routers by --routers-file volume (0 = all). The owner's 'top 20 routers'")
+    parser.add_argument("--decode", action="store_true", help="router-direction: print a per-router decode worksheet (buy vs sell discriminators + the side-encoding rule) as well as the coverage table")
+    parser.add_argument("--from-pumpswap", action="store_true", help="router-direction: sample from the pumpswap side (one desc sweep of the pumpswap program, bucketed by top-level router) instead of one fetch per router -- recent, balanced. Spreads thin across routers; prefer --routers-file --top N for deep per-router decode")
     parser.add_argument("--fires", type=str, default=None, help="frontrun-verify: JSON/JSONL of box fires {pool, slot, token_mint?, sym?, m2?, eta?} or a raw box log to grep for 'GATE FIRE' lines")
     parser.add_argument("--pairs", type=str, default=None, help="frontrun-verify: box fires by hand as 'pool:slot[:mint],pool:slot'")
     parser.add_argument("--gate", type=str, default=None, help="frontrun-verify: the exported gate JSON (flurry-study --export-gate)")
@@ -967,17 +969,22 @@ def main(argv: list[str] | None = None) -> None:
                     _progs = sorted(_rd.PIN_TARGETS)
                 else:
                     _progs = [p.strip() for p in args.routers.split(",") if p.strip()]
-                _per = max(1, min(1000, int(args.per_router)))
+                if args.top > 0:
+                    _progs = _progs[:args.top]                    # the owner's "top N routers"
+                _pp = min(1000, max(1, int(args.per_router)))     # per-page follows --per-router (budget spread)
+                _pages = max(1, (int(args.per_router) + _pp - 1) // _pp)
                 _rd_samples, _fetched = [], 0
                 for _prog in _progs:
                     if _h.credits_used >= _cap:
                         print(f"credit cap {_cap} reached after {_fetched}/{len(_progs)} routers", file=sys.stderr)
                         break
-                    _rd_samples += _rd.fetch_router_samples(_h, _prog, limit=_per)
+                    _rd_samples += _rd.fetch_router_samples(_h, _prog, pages=_pages, per_page=_pp)
                     _fetched += 1
-                    if _fetched % 20 == 0:
+                    if _fetched % 10 == 0:
                         print(f"fetched {_fetched}/{len(_progs)} routers, {_h.credits_used} credits",
                               file=sys.stderr, flush=True)
+            if args.decode:
+                print(_rd.decode_report(_rd_samples, counts=_counts))
             _rd_out = _rd.study(_rd_samples, counts=_counts, seed=0)
             if args.out:
                 with open(args.out, "w") as f:
