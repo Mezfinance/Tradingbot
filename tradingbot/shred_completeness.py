@@ -115,7 +115,7 @@ def _slot_counts(rec_vis: dict, mode: str) -> dict:
 _ZERO = {"n_buys": 0, "n_sells": 0, "buyers": set()}
 
 
-def compare_pool(cap_rec: dict, txs: list[dict]) -> Optional[dict]:
+def compare_pool(cap_rec: dict, txs: list[dict], route_classify=None) -> Optional[dict]:
     """One pool's capture vs Helius ground truth, over the box's watch window (the capture's slot range). Returns
     per-category trade counts + buyer-set recall, or None when there is nothing to compare (no mint, no capture
     slots, or Helius saw no trades in the window). Chain truth at three visibility levels from one tx set:
@@ -159,7 +159,9 @@ def compare_pool(cap_rec: dict, txs: list[dict]) -> Optional[dict]:
     dir_t = t["dir_buys"] + t["dir_sells"]
     box_t = t["box_buys"] + t["box_sells"]
     cap_t = t["cap_buys"] + t["cap_sells"]
+    rr = route_recovery(txs, pool, mint, lo, hi, route_classify) if route_classify else {}
     return {
+        **rr,
         "pool": pool, "slots_compared": len(slots),
         "all": all_t, "direct": dir_t, "box_visible": box_t, "capture": cap_t,
         "routed": all_t - dir_t,                 # aggregator CPI (no top-level decode sees it)
@@ -171,13 +173,80 @@ def compare_pool(cap_rec: dict, txs: list[dict]) -> Optional[dict]:
     }
 
 
+_INFRA = frozenset({
+    "ComputeBudget111111111111111111111111111111", "11111111111111111111111111111111",
+    "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA", "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+    "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL", "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr",
+    "Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo"})          # == localshred_consumer.INFRA_PROGRAMS
+
+
+def _inner_direction(tx: dict, pool: str, mint: str) -> Optional[str]:
+    """TRUE token direction of a routed swap on `pool`, from its inner pumpswap instruction (v1 or v2 disc +
+    the box orientation flip). None if the tx has no clean inner swap on this pool."""
+    for grp in (tx.get("meta") or {}).get("innerInstructions") or []:
+        for ix in grp.get("instructions") or []:
+            a = ix.get("accounts") or []
+            if ix.get("programId") != he.PUMPSWAP_PROGRAM or len(a) < 5 or a[0] != pool:
+                continue
+            try:
+                disc = he._b58decode(ix.get("data") or "")[:8]
+            except ValueError:
+                continue
+            inst_buy = True if disc in he._SWAP_BUYS else False if disc in he._SWAP_SELLS else None
+            if inst_buy is None or (a[3] == he.SOL_MINT) == (a[4] == he.SOL_MINT):
+                continue
+            token_is_base = a[3] != he.SOL_MINT
+            return "buy" if inst_buy == token_is_base else "sell"
+    return None
+
+
+def route_recovery(txs: list[dict], pool: str, mint: str, lo: int, hi: int, route_classify) -> dict:
+    """How the box's router rules (route_rules / localshred_consumer._recover_routed) would read each SUCCESSFUL
+    routed swap on `pool` inside the capture's slot window [lo, hi]. Mirrors the consumer: the first top-level
+    non-infra, non-pumpswap instruction whose accounts include the pool gets route_classify(..., token). Counts:
+    routed_seen (clean inner swap on the pool, no top-level pumpswap), rule_right / rule_wrong (rule fired,
+    vs the inner-swap truth), rule_tail (buyer_plus: counted a buy; tail_right = it really was a buy),
+    rule_drop (denylist / pin-target / abstain)."""
+    c = {k: 0 for k in ("routed_seen", "rule_right", "rule_wrong", "rule_tail", "tail_right", "rule_drop")}
+    for tx in txs:
+        if (tx.get("meta") or {}).get("err") is not None or not (lo <= int(tx.get("slot") or -1) <= hi):
+            continue
+        msg = (tx.get("transaction") or {}).get("message") or {}
+        top = msg.get("instructions") or []
+        if any(ix.get("programId") == he.PUMPSWAP_PROGRAM for ix in top):
+            continue                                              # direct swap: the capture's job, not a router's
+        truth = _inner_direction(tx, pool, mint)
+        if truth is None:
+            continue
+        c["routed_seen"] += 1
+        verdict = "drop"
+        for ix in top:
+            p, a = ix.get("programId"), ix.get("accounts") or []
+            if p in _INFRA or p == he.PUMPSWAP_PROGRAM or "parsed" in ix or pool not in a:
+                continue
+            try:
+                data = he._b58decode(ix.get("data") or "")
+            except ValueError:
+                data = b""
+            verdict = route_classify(p, data, list(range(len(a))), list(a), mint)
+            break
+        if verdict in ("buy", "sell"):
+            c["rule_right" if verdict == truth else "rule_wrong"] += 1
+        elif verdict == "buyer_plus":
+            c["rule_tail"] += 1
+            c["tail_right"] += truth == "buy"
+        else:
+            c["rule_drop"] += 1
+    return c
+
+
 def _pct(n: int, d: int) -> float:
     return round(100.0 * n / d, 1) if d else 0.0
 
 
 def study(cap_rows: list[dict], helius, max_credits: int = 40_000, span_s: float = 180.0,
           max_pools: int = 300, now: Optional[float] = None,
-          progress: Optional[Callable[[int, int, int], None]] = None) -> dict:
+          progress: Optional[Callable[[int, int, int], None]] = None, route_classify=None) -> dict:
     """Compare a sample of captured pools against Helius. Fetches each pool's trading window
     (``history_window`` aligned to the capture's first-seen ``create_ts``, like ``merge_capture_flows``),
     stops before a fetch could pass ``max_credits``, and aggregates. Research Helius key only."""
@@ -187,7 +256,8 @@ def study(cap_rows: list[dict], helius, max_credits: int = 40_000, span_s: float
              and len(cr.get("slots") or []) >= 1]
     pools.sort(key=lambda cr: hashlib.sha1(cr["pool"].encode()).hexdigest())   # stable: a cap leaves an even sample
     agg = {k: 0 for k in ("all", "direct", "box_visible", "capture", "routed", "lut", "absent",
-                           "chain_buyers", "box_buyers", "cap_hit_chain", "cap_hit_box")}
+                           "chain_buyers", "box_buyers", "cap_hit_chain", "cap_hit_box",
+                           "routed_seen", "rule_right", "rule_wrong", "rule_tail", "tail_right", "rule_drop")}
     rows, credits, compared, no_chain = [], 0, 0, 0
     per_page = MAX_PAGES * 10
     for i, cr in enumerate(pools):
@@ -198,7 +268,7 @@ def study(cap_rows: list[dict], helius, max_credits: int = 40_000, span_s: float
         ct = cr.get("create_ts") or 0
         txs, _ok = helius.history_window(cr["pool"], ct - 30, span_s + 60, MAX_PAGES)
         credits += per_page
-        res = compare_pool(cr, txs)
+        res = compare_pool(cr, txs, route_classify)
         if res is None:
             no_chain += 1
             if progress:
@@ -233,6 +303,15 @@ def study(cap_rows: list[dict], helius, max_credits: int = 40_000, span_s: float
         "buyer_recall_chain_pct": _pct(agg["cap_hit_chain"], agg["chain_buyers"]),
         "buyer_recall_box_pct": _pct(agg["cap_hit_box"], agg["box_buyers"]),
     }
+    if route_classify is not None:                    # router rules: what they would add on the same pools/slots
+        summary.update({
+            "routed_seen": agg["routed_seen"], "rule_right": agg["rule_right"], "rule_wrong": agg["rule_wrong"],
+            "rule_tail": agg["rule_tail"], "tail_right": agg["tail_right"], "rule_drop": agg["rule_drop"],
+            "rule_precision_pct": _pct(agg["rule_right"], agg["rule_right"] + agg["rule_wrong"]),
+            "rule_recall_of_routed_pct": _pct(agg["rule_right"], agg["routed_seen"]),
+            # headline: real (successful) swaps the box would decode = captured direct + rule-decoded routed
+            "decoded_with_rules_pct": _pct(agg["capture"] + agg["rule_right"], all_t),
+        })
     return {"freshness": fresh, "summary": summary, "pools": rows}
 
 
@@ -266,6 +345,14 @@ def render(out: dict) -> str:
              f"-- direct swaps the fuller LUT-resolved decode recovers")
     L.append(f"  routed (aggregator CPI) : {s['missing_routed']}  ({s['missing_routed_pct']}%)  "
              f"-- invisible to any top-level decode; router decoder NOT being built (0.2% of flow)")
+    if "decoded_with_rules_pct" in s:
+        L.append("")
+        L.append("ROUTER RULES  (what route_rules would add, same pools and slots; successful routed swaps only)")
+        L.append(f"  routed swaps seen     : {s['routed_seen']}")
+        L.append(f"  rule-decoded right    : {s['rule_right']}  wrong: {s['rule_wrong']}  "
+                 f"(precision {s['rule_precision_pct']}%, {s['rule_recall_of_routed_pct']}% of routed)")
+        L.append(f"  tail (counted a buy)  : {s['rule_tail']}  ({s['tail_right']} really buys)   dropped: {s['rule_drop']}")
+        L.append(f"  REAL SWAPS DECODED    : {s['have_pct']}% captured now -> {s['decoded_with_rules_pct']}% with the rules")
     L.append("")
     L.append("BUYER-SET RECALL  (the gate keys on the per-slot buyer set; a missed buyer misreads the symbol)")
     L.append(f"  vs every chain buyer : {s['buyer_recall_chain_pct']}%")

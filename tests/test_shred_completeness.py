@@ -161,3 +161,37 @@ def test_freshness_reports_age_and_span():
             {"pool": "p2", "create_ts": 4600, "slots": []}]
     fr = sc.freshness(rows, now=5000)
     assert fr["pools"] == 2 and fr["newest_age_s"] == 400.0 and fr["span_hours"] == 1.0
+
+
+def _routed_tx(slot, router, router_data_b58, inner_disc, base, quote, pool="POOL", err=None, extra_top=()):
+    from tradingbot.data import helius as h
+    inner = {"programId": h.PUMPSWAP_PROGRAM, "accounts": [pool, "U", "G", base, quote],
+             "data": h.b58encode(inner_disc + bytes(16))}
+    top = list(extra_top) + [{"programId": router, "accounts": ["U", pool, "X"], "data": router_data_b58}]
+    return {"slot": slot, "meta": {"err": err, "innerInstructions": [{"index": 0, "instructions": [inner]}]},
+            "transaction": {"message": {"instructions": top}}}
+
+
+def test_route_recovery_scores_rules_against_the_inner_swap():
+    from tradingbot import route_rules as rr
+    from tradingbot.data import helius as h
+    import tradingbot.shred_completeness as sc
+    R = "Rout3r1111111111111111111111111111111111111"
+    rules = {R: {"kind": "disc", "map": {"01" * 8: "buy", "02" * 8: "sell"}}}
+    cls = lambda p, d, a, k, t=None: rr.router_classify(p, d, a, k, t, rules=rules)   # noqa: E731
+    W, SELL, BUY = h.SOL_MINT, h._SWAP_SELL, bytes.fromhex("b817ee6167c5d33d")       # sell v1, buy_v2
+    d1, d2 = h.b58encode(b"\x01" * 8), h.b58encode(b"\x02" * 8)
+    txs = [
+        _routed_tx(100, R, d1, BUY, "TOKEN", W),              # rule buy, truth buy -> right
+        _routed_tx(101, R, d2, SELL, "TOKEN", W),             # rule sell, truth sell -> right
+        _routed_tx(102, R, d1, SELL, "TOKEN", W),             # rule buy, truth sell -> wrong
+        _routed_tx(103, R, h.b58encode(b"\x03" * 8), BUY, "TOKEN", W),   # abstain -> drop
+        _routed_tx(104, "TailProg", d1, BUY, "TOKEN", W),     # tail -> buyer_plus, really a buy
+        _routed_tx(105, R, d1, BUY, "TOKEN", W, err={"x": 1}),  # failed -> ignored
+        _routed_tx(999, R, d1, BUY, "TOKEN", W),              # outside the window -> ignored
+    ]
+    c = sc.route_recovery(txs, "POOL", "TOKEN", 100, 200, cls)
+    assert c == {"routed_seen": 5, "rule_right": 2, "rule_wrong": 1, "rule_tail": 1, "tail_right": 1, "rule_drop": 1}
+    # a denylisted router drops; a direct (top-level pumpswap) tx is not counted as routed
+    direct = _routed_tx(110, R, d1, BUY, "TOKEN", W, extra_top=[{"programId": h.PUMPSWAP_PROGRAM, "accounts": [], "data": ""}])
+    assert sc.route_recovery([direct], "POOL", "TOKEN", 100, 200, cls)["routed_seen"] == 0

@@ -234,6 +234,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--routers-file", type=str, default=None, help="router-direction: a JSON {program_id: routed-tx count} (the box's full cpi_routers dump) -- fetch+fit EVERY router (highest volume first, budget-capped) and report volume-weighted coverage of the routed flow")
     parser.add_argument("--per-router", type=int, default=2000, help="router-direction per-router fetch: recent (desc) transactions to read per router, paged in 1000s (~10 credits per 100). Deep enough to see buy AND sell")
     parser.add_argument("--top", type=int, default=0, help="router-direction: only fetch/decode the top-N routers by --routers-file volume (0 = all). The owner's 'top 20 routers'")
+    parser.add_argument("--route-rules", type=str, default=None, help="shred-completeness: router_rules.json -- also score how the box's router rules read each successful routed swap on the same pools/slots, and print the share of real swaps decoded with them")
     parser.add_argument("--raw-out", type=str, default=None, help="router-direction fetch: also write EVERY fetched tx (label-free compact record, gzip JSONL) here, for offline decoding")
     parser.add_argument("--diagnose", type=str, default=None, help="router-direction: comma-separated router ids; read ONE page (100 txs, ~10 credits) each and print why its txs were kept/dropped as samples")
     parser.add_argument("--skip-sampled", nargs="?", const="__default__", default=None, help="router-direction --routers-file: skip routers we already hold enough samples for (>=4 buy AND >=4 sell). Default list = the summary shipped in tradingbot/router_data/router_sampled.json; or pass a summary json / samples JSONL path. Only routers that still need samples are fetched")
@@ -917,8 +918,14 @@ def main(argv: list[str] | None = None) -> None:
         _sc_helius = _ScHelius(client=_sc_httpx.Client(timeout=60))   # research (backup) key, never the live key
         _sc_helius.min_interval_s = 1 / max(args.rps, 0.1)
         _sc_prog = lambda i, n, c: print(f"compare {i}/{n}, {c} credits", file=sys.stderr, flush=True)
+        _sc_cls = None
+        if args.route_rules:
+            from tradingbot import route_rules as _sc_rr
+            _sc_cls, _sc_n = _sc_rr.make_classifier(args.route_rules)
+            print(f"shred-completeness: {_sc_n} router rules from {args.route_rules}", file=sys.stderr)
         _sc_out = _sc.study(_sc_rows, _sc_helius, max_credits=int(args.max_credits or 40_000),
-                            span_s=args.span_s, max_pools=args.max_pools, progress=_sc_prog)
+                            span_s=args.span_s, max_pools=args.max_pools, progress=_sc_prog,
+                            route_classify=_sc_cls)
         print(json.dumps(_sc_out, indent=2) if args.json else _sc.render(_sc_out))
         return
 
