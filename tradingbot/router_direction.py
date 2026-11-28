@@ -699,15 +699,16 @@ def load_rules(path: str) -> dict:
 
 
 def load_samples(path: str) -> list:
-    """Load one or more router-samples JSONLs (comma-separated paths), de-duplicated by signature (a later
-    file's copy of a sig is dropped), so a top-up fetch can be merged with the original file safely."""
+    """Load one or more router-samples JSONLs (comma-separated paths), de-duplicated by (router, signature) (a
+    later file's copy is dropped), so a top-up fetch can be merged with the original file safely."""
     if "," in path:
         out, seen = [], set()
         for p in [x for x in path.split(",") if x]:
             for s in _load_samples_one(p):
-                if s.get("sig") and s["sig"] in seen:
+                key = (s.get("router"), s.get("sig"))           # one tx can sit under 2 routers: keep both
+                if s.get("sig") and key in seen:
                     continue
-                seen.add(s.get("sig"))
+                seen.add(key)
                 out.append(s)
         return out
     return _load_samples_one(path)

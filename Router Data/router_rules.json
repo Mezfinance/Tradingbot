@@ -353,5 +353,12 @@
    "9435acd457f73837": "sell"
   },
   "prefix": 8
+ },
+ "term9YPb9mzAsABaqN71A4xdbxHmpBNZavpBiQKZzN3": {
+  "kind": "per_disc",
+  "map": {
+   "afaf6d1f0d989bed": "buy"
+  },
+  "prefix": 8
  }
 }

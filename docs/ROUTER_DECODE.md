@@ -21,3 +21,11 @@ Validated rules: `Router Data/router_rules.json` (`load_rules` reads it; precisi
   `tradingbot/router_data/router_sampled.json` (summary of the 62MB JSONL). Counts copy:
   `tradingbot/router_data/router_counts.json`. Top 30 still-missing = 73.3% of routed volume.
 - Merge: `--samples "Router Data/router-samples.jsonl,Router Data/router-samples-top30.jsonl"` dedupes by sig.
+
+## Chunk 2 (2026-11-28) — top-30 top-up
+- Two runs (`router-samples-top30.jsonl`, `-top30-new.jsonl`) returned txs for only 4 of 30 routers
+  (JUP6, 6MWVTis8, term9, DF1ow4ts); the other 26 returned 0 both times (cause unverified; run log pending).
+- term9: ix `afaf6d1f…` = buy (302/302, stable); ix `de44ee3b…` (2 accounts, 2 random bytes) undecodable.
+- Jupiter (verified discs: `e517cb97…`=route, `bb64facc…`=route_v2): route dest_mint (acct 5) = token was
+  labelled sell 3/10 times (multi-hop/arb), so no precision-1.0 rule. Needs route-plan parsing or more data.
+- Coverage: 5.0% of routed volume (3.8% effective), 44 rules. Merge dedupe is per (router, sig).
