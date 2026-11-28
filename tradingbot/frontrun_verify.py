@@ -94,7 +94,8 @@ def _is_truncated(fired_slot: int, flow: dict, reached: bool) -> bool:
 
 def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, helius=None,
                rec: dict | None = None, span_s: float = 180.0, max_pages: int | None = None,
-               box_exact: bool = False, hybrid: bool = False, ws_only: bool = False) -> dict:
+               box_exact: bool = False, hybrid: bool = False, ws_only: bool = False,
+               start_ts: float | None = None) -> dict:
     """Replay one fired pool through the study's ground-truth path and score the box's gate on every slot.
     `rec` (a launch_record dict) short-circuits the fetch -- used by tests and when the box dumped its own series.
     `box_exact` builds the ground truth with the box's LUT drop replicated (launch_record vis_box_exact), so a
@@ -102,7 +103,12 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
     deeper gap than LUT (shred loss); one that vanishes is the drop_lut completeness gap.
     `hybrid` builds the ground truth as flurry_study._hybrid_bank (the box's live architecture: the CURRENT slot
     scored from the DIRECT shred view, the prior slots rebased to the FULL Helius view) instead of a single-vis
-    SlotBank -- so a hybrid-gate box fire is verified against the exact offline hybrid the gate was fit on."""
+    SlotBank -- so a hybrid-gate box fire is verified against the exact offline hybrid the gate was fit on.
+    `start_ts` (the pool's first-seen time from the box --capture, or (first_seen, fired_slot_sec) from
+    capture_align) aligns the fetch to the captured TRADING window as localshred-merge does (history_window from
+    start-30 for max(span_s, fired_sec+30)+60 s, so a late fire is still inside the window) instead of the pool's
+    creation tx. A hand-made pool's trading can start minutes after creation, so a creation-anchored fetch can
+    hold < 3 priced slots ("no flow") or run out of pages before the fire ("truncated")."""
     pool, slot, box = fire["pool"], int(fire["slot"]), fire.get("box") or {}
     is_cap = isinstance(rec, dict) and ("confirmed" in rec or "shred" in rec)   # a box capture, not a launch_record
     ws = ws_only or is_cap                          # single complete feed, no rebase (the box's + study's own path)
@@ -118,8 +124,19 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
         if not mint:
             res["status"] = "mint unresolved"
             return res
-        txs, reached, _err = helius.history_from_start(pool, span_s, max_pages or fl.MAX_PAGES)
-        rec = he.launch_record(txs, pool, mint, window_s=span_s, with_vis=(hybrid or (not ws and gate_vis != "full")),
+        pages = max_pages or fl.MAX_PAGES
+        if start_ts:                                # capture-aligned (the merge's window), not creation-anchored
+            t0, fire_sec = (start_ts if isinstance(start_ts, (tuple, list)) else (start_ts, None))
+            span = max(span_s, float(fire_sec) + 30) if fire_sec is not None else span_s   # reach the fired slot
+            res["window"] = [round(float(t0) - 30, 1), round(span + 60, 1)]
+            txs, ok = helius.history_window(pool, float(t0) - 30, span + 60, pages)
+            reached = ok and len(txs) < 100 * pages   # a full last page = page-capped (may stop short of the fire)
+            win = span + 90
+        else:
+            txs, reached, _err = helius.history_from_start(pool, span_s, pages)
+            win = span_s
+        res["aligned"] = bool(start_ts)
+        rec = he.launch_record(txs, pool, mint, window_s=win, with_vis=(hybrid or (not ws and gate_vis != "full")),
                                vis_box_exact=box_exact)
     saved_vq, saved_c, saved_da = fl.USE_VQ, fl.CAUSAL_WALLET, fl.DROP_ARTIFACTS
     try:
@@ -188,8 +205,10 @@ def verify_one(fire: dict, gate: dict, tier: str = "1", flurry_min: int = 3, hel
 
 def verify(fires: list[dict], gate: dict, helius=None, have: dict | None = None,
            tier: str = "1", flurry_min: int = 3, span_s: float = 180.0, max_pages: int | None = None,
-           box_exact: bool = False, hybrid: bool = False, ws_only: bool = False) -> dict:
-    """Verify every fire. `have` (pool -> launch_record OR box-capture dict) injects ground truth without Helius.
+           box_exact: bool = False, hybrid: bool = False, ws_only: bool = False,
+           start_ts: dict | None = None) -> dict:
+    """Verify every fire. `start_ts` (pool -> first-seen ts, from capture_start_ts) aligns each fetch to the
+    captured trading window (see verify_one). `have` (pool -> launch_record OR box-capture dict) injects ground truth without Helius.
     ws_only: score the capture's single complete+priced feed (confirmed series) through SlotBank with NO rebase --
     the box's and study's own path, so a train=serve gate reproduces by construction (frontrun-verify is then an
     integration check: did the live fires come from the captured feed, not a hybrid reconstruction)."""
@@ -198,7 +217,8 @@ def verify(fires: list[dict], gate: dict, helius=None, have: dict | None = None,
         pg.compile_gate(gate)
     rows = [verify_one(f, gate, tier, flurry_min, helius=helius,
                        rec=(have or {}).get(f["pool"]), span_s=span_s, max_pages=max_pages,
-                       box_exact=box_exact, hybrid=hybrid, ws_only=ws_only) for f in fires]
+                       box_exact=box_exact, hybrid=hybrid, ws_only=ws_only,
+                       start_ts=_align_for(start_ts, f)) for f in fires]
     ok = [r for r in rows if r.get("status") == "ok"]
     repro = sum(1 for r in ok if r["reproduced"])
     trunc = sum(1 for r in rows if r.get("status") == "truncated")
@@ -207,6 +227,44 @@ def verify(fires: list[dict], gate: dict, helius=None, have: dict | None = None,
             "n_fires": len(fires), "n_checked": len(ok), "n_reproduced": repro, "n_diverged": len(ok) - repro,
             "n_truncated": trunc, "dist": _distance(ok), "rows": rows,
             "usd_total": round(sum(usd), 2), "usd_n": len(usd), "usd_stake": STAKE_USD}
+
+
+def capture_start_ts(path: str) -> dict:
+    """pool -> [(create_ts, {slot: sec}), ...] from a box --capture JSONL: every captured window of the pool (a
+    pool can be closed and re-opened, giving several rows), with each captured slot's offset from first-seen.
+    _align_for picks the window holding the fired slot, so verify fetches the window the fire came from."""
+    out: dict = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            p = r.get("pool")
+            if not p or not r.get("create_ts"):
+                continue
+            secs = {int(x[1]): float(x[0]) for x in (r.get("slots") or []) if len(x) > 1}
+            out.setdefault(p, []).append((float(r["create_ts"]), secs))
+    return out
+
+
+def _align_for(windows: dict | None, fire: dict):
+    """The (first_seen, fired_slot_sec) fetch anchor for one fire: the capture window that holds the fired slot;
+    else the latest window that opened before it (fire_sec estimated at 0.4 s/slot); else the richest window.
+    None when the pool is not in the capture (falls back to the creation-anchored fetch)."""
+    wins = (windows or {}).get(fire["pool"])
+    if not wins:
+        return None
+    slot = int(fire["slot"])
+    for t0, secs in wins:
+        if slot in secs:
+            return (t0, secs[slot])
+    before = [(min(secs), t0, secs) for t0, secs in wins if secs and min(secs) <= slot]
+    if before:
+        s0, t0, secs = max(before)
+        return (t0, secs[s0] + 0.4 * (slot - s0))
+    t0, secs = max(wins, key=lambda w: len(w[1]))
+    return (t0, None)
 
 
 def _distance(ok: list[dict]) -> dict:

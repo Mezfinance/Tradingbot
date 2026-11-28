@@ -214,3 +214,46 @@ def test_box_exact_drops_lut_pooled_direct_swaps():
     stat = _lut_tx(pool, mint, lut_pool=False)
     assert he._lut_sourced(stat, pool) is False
     assert he.launch_record([stat], pool, mint, with_vis=True, vis_box_exact=True)["txs"][0][fl._VIS] is True
+
+
+# -- capture-aligned fetch: a hand-made pool's trading can start long after creation, so verify must fetch the
+#    captured window (as localshred-merge does), stretched to reach the fired slot --
+
+class _FakeHelius:
+    def __init__(self):
+        self.calls = []
+
+    def accounts(self, pools):
+        return {}
+
+    def history_window(self, pool, from_ts, span_s, pages):
+        self.calls.append(("window", from_ts, span_s, pages))
+        return [], True
+
+    def history_from_start(self, pool, span_s, pages):
+        self.calls.append(("start", span_s, pages))
+        return [], True, False
+
+
+def test_capture_align_picks_the_window_holding_the_fired_slot(tmp_path):
+    import json
+    cap = tmp_path / "cap.jsonl"
+    cap.write_text("\n".join(json.dumps(r) for r in [
+        {"pool": "P", "create_ts": 1000.0, "slots": [[0.0, 50, 1, 0, []], [4.0, 60, 1, 0, []]]},
+        {"pool": "P", "create_ts": 5000.0, "slots": [[0.0, 900, 1, 0, []], [400.0, 1900, 2, 3, []]]},
+    ]) + "\n")
+    w = fv.capture_start_ts(str(cap))
+    assert fv._align_for(w, {"pool": "P", "slot": 1900}) == (5000.0, 400.0)       # exact captured slot
+    assert fv._align_for(w, {"pool": "P", "slot": 1000}) == (5000.0, 40.0)        # inside a window, 0.4 s/slot
+    assert fv._align_for(w, {"pool": "Q", "slot": 1}) is None                     # not captured -> creation fetch
+
+
+def test_aligned_fetch_uses_history_window_and_reaches_the_fire():
+    h = _FakeHelius()
+    fire = {"pool": "P", "slot": 1900, "mint": "M", "box": {}}
+    r = fv.verify_one(fire, dict(GATE), helius=h, span_s=180.0, max_pages=20, start_ts=(5000.0, 400.0))
+    assert h.calls == [("window", 4970.0, 490.0, 20)]       # from first-seen-30, long enough to pass the fire
+    assert r["aligned"] is True
+    h2 = _FakeHelius()
+    fv.verify_one(fire, dict(GATE), helius=h2, span_s=180.0, max_pages=6)
+    assert h2.calls == [("start", 180.0, 6)]                # no capture -> the old creation-anchored fetch
